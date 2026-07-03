@@ -1,0 +1,42 @@
+# Rocket.Chat -> MongoDB fallback map for rc-repro.
+#
+# PRIMARY resolution is a live lookup against releases.rocket.chat/<v>/info
+# (see versions.py). This file is only the OFFLINE FALLBACK, used when that
+# endpoint is unreachable, or for old releases that predate its
+# `compatibleMongoVersions` field.
+#
+# Only the MongoDB *tag* is stored per RC range; flavor / shell / oplog are
+# derived in code from the RC and Mongo majors:
+#   - mongo_flavor = "official" if RC major >= 8 else "bitnami-legacy"
+#   - mongo_shell  = "mongosh"  if Mongo major >= 5 else "mongo"  (official only)
+#   - oplog        = RC major < 8  (MONGO_OPLOG_URL; deprecated in 8.x)
+#
+# Constraints are PEP440 specifiers (comma = AND); first match wins, newest first.
+
+default_rc_image: registry.rocket.chat/rocketchat/rocket.chat
+
+rules:
+  - rc: ">=8.2.0"
+    mongo: "8.0"
+    note: "RC 8.2+ -> MongoDB 8.0 (per releases.rocket.chat)."
+  - rc: ">=8.0.0,<8.2.0"
+    mongo: "8.2"
+    note: "RC 8.0/8.1 -> MongoDB 8.2 (per releases.rocket.chat)."
+  - rc: ">=7.0.0,<8.0.0"
+    mongo: "7.0"
+    note: "RC 7.x supports 5.0/6.0/7.0; 7.0 chosen."
+  - rc: ">=6.0.0,<7.0.0"
+    mongo: "6.0"
+    note: "RC 6.x supports 4.4/5.0/6.0; 6.0 recommended."
+  - rc: ">=5.0.0,<6.0.0"
+    mongo: "5.0"
+    note: "RC 5.x supports 4.2/4.4/5.0."
+  - rc: ">=4.0.0,<5.0.0"
+    mongo: "4.4"
+    note: "RC 4.x supports 3.6-4.4; needs MONGO_OPLOG_URL."
+  - rc: ">=3.0.0,<4.0.0"
+    mongo: "4.0"
+    note: "RC 3.x supports 3.4-4.0; needs MONGO_OPLOG_URL."
+  - rc: "<3.0.0"
+    mongo: "3.6"
+    note: "Legacy RC (<3.0); best-effort."

@@ -1,0 +1,9 @@
+name: default
+description: >-
+  Vanilla Rocket.Chat, ready to use immediately: setup wizard skipped and an
+  admin user auto-created (admin / admin123).
+requires_license: false
+env: {}
+depends_on: []
+services: {}
+rocketchat: {}

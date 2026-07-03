@@ -1,0 +1,16 @@
+name: airgapped
+description: >-
+  Simulates an air-gapped workspace with no Rocket.Chat Cloud connectivity. The
+  Cloud URL and workspace credentials point at non-routable placeholders, so
+  cloud sync, registration and marketplace calls never reach out. Use to
+  reproduce offline / disconnected-workspace behaviour.
+requires_license: false
+env:
+  # Fake cloud endpoint + pre-set workspace credentials => the workspace looks
+  # registered and never phones home to cloud.rocket.chat.
+  OVERWRITE_SETTING_Cloud_Url: https://airgapped-workspace.rocket.chat
+  OVERWRITE_SETTING_Cloud_Workspace_Client_Id: airgapped
+  OVERWRITE_SETTING_Cloud_Workspace_Client_Secret: airgapped
+depends_on: []
+services: {}
+rocketchat: {}
