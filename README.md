@@ -230,6 +230,7 @@ Run `rc-repro <command> --help` for flags.
 ## Development
 
 ```bash
+python -m pip install --upgrade pip   # editable installs need pip >= 21.3
 pip install -e ".[dev]"
 pytest                     # pure-logic tests (no Docker needed)
 ```
