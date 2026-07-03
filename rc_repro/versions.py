@@ -38,7 +38,7 @@ class Resolved:
 
 @lru_cache(maxsize=1)
 def _load_map() -> dict:
-    text = resources.files("rc_repro").joinpath("data", "versions.yaml").read_text()
+    text = resources.files("rc_repro").joinpath("data", "versions.yaml").read_text(encoding="utf-8")
     data = yaml.safe_load(text)
     if not data or "rules" not in data:
         raise RuntimeError("data/versions.yaml is missing or has no rules")

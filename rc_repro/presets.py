@@ -72,7 +72,7 @@ def load(name: str, params: dict | None = None) -> Preset:
 
     user_path = config.preset_dir() / f"{name}.yaml"
     if user_path.exists():
-        return _parse(user_path.read_text(), source=str(user_path))
+        return _parse(user_path.read_text(encoding="utf-8"), source=str(user_path))
 
     builders = _dynamic_builders()
     if name in builders:
@@ -81,7 +81,7 @@ def load(name: str, params: dict | None = None) -> Preset:
     builtin = resources.files("rc_repro").joinpath("data", "presets", f"{name}.yaml")
     if not builtin.is_file():
         raise ValueError(f"unknown preset {name!r} (run `rc-repro presets` to list)")
-    return _parse(builtin.read_text(), source="built-in")
+    return _parse(builtin.read_text(encoding="utf-8"), source="built-in")
 
 
 def list_presets() -> list[Preset]:
@@ -90,7 +90,7 @@ def list_presets() -> list[Preset]:
     builtin_dir = resources.files("rc_repro").joinpath("data", "presets")
     for entry in builtin_dir.iterdir():
         if entry.name.endswith(".yaml"):
-            p = _parse(entry.read_text(), source="built-in")
+            p = _parse(entry.read_text(encoding="utf-8"), source="built-in")
             seen[p.name] = p
 
     for name, build in _dynamic_builders().items():
@@ -99,7 +99,7 @@ def list_presets() -> list[Preset]:
     user_dir = config.preset_dir()
     if user_dir.exists():
         for path in sorted(user_dir.glob("*.yaml")):
-            p = _parse(path.read_text(), source=str(path))
+            p = _parse(path.read_text(encoding="utf-8"), source=str(path))
             seen[p.name] = p
 
     return [seen[k] for k in sorted(seen)]

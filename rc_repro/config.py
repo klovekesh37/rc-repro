@@ -53,7 +53,7 @@ def load_config() -> dict:
     path = config_file()
     if not path.exists():
         return {}
-    data = yaml.safe_load(path.read_text()) or {}
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         return {}
     return data
@@ -61,4 +61,4 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     home().mkdir(parents=True, exist_ok=True)
-    config_file().write_text(yaml.safe_dump(cfg, sort_keys=False))
+    config_file().write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")

@@ -10,6 +10,7 @@ import json
 import shutil
 import socket
 import subprocess
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -49,17 +50,17 @@ def write(name: str, compose_yaml: str, meta: Metadata,
           files: list[tuple[str, str]] | None = None) -> None:
     ws = workspace(name)
     ws.mkdir(parents=True, exist_ok=True)
-    (ws / "docker-compose.yml").write_text(compose_yaml)
-    (ws / "repro.json").write_text(json.dumps(asdict(meta), indent=2))
+    (ws / "docker-compose.yml").write_text(compose_yaml, encoding="utf-8")
+    (ws / "repro.json").write_text(json.dumps(asdict(meta), indent=2), encoding="utf-8")
     # Preset-generated files (e.g. a seeded LDIF that a service mounts).
     for relpath, content in files or []:
         fp = ws / relpath
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        fp.write_text(content, encoding="utf-8")
 
 
 def read_meta(name: str) -> Metadata:
-    blob = json.loads((workspace(name) / "repro.json").read_text())
+    blob = json.loads((workspace(name) / "repro.json").read_text(encoding="utf-8"))
     return Metadata(**blob)
 
 
@@ -85,7 +86,11 @@ def used_ports() -> set[int]:
 def port_free(port: int) -> bool:
     """True if `port` can be bound on the host right now (nothing listening)."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # On Unix, SO_REUSEADDR lets us probe a port that's only in TIME_WAIT.
+        # On Windows it would let bind() succeed even for an active listener
+        # (a false "free"), so skip it there.
+        if sys.platform != "win32":
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("0.0.0.0", port))
             return True
