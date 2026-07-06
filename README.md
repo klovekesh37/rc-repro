@@ -151,6 +151,32 @@ depends_on: [my-sidecar]
 
 ---
 
+## Sample data (`--seed`)
+
+A fresh repro is empty. Many tickets (message sync, search, notifications, UI
+with data, permissions) need a populated workspace — `--seed` creates realistic
+users, channels, DMs, and messages (authored across the users, not just admin).
+
+```bash
+rc-repro up --version 8.5.1 --name acme-1234 --seed                 # small (default)
+rc-repro up --version 8.5.1 --name acme-1234 --seed --seed-profile standard
+rc-repro seed --name acme-1234 --profile large                      # seed an existing repro
+rc-repro seed --name acme-1234 --users 30 --channels 10 --messages 40   # custom counts
+```
+
+| Profile | Users | Channels | Msgs/channel | DMs | Threads/reactions |
+|---------|-------|----------|--------------|-----|-------------------|
+| `small` (default) | 5 | 3 | 5 | 2 | no |
+| `standard` | 20 | 8 | 20 | 5 | yes |
+| `large` | 100 | 20 | 100 | 20 | yes |
+
+Seed users are named `alice`, `bob`, … (password = username). Seeding disables
+email-2FA and temporarily the API rate limiter so it can log in as each user and
+post at volume. Best for realistic *content* — for huge user counts use the
+`ldap` preset. (Design notes: [`docs/seed-design.md`](docs/seed-design.md).)
+
+---
+
 ## API testing
 
 For reproducing REST-API tickets (auth is set up so you can call endpoints instantly):
@@ -217,6 +243,7 @@ Override the root with `RC_REPRO_HOME`.
 | `list` | all repros: version, port, state, URL |
 | `info` | URL, admin creds, curl snippet, preset notes |
 | `token` / `api` / `pat` | REST auth + calls |
+| `seed` | populate a repro with sample users/channels/messages |
 | `logs` | tail a repro's logs |
 | `presets` | list available presets |
 | `versions <X.Y.Z>` | show the resolved MongoDB pairing |

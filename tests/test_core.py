@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from rc_repro import compose, presets, versions
+from rc_repro import compose, presets, seed, versions
 
 
 # --- version resolution (offline / fallback map) ------------------------------
@@ -111,3 +111,26 @@ def test_compose_yaml_is_valid():
     text = compose.to_yaml(doc)
     parsed = yaml.safe_load(text)
     assert parsed["name"] == "rcrepro-t"
+
+
+# --- seed ---------------------------------------------------------------------
+
+
+def test_seed_profile_and_overrides():
+    p = seed.plan_from("standard")
+    assert (p.users, p.channels, p.messages, p.rich) == (20, 8, 20, True)
+    p2 = seed.plan_from("standard", users=3, messages=1)
+    assert p2.users == 3 and p2.messages == 1 and p2.channels == 8  # override + inherit
+
+
+def test_seed_usernames_avoid_userN_collision():
+    # ldap/saml presets use user1..userN; seed users must never collide.
+    names = [seed.username(i) for i in range(60)]
+    assert all(not n.startswith("user") for n in names)
+    assert len(set(names)) == len(names)          # unique
+    assert names[0] == "alice"
+
+
+def test_seed_channel_names_unique():
+    names = [seed.channel_name(i) for i in range(30)]
+    assert len(set(names)) == len(names)

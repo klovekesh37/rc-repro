@@ -7,11 +7,12 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
-from typing import NoReturn
+from typing import NoReturn, Optional
 
 import typer
 
 from rc_repro import compose, config, presets, rcapi, runner, versions
+from rc_repro import seed as seeder
 
 app = typer.Typer(
     add_completion=False,
@@ -92,6 +93,8 @@ def up(
     mongo: str = typer.Option("", "--mongo", help="override the resolved MongoDB tag"),
     reg_token: str = typer.Option("", "--reg-token", help="cloud registration token (EE license)"),
     set_: list[str] = typer.Option(None, "--set", help="preset parameter KEY=VALUE (repeatable), e.g. --set users=5"),
+    seed: bool = typer.Option(False, "--seed", help="populate with sample users/channels/messages after boot"),
+    seed_profile: str = typer.Option("small", "--seed-profile", help="seed size: small | standard | large"),
     pin: bool = typer.Option(False, "--pin", help="mark persistent + set as default"),
     wait: bool = typer.Option(False, "--wait", help="block until RC is serving"),
     offline: bool = typer.Option(False, "--offline", help="skip the live version lookup"),
@@ -122,11 +125,11 @@ def up(
     except ValueError as exc:
         _err(str(exc))
 
-    # Presets with post-ready actions (e.g. Keycloak SAML) only work once those
-    # run, which needs readiness — so imply --wait for them.
-    if pre.post_ready and not wait:
+    # Post-ready preset actions (e.g. Keycloak SAML) and --seed both need RC to
+    # be serving first, so imply --wait for them.
+    if (pre.post_ready or seed) and not wait:
         wait = True
-        typer.echo("(preset self-configures after boot — waiting for readiness)")
+        typer.echo("(waiting for readiness — preset self-config / --seed run after boot)")
 
     repro_name = _sanitize(name) if name else _derive_name(version, preset)
 
@@ -146,6 +149,8 @@ def up(
                 _err("`docker compose up` failed (see output above)")
         meta = runner.read_meta(repro_name)
         _post_up(meta, wait)
+        if seed:
+            _run_seed(meta, seed_profile)
         return
 
     host_port = port or runner.pick_port()
@@ -212,6 +217,27 @@ def up(
         _err("`docker compose up` failed (see output above)")
 
     _post_up(meta, wait)
+    if seed:
+        _run_seed(meta, seed_profile)
+
+
+def _run_seed(meta: runner.Metadata, profile: str,
+              users=None, channels=None, messages=None) -> None:
+    try:
+        auth = rcapi.login(meta.root_url)
+    except Exception as exc:  # noqa: BLE001
+        _err(f"can't seed — repro not ready (`rc-repro ready --name {meta.name}`): {exc}")
+    plan = seeder.plan_from(profile, users, channels, messages)
+    typer.echo(
+        f"Seeding {meta.name!r} (profile: {profile} — {plan.users} users, "
+        f"{plan.channels} channels, {plan.messages} msgs/channel)…"
+    )
+    s = seeder.seed(meta.root_url, auth, plan, log=lambda m: typer.echo(f"  {m}"))
+    typer.secho(
+        f"✓ seeded: {s['users']} users, {s['channels']} channels, "
+        f"~{s['messages']} messages, {s['dms']} DMs",
+        fg=typer.colors.GREEN,
+    )
 
 
 def _post_up(meta: runner.Metadata, wait: bool) -> None:
@@ -516,6 +542,20 @@ def pat(
         _err(f"could not create PAT (ready? `rc-repro ready --name {m.name}`): {exc}")
     typer.echo(f"# Personal Access Token for {m.name} ({m.root_url}) — bypass_2fa={bypass_2fa}")
     typer.echo(f'-H "X-Auth-Token: {token}" -H "X-User-Id: {auth.user_id}"')
+
+
+@app.command(name="seed")
+def seed_cmd(
+    name: str = typer.Option("", "--name", "-n"),
+    profile: str = typer.Option("small", "--profile", help="small | standard | large"),
+    users: Optional[int] = typer.Option(None, "--users", help="override user count"),
+    channels: Optional[int] = typer.Option(None, "--channels", help="override channel count"),
+    messages: Optional[int] = typer.Option(None, "--messages", help="override messages per channel"),
+) -> None:
+    """Populate a repro with sample users, channels, DMs and messages."""
+    _require_docker()
+    m = runner.read_meta(_resolve_name(name))
+    _run_seed(m, profile, users, channels, messages)
 
 
 @app.command()
