@@ -132,7 +132,6 @@ def build(spec: Spec) -> dict:
         "restart": "always",
         "environment": _rc_environment(spec),
         "ports": [f"{spec.host_port}:{spec.container_port}"],
-        "volumes": ["uploads:/app/uploads"],
         "depends_on": (
             {"mongo-init": {"condition": "service_completed_successfully"}}
             if official
@@ -148,7 +147,7 @@ def build(spec: Spec) -> dict:
     doc: dict = {
         "name": spec.project_name,
         "services": services,
-        "volumes": {"mongodb_data": {"driver": "local"}, "uploads": {"driver": "local"}},
+        "volumes": {"mongodb_data": {"driver": "local"}},
     }
 
     # --- apply the preset's backing services / RC patch / depends_on ---
