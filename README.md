@@ -1,115 +1,120 @@
 # rc-repro
 
-Spin up a **version-matched Rocket.Chat reproduction environment** in one command.
-
-Give it a Rocket.Chat version; rc-repro resolves the compatible MongoDB, generates
-a Docker Compose stack, boots it, and (with a preset) wires up backing services
-like LDAP or SAML — so you can reproduce a customer's issue on their *exact*
-version in minutes instead of hand-building it.
+Spin up a **version-matched Rocket.Chat reproduction environment in one command** —
+the right Rocket.Chat version paired with a compatible MongoDB, plus optional
+backing services (LDAP, SAML) and sample data. Reproduce a customer's issue on
+their *exact* version in minutes instead of hand-building a compose stack.
 
 ```bash
-rc-repro up --version 8.5.1 --wait          # a clean RC 8.5.1 + matching Mongo
+rc-repro up --version 8.5.1 --wait          # clean RC 8.5.1 + matching Mongo
 rc-repro up --version 6.5.3 --preset ldap   # RC 6.5.3 + seeded OpenLDAP
 rc-repro up --version 8.4.1 --preset saml   # RC 8.4.1 + a Keycloak SAML IdP
 ```
 
-## Quickstart
+## Contents
+
+1. [Prerequisites](#1-prerequisites)
+2. [Install](#2-install)
+3. [Your first repro](#3-your-first-repro)
+4. [Everyday commands](#4-everyday-commands)
+5. [Presets](#5-presets)
+6. [Sample data (`--seed`)](#6-sample-data---seed)
+7. [API testing](#7-api-testing)
+8. [Command reference](#8-command-reference)
+9. [Troubleshooting](#9-troubleshooting)
+10. [How version → MongoDB resolution works](#10-how-version--mongodb-resolution-works)
+11. [Where state lives](#11-where-state-lives)
+12. [Development](#12-development)
+
+---
+
+## 1. Prerequisites
+
+- **Docker Desktop** (or Docker Engine) with `docker compose` v2 — **must be running**.
+- **Python 3.11+**.
+- Internet access (to pull images and look up version compatibility).
+
+> **Apple Silicon note:** only the Bitnami MongoDB image (used for MongoDB < 8,
+> i.e. RC < 8) is amd64-only and runs under emulation, so those boots are slower.
+> Everything else (Rocket.Chat, official MongoDB 8+, OpenLDAP, Keycloak) is native.
+
+## 2. Install
+
+**Recommended — with [pipx](https://pipx.pypa.io) (isolated, adds `rc-repro` to your PATH):**
 
 ```bash
-pipx install git+https://github.com/klovekesh37/rc-repro   # needs Docker + Python 3.11+
-rc-repro doctor                                           # confirm Docker/ports/disk are OK
-rc-repro up --version 8.5.1 --name test --wait            # boots, waits until serving
-# open the printed URL, log in as admin / admin123
-rc-repro down --name test --volumes                       # clean up
+pipx install git+https://github.com/klovekesh37/rc-repro
 ```
 
----
-
-## Why
-
-Reproducing a support ticket usually means: figure out which MongoDB the customer's
-version needs, hand-write a compose file, wire the replica set, set env vars, click
-through the setup wizard, and — for LDAP/SAML tickets — stand up a whole directory
-or identity provider. That's 20 minutes to an afternoon per ticket, done slightly
-differently by every analyst.
-
-rc-repro does the *deciding* (what to run) so Docker can do the *running*. It's the
-fast path for **version-, config-, auth-, API-, and SSO-class** tickets.
-
----
-
-## Requirements
-
-- **Docker Desktop** (or Docker Engine) with `docker compose` v2 — must be running.
-- **Python 3.11+**.
-- Internet (for pulling images and the live version lookup; `--offline` skips the latter).
-
-> On Apple Silicon, only the Bitnami MongoDB image (used for MongoDB < 8, i.e.
-> RC < 8) is amd64-only and runs under emulation — those boots are a bit slower.
-> Everything else (Rocket.Chat, official MongoDB 8+, OpenLDAP, Keycloak) is
-> arm64-native.
-
-## Install
+**Alternative — a plain virtualenv:**
 
 ```bash
-pipx install git+https://github.com/klovekesh37/rc-repro        # recommended
-# or, for local development:
 git clone https://github.com/klovekesh37/rc-repro.git && cd rc-repro
 python3 -m venv .venv && source .venv/bin/activate
+python -m pip install --upgrade pip     # editable installs need pip >= 21.3
 pip install -e .
 ```
 
-Verify: `rc-repro doctor` (preflight — checks Docker, Compose, disk, ports, connectivity).
-
----
-
-## Everyday use
+Then confirm your machine is ready:
 
 ```bash
-# Reproduce a ticket on the customer's exact version, tagged to the ticket id
-rc-repro up --version 7.4.1 --name acme-1234 --wait
-
-# See what's running
-rc-repro list
-
-# Grab API access / hit the REST API (see "API testing" below)
-rc-repro token --name acme-1234
-rc-repro api   --name acme-1234 GET /api/v1/me
-
-# Tail logs (attach to a ticket)
-rc-repro logs --name acme-1234 -f
-
-# Tear it down (keep data) / delete it entirely
-rc-repro down --name acme-1234
-rc-repro down --name acme-1234 --volumes
+rc-repro doctor
 ```
 
-`--wait` blocks until Rocket.Chat is actually serving (and skips the setup wizard).
-Every repro auto-creates an admin: **`admin` / `admin123`**.
+`doctor` checks Docker, Compose, disk, connectivity and ports. Fix any ✗ before continuing.
 
-### A persistent "daily driver"
+## 3. Your first repro
 
-You don't have to recreate an instance every time. Pin one and just start/stop it:
+```bash
+# 1. Create a repro on a specific version and wait until it's actually serving
+rc-repro up --version 8.5.1 --name test --wait
+
+# 2. Open the printed URL (http://localhost:<port>) and log in:
+#      username: admin    password: admin123
+
+# 3. When you're done, remove it
+rc-repro down --name test --volumes
+```
+
+That's the whole loop: **`up` → use it → `down`**.
+
+- `--wait` blocks until Rocket.Chat responds (first boot pulls images and can take a few minutes), and skips the setup wizard so you land straight in.
+- `--name` is optional (a name is derived from the version); use a **ticket id** so `list` maps repros to your work.
+- Every repro auto-creates the same admin: **`admin` / `admin123`**.
+
+## 4. Everyday commands
+
+```bash
+rc-repro list                     # all repros: version, port, state, URL
+rc-repro info   --name test       # URL, admin creds, handy snippets
+rc-repro logs   --name test -f    # tail logs (attach to a ticket)
+rc-repro ready  --name test       # block until it's serving (if you didn't use --wait)
+```
+
+**Lifecycle** — a repro is a long-lived thing you pause/resume, not something you recreate:
+
+| Command | Effect |
+|---|---|
+| `up` | create; if it already exists, bring it back up (data intact) |
+| `stop` / `start` | pause / resume — containers kept, resumes in seconds |
+| `down` | remove containers, **keep** data + record (shows as `down`) |
+| `down --volumes` | delete the data and forget the repro |
+| `prune` | remove all `down` repros (skips pinned & running) |
+
+**Persistent "daily driver"** — pin one and just start/stop it:
 
 ```bash
 rc-repro up --version 8.5.1 --name main --pin    # once
 rc-repro start        # each morning (acts on the pinned default)
-rc-repro stop         # each evening — nothing lost, resumes in seconds
+rc-repro stop         # each evening — nothing lost
 ```
 
-| Verb | What it does |
-|------|--------------|
-| `up` | create; if it already exists, bring it back up (data intact) |
-| `stop` / `start` | pause / resume (containers kept) |
-| `down` | remove containers, **keep** data + record (shows as `down`) |
-| `down --volumes` | delete data and forget the repro |
-| `prune` | remove all `down` repros (skips pinned & running) |
+Once a repro is pinned (or set with `rc-repro use <name>`), commands with no
+`--name` act on it: `rc-repro start`, `rc-repro logs -f`, etc.
 
----
+## 5. Presets
 
-## Presets
-
-A preset turns a bare RC into a scenario. `rc-repro presets` lists them.
+A preset turns a bare RC into a scenario. See them with `rc-repro presets`.
 
 | Preset | Brings up | Reproduces |
 |--------|-----------|------------|
@@ -118,7 +123,11 @@ A preset turns a bare RC into a scenario. `rc-repro presets` lists them.
 | `ldap` | OpenLDAP seeded with users + a group | LDAP auth / sync tickets |
 | `saml` | a real Keycloak IdP (SAML realm + users) | SAML SSO login |
 
-**Parameters** (some presets accept them via `--set`):
+```bash
+rc-repro up --version 8.5.1 --preset ldap
+```
+
+**Parameters** (some presets accept `--set`):
 
 ```bash
 rc-repro up --version 8.5.1 --preset ldap --set users=5        # 5 LDAP users
@@ -126,17 +135,16 @@ rc-repro up --version 8.5.1 --preset ldap --set users=130000   # scale/perf repr
 rc-repro up --version 8.5.1 --preset saml --set users=20       # 20 Keycloak users
 ```
 
-For `ldap` and `saml`, log in as **`user1` / `user1`** (…`userN`/`userN`).
+For `ldap` and `saml`, log in as **`user1` / `user1`** (…`userN` / `userN`).
 
-> **Keycloak console** (SAML preset): `http://localhost:8081` (`admin`/`admin`).
-> Your test users live in the **`rcrepro`** realm — the console opens on `master`,
-> so switch the realm dropdown (top-left) or open
-> `http://localhost:8081/admin/master/console/#/rcrepro/users`. rc-repro prints this
-> after `up` and in `rc-repro info`.
+> **Keycloak console** (`saml` preset): `http://localhost:8081` (`admin`/`admin`).
+> The console opens on the **`master`** realm, but your SAML users live in the
+> **`rcrepro`** realm — switch the realm dropdown (top-left), or open Users directly:
+> `http://localhost:8081/admin/master/console/#/rcrepro/users`.
+> (`rc-repro info` prints this too.)
 
-### Custom / team presets
-
-Drop a YAML file in `~/.rc-repro/presets/<name>.yaml` to add or override a preset:
+**Custom / team presets** — drop a YAML file in `~/.rc-repro/presets/<name>.yaml`
+(overrides a built-in of the same name):
 
 ```yaml
 name: my-scenario
@@ -144,24 +152,21 @@ description: What this reproduces.
 env:                       # merged into the rocketchat service
   OVERWRITE_SETTING_Some_Setting: "true"
 services:                  # optional extra compose services
-  my-sidecar:
-    image: some/image:tag
+  my-sidecar: { image: some/image:tag }
 depends_on: [my-sidecar]
 ```
 
----
+## 6. Sample data (`--seed`)
 
-## Sample data (`--seed`)
-
-A fresh repro is empty. Many tickets (message sync, search, notifications, UI
-with data, permissions) need a populated workspace — `--seed` creates realistic
-users, channels, DMs, and messages (authored across the users, not just admin).
+A fresh repro is empty. Tickets about message sync, search, notifications, UI
+with data, or permissions need a populated workspace — `--seed` creates realistic
+users, channels, DMs and messages (authored across the users, not just admin).
 
 ```bash
-rc-repro up --version 8.5.1 --name acme-1234 --seed                 # small (default)
-rc-repro up --version 8.5.1 --name acme-1234 --seed --seed-profile standard
-rc-repro seed --name acme-1234 --profile large                      # seed an existing repro
-rc-repro seed --name acme-1234 --users 30 --channels 10 --messages 40   # custom counts
+rc-repro up --version 8.5.1 --name test --seed                 # small (default)
+rc-repro up --version 8.5.1 --name test --seed --seed-profile standard
+rc-repro seed --name test --profile large                      # seed an existing repro
+rc-repro seed --name test --users 30 --channels 10 --messages 40   # custom counts
 ```
 
 | Profile | Users | Channels | Msgs/channel | DMs | Threads/reactions |
@@ -170,108 +175,114 @@ rc-repro seed --name acme-1234 --users 30 --channels 10 --messages 40   # custom
 | `standard` | 20 | 8 | 20 | 5 | yes |
 | `large` | 100 | 20 | 100 | 20 | yes |
 
-Seed users are named `alice`, `bob`, … (password = username). Seeding disables
-email-2FA and temporarily the API rate limiter so it can log in as each user and
-post at volume. Best for realistic *content* — for huge user counts use the
-`ldap` preset. (Design notes: [`docs/seed-design.md`](docs/seed-design.md).)
+Seed users are `alice`, `bob`, … (password = username). Seeding disables email-2FA
+and briefly the API rate limiter so it can log in as each user and post at volume.
+For huge *user* counts use the `ldap` preset instead. (Design: [`docs/seed-design.md`](docs/seed-design.md).)
 
----
+## 7. API testing
 
-## API testing
-
-For reproducing REST-API tickets (auth is set up so you can call endpoints instantly):
+Auth is set up so you can hit the REST API immediately:
 
 ```bash
-rc-repro token --name acme-1234                       # prints -H auth headers
-rc-repro api   --name acme-1234 GET /api/v1/me
-rc-repro api   --name acme-1234 POST /api/v1/users.create -d '{"name":"…", ...}'
+rc-repro token --name test                     # prints -H auth headers
+rc-repro api   --name test GET /api/v1/me
+rc-repro api   --name test POST /api/v1/users.create -d '{"name":"Bob","username":"bob","email":"b@x.com","password":"p"}'
 
 # Mirror a customer's Personal Access Token (with "Ignore 2FA"):
-rc-repro api --name acme-1234 --pat  POST /api/v1/users.update -d '{"userId":"…","data":{"name":"X"}}'
+rc-repro api --name test --pat  POST /api/v1/users.update -d '{"userId":"ID","data":{"name":"X"}}'
 # Get past a 2FA-guarded admin endpoint:
-rc-repro api --name acme-1234 --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
+rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 ```
 
----
+## 8. Command reference
 
-## How version → MongoDB resolution works
-
-`rc-repro up --version X` (and `rc-repro versions X`) resolves the MongoDB pairing:
-
-1. **Live:** queries `releases.rocket.chat/<version>/info` (Rocket.Chat's own
-   per-release compatibility data) and picks the highest supported MongoDB.
-2. **Fallback:** if offline / the release predates that data, uses the shipped
-   `rc_repro/data/versions.yaml` map.
-
-The MongoDB image is chosen by the resolved **Mongo** version: **Mongo ≥ 8** →
-official `mongo:` (multi-arch) + a one-shot init container; **Mongo < 8** →
-`bitnamilegacy/mongodb` (auto-inits the replica set — Bitnami's public images were
-deprecated and moved to the `bitnamilegacy` namespace). `MONGO_OPLOG_URL` is
-emitted only for RC < 8 (deprecated in 8.x).
-
-```bash
-rc-repro versions 6.5.3     # show what would be used, without launching
-```
-
----
-
-## Where things live
-
-```
-~/.rc-repro/
-├── config.yaml            # default_repro, optional reg_token / rc_image
-├── presets/               # your custom/team presets
-└── repros/<name>/
-    ├── docker-compose.yml # generated — don't hand-edit; re-run `up`
-    ├── repro.json         # metadata
-    └── …                  # preset-generated files (e.g. LDIF, realm JSON)
-```
-
-Override the root with `RC_REPRO_HOME`.
-
----
-
-## Commands
-
-| | |
+| Command | Purpose |
 |---|---|
 | `up` | create & start a version-matched repro |
 | `ready` | block until RC is serving (`/api/info`) |
 | `start` / `stop` / `restart` | lifecycle without recreating |
-| `down` | remove containers (`--volumes` deletes data + record) |
+| `down` | remove containers (`--volumes` also deletes data + record) |
 | `use <name>` | set the default repro for name-less commands |
 | `list` | all repros: version, port, state, URL |
-| `info` | URL, admin creds, curl snippet, preset notes |
+| `info` | URL, admin creds, snippets, preset notes |
 | `token` / `api` / `pat` | REST auth + calls |
 | `seed` | populate a repro with sample users/channels/messages |
 | `logs` | tail a repro's logs |
 | `presets` | list available presets |
-| `versions <X.Y.Z>` | show the resolved MongoDB pairing |
+| `versions <X.Y.Z>` | show the resolved MongoDB pairing (without launching) |
 | `doctor` | preflight checks (Docker, Compose, disk, ports, connectivity) |
 | `prune` | delete all `down` repros |
 
 Run `rc-repro <command> --help` for flags.
 
----
+## 9. Troubleshooting
 
-## Development
+**`command not found: rc-repro`**
+The install didn't add it to PATH. With `pipx`, run `pipx ensurepath` and open a new
+terminal. With a venv, `source .venv/bin/activate` first.
+
+**`ERROR: ... setup.py not found ... editable mode`** (during `pip install -e .`)
+Your pip is too old (< 21.3). Run `python -m pip install --upgrade pip` then retry —
+or just `pip install .` (non-editable). *(The repo also ships a shim so this
+shouldn't happen after a fresh `git pull`.)*
+
+**`error: Docker isn't running`**
+Start Docker Desktop (or `dockerd`) and wait for it to be ready, then retry.
+`rc-repro doctor` confirms it.
+
+**First `up` is very slow / seems stuck**
+First boot pulls ~1.5 GB (RC) + MongoDB, then runs migrations — a few minutes is
+normal. Use `rc-repro logs --name <n> -f` to watch. On Apple Silicon, RC < 8 and
+LDAP boots run under emulation and are slower.
+
+**A port is already in use**
+rc-repro auto-picks the next free port from 3000, so this is usually handled.
+`rc-repro doctor` shows the next free port. (Note: the `saml` preset's Keycloak
+uses a fixed `8081` — don't run two `saml` repros at once.)
+
+**SAML: "no users" in the Keycloak console**
+You're on the `master` realm; your users are in **`rcrepro`**. Switch the realm
+dropdown, or open `http://localhost:8081/admin/master/console/#/rcrepro/users`.
+The "temporary admin" banner on `master` is normal dev-mode behaviour — ignore it.
+
+**A repro won't come back after `down`**
+`down` keeps the data volume; `rc-repro up` (same name) recreates it with data
+intact. If you used `down --volumes`, the data and record are gone — create fresh.
+
+## 10. How version → MongoDB resolution works
+
+`rc-repro up --version X` (and `rc-repro versions X`) resolves the MongoDB pairing:
+
+1. **Live:** queries `releases.rocket.chat/<version>/info` (Rocket.Chat's own
+   per-release compatibility data) and picks the highest supported MongoDB.
+2. **Fallback:** if offline or the release predates that data, uses the shipped
+   `rc_repro/data/versions.yaml` map (`--offline` forces this path).
+
+The MongoDB image is chosen by the resolved **Mongo** version: **Mongo ≥ 8** →
+official `mongo:` (multi-arch) + a one-shot init container; **Mongo < 8** →
+`bitnamilegacy/mongodb` (auto-inits the replica set). `MONGO_OPLOG_URL` is emitted
+only for RC < 8 (deprecated in 8.x).
+
+## 11. Where state lives
+
+```
+~/.rc-repro/                  # override with RC_REPRO_HOME
+├── config.yaml               # default_repro, optional reg_token / rc_image
+├── presets/                  # your custom/team presets
+└── repros/<name>/
+    ├── docker-compose.yml     # generated — don't hand-edit; re-run `up`
+    ├── repro.json             # metadata
+    └── …                      # preset-generated files (LDIF, realm JSON, …)
+```
+
+## 12. Development
 
 ```bash
-python -m pip install --upgrade pip   # editable installs need pip >= 21.3
+git clone https://github.com/klovekesh37/rc-repro.git && cd rc-repro
+python -m pip install --upgrade pip
 pip install -e ".[dev]"
-pytest                     # pure-logic tests (no Docker needed)
+pytest                         # pure-logic tests — no Docker needed
 ```
 
-Architecture and design rationale are in [`DESIGN.md`](DESIGN.md). Module layout:
-
-| Module | Responsibility |
-|--------|----------------|
-| `cli.py` | Typer commands, orchestration, output |
-| `versions.py` | RC version → MongoDB pairing (live + fallback) |
-| `presets.py` | load presets (static YAML + dynamic builders) |
-| `ldap_preset.py` / `saml_preset.py` | generate the LDAP / Keycloak scenarios |
-| `compose.py` | build the docker-compose document |
-| `runner.py` | on-disk state + `docker compose` invocations |
-| `rcapi.py` | minimal Rocket.Chat REST client (readiness, auth, settings) |
-| `config.py` | paths, constants, persisted config |
-```
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the project layout and how to add a
+preset, and [`DESIGN.md`](DESIGN.md) for design rationale.
