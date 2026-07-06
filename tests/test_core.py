@@ -90,10 +90,12 @@ def _spec(version: str, preset_name: str = "default"):
     )
 
 
-def test_compose_official_has_init_container():
-    doc = compose.build(_spec("8.4.1"))
-    assert "mongo-init" in doc["services"]           # official flavor
-    assert doc["services"]["mongodb"]["image"].startswith("docker.io/mongo:")
+def test_compose_official_has_community_server_and_init():
+    doc = compose.build(_spec("8.4.1"))           # RC 8 -> Mongo 8 -> official flavor
+    assert "mongo-init" in doc["services"]
+    assert "mongodb-fix-permission" in doc["services"]   # community-server runs as uid 1001
+    assert "mongodb-community-server" in doc["services"]["mongodb"]["image"]
+    assert doc["services"]["mongodb"]["user"] == "1001"
     assert "MONGO_OPLOG_URL" not in doc["services"]["rocketchat"]["environment"]
 
 

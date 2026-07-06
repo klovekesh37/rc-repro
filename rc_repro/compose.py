@@ -94,20 +94,35 @@ def _mongo_service_bitnami(spec: Spec) -> dict:
 
 
 def _mongo_service_official(spec: Spec) -> dict:
-    shell = spec.mongo_shell
-    ping = f"{shell} --quiet --eval 'db.adminCommand({{ping:1}}).ok' | grep -q 1 || exit 1"
+    # Mirrors the official RocketChat/rocketchat-compose: MongoDB Inc's
+    # community-server image (runs as uid 1001), so a fix-permission container
+    # chowns the data dir first, then a one-shot container initiates the replica
+    # set. `directConnection=true` lets mongosh reach the node before rs.initiate.
+    image = f"docker.io/mongodb/mongodb-community-server:{spec.mongo_tag}-ubi8"
+    shell = spec.mongo_shell  # mongosh for Mongo >= 5
+    uri = "mongodb://mongodb:27017/?directConnection=true"
     initiate = (
         "try { rs.status() } catch (e) { rs.initiate({ _id: 'rs0', "
         "members: [{ _id: 0, host: 'mongodb:27017' }] }) }"
     )
     return {
+        "mongodb-fix-permission": {
+            "image": image,
+            "user": "0",
+            "restart": "on-failure",
+            "volumes": ["mongodb_data:/data/db:rw"],
+            "entrypoint": ["sh", "-c", "chown -R 1001 /data/db"],
+        },
         "mongodb": {
-            "image": f"docker.io/mongo:{spec.mongo_tag}",
+            "image": image,
+            "user": "1001",
             "restart": "always",
-            "command": ["mongod", "--replSet", "rs0", "--bind_ip_all"],
-            "volumes": ["mongodb_data:/data/db"],
+            "depends_on": {"mongodb-fix-permission": {"condition": "service_completed_successfully"}},
+            "volumes": ["mongodb_data:/data/db:rw"],
+            "entrypoint": ["mongod", "--replSet", "rs0", "--bind_ip_all"],
+            "environment": {"ALLOW_EMPTY_PASSWORD": "yes"},
             "healthcheck": {
-                "test": ["CMD-SHELL", ping],
+                "test": ["CMD", shell, uri, "--eval", "db.adminCommand('ping')"],
                 "interval": "10s",
                 "timeout": "10s",
                 "retries": 30,
@@ -115,10 +130,10 @@ def _mongo_service_official(spec: Spec) -> dict:
             },
         },
         "mongo-init": {
-            "image": f"docker.io/mongo:{spec.mongo_tag}",
+            "image": image,
             "restart": "no",
             "depends_on": {"mongodb": {"condition": "service_healthy"}},
-            "entrypoint": [shell, "--host", "mongodb:27017", "--quiet", "--eval", initiate],
+            "entrypoint": [shell, uri, "--eval", initiate],
         },
     }
 

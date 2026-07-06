@@ -259,7 +259,8 @@ intact. If you used `down --volumes`, the data and record are gone — create fr
    `rc_repro/data/versions.yaml` map (`--offline` forces this path).
 
 The MongoDB image is chosen by the resolved **Mongo** version: **Mongo ≥ 8** →
-official `mongo:` (multi-arch) + a one-shot init container; **Mongo < 8** →
+`mongodb/mongodb-community-server` + a fix-permission and a one-shot init
+container (matching the official `RocketChat/rocketchat-compose`); **Mongo < 8** →
 `bitnamilegacy/mongodb` (auto-inits the replica set). `MONGO_OPLOG_URL` is emitted
 only for RC < 8 (deprecated in 8.x).
 
