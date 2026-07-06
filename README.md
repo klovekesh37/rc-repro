@@ -5,28 +5,6 @@ the right Rocket.Chat version paired with a compatible MongoDB, plus optional
 backing services (LDAP, SAML) and sample data. Reproduce a customer's issue on
 their *exact* version in minutes instead of hand-building a compose stack.
 
-```bash
-rc-repro up --version 8.5.1 --wait          # clean RC 8.5.1 + matching Mongo
-rc-repro up --version 6.5.3 --preset ldap   # RC 6.5.3 + seeded OpenLDAP
-rc-repro up --version 8.4.1 --preset saml   # RC 8.4.1 + a Keycloak SAML IdP
-```
-
-## Contents
-
-1. [Prerequisites](#1-prerequisites)
-2. [Install](#2-install)
-3. [Your first repro](#3-your-first-repro)
-4. [Everyday commands](#4-everyday-commands)
-5. [Presets](#5-presets)
-6. [Sample data (`--seed`)](#6-sample-data---seed)
-7. [API testing](#7-api-testing)
-8. [Command reference](#8-command-reference)
-9. [Troubleshooting](#9-troubleshooting)
-10. [How version → MongoDB resolution works](#10-how-version--mongodb-resolution-works)
-11. [Where state lives](#11-where-state-lives)
-12. [Development](#12-development)
-
----
 
 ## 1. Prerequisites
 
@@ -215,41 +193,7 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 
 Run `rc-repro <command> --help` for flags.
 
-## 9. Troubleshooting
-
-**`command not found: rc-repro`**
-The install didn't add it to PATH. With `pipx`, run `pipx ensurepath` and open a new
-terminal. With a venv, `source .venv/bin/activate` first.
-
-**`ERROR: ... setup.py not found ... editable mode`** (during `pip install -e .`)
-Your pip is too old (< 21.3). Run `python -m pip install --upgrade pip` then retry —
-or just `pip install .` (non-editable). *(The repo also ships a shim so this
-shouldn't happen after a fresh `git pull`.)*
-
-**`error: Docker isn't running`**
-Start Docker Desktop (or `dockerd`) and wait for it to be ready, then retry.
-`rc-repro doctor` confirms it.
-
-**First `up` is very slow / seems stuck**
-First boot pulls ~1.5 GB (RC) + MongoDB, then runs migrations — a few minutes is
-normal. Use `rc-repro logs --name <n> -f` to watch. On Apple Silicon, RC < 8 and
-LDAP boots run under emulation and are slower.
-
-**A port is already in use**
-rc-repro auto-picks the next free port from 3000, so this is usually handled.
-`rc-repro doctor` shows the next free port. (Note: the `saml` preset's Keycloak
-uses a fixed `8081` — don't run two `saml` repros at once.)
-
-**SAML: "no users" in the Keycloak console**
-You're on the `master` realm; your users are in **`rcrepro`**. Switch the realm
-dropdown, or open `http://localhost:8081/admin/master/console/#/rcrepro/users`.
-The "temporary admin" banner on `master` is normal dev-mode behaviour — ignore it.
-
-**A repro won't come back after `down`**
-`down` keeps the data volume; `rc-repro up` (same name) recreates it with data
-intact. If you used `down --volumes`, the data and record are gone — create fresh.
-
-## 10. How version → MongoDB resolution works
+## 9. How version → MongoDB resolution works
 
 `rc-repro up --version X` (and `rc-repro versions X`) resolves the MongoDB pairing:
 
@@ -264,7 +208,7 @@ container (matching the official `RocketChat/rocketchat-compose`); **Mongo < 8**
 `bitnamilegacy/mongodb` (auto-inits the replica set). `MONGO_OPLOG_URL` is emitted
 only for RC < 8 (deprecated in 8.x).
 
-## 11. Where state lives
+## 10. Where state lives
 
 ```
 ~/.rc-repro/                  # override with RC_REPRO_HOME
@@ -276,7 +220,7 @@ only for RC < 8 (deprecated in 8.x).
     └── …                      # preset-generated files (LDIF, realm JSON, …)
 ```
 
-## 12. Development
+## 11. Development
 
 ```bash
 git clone https://github.com/klovekesh37/rc-repro.git && cd rc-repro
@@ -286,4 +230,4 @@ pytest                         # pure-logic tests — no Docker needed
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the project layout and how to add a
-preset, and [`DESIGN.md`](DESIGN.md) for design rationale.
+preset.
