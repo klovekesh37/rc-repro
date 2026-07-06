@@ -21,3 +21,4 @@ env/
 
 # pytest
 .pytest_cache/
+DESIGN.md
