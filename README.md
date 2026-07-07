@@ -41,6 +41,17 @@ rc-repro doctor
 
 `doctor` checks Docker, Compose, disk, connectivity and ports. Fix any ✗ before continuing.
 
+### Updating to the latest version
+
+```bash
+pipx reinstall rc-repro          # always re-pulls the latest from GitHub
+# or, once a new release version is published:
+pipx upgrade rc-repro
+```
+
+Use **`reinstall`** to be sure — `pipx upgrade` only picks up changes when the
+package version was bumped. (Venv installs: `git pull && pip install -e .`.)
+
 ## 3. Your first repro
 
 ```bash
