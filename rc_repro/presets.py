@@ -56,9 +56,9 @@ def _parse(text: str, source: str) -> Preset:
 
 def _dynamic_builders() -> dict:
     """Registry of code-generated presets (imported lazily to avoid cycles)."""
-    from rc_repro import ldap_preset, saml_preset
+    from rc_repro import ldap_preset, oidc_preset, saml_preset
 
-    return {"ldap": ldap_preset.build, "saml": saml_preset.build}
+    return {"ldap": ldap_preset.build, "saml": saml_preset.build, "oidc": oidc_preset.build}
 
 
 def load(name: str, params: dict | None = None) -> Preset:

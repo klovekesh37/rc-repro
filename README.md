@@ -111,10 +111,15 @@ A preset turns a bare RC into a scenario. See them with `rc-repro presets`.
 | `airgapped` | RC with Cloud endpoints stubbed out | offline / disconnected-workspace behaviour |
 | `ldap` | OpenLDAP seeded with users + a group | LDAP auth / sync tickets |
 | `saml` | a real Keycloak IdP (SAML realm + users) | SAML SSO login |
+| `oidc` | a real Keycloak IdP (OpenID Connect + users) | OIDC / OAuth SSO login |
 
 ```bash
 rc-repro up --version 8.5.1 --preset ldap
 ```
+
+> **`oidc` needs one host entry.** OIDC's login URL must resolve the same way for
+> your browser and RC's backend, so add `127.0.0.1  keycloak` to `/etc/hosts`
+> (rc-repro prints this on `up`). Then log in via "Keycloak (OIDC)".
 
 **Parameters** (some presets accept `--set`):
 
@@ -124,7 +129,7 @@ rc-repro up --version 8.5.1 --preset ldap --set users=130000   # scale/perf repr
 rc-repro up --version 8.5.1 --preset saml --set users=20       # 20 Keycloak users
 ```
 
-For `ldap` and `saml`, log in as **`user1` / `user1`** (…`userN` / `userN`).
+For `ldap`, `saml` and `oidc`, log in as **`user1` / `user1`** (…`userN` / `userN`).
 
 > **Keycloak console** (`saml` preset): `http://localhost:8081` (`admin`/`admin`).
 > The console opens on the **`master`** realm, but your SAML users live in the

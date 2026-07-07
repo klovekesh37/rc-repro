@@ -322,14 +322,24 @@ def _do_ready(meta: runner.Metadata, timeout: float = 300.0) -> None:
                 # defaults to sslRequired=external and rejects HTTP via the docker
                 # port-forward. Relax it so the console is reachable over HTTP.
                 svc = action.get("service", "keycloak")
+                port = action.get("port", 8080)   # Keycloak's internal HTTP port
                 kcadm = "/opt/keycloak/bin/kcadm.sh"
                 script = (
-                    f'{kcadm} config credentials --server http://localhost:8080 '
+                    f'{kcadm} config credentials --server http://localhost:{port} '
                     f'--realm master --user admin --password admin >/dev/null && '
                     f'{kcadm} update realms/master -s sslRequired=NONE'
                 )
                 if runner.compose_exec(meta.name, svc, ["bash", "-lc", script]) == 0:
                     typer.echo("  ✓ Keycloak admin console enabled over HTTP.")
+            elif action.get("action") == "create_oauth_provider":
+                # Custom OAuth providers can't be configured via OVERWRITE env
+                # (their settings don't exist until created) — create, then set.
+                if rcapi.add_oauth_service(meta.root_url, auth, config.ADMIN_PASSWORD, action["name"]):
+                    for sid, val in action["settings"].items():
+                        rcapi.set_setting(meta.root_url, auth, config.ADMIN_PASSWORD, sid, val)
+                    typer.echo("  ✓ OIDC provider created; login button registered.")
+                else:
+                    typer.secho("  ⚠ could not create the OAuth provider", fg=typer.colors.YELLOW)
 
     running = info.get("version", "?")
     typer.secho(f"✓ ready — Rocket.Chat {running} at {meta.root_url}", fg=typer.colors.GREEN)

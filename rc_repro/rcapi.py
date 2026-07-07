@@ -7,6 +7,7 @@ endpoint; auth uses /api/v1/login with the auto-provisioned admin.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -155,6 +156,25 @@ def set_setting(root_url: str, auth: Auth, password: str, setting_id: str, value
         resp = requests.post(
             f"{root_url.rstrip('/')}/api/v1/settings/{setting_id}",
             headers=headers, json={"value": value}, timeout=timeout,
+        )
+        return resp.status_code == 200 and resp.json().get("success") is True
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def add_oauth_service(root_url: str, auth: Auth, password: str, name: str, timeout: float = 15.0) -> bool:
+    """Create a Custom OAuth provider via RC's `addOAuthService` method.
+
+    A custom provider's `Accounts_OAuth_Custom-<name>-*` settings don't exist
+    until it's created, so OVERWRITE_SETTING env can't configure it — this
+    creates the provider (and its settings) so they can then be set via the API.
+    """
+    headers = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    msg = json.dumps({"msg": "method", "id": "1", "method": "addOAuthService", "params": [name]})
+    try:
+        resp = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/method.call/addOAuthService",
+            headers=headers, json={"message": msg}, timeout=timeout,
         )
         return resp.status_code == 200 and resp.json().get("success") is True
     except (requests.RequestException, ValueError):
