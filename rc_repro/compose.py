@@ -138,9 +138,75 @@ def _mongo_service_official(spec: Spec) -> dict:
     }
 
 
+# Healthcheck for a Rocket.Chat instance. Uses `node` (always in the RC image)
+# to hit /api/info, so we don't depend on curl/wget being present.
+_RC_HEALTHCHECK = {
+    "test": [
+        "CMD", "node", "-e",
+        "require('http').get('http://localhost:3000/api/info',"
+        "r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+    ],
+    "interval": "10s",
+    "timeout": "5s",
+    "retries": 30,
+    "start_period": "60s",
+}
+
+
+def _as_condition_map(deps) -> dict:
+    """Normalise a depends_on (plain list or condition-map) to a condition-map."""
+    if isinstance(deps, dict):
+        return dict(deps)
+    return {d: {"condition": "service_started"} for d in (deps or [])}
+
+
+def _instance_services(base: dict, n: int, host_port: int) -> dict:
+    """Clone the rocketchat service into N instances (rocketchat-1..N).
+
+    Instances coordinate over NATS (the moleculer transporter), matching the
+    official RocketChat/rocketchat-compose. INSTANCE_IP is intentionally left
+    unset — the legacy DDP-mesh address isn't used once NATS is the transporter.
+
+    The load balancer owns the workspace port (host_port); each instance is ALSO
+    published directly on host_port+i so you can open a specific instance in the
+    browser (e.g. to post on one and watch it arrive on another). Traefik reaches
+    them over the compose network by service name regardless.
+
+    Cold start is serialised: only rocketchat-1 boots against the empty database
+    (running migrations and seeding settings); rocketchat-2..N wait for it to be
+    healthy first, so they never race it to insert the same records — which on a
+    fresh DB otherwise crashes an instance with E11000 duplicate-key errors.
+    """
+    out: dict = {}
+    for i in range(1, n + 1):
+        name = f"rocketchat-{i}"
+        inst = copy.deepcopy(base)
+        inst["ports"] = [f"{host_port + i}:{config.RC_CONTAINER_PORT}"]   # direct access
+        inst["environment"]["TRANSPORTER"] = "monolith+nats://nats:4222"
+        inst["healthcheck"] = copy.deepcopy(_RC_HEALTHCHECK)
+        if i > 1:
+            deps = _as_condition_map(inst.get("depends_on"))
+            deps["rocketchat-1"] = {"condition": "service_healthy"}
+            inst["depends_on"] = deps
+        out[name] = inst
+    return out
+
+
+def _add_depends(svc: dict, extra: list[str]) -> None:
+    """Add each name in `extra` to a service's depends_on (list or condition-dict)."""
+    deps = svc.get("depends_on")
+    for dep in extra:
+        if isinstance(deps, list):
+            if dep not in deps:
+                deps.append(dep)
+        elif isinstance(deps, dict):
+            deps.setdefault(dep, {"condition": "service_started"})
+
+
 def build(spec: Spec) -> dict:
     """Return the compose document (a plain dict) for `spec`."""
     official = spec.mongo_flavor == "official"
+    n = max(1, spec.preset.instances or 1)
 
     rocketchat: dict = {
         "image": f"{spec.rc_image}:{spec.rc_tag}",
@@ -154,7 +220,14 @@ def build(spec: Spec) -> dict:
         ),
     }
 
-    services: dict = {"rocketchat": rocketchat}
+    # Single instance (the default): one `rocketchat` service, unchanged. Many
+    # instances: clone it into rocketchat-1..N behind a load balancer.
+    rc_services: dict = (
+        {"rocketchat": rocketchat} if n == 1
+        else _instance_services(rocketchat, n, spec.host_port)
+    )
+
+    services: dict = dict(rc_services)
     services.update(
         _mongo_service_official(spec) if official else _mongo_service_bitnami(spec)
     )
@@ -168,15 +241,18 @@ def build(spec: Spec) -> dict:
     # --- apply the preset's backing services / RC patch / depends_on ---
     if spec.preset.services:
         _deep_merge(doc["services"], copy.deepcopy(spec.preset.services))
-    if spec.preset.rocketchat:
-        _deep_merge(rocketchat, copy.deepcopy(spec.preset.rocketchat))
-    for dep in spec.preset.depends_on:
-        deps = rocketchat["depends_on"]
-        if isinstance(deps, list):
-            if dep not in deps:
-                deps.append(dep)
-        elif isinstance(deps, dict):
-            deps.setdefault(dep, {"condition": "service_started"})
+    # The RC patch and extra depends_on apply to EVERY rocketchat instance.
+    for svc in rc_services.values():
+        if spec.preset.rocketchat:
+            _deep_merge(svc, copy.deepcopy(spec.preset.rocketchat))
+        _add_depends(svc, spec.preset.depends_on)
+
+    # A preset can hand the published host port to a front-end service (a load
+    # balancer) instead of rocketchat — the port isn't known until `up`, so it's
+    # injected here rather than in the preset.
+    entry = spec.preset.entry_service
+    if entry and entry in doc["services"]:
+        doc["services"][entry]["ports"] = [f"{spec.host_port}:80"]
 
     return doc
 

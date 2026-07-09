@@ -153,7 +153,14 @@ def up(
             _run_seed(meta, seed_profile)
         return
 
-    host_port = port or runner.pick_port()
+    # Multi-instance repros need a contiguous block: the load balancer + one
+    # port per instance (host_port+1..+N for direct access).
+    if port:
+        host_port = port
+    elif pre.instances > 1:
+        host_port = runner.pick_port_range(pre.instances + 1)
+    else:
+        host_port = runner.pick_port()
     root = root_url or f"http://localhost:{host_port}"
     token = reg_token or cfg.get("reg_token") or ""
 
@@ -190,6 +197,8 @@ def up(
         meta.extra["post_ready"] = pre.post_ready
     if pre.notes:
         meta.extra["notes"] = pre.notes
+    if pre.instances > 1:
+        meta.extra["instances"] = pre.instances
     runner.write(repro_name, compose.to_yaml(doc), meta, files=pre.files)
 
     if pin:
@@ -248,12 +257,26 @@ def _post_up(meta: runner.Metadata, wait: bool) -> None:
         typer.echo(f"  {meta.root_url}  (admin / {config.ADMIN_PASSWORD})")
         typer.echo(f"  wait until ready: rc-repro ready --name {meta.name}")
         typer.echo(f"  follow logs:      rc-repro logs --name {meta.name} -f")
+        _print_workspace(meta)   # the wait path prints it via _do_ready
 
     notes = meta.extra.get("notes")
     if notes:
         typer.echo("")
         for line in notes:
             typer.secho(line, fg=typer.colors.CYAN)
+
+
+def _print_workspace(meta: runner.Metadata) -> None:
+    """For a multi-instance repro, print the load-balanced workspace URL plus the
+    direct URL of each instance (host_port+i). No-op for single-instance repros."""
+    n = meta.extra.get("instances")
+    if not n:
+        return
+    typer.echo("")
+    typer.secho(f"Multi-instance ({n} instances, load-balanced by Traefik):", fg=typer.colors.CYAN)
+    typer.echo(f"  Workspace URL (open this) : {meta.root_url}")
+    for i in range(1, int(n) + 1):
+        typer.echo(f"    rocketchat-{i} (direct)   : http://localhost:{meta.host_port + i}")
 
 
 @app.command()
@@ -343,6 +366,7 @@ def _do_ready(meta: runner.Metadata, timeout: float = 300.0) -> None:
 
     running = info.get("version", "?")
     typer.secho(f"✓ ready — Rocket.Chat {running} at {meta.root_url}", fg=typer.colors.GREEN)
+    _print_workspace(meta)
     # The public /api/info redacts the patch (returns only major.minor), so
     # treat the running version as a prefix of the requested one.
     if running != "?" and not meta.rc_version.startswith(running):
@@ -470,6 +494,7 @@ def info(name: str = typer.Option("", "--name", "-n")) -> None:
     typer.echo(f"URL     : {m.root_url}")
     typer.echo(f"Admin   : {config.ADMIN_USERNAME} / {config.ADMIN_PASSWORD}")
     typer.echo(f"Preset  : {m.preset}")
+    _print_workspace(m)
     typer.echo("")
     typer.echo("Example API call:")
     typer.echo(f"  rc-repro api --name {m.name} GET /api/v1/me")

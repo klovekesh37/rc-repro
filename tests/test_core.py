@@ -76,6 +76,25 @@ def test_unknown_preset_raises():
     raise AssertionError("expected ValueError for unknown preset")
 
 
+def test_multi_instance_preset_shape():
+    p = presets.load("multi-instance", {"instances": "3"})
+    assert p.instances == 3
+    assert p.entry_service == "traefik"
+    assert "nats" in p.services and "traefik" in p.services
+    assert p.depends_on == ["nats"]
+    # Traefik uses a generated file-provider config listing the 3 backends
+    # (matches official rocketchat-compose; no Docker-socket label discovery).
+    dynamic = dict(p.files)["traefik/dynamic.yml"]
+    assert dynamic.count("- url:") == 3
+    assert "http://rocketchat-3:3000" in dynamic
+    assert all("docker.sock" not in v for v in p.services["traefik"].get("volumes", []))
+
+
+def test_multi_instance_clamps_instance_count():
+    assert presets.load("multi-instance", {"instances": "1"}).instances == 2   # min 2
+    assert presets.load("multi-instance", {"instances": "99"}).instances == 5  # max 5
+
+
 # --- compose building ---------------------------------------------------------
 
 
@@ -113,6 +132,44 @@ def test_compose_yaml_is_valid():
     text = compose.to_yaml(doc)
     parsed = yaml.safe_load(text)
     assert parsed["name"] == "rcrepro-t"
+
+
+def _multi_spec(version: str, instances: int):
+    r = versions.resolve(version, offline=True)
+    pre = presets.load("multi-instance", {"instances": str(instances)})
+    return compose.Spec(
+        project_name="rcrepro-t", rc_image=r.rc_image, rc_tag=r.rc_version,
+        mongo_tag=r.mongo_tag, mongo_flavor=r.mongo_flavor, mongo_shell=r.mongo_shell,
+        oplog=r.oplog, root_url="http://localhost:3000", host_port=3000,
+        reg_token=None, preset=pre,
+    )
+
+
+def test_compose_multi_instance_clones_and_meshes():
+    doc = compose.build(_multi_spec("8.4.1", 3))
+    svcs = doc["services"]
+    # three cloned RC instances, no single "rocketchat"
+    assert {"rocketchat-1", "rocketchat-2", "rocketchat-3"} <= set(svcs)
+    assert "rocketchat" not in svcs
+    inst = svcs["rocketchat-2"]
+    assert inst["environment"]["TRANSPORTER"] == "monolith+nats://nats:4222"
+    assert "INSTANCE_IP" not in inst["environment"]                # NATS transporter, not DDP mesh
+    assert inst["ports"] == ["3002:3000"]                          # direct access on host_port+2
+    assert "nats" in inst["depends_on"]                            # preset depends_on applied
+    # cold-start serialisation: 2..N wait for instance-1 to be healthy first
+    assert inst["depends_on"]["rocketchat-1"]["condition"] == "service_healthy"
+    assert "healthcheck" in svcs["rocketchat-1"]
+    # NATS + Traefik present; Traefik got the published host port
+    assert "nats" in svcs
+    assert svcs["traefik"]["ports"] == ["3000:80"]
+
+
+def test_compose_single_instance_unchanged_by_new_fields():
+    # default preset (instances=1) must still produce exactly one rocketchat.
+    doc = compose.build(_spec("8.4.1"))
+    assert "rocketchat" in doc["services"]
+    assert "rocketchat-1" not in doc["services"]
+    assert doc["services"]["rocketchat"]["ports"] == ["3000:3000"]
 
 
 # --- seed ---------------------------------------------------------------------

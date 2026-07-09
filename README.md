@@ -112,6 +112,7 @@ A preset turns a bare RC into a scenario. See them with `rc-repro presets`.
 | `ldap` | OpenLDAP seeded with users + a group | LDAP auth / sync tickets |
 | `saml` | a real Keycloak IdP (SAML realm + users) | SAML SSO login |
 | `oidc` | a real Keycloak IdP (OpenID Connect + users) | OIDC / OAuth SSO login |
+| `multi-instance` | N RC instances + Traefik load balancer + NATS, one shared Mongo | horizontal scaling / cross-instance real-time |
 
 ```bash
 rc-repro up --version 8.5.1 --preset ldap
@@ -127,9 +128,15 @@ rc-repro up --version 8.5.1 --preset ldap
 rc-repro up --version 8.5.1 --preset ldap --set users=5        # 5 LDAP users
 rc-repro up --version 8.5.1 --preset ldap --set users=130000   # scale/perf repro
 rc-repro up --version 8.5.1 --preset saml --set users=20       # 20 Keycloak users
+rc-repro up --version 8.5.1 --preset multi-instance --set instances=3   # 3 instances behind a load balancer
 ```
 
 For `ldap`, `saml` and `oidc`, log in as **`user1` / `user1`** (…`userN` / `userN`).
+
+> **`multi-instance`** runs N Rocket.Chat instances behind Traefik on one URL, sharing
+> one MongoDB and coordinating over NATS. Confirm the mesh with
+> `rc-repro api --name <name> GET /api/v1/instances.get` (lists every connected instance).
+> Traefik discovers instances via the Docker socket (`/var/run/docker.sock`).
 
 > **Keycloak console** (`saml` preset): `http://localhost:8081` (`admin`/`admin`).
 > The console opens on the **`master`** realm, but your SAML users live in the

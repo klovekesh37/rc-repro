@@ -80,7 +80,15 @@ def list_meta() -> list[Metadata]:
 
 
 def used_ports() -> set[int]:
-    return {m.host_port for m in list_meta()}
+    ports: set[int] = set()
+    for m in list_meta():
+        ports.add(m.host_port)
+        # A multi-instance repro also occupies host_port+1..+N (direct instance
+        # access), so those are claimed too.
+        n = m.extra.get("instances") if isinstance(m.extra, dict) else None
+        if isinstance(n, int) and n > 1:
+            ports.update(m.host_port + i for i in range(1, n + 1))
+    return ports
 
 
 def port_free(port: int) -> bool:
@@ -105,6 +113,19 @@ def pick_port(start: int = 3000) -> int:
     while port in used or not port_free(port):
         port += 1
     return port
+
+
+def pick_port_range(count: int, start: int = 3000) -> int:
+    """Lowest base port with `count` consecutive ports all unclaimed AND free.
+
+    Used by multi-instance repros, which need one port for the load balancer plus
+    one per instance (the block [base, base+count)).
+    """
+    used = used_ports()
+    base = start
+    while not all((base + i) not in used and port_free(base + i) for i in range(count)):
+        base += 1
+    return base
 
 
 def remove(name: str) -> None:
@@ -180,7 +201,9 @@ def rc_state(name: str) -> str:
     """
     for line in ps(name).splitlines():
         parts = line.split("\t")
-        if parts and parts[0] == "rocketchat":
+        # "rocketchat" for a normal repro, "rocketchat-1"/"-2"/… for a
+        # multi-instance one — the first instance found is enough for readiness.
+        if parts and (parts[0] == "rocketchat" or parts[0].startswith("rocketchat-")):
             return parts[1] if len(parts) > 1 else "unknown"
     return "absent"
 

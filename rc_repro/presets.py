@@ -36,6 +36,13 @@ class Preset:
     # Human-facing tips printed after `up` and by `info` (e.g. where the IdP
     # console lives and which realm the users are in).
     notes: list[str] = field(default_factory=list)
+    # Number of Rocket.Chat app instances to run. >1 makes compose.build clone the
+    # rocketchat service into rocketchat-1..N (meshed via NATS) — see the
+    # multi-instance preset. Default 1 = the normal single-instance repro.
+    instances: int = 1
+    # Service the published host port maps to instead of `rocketchat` (e.g. a
+    # load balancer that fronts the instances). Empty = rocketchat owns the port.
+    entry_service: str = ""
 
 
 def _parse(text: str, source: str) -> Preset:
@@ -51,14 +58,21 @@ def _parse(text: str, source: str) -> Preset:
         depends_on=raw.get("depends_on") or [],
         requires_license=bool(raw.get("requires_license", False)),
         source=source,
+        instances=int(raw.get("instances", 1) or 1),
+        entry_service=raw.get("entry_service", "") or "",
     )
 
 
 def _dynamic_builders() -> dict:
     """Registry of code-generated presets (imported lazily to avoid cycles)."""
-    from rc_repro import ldap_preset, oidc_preset, saml_preset
+    from rc_repro import ldap_preset, multi_instance_preset, oidc_preset, saml_preset
 
-    return {"ldap": ldap_preset.build, "saml": saml_preset.build, "oidc": oidc_preset.build}
+    return {
+        "ldap": ldap_preset.build,
+        "saml": saml_preset.build,
+        "oidc": oidc_preset.build,
+        "multi-instance": multi_instance_preset.build,
+    }
 
 
 def load(name: str, params: dict | None = None) -> Preset:
