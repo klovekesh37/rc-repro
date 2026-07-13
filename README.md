@@ -136,7 +136,8 @@ For `ldap`, `saml` and `oidc`, log in as **`user1` / `user1`** (…`userN` / `us
 > **`multi-instance`** runs N Rocket.Chat instances behind Traefik on one URL, sharing
 > one MongoDB and coordinating over NATS. Confirm the mesh with
 > `rc-repro api --name <name> GET /api/v1/instances.get` (lists every connected instance).
-> Traefik discovers instances via the Docker socket (`/var/run/docker.sock`).
+> Traefik load-balances via its file provider — a generated `traefik/dynamic.yml`
+> listing the `rocketchat-1..N` backends (no Docker socket needed).
 
 > **Keycloak console** (`saml` preset): `http://localhost:8081` (`admin`/`admin`).
 > The console opens on the **`master`** realm, but your SAML users live in the
@@ -178,7 +179,7 @@ rc-repro seed --name test --users 30 --channels 10 --messages 40   # custom coun
 
 Seed users are `alice`, `bob`, … (password = username). Seeding disables email-2FA
 and briefly the API rate limiter so it can log in as each user and post at volume.
-For huge *user* counts use the `ldap` preset instead. (Design: [`docs/seed-design.md`](docs/seed-design.md).)
+For huge *user* counts use the `ldap` preset instead.
 
 ## 7. API testing
 

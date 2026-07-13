@@ -104,7 +104,7 @@ def build(params: dict) -> Preset:
         params_help={"instances": "number of Rocket.Chat instances (default 2, max 5)"},
         notes=[
             "Verify the mesh (lists every connected instance):",
-            "    rc-repro api --name <name> --2fa GET /api/v1/instances.get",
+            "    rc-repro api --name <name> GET /api/v1/instances.get",
             "Open two different instance URLs (shown above) in separate browsers,",
             "  post in one and watch it arrive in the other (cross-instance real-time).",
         ],

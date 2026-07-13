@@ -21,4 +21,7 @@ env/
 
 # pytest
 .pytest_cache/
+
+# Design / internal docs (kept local)
 DESIGN.md
+docs/

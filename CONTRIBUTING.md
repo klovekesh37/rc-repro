@@ -1,7 +1,7 @@
 # Contributing to rc-repro
 
 Short guide for teammates working on the tool itself. For *using* rc-repro, see
-[README.md](README.md); for design rationale, [DESIGN.md](DESIGN.md).
+[README.md](README.md).
 
 ## Dev setup
 
@@ -20,10 +20,12 @@ CI runs `pytest` on every push/PR (see `.github/workflows/ci.yml`).
 | `rc_repro/cli.py` | Typer commands, orchestration, output |
 | `rc_repro/versions.py` | RC version → MongoDB pairing (live lookup + fallback map) |
 | `rc_repro/presets.py` | load presets (static YAML + dynamic builders) |
-| `rc_repro/ldap_preset.py`, `saml_preset.py` | generate the LDAP / Keycloak scenarios |
-| `rc_repro/compose.py` | build the docker-compose document |
+| `rc_repro/ldap_preset.py`, `saml_preset.py`, `oidc_preset.py` | generate the LDAP / Keycloak (SAML & OIDC) scenarios |
+| `rc_repro/multi_instance_preset.py` | generate the multi-instance (Traefik + NATS) scenario |
+| `rc_repro/compose.py` | build the docker-compose document (incl. cloning RC into N instances) |
 | `rc_repro/runner.py` | on-disk state + `docker compose` invocations |
 | `rc_repro/rcapi.py` | minimal Rocket.Chat REST client (readiness, auth, settings) |
+| `rc_repro/seed.py` | populate a repro with sample users/channels/messages via REST |
 | `rc_repro/config.py` | paths, constants, persisted config |
 | `rc_repro/data/` | shipped version map + static preset YAML |
 
