@@ -103,8 +103,12 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
         rcapi.set_setting(root_url, admin, config.ADMIN_PASSWORD, setting_id, value)
 
     # Make seeding possible/fast: new users' logins aren't blocked by email-2FA,
-    # and bulk calls aren't throttled.
-    _set("Accounts_TwoFactorAuthentication_By_Email_Enabled", False)
+    # and bulk calls aren't throttled. Email-2FA is RESTORED afterwards if it was
+    # on (the `email` preset enables it deliberately — seeding must not turn the
+    # OTP flow off behind the user's back).
+    email_2fa = "Accounts_TwoFactorAuthentication_By_Email_Enabled"
+    email_2fa_was_on = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, email_2fa) is True
+    _set(email_2fa, False)
     _set("API_Enable_Rate_Limiter", False)
 
     # 1. Users (idempotent: an existing user just gets logged into).
@@ -175,4 +179,6 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
     log(f"messages: ~{total_msgs}  DMs: {dms}")
 
     _set("API_Enable_Rate_Limiter", True)  # restore
+    if email_2fa_was_on:
+        _set(email_2fa, True)              # restore OTP (email preset)
     return {"users": len(names), "channels": plan.channels, "messages": total_msgs, "dms": dms}

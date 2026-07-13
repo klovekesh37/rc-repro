@@ -112,6 +112,7 @@ A preset turns a bare RC into a scenario. See them with `rc-repro presets`.
 | `ldap` | OpenLDAP seeded with users + a group | LDAP auth / sync tickets |
 | `saml` | a real Keycloak IdP (SAML realm + users) | SAML SSO login |
 | `oidc` | a real Keycloak IdP (OpenID Connect + users) | OIDC / OAuth SSO login |
+| `email` | Mailpit mailcatcher wired to RC's SMTP | email flows: invites, password reset, verification, 2FA codes |
 | `multi-instance` | N RC instances + Traefik load balancer + NATS, one shared Mongo | horizontal scaling / cross-instance real-time |
 
 ```bash
@@ -129,9 +130,22 @@ rc-repro up --version 8.5.1 --preset ldap --set users=5        # 5 LDAP users
 rc-repro up --version 8.5.1 --preset ldap --set users=130000   # scale/perf repro
 rc-repro up --version 8.5.1 --preset saml --set users=20       # 20 Keycloak users
 rc-repro up --version 8.5.1 --preset multi-instance --set instances=3   # 3 instances behind a load balancer
+rc-repro up --version 8.5.1 --preset email --seed --wait                # Mailpit + verified sample users
+rc-repro up --version 8.5.1 --preset email --set verification=true      # require signup email verification
 ```
 
 For `ldap`, `saml` and `oidc`, log in as **`user1` / `user1`** (…`userN` / `userN`).
+
+> **`email`** captures every email RC sends (nothing leaves your machine) in
+> Mailpit at `http://localhost:8025` — one **catch-all inbox for all users**;
+> check the To: column. Covers invites, password resets, verification and
+> notification mail out of the box. **Email-2FA is enabled globally**, but RC only
+> applies it to users with a *verified* email: seeded users are verified, so
+> `alice` / `alice` gets the full OTP flow (code lands in Mailpit); `admin` isn't,
+> so it logs in plain until you verify it (Admin → Users → admin → Verified).
+> rc-repro's own `token`/`api`/`seed` calls fetch a required code from Mailpit
+> automatically, so they keep working either way. `--set verification=true` also
+> makes new signups verify their address first.
 
 > **`multi-instance`** runs N Rocket.Chat instances behind Traefik on one URL, sharing
 > one MongoDB and coordinating over NATS. Confirm the mesh with

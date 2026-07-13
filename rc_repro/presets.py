@@ -43,6 +43,9 @@ class Preset:
     # Service the published host port maps to instead of `rocketchat` (e.g. a
     # load balancer that fronts the instances). Empty = rocketchat owns the port.
     entry_service: str = ""
+    # Arbitrary metadata copied into the repro's repro.json (meta.extra) — e.g.
+    # the email preset stores mailpit_url so rcapi.login can fetch OTP codes.
+    extra: dict = field(default_factory=dict)
 
 
 def _parse(text: str, source: str) -> Preset:
@@ -60,14 +63,22 @@ def _parse(text: str, source: str) -> Preset:
         source=source,
         instances=int(raw.get("instances", 1) or 1),
         entry_service=raw.get("entry_service", "") or "",
+        extra=raw.get("extra") or {},
     )
 
 
 def _dynamic_builders() -> dict:
     """Registry of code-generated presets (imported lazily to avoid cycles)."""
-    from rc_repro import ldap_preset, multi_instance_preset, oidc_preset, saml_preset
+    from rc_repro import (
+        email_preset,
+        ldap_preset,
+        multi_instance_preset,
+        oidc_preset,
+        saml_preset,
+    )
 
     return {
+        "email": email_preset.build,
         "ldap": ldap_preset.build,
         "saml": saml_preset.build,
         "oidc": oidc_preset.build,

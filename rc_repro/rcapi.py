@@ -72,25 +72,118 @@ def wait_ready(
         time.sleep(interval)
 
 
-def login(
-    root_url: str,
-    user: str = config.ADMIN_USERNAME,
-    password: str = config.ADMIN_PASSWORD,
-    timeout: float = 10.0,
-) -> Auth:
-    """Log in and return an Auth (token + user id)."""
-    resp = requests.post(
-        f"{root_url.rstrip('/')}/api/v1/login",
-        json={"user": user, "password": password},
-        timeout=timeout,
-    )
-    resp.raise_for_status()
+def _auth_from(resp) -> Auth:
     data = resp.json().get("data", {})
     token = data.get("authToken")
     user_id = data.get("userId")
     if not token or not user_id:
         raise RuntimeError(f"login did not return a token: {resp.text[:200]}")
     return Auth(token=token, user_id=user_id)
+
+
+def login(
+    root_url: str,
+    user: str = config.ADMIN_USERNAME,
+    password: str = config.ADMIN_PASSWORD,
+    timeout: float = 10.0,
+    mailpit_url: str | None = None,
+) -> Auth:
+    """Log in and return an Auth (token + user id).
+
+    When the workspace has email-2FA enabled (the `email` preset does, by
+    default), a plain login is rejected with `totp-required`. In that case we
+    retry with the password-fallback 2FA method, and if that's not accepted and
+    a Mailpit URL is known (meta.extra["mailpit_url"]), we trigger the code
+    email, read the 6-digit code from Mailpit's API, and retry with it — so
+    rc-repro's own admin calls keep working while OTP stays on for browsers.
+    """
+    base = f"{root_url.rstrip('/')}/api/v1"
+    creds = {"user": user, "password": password}
+
+    resp = requests.post(f"{base}/login", json=creds, timeout=timeout)
+    if resp.status_code == 200:
+        return _auth_from(resp)
+    if "totp-required" not in resp.text:
+        resp.raise_for_status()
+
+    # 2FA challenge. Try the password-fallback method first (no email needed).
+    resp2 = requests.post(
+        f"{base}/login", json=creds, timeout=timeout,
+        headers=password_2fa_headers(password),
+    )
+    if resp2.status_code == 200:
+        return _auth_from(resp2)
+
+    if not mailpit_url:
+        raise RuntimeError(
+            "login requires an email-2FA code and no Mailpit URL is configured "
+            f"(is this the `email` preset?): {resp.text[:200]}"
+        )
+
+    # Ask RC to (re)send the code, then fish it out of Mailpit. Filter by the
+    # recipient so a code for another user (Mailpit is a catch-all inbox for
+    # every address) is never picked up by mistake.
+    requests.post(
+        f"{base}/users.2fa.sendEmailCode",
+        json={"emailOrUsername": user}, timeout=timeout,
+    )
+    to_email = user if "@" in user else (
+        config.ADMIN_EMAIL if user == config.ADMIN_USERNAME else None
+    )
+    code = fetch_email_otp(mailpit_url, to_email=to_email)
+    if not code:
+        raise RuntimeError("email-2FA code did not arrive in Mailpit within the timeout")
+    resp3 = requests.post(
+        f"{base}/login", json=creds, timeout=timeout,
+        headers={"x-2fa-code": code, "x-2fa-method": "email"},
+    )
+    resp3.raise_for_status()
+    return _auth_from(resp3)
+
+
+def _extract_otp(text: str) -> str | None:
+    """First standalone 6-digit code in an email body, or None."""
+    m = re.search(r"(?<!\d)(\d{6})(?!\d)", text or "")
+    return m.group(1) if m else None
+
+
+def _addressed_to(item: dict, to_email: str | None) -> bool:
+    if not to_email:
+        return True
+    addrs = [a.get("Address", "") for a in item.get("To") or []]
+    return to_email.lower() in (a.lower() for a in addrs)
+
+
+def fetch_email_otp(
+    mailpit_url: str, to_email: str | None = None,
+    timeout: float = 30.0, interval: float = 1.5,
+) -> str | None:
+    """Poll Mailpit's API for the newest message (optionally only those addressed
+    to `to_email` — Mailpit is a catch-all inbox for every user) and extract a
+    6-digit code. Returns None if no code shows up within `timeout`.
+    """
+    base = mailpit_url.rstrip("/")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            listing = requests.get(f"{base}/api/v1/messages", params={"limit": 10}, timeout=5)
+            if listing.status_code == 200:
+                for item in listing.json().get("messages") or []:   # newest first
+                    mid = item.get("ID")
+                    if not mid or not _addressed_to(item, to_email):
+                        continue
+                    msg = requests.get(f"{base}/api/v1/message/{mid}", timeout=5)
+                    if msg.status_code != 200:
+                        continue
+                    body = msg.json()
+                    code = _extract_otp(body.get("Text") or "") or _extract_otp(body.get("HTML") or "")
+                    if code:
+                        return code
+        except (requests.RequestException, ValueError):
+            pass
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(interval)
 
 
 def complete_setup_wizard(root_url: str, auth: Auth, password: str, timeout: float = 15.0) -> bool:
@@ -147,6 +240,21 @@ def generate_pat(
     if j2.get("success") and j2.get("token"):
         return j2["token"]
     raise RuntimeError(f"could not create PAT: {r.text[:200]}")
+
+
+def get_setting(root_url: str, auth: Auth, password: str, setting_id: str, timeout: float = 15.0):
+    """Read a Rocket.Chat setting's current value, or None if unavailable."""
+    headers = {**auth.headers(), **password_2fa_headers(password)}
+    try:
+        resp = requests.get(
+            f"{root_url.rstrip('/')}/api/v1/settings/{setting_id}",
+            headers=headers, timeout=timeout,
+        )
+        if resp.status_code == 200 and resp.json().get("success") is True:
+            return resp.json().get("value")
+    except (requests.RequestException, ValueError):
+        pass
+    return None
 
 
 def set_setting(root_url: str, auth: Auth, password: str, setting_id: str, value, timeout: float = 15.0) -> bool:

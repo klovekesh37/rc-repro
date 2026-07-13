@@ -20,7 +20,7 @@ CI runs `pytest` on every push/PR (see `.github/workflows/ci.yml`).
 | `rc_repro/cli.py` | Typer commands, orchestration, output |
 | `rc_repro/versions.py` | RC version → MongoDB pairing (live lookup + fallback map) |
 | `rc_repro/presets.py` | load presets (static YAML + dynamic builders) |
-| `rc_repro/ldap_preset.py`, `saml_preset.py`, `oidc_preset.py` | generate the LDAP / Keycloak (SAML & OIDC) scenarios |
+| `rc_repro/ldap_preset.py`, `saml_preset.py`, `oidc_preset.py`, `email_preset.py` | generate the LDAP / Keycloak (SAML & OIDC) / Mailpit scenarios |
 | `rc_repro/multi_instance_preset.py` | generate the multi-instance (Traefik + NATS) scenario |
 | `rc_repro/compose.py` | build the docker-compose document (incl. cloning RC into N instances) |
 | `rc_repro/runner.py` | on-disk state + `docker compose` invocations |

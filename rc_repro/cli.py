@@ -63,6 +63,12 @@ def _require_docker() -> None:
         _err("Docker isn't running. Start Docker Desktop and try again.")
 
 
+def _login(meta: runner.Metadata) -> rcapi.Auth:
+    """Admin login for a repro. Passes the repro's Mailpit URL (email preset)
+    so rcapi can satisfy an email-2FA challenge automatically."""
+    return rcapi.login(meta.root_url, mailpit_url=meta.extra.get("mailpit_url"))
+
+
 def _pretty_state(status: str) -> str:
     """Friendly label from a `docker compose ls` status.
 
@@ -199,6 +205,8 @@ def up(
         meta.extra["notes"] = pre.notes
     if pre.instances > 1:
         meta.extra["instances"] = pre.instances
+    if pre.extra:
+        meta.extra.update(pre.extra)
     runner.write(repro_name, compose.to_yaml(doc), meta, files=pre.files)
 
     if pin:
@@ -233,7 +241,7 @@ def up(
 def _run_seed(meta: runner.Metadata, profile: str,
               users=None, channels=None, messages=None) -> None:
     try:
-        auth = rcapi.login(meta.root_url)
+        auth = _login(meta)
     except Exception as exc:  # noqa: BLE001
         _err(f"can't seed — repro not ready (`rc-repro ready --name {meta.name}`): {exc}")
     plan = seeder.plan_from(profile, users, channels, messages)
@@ -310,7 +318,7 @@ def _do_ready(meta: runner.Metadata, timeout: float = 300.0) -> None:
     # usable immediately. Best-effort (custom-admin presets / 2FA may block it).
     auth = None
     try:
-        auth = rcapi.login(meta.root_url)
+        auth = _login(meta)
         if rcapi.complete_setup_wizard(meta.root_url, auth, config.ADMIN_PASSWORD):
             typer.echo("  setup wizard skipped — no registration needed.")
     except Exception:  # noqa: BLE001 - finalize is best-effort
@@ -512,7 +520,7 @@ def token(name: str = typer.Option("", "--name", "-n")) -> None:
     _require_docker()
     m = runner.read_meta(_resolve_name(name))
     try:
-        auth = rcapi.login(m.root_url)
+        auth = _login(m)
     except Exception as exc:  # noqa: BLE001 - surface any auth/connection failure
         _err(f"could not log in (is it ready? `rc-repro ready --name {m.name}`): {exc}")
     typer.echo(f'-H "X-Auth-Token: {auth.token}" -H "X-User-Id: {auth.user_id}"')
@@ -537,7 +545,7 @@ def api(
     _require_docker()
     m = runner.read_meta(_resolve_name(name))
     try:
-        auth = rcapi.login(m.root_url)
+        auth = _login(m)
         if pat:
             token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, bypass_2fa=True)
             auth = rcapi.Auth(token=token, user_id=auth.user_id)  # use the PAT as the auth token
@@ -571,7 +579,7 @@ def pat(
     _require_docker()
     m = runner.read_meta(_resolve_name(name))
     try:
-        auth = rcapi.login(m.root_url)
+        auth = _login(m)
         token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, token_name=label, bypass_2fa=bypass_2fa)
     except Exception as exc:  # noqa: BLE001
         _err(f"could not create PAT (ready? `rc-repro ready --name {m.name}`): {exc}")

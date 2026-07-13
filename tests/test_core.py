@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from rc_repro import compose, presets, seed, versions
+from rc_repro import compose, presets, rcapi, seed, versions
 
 
 # --- version resolution (offline / fallback map) ------------------------------
@@ -88,6 +88,43 @@ def test_multi_instance_preset_shape():
     assert dynamic.count("- url:") == 3
     assert "http://rocketchat-3:3000" in dynamic
     assert all("docker.sock" not in v for v in p.services["traefik"].get("volumes", []))
+
+
+def test_email_preset_shape():
+    p = presets.load("email")
+    assert "mailpit" in p.services
+    assert p.depends_on == ["mailpit"]
+    assert p.env["OVERWRITE_SETTING_SMTP_Host"] == "mailpit"
+    assert p.env["OVERWRITE_SETTING_SMTP_Port"] == "1025"
+    # Email-2FA is enabled globally (codes land in Mailpit). No forced opt-in:
+    # it only gates users with verified emails (seeded users are; admin isn't
+    # until verified manually), so plain admin login keeps working.
+    assert p.env["OVERWRITE_SETTING_Accounts_TwoFactorAuthentication_By_Email_Enabled"] == "true"
+    assert p.post_ready == []
+    # rcapi.login needs Mailpit's URL to fetch codes for rc-repro's own calls
+    # whenever a login is 2FA-gated.
+    assert p.extra["mailpit_url"] == "http://localhost:8025"
+    # verification is opt-in
+    assert "OVERWRITE_SETTING_Accounts_EmailVerification" not in p.env
+    assert (
+        presets.load("email", {"verification": "true"})
+        .env["OVERWRITE_SETTING_Accounts_EmailVerification"] == "true"
+    )
+
+
+def test_email_otp_extraction():
+    assert rcapi._extract_otp("Your login code is 428913, valid 5 min.") == "428913"
+    assert rcapi._extract_otp("<b>042891</b>") == "042891"
+    assert rcapi._extract_otp("order #12345678 shipped") is None   # not 6 digits
+    assert rcapi._extract_otp("") is None
+
+
+def test_email_otp_recipient_filter():
+    # Mailpit is a catch-all inbox — the fetcher must only match the right user.
+    msg = {"To": [{"Address": "Alice@Example.com"}]}
+    assert rcapi._addressed_to(msg, "alice@example.com")       # case-insensitive
+    assert not rcapi._addressed_to(msg, "admin@example.com")   # other user's mail
+    assert rcapi._addressed_to(msg, None)                      # no filter -> any
 
 
 def test_multi_instance_clamps_instance_count():
