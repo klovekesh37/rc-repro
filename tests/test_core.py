@@ -127,6 +127,38 @@ def test_email_otp_recipient_filter():
     assert rcapi._addressed_to(msg, None)                      # no filter -> any
 
 
+def test_s3_minio_preset_shape():
+    p = presets.load("s3_minio")
+    assert "minio" in p.services and "minio-init" in p.services
+    assert p.env["OVERWRITE_SETTING_FileUpload_Storage_Type"] == "AmazonS3"
+    assert p.env["OVERWRITE_SETTING_FileUpload_S3_ForcePathStyle"] == "true"
+    # Default mode proxies downloads through RC — zero-setup, no hosts entry.
+    assert p.env["OVERWRITE_SETTING_FileUpload_S3_Proxy_Uploads"] == "true"
+    assert p.env["OVERWRITE_SETTING_FileUpload_S3_Proxy_Avatars"] == "true"
+    # The object store persists via a named volume (Preset.volumes).
+    assert p.volumes == {"minio_data": {"driver": "local"}}
+    assert p.depends_on == ["minio"]
+
+
+def test_s3_minio_presigned_mode_and_bucket():
+    p = presets.load("s3_minio", {"presigned": "true", "bucket": "tickets"})
+    assert p.env["OVERWRITE_SETTING_FileUpload_S3_Proxy_Uploads"] == "false"
+    assert p.env["OVERWRITE_SETTING_FileUpload_S3_Bucket"] == "tickets"
+    assert p.env["OVERWRITE_SETTING_FileUpload_S3_BucketURL"].endswith("/tickets")
+    assert any("/etc/hosts" in n for n in p.notes)   # browser needs the hosts line
+    # bucket-init creates the custom bucket
+    assert "local/tickets" in p.services["minio-init"]["entrypoint"][-1]
+
+
+def test_compose_merges_preset_volumes():
+    # The Preset.volumes framework change: preset volumes land in the top-level
+    # volumes block (else compose rejects the file), base volume untouched.
+    doc = compose.build(_spec("8.4.1", "s3_minio"))
+    assert "minio_data" in doc["volumes"]
+    assert "mongodb_data" in doc["volumes"]
+    assert "minio_data:/data" in doc["services"]["minio"]["volumes"]
+
+
 def test_multi_instance_clamps_instance_count():
     assert presets.load("multi-instance", {"instances": "1"}).instances == 2   # min 2
     assert presets.load("multi-instance", {"instances": "99"}).instances == 5  # max 5

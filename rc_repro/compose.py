@@ -238,9 +238,11 @@ def build(spec: Spec) -> dict:
         "volumes": {"mongodb_data": {"driver": "local"}},
     }
 
-    # --- apply the preset's backing services / RC patch / depends_on ---
+    # --- apply the preset's backing services / volumes / RC patch / depends_on ---
     if spec.preset.services:
         _deep_merge(doc["services"], copy.deepcopy(spec.preset.services))
+    if spec.preset.volumes:
+        doc["volumes"].update(copy.deepcopy(spec.preset.volumes))
     # The RC patch and extra depends_on apply to EVERY rocketchat instance.
     for svc in rc_services.values():
         if spec.preset.rocketchat:

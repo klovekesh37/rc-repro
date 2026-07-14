@@ -113,6 +113,7 @@ A preset turns a bare RC into a scenario. See them with `rc-repro presets`.
 | `saml` | a real Keycloak IdP (SAML realm + users) | SAML SSO login |
 | `oidc` | a real Keycloak IdP (OpenID Connect + users) | OIDC / OAuth SSO login |
 | `email` | Mailpit mailcatcher wired to RC's SMTP | email flows: invites, password reset, verification, 2FA codes |
+| `s3_minio` | MinIO object storage as RC's file upload backend | S3 storage tickets: uploads, previews, presigned URLs |
 | `multi-instance` | N RC instances + Traefik load balancer + NATS, one shared Mongo | horizontal scaling / cross-instance real-time |
 
 ```bash
@@ -132,6 +133,8 @@ rc-repro up --version 8.5.1 --preset saml --set users=20       # 20 Keycloak use
 rc-repro up --version 8.5.1 --preset multi-instance --set instances=3   # 3 instances behind a load balancer
 rc-repro up --version 8.5.1 --preset email --seed --wait                # Mailpit + verified sample users
 rc-repro up --version 8.5.1 --preset email --set verification=true      # require signup email verification
+rc-repro up --version 8.5.1 --preset s3_minio                           # files stored in MinIO instead of GridFS
+rc-repro up --version 8.5.1 --preset s3_minio --set presigned=true      # real presigned URLs (needs hosts entry)
 ```
 
 For `ldap`, `saml` and `oidc`, log in as **`user1` / `user1`** (…`userN` / `userN`).
@@ -146,6 +149,13 @@ For `ldap`, `saml` and `oidc`, log in as **`user1` / `user1`** (…`userN` / `us
 > rc-repro's own `token`/`api`/`seed` calls fetch a required code from Mailpit
 > automatically, so they keep working either way. `--set verification=true` also
 > makes new signups verify their address first.
+
+> **`s3_minio`** stores RC's file uploads in a MinIO bucket (auto-created) instead
+> of GridFS — browse it at `http://localhost:9001` (`rcrepro` / `rcrepro-secret`).
+> By default downloads are proxied through RC so everything works with zero setup.
+> `--set presigned=true` switches to real presigned MinIO URLs — add
+> `127.0.0.1  minio` to `/etc/hosts` (printed on `up`); removing that line
+> reproduces the classic "uploads work but previews/downloads break" ticket.
 
 > **`multi-instance`** runs N Rocket.Chat instances behind Traefik on one URL, sharing
 > one MongoDB and coordinating over NATS. Confirm the mesh with

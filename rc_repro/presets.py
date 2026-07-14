@@ -46,6 +46,11 @@ class Preset:
     # Arbitrary metadata copied into the repro's repro.json (meta.extra) — e.g.
     # the email preset stores mailpit_url so rcapi.login can fetch OTP codes.
     extra: dict = field(default_factory=dict)
+    # Named volumes merged into the compose top-level `volumes:` block, for
+    # preset services that persist data (e.g. MinIO's object store). A service
+    # mounting an undeclared volume fails compose validation, so any volume a
+    # preset service references must be declared here.
+    volumes: dict = field(default_factory=dict)
 
 
 def _parse(text: str, source: str) -> Preset:
@@ -64,6 +69,7 @@ def _parse(text: str, source: str) -> Preset:
         instances=int(raw.get("instances", 1) or 1),
         entry_service=raw.get("entry_service", "") or "",
         extra=raw.get("extra") or {},
+        volumes=raw.get("volumes") or {},
     )
 
 
@@ -74,6 +80,7 @@ def _dynamic_builders() -> dict:
         ldap_preset,
         multi_instance_preset,
         oidc_preset,
+        s3_minio_preset,
         saml_preset,
     )
 
@@ -83,6 +90,7 @@ def _dynamic_builders() -> dict:
         "saml": saml_preset.build,
         "oidc": oidc_preset.build,
         "multi-instance": multi_instance_preset.build,
+        "s3_minio": s3_minio_preset.build,
     }
 
 
