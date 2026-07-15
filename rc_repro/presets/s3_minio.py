@@ -26,10 +26,17 @@ Parameters (via `--set`):
 
 from __future__ import annotations
 
-from rc_repro.presets import Preset
+import re
 
-_S3_PORT = 9000       # S3 API — same inside and published, so presigned URLs are
-_CONSOLE_PORT = 9001  # valid from the browser (via /etc/hosts) and RC alike
+from rc_repro import config
+from rc_repro.presets import Preset, _common
+
+# S3 bucket naming rules (also keeps the name shell-safe in minio-init).
+_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+
+# S3 API — same inside and published, so presigned URLs are valid from the
+# browser (via /etc/hosts) and RC alike. Console is the second registry port.
+_S3_PORT, _CONSOLE_PORT = config.PRESET_PORTS["s3_minio"]
 _USER = "rcrepro"
 _PASSWORD = "rcrepro-secret"   # MinIO requires >= 8 chars; throwaway repro creds
 # Pinned multi-arch (amd64/arm64) tags — verified via docker manifest inspect.
@@ -37,13 +44,14 @@ _MINIO_TAG = "RELEASE.2025-09-07T16-13-09Z"
 _MC_TAG = "RELEASE.2025-08-13T08-35-41Z"
 
 
-def _truthy(v) -> bool:
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
-
-
 def build(params: dict) -> Preset:
-    presigned = _truthy(params.get("presigned", False))
-    bucket = str(params.get("bucket", "rcrepro-uploads") or "rcrepro-uploads")
+    presigned = _common.truthy_param(params, "presigned")
+    bucket = _common.str_param(params, "bucket", "rcrepro-uploads")
+    if not _BUCKET_RE.match(bucket):
+        raise ValueError(
+            f"--set bucket={bucket!r} is not a valid S3 bucket name "
+            "(3-63 chars: lowercase letters, digits, dots, hyphens)"
+        )
 
     services = {
         "minio": {
@@ -122,5 +130,6 @@ def build(params: dict) -> Preset:
             "bucket": "bucket name (default rcrepro-uploads)",
         },
         volumes={"minio_data": {"driver": "local"}},
+        ports=list(config.PRESET_PORTS["s3_minio"]),
         notes=notes,
     )

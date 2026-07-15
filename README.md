@@ -2,8 +2,9 @@
 
 Spin up a **version-matched Rocket.Chat reproduction environment in one command** —
 the right Rocket.Chat version paired with a compatible MongoDB, plus optional
-backing services (LDAP, SAML) and sample data. Reproduce a customer's issue on
-their *exact* version in minutes instead of hand-building a compose stack.
+backing services (LDAP, SAML/OIDC via Keycloak, email, S3 storage, multi-instance)
+and sample data. Reproduce a customer's issue on their *exact* version in minutes
+instead of hand-building a compose stack.
 
 
 ## 1. Prerequisites
@@ -70,6 +71,13 @@ That's the whole loop: **`up` → use it → `down`**.
 - `--wait` blocks until Rocket.Chat responds (first boot pulls images and can take a few minutes), and skips the setup wizard so you land straight in.
 - `--name` is optional (a name is derived from the version); use a **ticket id** so `list` maps repros to your work.
 - Every repro auto-creates the same admin: **`admin` / `admin123`**.
+- **Local-only by default:** all published ports bind to `127.0.0.1`, so repros
+  (which run these well-known credentials) aren't reachable from your network.
+  MongoDB and NATS are never published at all (stricter than the official compose).
+  ⚠ `--bind 0.0.0.0` exposes RC **and every sidecar** (Keycloak, Mailpit, MinIO —
+  all with known credentials) to your whole network. Treat it as dangerous:
+  trusted networks only, take the repro down when done. rc-repro is a local
+  reproduction tool — never a production or internet-facing deployment.
 
 ## 4. Everyday commands
 
@@ -170,7 +178,8 @@ For `ldap`, `saml` and `oidc`, log in as **`user1` / `user1`** (…`userN` / `us
 > (`rc-repro info` prints this too.)
 
 **Custom / team presets** — drop a YAML file in `~/.rc-repro/presets/<name>.yaml`
-(overrides a built-in of the same name):
+(overrides a built-in of the same name). **Treat preset files as code**: they can
+run arbitrary containers and mount files — only use presets you trust.
 
 ```yaml
 name: my-scenario
@@ -181,6 +190,17 @@ services:                  # optional extra compose services
   my-sidecar: { image: some/image:tag }
 depends_on: [my-sidecar]
 ```
+
+**Enterprise (EE) license** — pass a cloud **registration token**: the workspace
+self-registers on first boot and Rocket.Chat Cloud syncs its license down
+(needs internet; get the token from the cloud console):
+
+```bash
+rc-repro up --version 8.5.1 --reg-token <your-token> --wait
+```
+
+To avoid retyping it, put `reg_token: <your-token>` in `~/.rc-repro/config.yaml`
+or export `RC_REPRO_REG_TOKEN` — every new repro then registers automatically.
 
 ## 6. Sample data (`--seed`)
 
@@ -201,9 +221,11 @@ rc-repro seed --name test --users 30 --channels 10 --messages 40   # custom coun
 | `standard` | 20 | 8 | 20 | 5 | yes |
 | `large` | 100 | 20 | 100 | 20 | yes |
 
-Seed users are `alice`, `bob`, … (password = username). Seeding disables email-2FA
-and briefly the API rate limiter so it can log in as each user and post at volume.
-For huge *user* counts use the `ldap` preset instead.
+Seed users are `alice`, `bob`, … (password = username). While seeding, email-2FA
+and the API rate limiter are temporarily disabled so it can log in as each user
+and post at volume — both are **restored to their prior values afterward** (so
+seeding an `email` repro leaves its 2FA setting on). For huge *user* counts use
+the `ldap` preset instead.
 
 ## 7. API testing
 
@@ -267,6 +289,10 @@ only for RC < 8 (deprecated in 8.x).
     ├── repro.json             # metadata
     └── …                      # preset-generated files (LDIF, realm JSON, …)
 ```
+
+Config values can also come from the environment (env wins over `config.yaml`) —
+handy for CI/scripts: `RC_REPRO_HOME`, `RC_REPRO_REG_TOKEN`, `RC_REPRO_RC_IMAGE`,
+`RC_REPRO_BIND_HOST` (default `127.0.0.1`; the `--bind` flag wins over both).
 
 ## 11. Development
 

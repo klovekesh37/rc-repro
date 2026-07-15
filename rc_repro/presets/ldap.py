@@ -13,7 +13,7 @@ LDAP_Login_Fallback, so rc-repro's own API/token calls keep functioning.
 
 from __future__ import annotations
 
-from rc_repro.presets import Preset
+from rc_repro.presets import Preset, _common
 
 # osixia imports custom LDIF from here on first boot (with `--copy-service`).
 _BOOTSTRAP_PATH = "/container/service/slapd/assets/config/bootstrap/ldif/custom/50-rc-users.ldif"
@@ -54,8 +54,8 @@ def _ldif(base_dn: str, domain: str, users: int) -> str:
 
 
 def build(params: dict) -> Preset:
-    users = int(params.get("users", 5) or 5)
-    domain = str(params.get("domain", "example.com") or "example.com")
+    users = _common.int_param(params, "users", 5)
+    domain = _common.str_param(params, "domain", "example.com")
     base_dn = ",".join(f"dc={part}" for part in domain.split("."))
     admin_pw = "admin"
 

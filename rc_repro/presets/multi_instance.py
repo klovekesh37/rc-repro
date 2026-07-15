@@ -22,7 +22,7 @@ Parameters (via `--set`):
 
 from __future__ import annotations
 
-from rc_repro.presets import Preset
+from rc_repro.presets import Preset, _common
 
 # Pinned to match the official rocketchat-compose defaults (both multi-arch;
 # verify with `docker manifest inspect` before release, as with the Mongo images).
@@ -62,7 +62,7 @@ def _dynamic_config(n: int) -> str:
 
 
 def build(params: dict) -> Preset:
-    instances = max(2, min(5, int(params.get("instances", 2) or 2)))
+    instances = max(2, min(5, _common.int_param(params, "instances", 2)))
 
     services = {
         # Inter-instance message broker (presence, notifications, streaming).

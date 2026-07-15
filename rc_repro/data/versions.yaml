@@ -6,8 +6,8 @@
 # `compatibleMongoVersions` field.
 #
 # Only the MongoDB *tag* is stored per RC range; flavor / shell / oplog are
-# derived in code from the RC and Mongo majors:
-#   - mongo_flavor = "official" if RC major >= 8 else "bitnami-legacy"
+# derived in code (versions.py) from the RC and Mongo majors:
+#   - mongo_flavor = "official" if MONGO major >= 8 else "bitnami-legacy"
 #   - mongo_shell  = "mongosh"  if Mongo major >= 5 else "mongo"  (official only)
 #   - oplog        = RC major < 8  (MONGO_OPLOG_URL; deprecated in 8.x)
 #

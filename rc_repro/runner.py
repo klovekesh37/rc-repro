@@ -88,7 +88,15 @@ def used_ports() -> set[int]:
         n = m.extra.get("instances") if isinstance(m.extra, dict) else None
         if isinstance(n, int) and n > 1:
             ports.update(m.host_port + i for i in range(1, n + 1))
+        # Preset side services (Keycloak/Mailpit/MinIO…) publish fixed host
+        # ports, recorded at `up` — claimed too, so allocation avoids them.
+        side = m.extra.get("sidecar_ports") if isinstance(m.extra, dict) else None
+        if isinstance(side, list):
+            ports.update(int(p) for p in side if isinstance(p, int) or str(p).isdigit())
     return ports
+
+
+PORT_MAX = 65535
 
 
 def port_free(port: int) -> bool:
@@ -102,16 +110,24 @@ def port_free(port: int) -> bool:
         try:
             s.bind(("0.0.0.0", port))
             return True
-        except OSError:
+        except (OSError, OverflowError):
             return False
 
 
 def pick_port(start: int = 3000) -> int:
-    """Lowest port >= start not claimed by another repro AND free on the host."""
+    """Lowest port >= start not claimed by another repro AND free on the host.
+
+    Bounded: raises RuntimeError instead of scanning past 65535 (which happens
+    when the host can't bind anything, e.g. sandboxed environments)."""
     used = used_ports()
     port = start
     while port in used or not port_free(port):
         port += 1
+        if port > PORT_MAX:
+            raise RuntimeError(
+                f"no free host port found (scanned {start}-{PORT_MAX}) — "
+                "can this environment bind TCP ports at all?"
+            )
     return port
 
 
@@ -119,12 +135,16 @@ def pick_port_range(count: int, start: int = 3000) -> int:
     """Lowest base port with `count` consecutive ports all unclaimed AND free.
 
     Used by multi-instance repros, which need one port for the load balancer plus
-    one per instance (the block [base, base+count)).
-    """
+    one per instance (the block [base, base+count)). Bounded like pick_port."""
     used = used_ports()
     base = start
     while not all((base + i) not in used and port_free(base + i) for i in range(count)):
         base += 1
+        if base + count - 1 > PORT_MAX:
+            raise RuntimeError(
+                f"no free block of {count} consecutive host ports found "
+                f"(scanned from {start}) — can this environment bind TCP ports at all?"
+            )
     return base
 
 
@@ -148,12 +168,17 @@ def _compose(name: str, *args: str, capture: bool = False) -> subprocess.Complet
 
 def up(name: str, *, pull: bool = True) -> int:
     if pull:
+        # A failed pull is deliberately non-fatal: cached images may satisfy
+        # `up -d` anyway (e.g. registry hiccup), and `up` itself fails loudly
+        # if an image is truly missing.
         _compose(name, "pull")
-    return _compose(name, "up", "-d").returncode
+    # --remove-orphans: if the compose file changed shape (e.g. a different
+    # preset after --force), containers of dropped services are cleaned up.
+    return _compose(name, "up", "-d", "--remove-orphans").returncode
 
 
 def down(name: str, *, volumes: bool = False) -> int:
-    args = ["down"]
+    args = ["down", "--remove-orphans"]
     if volumes:
         args.append("-v")
     return _compose(name, *args).returncode
@@ -208,19 +233,21 @@ def rc_state(name: str) -> str:
     return "absent"
 
 
-def project_states() -> dict[str, str]:
+def project_states() -> dict[str, str] | None:
     """Map compose project name -> status string for ALL projects, in one call.
 
     Uses `docker compose ls` so listing N repros costs one subprocess, not N.
     Status looks like "running(3)" / "exited(2)"; a fully `down`ed repro (no
-    containers) is absent from the output.
+    containers) is absent from the output. Returns None if the query itself
+    failed — callers that DELETE based on absence (prune) must not confuse
+    "no projects" with "couldn't ask docker".
     """
     proc = subprocess.run(
         ["docker", "compose", "ls", "--all", "--format", "json"],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        return {}
+        return None
     raw = (proc.stdout or "").strip()
     if not raw:
         return {}

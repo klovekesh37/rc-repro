@@ -51,6 +51,10 @@ class Preset:
     # mounting an undeclared volume fails compose validation, so any volume a
     # preset service references must be declared here.
     volumes: dict = field(default_factory=dict)
+    # Host ports the preset's side services publish (from config.PRESET_PORTS).
+    # Declared so port allocation/preflight can see them — two repros publishing
+    # the same sidecar port would collide at `docker compose up`.
+    ports: list[int] = field(default_factory=list)
 
 
 def _parse(text: str, source: str) -> Preset:
@@ -66,31 +70,34 @@ def _parse(text: str, source: str) -> Preset:
         depends_on=raw.get("depends_on") or [],
         requires_license=bool(raw.get("requires_license", False)),
         source=source,
+        notes=[str(line) for line in raw.get("notes") or []],
+        params_help=raw.get("params_help") or {},
         instances=int(raw.get("instances", 1) or 1),
         entry_service=raw.get("entry_service", "") or "",
         extra=raw.get("extra") or {},
         volumes=raw.get("volumes") or {},
+        ports=[int(p) for p in raw.get("ports") or []],
     )
 
 
 def _dynamic_builders() -> dict:
     """Registry of code-generated presets (imported lazily to avoid cycles)."""
-    from rc_repro import (
-        email_preset,
-        ldap_preset,
-        multi_instance_preset,
-        oidc_preset,
-        s3_minio_preset,
-        saml_preset,
+    from rc_repro.presets import (
+        email,
+        ldap,
+        multi_instance,
+        oidc,
+        s3_minio,
+        saml,
     )
 
     return {
-        "email": email_preset.build,
-        "ldap": ldap_preset.build,
-        "saml": saml_preset.build,
-        "oidc": oidc_preset.build,
-        "multi-instance": multi_instance_preset.build,
-        "s3_minio": s3_minio_preset.build,
+        "email": email.build,
+        "ldap": ldap.build,
+        "saml": saml.build,
+        "oidc": oidc.build,
+        "multi-instance": multi_instance.build,
+        "s3_minio": s3_minio.build,
     }
 
 

@@ -16,14 +16,12 @@ exchange. The IdP is published on host port 8081 (browser-reachable).
 
 from __future__ import annotations
 
-import json
+from rc_repro import config
+from rc_repro.presets import Preset, _common, _keycloak
 
-from rc_repro.presets import Preset
-
-_KC_PORT = 8081
-_KC_REALM = "rcrepro"
+_KC_PORT = config.PRESET_PORTS["saml"][0]
+_KC_REALM = _keycloak.REALM
 _KC_CLIENT = "rc-repro-saml-sp"  # must equal RC's SAML issuer
-_DOMAIN = "example.com"
 
 
 def _saml_mapper(name: str, user_property: str) -> dict:
@@ -66,51 +64,13 @@ def _client() -> dict:
     }
 
 
-def _users(count: int) -> list[dict]:
-    return [
-        {
-            "username": f"user{i}",
-            "enabled": True,
-            "emailVerified": True,
-            "email": f"user{i}@{_DOMAIN}",
-            "firstName": "User",
-            "lastName": str(i),
-            "credentials": [{"type": "password", "value": f"user{i}", "temporary": False}],
-        }
-        for i in range(1, count + 1)
-    ]
-
-
-def _realm_json(users: int) -> str:
-    realm = {
-        "realm": _KC_REALM,
-        "enabled": True,
-        "sslRequired": "none",  # allow HTTP (browser reaches Keycloak via docker port-forward)
-        "clients": [_client()],
-        "users": _users(users),
-    }
-    return json.dumps(realm, indent=2)
-
-
 def build(params: dict) -> Preset:
-    users = int(params.get("users", 5) or 5)
+    users = _common.int_param(params, "users", 5)
     saml_ep = f"http://localhost:{_KC_PORT}/realms/{_KC_REALM}/protocol/saml"
     descriptor = f"{saml_ep}/descriptor"
 
     services = {
-        "keycloak": {
-            "image": "quay.io/keycloak/keycloak:26.0",
-            "command": ["start-dev", "--import-realm"],
-            "environment": {
-                "KC_BOOTSTRAP_ADMIN_USERNAME": "admin",
-                "KC_BOOTSTRAP_ADMIN_PASSWORD": "admin",
-            },
-            "volumes": [
-                "./saml/keycloak-realm.json:/opt/keycloak/data/import/rcrepro-realm.json:ro"
-            ],
-            "ports": [f"{_KC_PORT}:8080"],
-            "restart": "unless-stopped",
-        }
+        "keycloak": _keycloak.service("./saml/keycloak-realm.json", _KC_PORT),
     }
     env = {
         "OVERWRITE_SETTING_SAML_Custom_Default": "true",
@@ -144,8 +104,9 @@ def build(params: dict) -> Preset:
         depends_on=["keycloak"],
         requires_license=False,
         source="built-in (dynamic)",
-        files=[("saml/keycloak-realm.json", _realm_json(users))],
+        files=[("saml/keycloak-realm.json", _keycloak.realm_json([_client()], users))],
         params_help={"users": "number of Keycloak test users (default 5)"},
+        ports=list(config.PRESET_PORTS["saml"]),
         notes=[
             f"Keycloak admin console: http://localhost:{_KC_PORT}  (admin / admin)",
             f"  Your SAML users live in the '{_KC_REALM}' realm, NOT 'master' (the",

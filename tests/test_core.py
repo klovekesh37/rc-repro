@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from rc_repro import compose, presets, rcapi, seed, versions
+from rc_repro import compose, config, presets, rcapi, runner, seed, versions
 
 
 # --- version resolution (offline / fallback map) ------------------------------
@@ -66,6 +66,34 @@ def test_saml_preset_realm_scales_with_users():
     assert [u["username"] for u in realm["users"]] == ["user1", "user2", "user3", "user4"]
     assert realm["sslRequired"] == "none"
     assert p.post_ready  # fetches the IdP cert at runtime
+
+
+def test_param_helpers():
+    from rc_repro.presets import _common
+    assert _common.truthy_param({"x": "YES"}, "x") is True
+    assert _common.truthy_param({"x": "0"}, "x") is False
+    assert _common.truthy_param({}, "x", default=True) is True
+    assert _common.int_param({"n": "7"}, "n", 5) == 7
+    assert _common.int_param({"n": ""}, "n", 5) == 5      # empty -> default
+    assert _common.int_param({}, "n", 5) == 5
+    assert _common.str_param({"b": ""}, "b", "d") == "d"
+    assert _common.str_param({"b": "x"}, "b", "d") == "x"
+
+
+def test_keycloak_shared_scaffolding():
+    from rc_repro.presets import _keycloak
+    us = _keycloak.users(2)
+    assert [u["username"] for u in us] == ["user1", "user2"]
+    # saml shape: publish host port -> Keycloak's default 8080
+    svc = _keycloak.service("./x/realm.json", 8081)
+    assert svc["ports"] == ["8081:8080"]
+    assert "KC_HTTP_PORT" not in svc["environment"]
+    # oidc shape: same port inside and out (single keycloak:<port> URL)
+    svc2 = _keycloak.service("./x/realm.json", 8085, http_port=8085)
+    assert svc2["ports"] == ["8085:8085"]
+    assert svc2["environment"]["KC_HTTP_PORT"] == "8085"
+    realm = json.loads(_keycloak.realm_json([{"clientId": "c"}], 2))
+    assert realm["realm"] == "rcrepro" and len(realm["users"]) == 2
 
 
 def test_unknown_preset_raises():
@@ -167,14 +195,12 @@ def test_multi_instance_clamps_instance_count():
 # --- compose building ---------------------------------------------------------
 
 
-def _spec(version: str, preset_name: str = "default"):
+def _spec(version: str, preset_name: str = "default", params: dict | None = None):
     r = versions.resolve(version, offline=True)
-    pre = presets.load(preset_name)
-    return compose.Spec(
-        project_name="rcrepro-t", rc_image=r.rc_image, rc_tag=r.rc_version,
-        mongo_tag=r.mongo_tag, mongo_flavor=r.mongo_flavor, mongo_shell=r.mongo_shell,
-        oplog=r.oplog, root_url="http://localhost:3000", host_port=3000,
-        reg_token=None, preset=pre,
+    pre = presets.load(preset_name, params or {})
+    return compose.Spec.from_resolved(
+        r, project_name="rcrepro-t", root_url="http://localhost:3000",
+        host_port=3000, reg_token=None, preset=pre,
     )
 
 
@@ -203,19 +229,8 @@ def test_compose_yaml_is_valid():
     assert parsed["name"] == "rcrepro-t"
 
 
-def _multi_spec(version: str, instances: int):
-    r = versions.resolve(version, offline=True)
-    pre = presets.load("multi-instance", {"instances": str(instances)})
-    return compose.Spec(
-        project_name="rcrepro-t", rc_image=r.rc_image, rc_tag=r.rc_version,
-        mongo_tag=r.mongo_tag, mongo_flavor=r.mongo_flavor, mongo_shell=r.mongo_shell,
-        oplog=r.oplog, root_url="http://localhost:3000", host_port=3000,
-        reg_token=None, preset=pre,
-    )
-
-
 def test_compose_multi_instance_clones_and_meshes():
-    doc = compose.build(_multi_spec("8.4.1", 3))
+    doc = compose.build(_spec("8.4.1", "multi-instance", {"instances": "3"}))
     svcs = doc["services"]
     # three cloned RC instances, no single "rocketchat"
     assert {"rocketchat-1", "rocketchat-2", "rocketchat-3"} <= set(svcs)
@@ -223,14 +238,14 @@ def test_compose_multi_instance_clones_and_meshes():
     inst = svcs["rocketchat-2"]
     assert inst["environment"]["TRANSPORTER"] == "monolith+nats://nats:4222"
     assert "INSTANCE_IP" not in inst["environment"]                # NATS transporter, not DDP mesh
-    assert inst["ports"] == ["3002:3000"]                          # direct access on host_port+2
+    assert inst["ports"] == ["127.0.0.1:3002:3000"]                # direct access on host_port+2, loopback-bound
     assert "nats" in inst["depends_on"]                            # preset depends_on applied
     # cold-start serialisation: 2..N wait for instance-1 to be healthy first
     assert inst["depends_on"]["rocketchat-1"]["condition"] == "service_healthy"
     assert "healthcheck" in svcs["rocketchat-1"]
     # NATS + Traefik present; Traefik got the published host port
     assert "nats" in svcs
-    assert svcs["traefik"]["ports"] == ["3000:80"]
+    assert svcs["traefik"]["ports"] == ["127.0.0.1:3000:80"]
 
 
 def test_compose_single_instance_unchanged_by_new_fields():
@@ -238,7 +253,152 @@ def test_compose_single_instance_unchanged_by_new_fields():
     doc = compose.build(_spec("8.4.1"))
     assert "rocketchat" in doc["services"]
     assert "rocketchat-1" not in doc["services"]
-    assert doc["services"]["rocketchat"]["ports"] == ["3000:3000"]
+    assert doc["services"]["rocketchat"]["ports"] == ["127.0.0.1:3000:3000"]
+
+
+def test_compose_binds_loopback_everywhere():
+    # Hardening: every published port (RC + all sidecars) binds to 127.0.0.1
+    # by default (official rocketchat-compose BIND_IP pattern).
+    doc = compose.build(_spec("8.4.1", "s3_minio"))
+    published = [p for svc in doc["services"].values() for p in svc.get("ports", [])]
+    assert published, "expected published ports"
+    assert all(p.startswith("127.0.0.1:") for p in published), published
+
+
+def test_compose_bind_override():
+    spec = _spec("8.4.1")
+    spec.bind_host = "0.0.0.0"   # up --bind 0.0.0.0 (deliberate LAN sharing)
+    doc = compose.build(spec)
+    assert doc["services"]["rocketchat"]["ports"] == ["0.0.0.0:3000:3000"]
+
+
+def test_s3_bucket_name_validated():
+    try:
+        presets.load("s3_minio", {"bucket": "Bad Name!"})
+    except ValueError as exc:
+        assert "bucket" in str(exc)
+        return
+    raise AssertionError("expected ValueError for an invalid bucket name")
+
+
+def test_int_param_bad_value_is_actionable():
+    from rc_repro.presets import _common
+    try:
+        _common.int_param({"users": "many"}, "users", 5)
+    except ValueError as exc:
+        assert "--set users=" in str(exc)
+        return
+    raise AssertionError("expected ValueError for a non-numeric --set value")
+
+
+def test_pick_port_bounded(monkeypatch):
+    # Hosts where nothing can bind (sandboxes) must get a clean error, not an
+    # OverflowError from scanning past 65535.
+    monkeypatch.setattr(runner, "port_free", lambda p: False)
+    monkeypatch.setattr(runner, "used_ports", set)
+    try:
+        runner.pick_port()
+    except RuntimeError as exc:
+        assert "no free host port" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+    try:
+        runner.pick_port_range(3)
+    except RuntimeError as exc:
+        assert "consecutive" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_seed_profile_strict():
+    try:
+        seed.plan_from("larg")   # typo must not silently seed `small`
+    except ValueError as exc:
+        assert "unknown seed profile" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_multi_instance_bad_count_is_actionable():
+    try:
+        presets.load("multi-instance", {"instances": "many"})
+    except ValueError as exc:
+        assert "--set instances=" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_yaml_preset_notes_parsed(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    pdir = tmp_path / "presets"
+    pdir.mkdir(parents=True)
+    (pdir / "team.yaml").write_text(
+        "name: team\nnotes: [tip one, tip two]\nparams_help: {x: does x}\n"
+    )
+    p = presets.load("team")
+    assert p.notes == ["tip one", "tip two"]
+    assert p.params_help == {"x": "does x"}
+
+
+def test_sanitize_can_produce_empty_name():
+    # cli.up guards this: an all-symbols --name would otherwise write into the
+    # repros root itself.
+    from rc_repro.cli import _sanitize
+    assert _sanitize("!!!") == ""
+
+
+# --- config / runner (12-factor items) -----------------------------------------
+
+
+def test_preset_ports_match_registry():
+    # Every preset with side services declares exactly its registry ports, so
+    # allocation/preflight can see them.
+    for name, expected in config.PRESET_PORTS.items():
+        p = presets.load(name)
+        assert p.ports == list(expected), f"{name} declares {p.ports}, registry says {expected}"
+    assert presets.load("default").ports == []
+
+
+def test_used_ports_includes_sidecars(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    meta = runner.Metadata(
+        name="x", project="rcrepro-x", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="saml",
+        root_url="http://localhost:3000", host_port=3000, version_source="map",
+        extra={"sidecar_ports": [8081]},
+    )
+    runner.write("x", "services: {}\n", meta)
+    assert {3000, 8081} <= runner.used_ports()
+
+
+def test_config_env_overrides(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setenv("RC_REPRO_REG_TOKEN", "tok-from-env")
+    cfg = config.load_config()
+    assert cfg["reg_token"] == "tok-from-env"
+    # env wins over the file
+    config.save_config({"reg_token": "tok-from-file"})
+    assert config.load_config()["reg_token"] == "tok-from-env"
+
+
+def test_env_values_never_persisted_to_config_file(tmp_path, monkeypatch):
+    # Regression: read-modify-write flows (up --pin / use) must not bake
+    # ephemeral env values (secrets!) into config.yaml.
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setenv("RC_REPRO_REG_TOKEN", "SECRET")
+    raw = config.load_config(with_env=False)   # what save paths must use
+    assert "reg_token" not in raw
+    raw["default_repro"] = "x"
+    config.save_config(raw)
+    assert "SECRET" not in config.config_file().read_text()
+    # ...while readers still see the env value
+    assert config.load_config()["reg_token"] == "SECRET"
+
+
+def test_version_single_source():
+    import rc_repro
+    # resolved from package metadata (pyproject), never a hardcoded literal
+    assert rc_repro.__version__ and rc_repro.__version__ != "0.0.0-dev"
 
 
 # --- seed ---------------------------------------------------------------------

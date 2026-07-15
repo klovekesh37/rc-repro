@@ -1,9 +1,9 @@
 """Dynamic `oidc` preset: a Keycloak OpenID Connect IdP that Rocket.Chat logs in
 against via its Custom OAuth provider.
 
-Reuses the Keycloak image and the SAML preset's user generation, but ships an
-OIDC client instead of a SAML one. OIDC authenticates with a client id + a fixed
-client secret (no signing certs), so there's no runtime cert fetch.
+Reuses the shared Keycloak scaffolding (_keycloak), but ships an OIDC client
+instead of a SAML one. OIDC authenticates with a client id + a fixed client
+secret (no signing certs), so there's no runtime cert fetch.
 
 THE ONE GOTCHA (see docs/oidc-design.md §5): OIDC's `url` is used by BOTH the
 browser (authorize) and RC's backend (token/userinfo). We use a single shared
@@ -15,14 +15,12 @@ presets don't collide).
 
 from __future__ import annotations
 
-import json
+from rc_repro import config
+from rc_repro.presets import Preset, _common, _keycloak
 
-from rc_repro import saml_preset
-from rc_repro.presets import Preset
-
-_KC_PORT = 8085          # uncommon + distinct from SAML's 8081, so both presets can run at once
-                         # (8080 is too commonly occupied — e.g. other local Keycloaks)
-_KC_REALM = "rcrepro"
+_KC_PORT = config.PRESET_PORTS["oidc"][0]   # distinct from SAML's, so both presets can run at once
+                                            # (8080 is too commonly occupied — e.g. other local Keycloaks)
+_KC_REALM = _keycloak.REALM
 _KC_HOST = "keycloak"    # resolvable from RC (compose DNS) AND the browser (/etc/hosts)
 _CLIENT_ID = "rc-oidc"
 _CLIENT_SECRET = "rc-oidc-secret"
@@ -45,40 +43,18 @@ def _oidc_client() -> dict:
     }
 
 
-def _realm_json(users: int) -> str:
-    realm = {
-        "realm": _KC_REALM,
-        "enabled": True,
-        "sslRequired": "none",
-        "clients": [_oidc_client()],
-        "users": saml_preset._users(users),   # reuse: user1..userN, password=username
-    }
-    return json.dumps(realm, indent=2)
-
-
 def build(params: dict) -> Preset:
-    users = int(params.get("users", 5) or 5)
+    users = _common.int_param(params, "users", 5)
     realm_base = f"http://{_KC_HOST}:{_KC_PORT}/realms/{_KC_REALM}"
     setting = f"Accounts_OAuth_Custom-{_PROVIDER.capitalize()}"   # Accounts_OAuth_Custom-Keycloak
 
     services = {
-        "keycloak": {
-            "image": "quay.io/keycloak/keycloak:26.0",
-            "command": ["start-dev", "--import-realm"],
-            "environment": {
-                "KC_BOOTSTRAP_ADMIN_USERNAME": "admin",
-                "KC_BOOTSTRAP_ADMIN_PASSWORD": "admin",
-                # Listen on the same port we publish, so the single `keycloak:8085`
-                # URL works from the browser (via /etc/hosts) and RC's backend
-                # (via the compose network) identically.
-                "KC_HTTP_PORT": str(_KC_PORT),
-            },
-            "volumes": [
-                "./oidc/keycloak-realm.json:/opt/keycloak/data/import/rcrepro-realm.json:ro"
-            ],
-            "ports": [f"{_KC_PORT}:{_KC_PORT}"],
-            "restart": "unless-stopped",
-        }
+        # http_port: listen on the same port we publish, so the single
+        # `keycloak:8085` URL works from the browser (via /etc/hosts) and RC's
+        # backend (via the compose network) identically.
+        "keycloak": _keycloak.service(
+            "./oidc/keycloak-realm.json", _KC_PORT, http_port=_KC_PORT
+        ),
     }
 
     # A custom OAuth provider's settings don't exist until it's created via the
@@ -124,8 +100,9 @@ def build(params: dict) -> Preset:
         depends_on=["keycloak"],
         requires_license=False,
         source="built-in (dynamic)",
-        files=[("oidc/keycloak-realm.json", _realm_json(users))],
+        files=[("oidc/keycloak-realm.json", _keycloak.realm_json([_oidc_client()], users))],
         params_help={"users": "number of Keycloak test users (default 5)"},
+        ports=list(config.PRESET_PORTS["oidc"]),
         post_ready=[
             {"action": "keycloak_master_ssl_off", "service": "keycloak", "port": _KC_PORT},
             # Create the Custom OAuth provider and configure it (can't be done via

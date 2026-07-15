@@ -65,7 +65,11 @@ PROFILES: dict[str, Plan] = {
 
 
 def plan_from(profile: str, users=None, channels=None, messages=None) -> Plan:
-    base = PROFILES.get(profile, PROFILES["small"])
+    if profile not in PROFILES:
+        raise ValueError(
+            f"unknown seed profile {profile!r} (want {' | '.join(PROFILES)})"
+        )
+    base = PROFILES[profile]
     return Plan(
         users=base.users if users is None else max(0, users),
         channels=base.channels if channels is None else max(0, channels),
@@ -103,14 +107,29 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
         rcapi.set_setting(root_url, admin, config.ADMIN_PASSWORD, setting_id, value)
 
     # Make seeding possible/fast: new users' logins aren't blocked by email-2FA,
-    # and bulk calls aren't throttled. Email-2FA is RESTORED afterwards if it was
-    # on (the `email` preset enables it deliberately — seeding must not turn the
-    # OTP flow off behind the user's back).
+    # and bulk calls aren't throttled. Both settings are restored to their PRIOR
+    # values afterwards — in a finally, so a mid-seed crash can't leave the
+    # workspace's security settings silently changed. ("Was off before" is only
+    # honoured when we could actually read the setting; unknown -> restore on.)
     email_2fa = "Accounts_TwoFactorAuthentication_By_Email_Enabled"
+    rate_limiter = "API_Enable_Rate_Limiter"
     email_2fa_was_on = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, email_2fa) is True
+    limiter_was_off = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, rate_limiter) is False
     _set(email_2fa, False)
-    _set("API_Enable_Rate_Limiter", False)
+    _set(rate_limiter, False)
 
+    try:
+        return _seed_body(root_url, admin_hdr, plan, post, log)
+    finally:
+        if not limiter_was_off:
+            _set(rate_limiter, True)
+        if email_2fa_was_on:
+            _set(email_2fa, True)
+
+
+def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
+    """The actual content creation (users/channels/DMs/messages); split out so
+    seed() can guarantee setting restoration in a finally."""
     # 1. Users (idempotent: an existing user just gets logged into).
     tokens: dict[str, rcapi.Auth] = {}
     names = [username(i) for i in range(plan.users)]
@@ -178,7 +197,4 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
             dms += 1
     log(f"messages: ~{total_msgs}  DMs: {dms}")
 
-    _set("API_Enable_Rate_Limiter", True)  # restore
-    if email_2fa_was_on:
-        _set(email_2fa, True)              # restore OTP (email preset)
     return {"users": len(names), "channels": plan.channels, "messages": total_msgs, "dms": dms}

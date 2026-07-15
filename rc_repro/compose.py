@@ -29,6 +29,31 @@ class Spec:
     reg_token: str | None
     preset: Preset
     container_port: int = config.RC_CONTAINER_PORT
+    # Host interface published ports bind to (the official rocketchat-compose
+    # BIND_IP pattern). Loopback by default: repros run weak fixed credentials,
+    # so they must not be reachable from the local network unless asked
+    # (`up --bind 0.0.0.0` / RC_REPRO_BIND_HOST).
+    bind_host: str = config.DEFAULT_BIND_HOST
+
+    @classmethod
+    def from_resolved(cls, resolved, *, project_name: str, root_url: str,
+                      host_port: int, reg_token: str | None, preset: Preset,
+                      bind_host: str = config.DEFAULT_BIND_HOST) -> "Spec":
+        """Build a Spec from a versions.Resolved plus the launch-time choices."""
+        return cls(
+            project_name=project_name,
+            rc_image=resolved.rc_image,
+            rc_tag=resolved.rc_version,
+            mongo_tag=resolved.mongo_tag,
+            mongo_flavor=resolved.mongo_flavor,
+            mongo_shell=resolved.mongo_shell,
+            oplog=resolved.oplog,
+            root_url=root_url,
+            host_port=host_port,
+            reg_token=reg_token,
+            preset=preset,
+            bind_host=bind_host,
+        )
 
 
 def _deep_merge(base: dict, patch: dict) -> dict:
@@ -47,7 +72,7 @@ def _rc_environment(spec: Spec) -> dict:
         "PORT": str(spec.container_port),
         "DEPLOY_METHOD": "docker",
         "DEPLOY_PLATFORM": "compose",
-        "MONGO_URL": "mongodb://mongodb:27017/rocketchat?replicaSet=rs0",
+        "MONGO_URL": config.MONGO_URL,
         "ALLOW_UNSAFE_QUERY_AND_FIELDS_API_PARAMS": "true",
         # Every repro should be usable out of the box: skip the setup wizard
         # (rc-repro also finalizes it over the API on `ready`) and auto-provision
@@ -60,7 +85,7 @@ def _rc_environment(spec: Spec) -> dict:
         "ADMIN_PASS": config.ADMIN_PASSWORD,
     }
     if spec.oplog:  # RC < 8 only; deprecated in 8.x
-        env["MONGO_OPLOG_URL"] = "mongodb://mongodb:27017/local?replicaSet=rs0"
+        env["MONGO_OPLOG_URL"] = config.MONGO_OPLOG_URL
     if spec.reg_token:
         env["REG_TOKEN"] = spec.reg_token
     # Preset env (OVERWRITE_SETTING_* etc.) wins over base defaults.
@@ -256,7 +281,26 @@ def build(spec: Spec) -> dict:
     if entry and entry in doc["services"]:
         doc["services"][entry]["ports"] = [f"{spec.host_port}:80"]
 
+    _bind_ports(doc, spec.bind_host)
+
     return doc
+
+
+def _bind_ports(doc: dict, bind: str) -> None:
+    """Prefix every published port with the bind host, unless one is already
+    given. Applied to ALL services in one pass — RC, multi-instance direct
+    ports, the load balancer, and preset sidecars — mirroring the official
+    rocketchat-compose `${BIND_IP}:${HOST_PORT}:${PORT}` pattern."""
+    if not bind:
+        return
+    for svc in doc["services"].values():
+        ports = svc.get("ports")
+        if not ports:
+            continue
+        svc["ports"] = [
+            f"{bind}:{p}" if str(p).split(":", 1)[0].isdigit() else str(p)
+            for p in ports
+        ]
 
 
 def to_yaml(doc: dict) -> str:

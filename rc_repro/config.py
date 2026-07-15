@@ -28,6 +28,40 @@ ADMIN_PASSWORD = "admin123"
 ADMIN_EMAIL = "admin@example.com"
 ADMIN_NAME = "Admin"
 
+# Host ports published by preset side services. One registry so presets can't
+# silently collide with each other — a new preset picks a port by looking here.
+# (RC's own port is allocated dynamically per repro; these are fixed for now —
+# see runner.used_ports, which makes them visible to allocation/preflight.)
+PRESET_PORTS: dict[str, tuple[int, ...]] = {
+    "saml": (8081,),          # Keycloak (SAML)
+    "oidc": (8085,),          # Keycloak (OIDC; same port inside+out)
+    "email": (8025,),         # Mailpit web UI / API
+    "s3_minio": (9000, 9001), # MinIO S3 API + console
+}
+
+# Host interface published ports bind to. Loopback: repros use weak fixed
+# credentials, so they should not be reachable from the local network unless
+# the user opts in (`up --bind 0.0.0.0` or RC_REPRO_BIND_HOST). Matches the
+# official rocketchat-compose .env.example posture for local/backing services.
+DEFAULT_BIND_HOST = "127.0.0.1"
+
+# In-network addresses of the Mongo replica set (compose service DNS).
+MONGO_URL = "mongodb://mongodb:27017/rocketchat?replicaSet=rs0"
+MONGO_OPLOG_URL = "mongodb://mongodb:27017/local?replicaSet=rs0"
+
+# Key under Metadata.extra where the email preset records Mailpit's URL, so
+# rcapi.login can fetch email-2FA codes for rc-repro's own admin calls.
+EXTRA_MAILPIT_URL = "mailpit_url"
+
+# Environment overrides for config.yaml values (env wins over the file):
+#   RC_REPRO_REG_TOKEN  -> reg_token     RC_REPRO_RC_IMAGE -> rc_image
+#   RC_REPRO_BIND_HOST  -> bind_host     (RC_REPRO_HOME is handled in home())
+_ENV_OVERRIDES = {
+    "reg_token": "RC_REPRO_REG_TOKEN",
+    "rc_image": "RC_REPRO_RC_IMAGE",
+    "bind_host": "RC_REPRO_BIND_HOST",
+}
+
 
 def home() -> Path:
     """Root state directory, created on demand."""
@@ -48,14 +82,24 @@ def config_file() -> Path:
     return home() / "config.yaml"
 
 
-def load_config() -> dict:
-    """Load ~/.rc-repro/config.yaml, or {} if absent."""
+def load_config(with_env: bool = True) -> dict:
+    """Load ~/.rc-repro/config.yaml (or {}), with env-var overrides applied.
+
+    Pass with_env=False when the dict will be written back via save_config —
+    otherwise ephemeral env values (e.g. RC_REPRO_REG_TOKEN) would be persisted
+    into the file.
+    """
     path = config_file()
-    if not path.exists():
-        return {}
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    if not isinstance(data, dict):
-        return {}
+    data: dict = {}
+    if path.exists():
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if isinstance(loaded, dict):
+            data = loaded
+    if with_env:
+        for key, env in _ENV_OVERRIDES.items():
+            val = os.environ.get(env)
+            if val:
+                data[key] = val
     return data
 
 

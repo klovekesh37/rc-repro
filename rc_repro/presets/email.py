@@ -20,20 +20,16 @@ Parameters (via `--set`):
 
 from __future__ import annotations
 
-from rc_repro.presets import Preset
+from rc_repro import config
+from rc_repro.presets import Preset, _common
 
-_MAILPIT_WEB_PORT = 8025   # web UI + API; SMTP :1025 stays compose-internal.
-                           # Distinct from SAML(8081)/OIDC(8085) so presets coexist.
+_MAILPIT_WEB_PORT = config.PRESET_PORTS["email"][0]   # web UI + API; SMTP :1025 stays compose-internal
 _SMTP_PORT = 1025
 _FROM = "rocketchat@example.com"
 
 
-def _truthy(v) -> bool:
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
-
-
 def build(params: dict) -> Preset:
-    verification = _truthy(params.get("verification", False))
+    verification = _common.truthy_param(params, "verification")
     mailpit_url = f"http://localhost:{_MAILPIT_WEB_PORT}"
 
     services = {
@@ -80,7 +76,8 @@ def build(params: dict) -> Preset:
         params_help={
             "verification": "require email verification on new accounts (default false)",
         },
-        extra={"mailpit_url": mailpit_url},
+        extra={config.EXTRA_MAILPIT_URL: mailpit_url},
+        ports=list(config.PRESET_PORTS["email"]),
         notes=[
             f"Mailpit (EVERY email RC sends, for ALL users, lands here): {mailpit_url}",
             "  — one shared inbox; tell users apart by the To: column.",
