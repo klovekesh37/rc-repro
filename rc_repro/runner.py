@@ -53,10 +53,13 @@ def write(name: str, compose_yaml: str, meta: Metadata,
     (ws / "docker-compose.yml").write_text(compose_yaml, encoding="utf-8")
     (ws / "repro.json").write_text(json.dumps(asdict(meta), indent=2), encoding="utf-8")
     # Preset-generated files (e.g. a seeded LDIF that a service mounts).
+    # `{{ROOT_URL}}` is substituted with the repro's URL — presets are built
+    # before the host port is known, so a generated file that must reference the
+    # workspace URL (e.g. the livechat widget embed snippet) uses the placeholder.
     for relpath, content in files or []:
         fp = ws / relpath
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content, encoding="utf-8")
+        fp.write_text(content.replace("{{ROOT_URL}}", meta.root_url), encoding="utf-8")
 
 
 def read_meta(name: str) -> Metadata:
@@ -100,7 +103,18 @@ PORT_MAX = 65535
 
 
 def port_free(port: int) -> bool:
-    """True if `port` can be bound on the host right now (nothing listening)."""
+    """True if `port` is free to publish on the host right now."""
+    # First: is something already LISTENING on loopback? A wildcard bind with
+    # SO_REUSEADDR (below) can miss a docker publish on 127.0.0.1:<port> (repros
+    # bind loopback), so probe it directly — connect success == in use.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.2)
+        try:
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                return False
+        except OSError:
+            return False
+    # Then: can we actually bind it? (catches reserved-but-not-listening ports.)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         # On Unix, SO_REUSEADDR lets us probe a port that's only in TIME_WAIT.
         # On Windows it would let bind() succeed even for an active listener

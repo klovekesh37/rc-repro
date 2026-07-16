@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sys
+import textwrap
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -122,6 +124,12 @@ def _parse_set_params(set_: list[str] | None) -> dict[str, str]:
     return params
 
 
+def _unknown_params(params: dict, pre: presets.Preset) -> list[str]:
+    """`--set` keys the preset doesn't accept (typos like `agent` for `agents`
+    were silently ignored before). Known keys = the preset's params_help."""
+    return sorted(set(params) - set(pre.params_help))
+
+
 def _reuse_existing(repro_name: str, wait: bool, seed: bool, seed_profile: str) -> None:
     """The idempotent `up` path for an existing repro: `docker compose up -d`
     handles both a `stop`-paused repro (containers exist -> started) and a
@@ -184,16 +192,53 @@ def _pick_host_port(port: int, pre: presets.Preset, exclude: str = "") -> int:
 
 
 def _print_plan(repro_name: str, resolved, pre: presets.Preset, root: str, token: str) -> None:
-    typer.echo(f"Reproduction {repro_name!r}")
-    typer.echo(f"  Rocket.Chat : {resolved.rc_image}:{resolved.rc_version}")
+    # Compact one-liner before the (possibly slow) image pull; the full summary
+    # panel is shown once the repro is ready.
     typer.echo(
-        f"  MongoDB     : {resolved.mongo_tag} ({resolved.mongo_flavor}) via {resolved.source}"
+        f"Creating {repro_name!r} — RC {resolved.rc_version}, "
+        f"Mongo {resolved.mongo_tag} ({resolved.mongo_flavor}), preset {pre.name}…"
     )
-    typer.echo(f"  Preset      : {pre.name} ({pre.source})")
-    typer.echo(f"  URL         : {root}")
     if pre.requires_license and not token:
-        ui.warn("  note        : this preset needs an Enterprise license — pass --reg-token.")
-    typer.echo("")
+        ui.warn("  note: this preset needs an Enterprise license — pass --reg-token.")
+
+
+def _fmt_duration(secs: int) -> str:
+    """Human duration: 42s, 1m03s."""
+    return f"{secs}s" if secs < 60 else f"{secs // 60}m{secs % 60:02d}s"
+
+
+# Map the non-ASCII punctuation that shows up in preset descriptions to ASCII —
+# em/en dashes, ellipsis, curly quotes, arrows etc. are East-Asian "ambiguous"
+# width and render double-wide in some terminals, breaking box alignment.
+_ASCII_MAP = str.maketrans({
+    "—": "-", "–": "-", "…": "...", "’": "'", "‘": "'",
+    "“": '"', "”": '"', "→": "->", "←": "<-", "·": "-", " ": " ",
+})
+
+
+def _ascii(text: str) -> str:
+    return text.translate(_ASCII_MAP)
+
+
+def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | None = None) -> None:
+    """The boxed repro summary (URL + login + versions), shared by up/ready/info,
+    followed by multi-instance URLs. Title is the repro name only — kept pure
+    ASCII so box-drawing alignment can't be thrown off by wide/emoji glyphs
+    (status like "✓ ready" is printed on its own line by the caller)."""
+    rows = [
+        ("Rocket.Chat", meta.rc_version),
+        ("MongoDB", f"{meta.mongo_tag} ({meta.mongo_flavor})"),
+        ("Preset", meta.preset),
+        ("URL", meta.root_url),
+        ("Login", f"{config.ADMIN_USERNAME} / {config.ADMIN_PASSWORD}"),
+    ]
+    rows += extra_rows or []
+    ui.panel(meta.name, rows)
+    n = meta.extra.get("instances")
+    if n:
+        ui.hint(f"  instances ({n}, load-balanced by Traefik):")
+        for i in range(1, int(n) + 1):
+            ui.hint(f"    rocketchat-{i}: http://localhost:{meta.host_port + i}")
 
 
 # --- commands -----------------------------------------------------------------
@@ -234,10 +279,15 @@ def up(
     if mongo:
         versions.apply_mongo_override(resolved, mongo)
 
+    params = _parse_set_params(set_)
     try:
-        pre = presets.load(preset, _parse_set_params(set_))
+        pre = presets.load(preset, params)
     except ValueError as exc:
         _err(str(exc))
+    unknown = _unknown_params(params, pre)
+    if unknown:
+        valid = ", ".join(sorted(pre.params_help)) or "(this preset takes no --set params)"
+        _err(f"unknown --set param(s) for preset {preset!r}: {', '.join(unknown)} — valid: {valid}")
 
     # Post-ready preset actions (e.g. Keycloak SAML) and --seed both need RC to
     # be serving first, so imply --wait for them.
@@ -356,30 +406,25 @@ def _post_up(meta: runner.Metadata, wait: bool) -> None:
     if wait:
         _do_ready(meta)
     else:
-        ui.ok(f"✓ {meta.name!r} starting.")
-        typer.echo(f"  {meta.root_url}  (admin / {config.ADMIN_PASSWORD})")
-        typer.echo(f"  wait until ready: rc-repro ready --name {meta.name}")
-        typer.echo(f"  follow logs:      rc-repro logs --name {meta.name} -f")
-        _print_workspace(meta)   # the wait path prints it via _do_ready
+        ui.ok("✓ starting")
+        _summary_panel(meta)
+        ui.hint(f"  ready when serving : rc-repro ready --name {meta.name}")
+        ui.hint(f"  follow logs        : rc-repro logs --name {meta.name} -f")
+    _print_notes(meta)
 
+
+def _print_notes(meta: runner.Metadata) -> None:
     notes = meta.extra.get("notes")
-    if notes:
-        typer.echo("")
-        for line in notes:
-            ui.note(line)
-
-
-def _print_workspace(meta: runner.Metadata) -> None:
-    """For a multi-instance repro, print the load-balanced workspace URL plus the
-    direct URL of each instance (host_port+i). No-op for single-instance repros."""
-    n = meta.extra.get("instances")
-    if not n:
+    if not notes:
         return
+    inner = min(shutil.get_terminal_size((90, 24)).columns, 88) - 4
+    lines: list[str] = []
+    for n in notes:
+        n = _ascii(n)
+        lead = len(n) - len(n.lstrip())               # keep a note's own indent
+        lines += textwrap.wrap(n, width=inner, subsequent_indent=" " * (lead + 2)) or [""]
     typer.echo("")
-    ui.note(f"Multi-instance ({n} instances, load-balanced by Traefik):")
-    typer.echo(f"  Workspace URL (open this) : {meta.root_url}")
-    for i in range(1, int(n) + 1):
-        typer.echo(f"    rocketchat-{i} (direct)   : http://localhost:{meta.host_port + i}")
+    ui.box("notes", lines, inner, title_color=typer.colors.CYAN)
 
 
 @app.command()
@@ -473,10 +518,51 @@ def _pr_create_oauth_provider(meta: runner.Metadata, auth: rcapi.Auth, action: d
         ui.warn("  ⚠ could not create the OAuth provider")
 
 
+def _pr_livechat_setup(meta: runner.Metadata, auth: rcapi.Auth, action: dict) -> None:
+    """Full Omnichannel setup: make admin (+ agent1..N) available agents, create a
+    department and assign them all to it. Canned responses / business hours are
+    Enterprise-only — attempted best-effort, noted if the license isn't present."""
+    url, pw = meta.root_url, config.ADMIN_PASSWORD
+    # 1. Agents: admin always, plus agent1..N.
+    agents = [{"agentId": auth.user_id, "username": config.ADMIN_USERNAME}]
+    rcapi.add_livechat_agent(url, auth, pw, config.ADMIN_USERNAME)
+    for i in range(2, int(action.get("agents", 1)) + 1):
+        u = f"agent{i}"
+        rcapi.create_user(url, auth, pw, u)
+        rcapi.add_livechat_agent(url, auth, pw, u)
+        uid = rcapi.get_user_id(url, auth, u)
+        if uid:
+            agents.append({"agentId": uid, "username": u})
+    available = rcapi.set_livechat_available(url, auth, pw)
+
+    # 2. Department + assign every agent to it.
+    dept, dept_ok = action.get("department"), False
+    if dept:
+        dept_id = rcapi.ensure_livechat_department(url, auth, pw, dept)
+        if dept_id:
+            dept_ok = rcapi.assign_livechat_agents(url, auth, pw, dept_id, agents)
+
+    # 3. Canned response (Enterprise — best effort).
+    canned = rcapi.save_canned_response(url, auth, pw, "hello",
+                                        "Hi! Thanks for reaching out — how can I help?")
+
+    if available:
+        summary = f"  ✓ Omnichannel: {len(agents)} agent(s) available"
+        if dept_ok:
+            summary += f", '{dept}' department created + assigned"
+        typer.echo(summary + " — log into RC to go online.")
+    else:
+        ui.warn("  ⚠ set up the Omnichannel agent manually (Admin → Omnichannel → Agents)")
+    if not canned:
+        ui.note("  (canned responses & business hours are Enterprise features — pass "
+                "--reg-token to enable, else set them up manually)")
+
+
 _POST_READY_ACTIONS = {
     "saml_idp_cert": _pr_saml_idp_cert,
     "keycloak_master_ssl_off": _pr_keycloak_master_ssl_off,
     "create_oauth_provider": _pr_create_oauth_provider,
+    "livechat_setup": _pr_livechat_setup,
 }
 
 
@@ -490,15 +576,18 @@ def _run_post_ready(meta: runner.Metadata, auth) -> None:
 
 
 def _do_ready(meta: runner.Metadata, timeout: float = 300.0) -> None:
+    started = time.monotonic()
     info = _wait_serving(meta, timeout)
+    elapsed = int(time.monotonic() - started)   # time to actually serve /api/info
     auth = _finalize(meta)
     _run_post_ready(meta, auth)
 
-    running = info.get("version", "?")
-    ui.ok(f"✓ ready — Rocket.Chat {running} at {meta.root_url}")
-    _print_workspace(meta)
+    ui.ok("✓ ready")
+    _summary_panel(meta, extra_rows=[("Booted in", _fmt_duration(elapsed))])
+    ui.hint(f"  next: rc-repro logs --name {meta.name} -f")
     # The public /api/info redacts the patch (returns only major.minor), so
     # treat the running version as a prefix of the requested one.
+    running = info.get("version", "?")
     if running != "?" and not meta.rc_version.startswith(running):
         ui.warn(f"  note: running version {running} != requested {meta.rc_version}")
 
@@ -627,20 +716,10 @@ def info(name: str = typer.Option("", "--name", "-n")) -> None:
     """Show a repro's URL, admin credentials and a curl snippet."""
     target = _resolve_name(name)
     m = runner.read_meta(target)
-    typer.echo(f"Repro   : {m.name}  (RC {m.rc_version}, mongo {m.mongo_tag}/{m.mongo_flavor})")
-    typer.echo(f"URL     : {m.root_url}")
-    typer.echo(f"Admin   : {config.ADMIN_USERNAME} / {config.ADMIN_PASSWORD}")
-    typer.echo(f"Preset  : {m.preset}")
-    _print_workspace(m)
-    typer.echo("")
-    typer.echo("Example API call:")
-    typer.echo(f"  rc-repro api --name {m.name} GET /api/v1/me")
-    typer.echo(f"  curl {m.root_url}/api/info")
-    notes = m.extra.get("notes")
-    if notes:
-        typer.echo("")
-        for line in notes:
-            ui.note(line)
+    _summary_panel(m)
+    ui.hint(f"  api  : rc-repro api --name {m.name} GET /api/v1/me")
+    ui.hint(f"  curl : {m.root_url}/api/info")
+    _print_notes(m)
 
 
 @app.command()
@@ -745,11 +824,23 @@ def logs(
 @app.command(name="presets")
 def presets_cmd() -> None:
     """List available presets."""
-    for p in presets.list_presets():
-        ee = "  [needs license]" if p.requires_license else ""
-        typer.echo(f"{p.name:<14} {p.description.strip()}{ee}")
-        for key, help_text in p.params_help.items():
-            typer.echo(f"{'':<14}   --set {key}=…  {help_text}")
+    items = presets.list_presets()
+    inner = min(shutil.get_terminal_size((90, 24)).columns, 88) - 4   # box content width
+    typer.secho("Presets", bold=True)
+    typer.echo("")
+    for p in items:
+        lines = textwrap.wrap(_ascii(" ".join(p.description.split())), width=inner) or [""]
+        if p.params_help:
+            lines.append("")
+            key_w = max(len(k) for k in p.params_help)
+            for key, help_text in p.params_help.items():
+                entry = f"--set {key.ljust(key_w)}   {_ascii(' '.join(help_text.split()))}"
+                cont = " " * (len("--set ") + key_w + 3)   # hang-indent wrapped help
+                lines += textwrap.wrap(entry, width=inner, subsequent_indent=cont)
+        title = p.name + ("  [needs license]" if p.requires_license else "")
+        ui.box(title, lines, inner)
+        typer.echo("")
+    ui.hint("run: rc-repro up --version <X.Y.Z> --preset <name> [--set key=value]")
 
 
 @app.command(name="versions")

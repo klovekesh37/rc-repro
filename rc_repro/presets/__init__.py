@@ -85,6 +85,7 @@ def _dynamic_builders() -> dict:
     from rc_repro.presets import (
         email,
         ldap,
+        livechat,
         multi_instance,
         oidc,
         s3_minio,
@@ -94,6 +95,7 @@ def _dynamic_builders() -> dict:
     return {
         "email": email.build,
         "ldap": ldap.build,
+        "livechat": livechat.build,
         "saml": saml.build,
         "oidc": oidc.build,
         "multi-instance": multi_instance.build,

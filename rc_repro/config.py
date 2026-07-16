@@ -37,6 +37,7 @@ PRESET_PORTS: dict[str, tuple[int, ...]] = {
     "oidc": (8085,),          # Keycloak (OIDC; same port inside+out)
     "email": (8025,),         # Mailpit web UI / API
     "s3_minio": (9000, 9001), # MinIO S3 API + console
+    "livechat": (8090,),      # demo "customer website" embedding the widget
 }
 
 # Host interface published ports bind to. Loopback: repros use weak fixed

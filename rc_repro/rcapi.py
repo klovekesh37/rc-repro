@@ -289,6 +289,132 @@ def add_oauth_service(root_url: str, auth: Auth, password: str, name: str, timeo
         return False
 
 
+def _method_call(root_url: str, auth: Auth, password: str, method: str, params: list, timeout: float = 15.0) -> bool:
+    """Invoke a Meteor method over REST (method.call). Returns True on success."""
+    headers = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    msg = json.dumps({"msg": "method", "id": "1", "method": method, "params": params})
+    try:
+        resp = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/method.call/{method}",
+            headers=headers, json={"message": msg}, timeout=timeout,
+        )
+        return resp.status_code == 200 and resp.json().get("success") is True
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def create_user(root_url: str, auth: Auth, password: str, username: str, timeout: float = 15.0) -> bool:
+    """Create a verified user (idempotent-ish: an existing username just fails)."""
+    headers = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    try:
+        resp = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/users.create", headers=headers,
+            json={"name": username.capitalize(), "username": username,
+                  "email": f"{username}@example.com", "password": username,
+                  "verified": True, "requirePasswordChange": False},
+            timeout=timeout,
+        )
+        return resp.status_code == 200 and resp.json().get("success") is True
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def add_livechat_agent(root_url: str, auth: Auth, password: str, username: str, timeout: float = 15.0) -> bool:
+    """Make `username` an Omnichannel agent (assigns the livechat-agent role)."""
+    headers = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    try:
+        resp = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/livechat/users/agent",
+            headers=headers, json={"username": username}, timeout=timeout,
+        )
+        return resp.ok
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def get_user_id(root_url: str, auth: Auth, username: str, timeout: float = 15.0) -> str | None:
+    """Resolve a username to its _id via users.info, or None."""
+    try:
+        r = requests.get(
+            f"{root_url.rstrip('/')}/api/v1/users.info",
+            params={"username": username}, headers=auth.headers(), timeout=timeout,
+        )
+        if r.ok:
+            return (r.json().get("user") or {}).get("_id")
+    except (requests.RequestException, ValueError):
+        pass
+    return None
+
+
+def ensure_livechat_department(root_url: str, auth: Auth, password: str, name: str, timeout: float = 15.0) -> str | None:
+    """Create (or find, if it already exists) an Omnichannel department; return
+    its id. The create schema is strict — only these department fields, no
+    agents (assign those separately via assign_livechat_agents)."""
+    base = f"{root_url.rstrip('/')}/api/v1"
+    hdr = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    body = {"department": {"enabled": True, "name": name, "email": f"{name}@example.com",
+                           "showOnRegistration": True, "showOnOfflineForm": True}}
+    try:
+        r = requests.post(f"{base}/livechat/department", headers=hdr, json=body, timeout=timeout)
+        b = r.json()
+        if b.get("success"):
+            return (b.get("department") or {}).get("_id")
+        # Already exists (or strict-schema reject) — look it up by name.
+        existing = requests.get(f"{base}/livechat/department", headers=hdr, timeout=timeout).json()
+        for d in existing.get("departments", []):
+            if d.get("name") == name:
+                return d.get("_id")
+    except (requests.RequestException, ValueError):
+        pass
+    return None
+
+
+def assign_livechat_agents(root_url: str, auth: Auth, password: str, dept_id: str,
+                           agents: list[dict], timeout: float = 15.0) -> bool:
+    """Assign agents (list of {agentId, username}) to a department. Idempotent."""
+    hdr = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    upsert = [{"agentId": a["agentId"], "username": a["username"], "count": 0, "order": 0} for a in agents]
+    try:
+        r = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/livechat/department/{dept_id}/agents",
+            headers=hdr, json={"upsert": upsert, "remove": []}, timeout=timeout,
+        )
+        return r.ok
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def save_canned_response(root_url: str, auth: Auth, password: str, shortcut: str,
+                         text: str, timeout: float = 15.0) -> bool:
+    """Save a global canned response. This is an ENTERPRISE feature — returns
+    False on Community (403), so callers treat it as best-effort."""
+    hdr = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    try:
+        r = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/canned-responses",
+            headers=hdr, json={"shortcut": shortcut, "text": text, "scope": "global"},
+            timeout=timeout,
+        )
+        return r.status_code == 200 and r.json().get("success") is True
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def set_livechat_available(root_url: str, auth: Auth, password: str, timeout: float = 15.0) -> bool:
+    """Set the logged-in agent available for Omnichannel. Note: the workspace
+    only shows as "online" to visitors once that agent also has a live presence
+    (i.e. is logged into the RC UI) — this just flips the availability flag."""
+    headers = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    try:
+        resp = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/livechat/agent.status",
+            headers=headers, json={"status": "available"}, timeout=timeout,
+        )
+        return resp.status_code == 200 and resp.json().get("success") is True
+    except (requests.RequestException, ValueError):
+        return False
+
+
 def fetch_saml_idp_cert(descriptor_url: str, timeout: float = 90.0, interval: float = 3.0) -> str | None:
     """Fetch an IdP's signing cert from its SAML metadata descriptor.
 

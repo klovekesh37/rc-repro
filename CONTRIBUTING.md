@@ -22,7 +22,7 @@ CI runs `pytest` on every push/PR (see `.github/workflows/ci.yml`).
 | `rc_repro/presets/` | preset package: `__init__.py` holds the `Preset` dataclass + loader |
 | `rc_repro/presets/_common.py` | shared `--set` param helpers (`truthy_param`/`int_param`/`str_param`) |
 | `rc_repro/presets/_keycloak.py` | shared Keycloak scaffolding reused by `saml` + `oidc` |
-| `rc_repro/presets/ldap.py`, `saml.py`, `oidc.py`, `email.py`, `s3_minio.py` | generate the LDAP / Keycloak (SAML & OIDC) / Mailpit / MinIO scenarios |
+| `rc_repro/presets/ldap.py`, `saml.py`, `oidc.py`, `email.py`, `s3_minio.py`, `livechat.py` | generate the LDAP / Keycloak (SAML & OIDC) / Mailpit / MinIO / Omnichannel scenarios |
 | `rc_repro/presets/multi_instance.py` | generate the multi-instance (Traefik + NATS) scenario |
 | `rc_repro/compose.py` | build the docker-compose document (incl. cloning RC into N instances, port binding) |
 | `rc_repro/runner.py` | on-disk state, `docker compose` invocations, host-port allocation |

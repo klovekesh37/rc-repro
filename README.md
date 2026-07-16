@@ -122,6 +122,7 @@ A preset turns a bare RC into a scenario. See them with `rc-repro presets`.
 | `oidc` | a real Keycloak IdP (OpenID Connect + users) | OIDC / OAuth SSO login |
 | `email` | Mailpit mailcatcher wired to RC's SMTP | email flows: invites, password reset, verification, 2FA codes |
 | `s3_minio` | MinIO object storage as RC's file upload backend | S3 storage tickets: uploads, previews, presigned URLs |
+| `livechat` | Omnichannel on + an available agent + a demo website embedding the widget | Livechat widget load / CORS / routing / agent-availability |
 | `multi-instance` | N RC instances + Traefik load balancer + NATS, one shared Mongo | horizontal scaling / cross-instance real-time |
 
 ```bash
@@ -143,6 +144,7 @@ rc-repro up --version 8.5.1 --preset email --seed --wait                # Mailpi
 rc-repro up --version 8.5.1 --preset email --set verification=true      # require signup email verification
 rc-repro up --version 8.5.1 --preset s3_minio                           # files stored in MinIO instead of GridFS
 rc-repro up --version 8.5.1 --preset s3_minio --set presigned=true      # real presigned URLs (needs hosts entry)
+rc-repro up --version 8.5.1 --preset livechat --wait                    # Omnichannel + widget on a demo site
 ```
 
 For `ldap`, `saml` and `oidc`, log in as **`user1` / `user1`** (…`userN` / `userN`).
@@ -157,6 +159,18 @@ For `ldap`, `saml` and `oidc`, log in as **`user1` / `user1`** (…`userN` / `us
 > rc-repro's own `token`/`api`/`seed` calls fetch a required code from Mailpit
 > automatically, so they keep working either way. `--set verification=true` also
 > makes new signups verify their address first.
+
+> **`livechat`** enables Omnichannel, makes `admin` an available agent, creates a
+> **`support` department** with the agent(s) assigned, and serves a demo "customer
+> website" at `http://localhost:8090` that embeds the Livechat widget
+> **cross-origin** (the real setup where widget-load/CORS/CSP tickets happen). The
+> widget frames RC, so the preset also drops RC's `X-Frame-Options: sameorigin`
+> (`Iframe_Restrict_Access=false`) — otherwise the browser refuses to display it.
+> Open the site, start a chat as a visitor, answer it in RC's Omnichannel area
+> (the built-in same-origin widget is also at `<repro-url>/livechat`).
+> `--set agents=N` (all assigned to the department), `--set department=false`,
+> `--set registration=true`. **Business hours and canned responses are Enterprise
+> features** — pass `--reg-token` to set them up, otherwise they're skipped.
 
 > **`s3_minio`** stores RC's file uploads in a MinIO bucket (auto-created) instead
 > of GridFS — browse it at `http://localhost:9001` (`rcrepro` / `rcrepro-secret`).

@@ -187,6 +187,46 @@ def test_compose_merges_preset_volumes():
     assert "minio_data:/data" in doc["services"]["minio"]["volumes"]
 
 
+def test_livechat_preset_shape():
+    p = presets.load("livechat")
+    assert "widget-site" in p.services
+    assert p.env["OVERWRITE_SETTING_Livechat_enabled"] == "true"
+    assert p.env["OVERWRITE_SETTING_API_Enable_CORS"] == "true"   # cross-origin widget
+    # the widget iframes RC; X-Frame-Options: sameorigin would block it cross-origin
+    assert p.env["OVERWRITE_SETTING_Iframe_Restrict_Access"] == "false"
+    assert p.ports == [8090]
+    # widget page uses the {{ROOT_URL}} placeholder (substituted at write time)
+    assert "{{ROOT_URL}}/livechat" in dict(p.files)["livechat/index.html"]
+    # agent + department are set up once RC is serving
+    assert p.post_ready[0]["action"] == "livechat_setup"
+    # department is created by default (assign agents to it), opt-out via --set
+    assert p.post_ready[0]["department"] == "support"
+    assert presets.load("livechat", {"department": "false"}).post_ready[0]["department"] == ""
+
+
+def test_unknown_set_param_rejected():
+    # `--set agent=5` (typo for `agents`) was silently ignored before.
+    from rc_repro import cli
+    p = presets.load("livechat")
+    assert cli._unknown_params({"agent": "5"}, p) == ["agent"]      # typo caught
+    assert cli._unknown_params({"agents": "5"}, p) == []            # correct key accepted
+    assert cli._unknown_params({"x": "1"}, presets.load("default")) == ["x"]  # no-param preset
+
+
+def test_root_url_substitution(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from rc_repro import runner
+    meta = runner.Metadata(
+        name="lc", project="rcrepro-lc", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="livechat",
+        root_url="http://localhost:4321", host_port=4321, version_source="map",
+    )
+    runner.write("lc", "services: {}\n", meta,
+                 files=[("livechat/index.html", "src={{ROOT_URL}}/livechat")])
+    written = (runner.workspace("lc") / "livechat/index.html").read_text()
+    assert written == "src=http://localhost:4321/livechat"   # placeholder resolved
+
+
 def test_multi_instance_clamps_instance_count():
     assert presets.load("multi-instance", {"instances": "1"}).instances == 2   # min 2
     assert presets.load("multi-instance", {"instances": "99"}).instances == 5  # max 5
@@ -289,6 +329,21 @@ def test_int_param_bad_value_is_actionable():
         assert "--set users=" in str(exc)
         return
     raise AssertionError("expected ValueError for a non-numeric --set value")
+
+
+def test_port_free_detects_loopback_listener():
+    # Regression: repros bind 127.0.0.1:<port>, and a wildcard-bind probe with
+    # SO_REUSEADDR can miss a loopback listener on macOS -> auto-pick collides.
+    import socket
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        assert runner.port_free(port) is False   # something IS listening on loopback
+    finally:
+        srv.close()
 
 
 def test_pick_port_bounded(monkeypatch):
