@@ -97,6 +97,24 @@ def _check_sidecar_ports(pre: presets.Preset, exclude: str = "") -> None:
             _err(f"preset {pre.name!r} needs host port {p}, which is already in use on this machine")
 
 
+def _check_monitor_ports(exclude: str = "") -> None:
+    """Preflight the Prometheus/Grafana ports for --monitor / attach."""
+    wanted = set(config.MONITOR_PORTS)
+    own: set[int] = set()
+    for m in runner.list_meta():
+        claimed = set(m.extra.get("monitoring_ports") or []) if isinstance(m.extra, dict) else set()
+        if m.name == exclude:
+            own = claimed
+            continue
+        overlap = sorted(claimed & wanted)
+        if overlap:
+            _err(f"monitoring needs port(s) {overlap}, already used by repro {m.name!r} "
+                 f"(its monitoring) — stop it first: rc-repro monitor --name {m.name} --off")
+    for p in sorted(wanted - own):
+        if not runner.port_free(p):
+            _err(f"monitoring needs host port {p}, which is already in use on this machine")
+
+
 def _pretty_state(status: str) -> str:
     """Friendly label from a `docker compose ls` status.
 
@@ -130,7 +148,8 @@ def _unknown_params(params: dict, pre: presets.Preset) -> list[str]:
     return sorted(set(params) - set(pre.params_help))
 
 
-def _reuse_existing(repro_name: str, wait: bool, seed: bool, seed_profile: str) -> None:
+def _reuse_existing(repro_name: str, wait: bool, seed: bool, seed_profile: str,
+                    monitor: bool = False) -> None:
     """The idempotent `up` path for an existing repro: `docker compose up -d`
     handles both a `stop`-paused repro (containers exist -> started) and a
     `down`ed one (containers removed, volume kept -> recreated with its data).
@@ -143,6 +162,8 @@ def _reuse_existing(repro_name: str, wait: bool, seed: bool, seed_profile: str) 
         if runner.up(repro_name, pull=False) != 0:
             _err("`docker compose up` failed (see output above)")
     typer.echo("  (creation flags like --set/--bind/--port are ignored on an existing repro; --force recreates)")
+    if monitor:
+        ui.hint(f"  add monitoring to this running repro: rc-repro monitor --name {repro_name}")
     meta = runner.read_meta(repro_name)
     _post_up(meta, wait)
     if seed:
@@ -162,9 +183,10 @@ def _own_ports(name: str) -> set[int]:
     n = m.extra.get("instances") if isinstance(m.extra, dict) else None
     if isinstance(n, int) and n > 1:
         own.update(m.host_port + i for i in range(1, n + 1))
-    side = m.extra.get("sidecar_ports") if isinstance(m.extra, dict) else None
-    if isinstance(side, list):
-        own.update(int(p) for p in side if isinstance(p, int) or str(p).isdigit())
+    for key in ("sidecar_ports", "monitoring_ports"):
+        claimed = m.extra.get(key) if isinstance(m.extra, dict) else None
+        if isinstance(claimed, list):
+            own.update(int(p) for p in claimed if isinstance(p, int) or str(p).isdigit())
     return own
 
 
@@ -264,6 +286,7 @@ def up(
     no_pull: bool = typer.Option(False, "--no-pull", help="don't pull images first"),
     fresh: bool = typer.Option(False, "--fresh", help="wipe this repro's volume first"),
     force: bool = typer.Option(False, "--force", help="overwrite an existing repro"),
+    monitor: bool = typer.Option(False, "--monitor", help="also add Prometheus + Grafana (RC metrics dashboard)"),
 ) -> None:
     """Create and start a version-matched Rocket.Chat repro."""
     _require_docker()
@@ -304,10 +327,12 @@ def up(
     # Idempotent: an existing repro (unless --fresh/--force recreates it) is
     # simply brought back up with its data intact.
     if runner.exists(repro_name) and not force and not fresh:
-        _reuse_existing(repro_name, wait, seed, seed_profile)
+        _reuse_existing(repro_name, wait, seed, seed_profile, monitor=monitor)
         return
 
     _check_sidecar_ports(pre, exclude=repro_name)
+    if monitor:
+        _check_monitor_ports(exclude=repro_name)
     host_port = _pick_host_port(port, pre, exclude=repro_name)
     root = root_url or f"http://localhost:{host_port}"
     token = reg_token or cfg.get("reg_token") or ""
@@ -322,6 +347,7 @@ def up(
         reg_token=token or None,
         preset=pre,
         bind_host=bind_host,
+        monitoring=monitor,
     )
     doc = compose.build(spec)
 
@@ -349,6 +375,15 @@ def up(
         meta.extra.update(pre.extra)
     if pre.ports:
         meta.extra["sidecar_ports"] = pre.ports
+    files = list(pre.files)
+    if monitor:
+        from rc_repro import monitoring
+        targets = compose.rc_service_names(pre.instances)
+        files += monitoring.files(targets)
+        meta.extra["monitoring"] = True
+        meta.extra["monitoring_ports"] = list(config.MONITOR_PORTS)
+        meta.extra.setdefault("notes", [])
+        meta.extra["notes"] = list(meta.extra["notes"]) + monitoring.notes()
 
     # Recreate (--force/--fresh): tear the OLD release down BEFORE overwriting
     # its compose file — the old file still describes the running services, so
@@ -357,7 +392,7 @@ def up(
         if runner.down(repro_name, volumes=fresh) != 0:
             _err(f"could not tear down the existing {repro_name!r} (see output above); not overwriting it")
 
-    runner.write(repro_name, compose.to_yaml(doc), meta, files=pre.files)
+    runner.write(repro_name, compose.to_yaml(doc), meta, files=files)
 
     if pin:
         # Persist into the FILE only — never the env-merged view (with_env
@@ -618,6 +653,81 @@ def down(
         ui.ok(f"✓ {target!r} down (data kept).")
         typer.echo(f"  bring it back: rc-repro up --version <same> --name {target}")
         typer.echo("  delete for good: add --volumes, or run `rc-repro prune`")
+
+
+def _detect_bind(doc: dict) -> str:
+    """Read the host bind interface from an existing published port (host:hp:cp)."""
+    for svc in doc.get("services", {}).values():
+        for p in svc.get("ports", []):
+            parts = str(p).split(":")
+            if len(parts) == 3:
+                return parts[0]
+    return config.DEFAULT_BIND_HOST
+
+
+def _rc_services_in(doc: dict) -> list[str]:
+    return [s for s in doc.get("services", {}) if s == "rocketchat" or s.startswith("rocketchat-")]
+
+
+@app.command()
+def monitor(
+    name: str = typer.Option("", "--name", "-n"),
+    off: bool = typer.Option(False, "--off", help="detach: remove Prometheus + Grafana"),
+) -> None:
+    """Attach (or --off to detach) Prometheus + Grafana on a running repro."""
+    _require_docker()
+    from rc_repro import monitoring
+    m = runner.read_meta(_resolve_name(name))
+    doc = runner.read_compose(m.name)
+
+    if off:
+        rcapi_ok = False
+        try:
+            auth = _login(m)
+            rcapi_ok = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                         monitoring.RC_METRICS_SETTING, False)
+        except Exception:  # noqa: BLE001 - best-effort; the repro may be stopped
+            pass
+        runner.rm_services(m.name, list(monitoring.SERVICES))
+        for s in monitoring.SERVICES:
+            doc.get("services", {}).pop(s, None)
+        for v in monitoring.VOLUMES:
+            doc.get("volumes", {}).pop(v, None)
+        m.extra.pop("monitoring", None)
+        m.extra.pop("monitoring_ports", None)
+        m.extra["notes"] = [n for n in m.extra.get("notes", []) if n not in monitoring.notes()]
+        runner.write(m.name, compose.to_yaml(doc), m)
+        ui.ok(f"✓ monitoring detached from {m.name!r}"
+              + ("" if rcapi_ok else " (metrics setting left as-is — repro not reachable)"))
+        return
+
+    # Attach.
+    _check_monitor_ports(exclude=m.name)
+    # Enable RC metrics live via the API (persists in Mongo; no RC restart).
+    try:
+        auth = _login(m)
+        if not rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD, monitoring.RC_METRICS_SETTING, True):
+            ui.warn("  ⚠ could not enable RC metrics via the API (is it ready?)")
+    except Exception as exc:  # noqa: BLE001
+        _err(f"repro not reachable to enable metrics (`rc-repro ready --name {m.name}` first): {exc}")
+
+    mon = monitoring.bind_ports(monitoring.services(), _detect_bind(doc))
+    doc.setdefault("services", {}).update(mon)
+    doc.setdefault("volumes", {}).update(monitoring.volumes())
+
+    m.extra["monitoring"] = True
+    m.extra["monitoring_ports"] = list(config.MONITOR_PORTS)
+    notes = [n for n in m.extra.get("notes", []) if n not in monitoring.notes()] + monitoring.notes()
+    m.extra["notes"] = notes
+    targets = _rc_services_in(doc) or ["rocketchat"]
+    runner.write(m.name, compose.to_yaml(doc), m, files=monitoring.files(targets))
+
+    if runner.up(m.name, pull=True) != 0:   # starts prometheus+grafana; RC unchanged -> not recreated
+        _err("`docker compose up` failed bringing up monitoring (see output above)")
+    ui.ok(f"✓ monitoring attached to {m.name!r}")
+    typer.echo("")
+    for line in monitoring.notes():
+        ui.note(line)
 
 
 @app.command()

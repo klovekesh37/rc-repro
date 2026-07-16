@@ -40,6 +40,10 @@ PRESET_PORTS: dict[str, tuple[int, ...]] = {
     "livechat": (8090,),      # demo "customer website" embedding the widget
 }
 
+# Host ports for the --monitor add-on (Prometheus, Grafana). Not a preset, so
+# kept separate from PRESET_PORTS but treated the same for collision checks.
+MONITOR_PORTS: tuple[int, int] = (9090, 5050)
+
 # Host interface published ports bind to. Loopback: repros use weak fixed
 # credentials, so they should not be reachable from the local network unless
 # the user opts in (`up --bind 0.0.0.0` or RC_REPRO_BIND_HOST). Matches the

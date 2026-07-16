@@ -28,6 +28,7 @@ class Spec:
     host_port: int
     reg_token: str | None
     preset: Preset
+    monitoring: bool = False   # --monitor: add Prometheus + Grafana
     container_port: int = config.RC_CONTAINER_PORT
     # Host interface published ports bind to (the official rocketchat-compose
     # BIND_IP pattern). Loopback by default: repros run weak fixed credentials,
@@ -38,7 +39,8 @@ class Spec:
     @classmethod
     def from_resolved(cls, resolved, *, project_name: str, root_url: str,
                       host_port: int, reg_token: str | None, preset: Preset,
-                      bind_host: str = config.DEFAULT_BIND_HOST) -> "Spec":
+                      bind_host: str = config.DEFAULT_BIND_HOST,
+                      monitoring: bool = False) -> "Spec":
         """Build a Spec from a versions.Resolved plus the launch-time choices."""
         return cls(
             project_name=project_name,
@@ -53,7 +55,15 @@ class Spec:
             reg_token=reg_token,
             preset=preset,
             bind_host=bind_host,
+            monitoring=monitoring,
         )
+
+
+def rc_service_names(instances: int) -> list[str]:
+    """The rocketchat service name(s) in the compose doc: one 'rocketchat', or
+    'rocketchat-1..N' for a multi-instance repro. Used for Prometheus targets."""
+    n = max(1, instances or 1)
+    return ["rocketchat"] if n == 1 else [f"rocketchat-{i}" for i in range(1, n + 1)]
 
 
 def _deep_merge(base: dict, patch: dict) -> dict:
@@ -280,6 +290,14 @@ def build(spec: Spec) -> dict:
     entry = spec.preset.entry_service
     if entry and entry in doc["services"]:
         doc["services"][entry]["ports"] = [f"{spec.host_port}:80"]
+
+    # --- optional monitoring add-on (Prometheus + Grafana) ---
+    if spec.monitoring:
+        from rc_repro import monitoring
+        _deep_merge(doc["services"], monitoring.services())   # bare ports; bound below
+        doc["volumes"].update(monitoring.volumes())
+        for svc in rc_services.values():
+            svc["environment"][monitoring.RC_METRICS_ENV] = "true"
 
     _bind_ports(doc, spec.bind_host)
 

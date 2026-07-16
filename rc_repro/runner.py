@@ -67,6 +67,13 @@ def read_meta(name: str) -> Metadata:
     return Metadata(**blob)
 
 
+def read_compose(name: str) -> dict:
+    """Load a repro's generated docker-compose.yml as a dict (for in-place edits
+    like attaching/detaching the monitoring stack)."""
+    import yaml
+    return yaml.safe_load((workspace(name) / "docker-compose.yml").read_text(encoding="utf-8")) or {}
+
+
 def list_meta() -> list[Metadata]:
     root = config.repros_dir()
     if not root.exists():
@@ -91,11 +98,13 @@ def used_ports() -> set[int]:
         n = m.extra.get("instances") if isinstance(m.extra, dict) else None
         if isinstance(n, int) and n > 1:
             ports.update(m.host_port + i for i in range(1, n + 1))
-        # Preset side services (Keycloak/Mailpit/MinIO…) publish fixed host
-        # ports, recorded at `up` — claimed too, so allocation avoids them.
-        side = m.extra.get("sidecar_ports") if isinstance(m.extra, dict) else None
-        if isinstance(side, list):
-            ports.update(int(p) for p in side if isinstance(p, int) or str(p).isdigit())
+        # Preset side services (Keycloak/Mailpit/MinIO…) and the monitoring
+        # add-on (Prometheus/Grafana) publish fixed host ports recorded at `up` —
+        # claimed too, so RC port allocation avoids them.
+        for key in ("sidecar_ports", "monitoring_ports"):
+            claimed = m.extra.get(key) if isinstance(m.extra, dict) else None
+            if isinstance(claimed, list):
+                ports.update(int(p) for p in claimed if isinstance(p, int) or str(p).isdigit())
     return ports
 
 
@@ -222,6 +231,11 @@ def logs(name: str, *, follow: bool = False, tail: int | None = None) -> int:
 def compose_exec(name: str, service: str, args: list[str]) -> int:
     """Run a command inside a running compose service (docker compose exec -T)."""
     return _compose(name, "exec", "-T", service, *args).returncode
+
+
+def rm_services(name: str, services: list[str]) -> int:
+    """Stop and remove specific services (docker compose rm -s -f <services>)."""
+    return _compose(name, "rm", "-s", "-f", *services).returncode
 
 
 def ps(name: str) -> str:

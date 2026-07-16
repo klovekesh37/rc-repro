@@ -28,10 +28,11 @@ CI runs `pytest` on every push/PR (see `.github/workflows/ci.yml`).
 | `rc_repro/runner.py` | on-disk state, `docker compose` invocations, host-port allocation |
 | `rc_repro/rcapi.py` | minimal Rocket.Chat REST client (readiness, auth, 2FA/OTP, settings) |
 | `rc_repro/seed.py` | populate a repro with sample users/channels/messages via REST |
+| `rc_repro/monitoring.py` | `--monitor` add-on: Prometheus + Grafana services/config, attachable to any repro |
 | `rc_repro/ui.py` | terminal output helpers (`ok`/`warn`/`fail`/`note`/`die`) |
 | `rc_repro/config.py` | paths, constants, `PRESET_PORTS` registry, env-var overrides, persisted config |
 | `rc_repro/__init__.py` | `__version__` (single-sourced from `pyproject.toml` via `importlib.metadata`) |
-| `rc_repro/data/` | shipped version map + static preset YAML |
+| `rc_repro/data/` | shipped version map, static preset YAML, monitoring dashboard JSON |
 
 ## Adding a preset
 

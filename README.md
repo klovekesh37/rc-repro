@@ -216,6 +216,32 @@ rc-repro up --version 8.5.1 --reg-token <your-token> --wait
 To avoid retyping it, put `reg_token: <your-token>` in `~/.rc-repro/config.yaml`
 or export `RC_REPRO_REG_TOKEN` — every new repro then registers automatically.
 
+## 5b. Monitoring (`--monitor`)
+
+Add **Prometheus + Grafana** with Rocket.Chat metrics on top of *any* repro — it's
+an add-on, not a preset, so it layers onto whatever preset you chose (including
+`multi-instance`, where Prometheus scrapes every instance):
+
+```bash
+rc-repro up --version 8.5.1 --monitor                                   # any repro + monitoring
+rc-repro up --version 8.5.1 --preset multi-instance --set instances=3 --monitor
+```
+
+- **Grafana**: `http://localhost:5050` (`admin`/`admin`, anonymous view enabled) —
+  the official **"Rocket.Chat Metrics"** dashboard is auto-provisioned.
+- **Prometheus**: `http://localhost:9090` (Status → Targets shows RC up).
+
+Attach or detach on an **already-running** repro (RC is not restarted — metrics are
+enabled live via the API):
+
+```bash
+rc-repro monitor --name test            # attach Prometheus + Grafana
+rc-repro monitor --name test --off      # detach them
+```
+
+Config mirrors the official [`RocketChat/rocketchat-compose`](https://github.com/RocketChat/rocketchat-compose)
+monitoring stack (file-SD Prometheus + provisioned Grafana).
+
 ## 6. Sample data (`--seed`)
 
 A fresh repro is empty. Tickets about message sync, search, notifications, UI

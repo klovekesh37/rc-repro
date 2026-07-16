@@ -235,12 +235,13 @@ def test_multi_instance_clamps_instance_count():
 # --- compose building ---------------------------------------------------------
 
 
-def _spec(version: str, preset_name: str = "default", params: dict | None = None):
+def _spec(version: str, preset_name: str = "default", params: dict | None = None,
+          monitoring_flag: bool = False):
     r = versions.resolve(version, offline=True)
     pre = presets.load(preset_name, params or {})
     return compose.Spec.from_resolved(
         r, project_name="rcrepro-t", root_url="http://localhost:3000",
-        host_port=3000, reg_token=None, preset=pre,
+        host_port=3000, reg_token=None, preset=pre, monitoring=monitoring_flag,
     )
 
 
@@ -414,16 +415,18 @@ def test_preset_ports_match_registry():
     assert presets.load("default").ports == []
 
 
-def test_used_ports_includes_sidecars(tmp_path, monkeypatch):
+def test_used_ports_includes_sidecars_and_monitoring(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     meta = runner.Metadata(
         name="x", project="rcrepro-x", rc_version="8.5.1", rc_image="i",
         mongo_tag="8.0", mongo_flavor="official", preset="saml",
         root_url="http://localhost:3000", host_port=3000, version_source="map",
-        extra={"sidecar_ports": [8081]},
+        extra={"sidecar_ports": [8081], "monitoring_ports": [9090, 5050]},
     )
     runner.write("x", "services: {}\n", meta)
-    assert {3000, 8081} <= runner.used_ports()
+    # RC port, sidecar port, AND monitoring ports are all claimed so a new
+    # repro's auto-picked port can't collide with any of them.
+    assert {3000, 8081, 9090, 5050} <= runner.used_ports()
 
 
 def test_config_env_overrides(tmp_path, monkeypatch):
@@ -454,6 +457,63 @@ def test_version_single_source():
     import rc_repro
     # resolved from package metadata (pyproject), never a hardcoded literal
     assert rc_repro.__version__ and rc_repro.__version__ != "0.0.0-dev"
+
+
+# --- monitoring (--monitor add-on) --------------------------------------------
+
+
+def test_monitoring_added_to_any_preset():
+    from rc_repro import monitoring
+    # attaches to a plain repro: prometheus + grafana + exporters, RC metrics on,
+    # loopback-bound ports, its own volumes.
+    doc = compose.build(_spec("8.4.1", monitoring_flag=True))
+    svcs = doc["services"]
+    assert {"prometheus", "grafana", "node-exporter", "mongodb-exporter"} <= set(svcs)
+    assert doc["services"]["rocketchat"]["environment"][monitoring.RC_METRICS_ENV] == "true"
+    assert svcs["prometheus"]["ports"] == ["127.0.0.1:9090:9090"]
+    assert svcs["grafana"]["ports"] == ["127.0.0.1:5050:3000"]
+    # exporters are internal (scraped by Prometheus), not published to the host
+    assert "ports" not in svcs["node-exporter"]
+    assert "ports" not in svcs["mongodb-exporter"]
+    assert {"prometheus_tsdb", "grafana_data"} <= set(doc["volumes"])
+
+
+def test_monitoring_scrapes_all_multi_instances():
+    # the whole point of the flag: Prometheus targets follow the RC topology.
+    assert compose.rc_service_names(1) == ["rocketchat"]
+    assert compose.rc_service_names(3) == ["rocketchat-1", "rocketchat-2", "rocketchat-3"]
+    from rc_repro import monitoring
+    sd = dict(monitoring.files(["rocketchat-1", "rocketchat-2"]))["monitoring/file_sd_configs/rocketchat.yml"]
+    assert "rocketchat-1:9458" in sd and "rocketchat-2:9458" in sd
+
+
+def test_monitoring_ships_full_dashboards_and_exporter_targets():
+    from rc_repro import monitoring
+    files = dict(monitoring.files(["rocketchat"]))
+    dash = json.loads(files["monitoring/grafana/dashboards/rocketchat-metrics.json"])
+    assert dash["title"] == "Rocket.Chat Metrics" and len(dash["panels"]) > 30
+    # exporter dashboards shipped too
+    assert "monitoring/grafana/dashboards/node-exporter-full.json" in files
+    assert "monitoring/grafana/dashboards/mongodb-exporter.json" in files
+    # exporter scrape targets present
+    assert "mongodb-exporter:9216" in files["monitoring/file_sd_configs/mongo.yml"]
+    assert "node-exporter:9100" in files["monitoring/file_sd_configs/node-exporter.yml"]
+
+
+def test_no_monitoring_by_default():
+    doc = compose.build(_spec("8.4.1"))
+    assert "prometheus" not in doc["services"] and "grafana" not in doc["services"]
+
+
+def test_monitoring_bind_ports_handles_portless_exporters():
+    # Regression: the attach path binds ports over ALL monitoring services;
+    # node-exporter/mongodb-exporter have no 'ports' key -> must not KeyError.
+    from rc_repro import monitoring
+    bound = monitoring.bind_ports(monitoring.services(), "127.0.0.1")
+    assert bound["prometheus"]["ports"] == ["127.0.0.1:9090:9090"]
+    assert bound["grafana"]["ports"] == ["127.0.0.1:5050:3000"]
+    assert "ports" not in bound["node-exporter"]
+    assert "ports" not in bound["mongodb-exporter"]
 
 
 # --- seed ---------------------------------------------------------------------
