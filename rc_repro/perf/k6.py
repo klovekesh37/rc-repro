@@ -11,6 +11,7 @@ workspace, mounted at ``/k6``; the script's ``handleSummary`` writes
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from importlib import resources
 
@@ -64,6 +65,12 @@ def run(
 
     network = runner.project_name(name) + "_default"
     cmd = ["docker", "run", "--rm", "--network", network, "-v", f"{dest}:/k6"]
+    # Run as the host user so k6 can write /k6/summary.json into the bind-mounted
+    # dir. On Linux, bind-mount permissions are enforced and the image's non-root
+    # user otherwise can't write there ("permission denied"); Docker Desktop
+    # (mac/win) ignores this but the flag is harmless there. (POSIX only.)
+    if hasattr(os, "getuid"):
+        cmd += ["--user", f"{os.getuid()}:{os.getgid()}"]
     for k, v in env.items():
         cmd += ["-e", f"{k}={v}"]
     cmd += [K6_IMAGE, "run", f"/k6/{scenario}.js"]
