@@ -516,6 +516,252 @@ def test_monitoring_bind_ports_handles_portless_exporters():
     assert "ports" not in bound["mongodb-exporter"]
 
 
+# --- perf (Phase 1: timing + resource sampling) -------------------------------
+
+
+def test_timings_percentiles_and_histogram():
+    from rc_repro.perf import Timings
+    t = Timings()
+    for v in range(1, 101):        # 1..100 ms
+        t.add(float(v))
+    s = t.summary()
+    assert s["count"] == 100
+    assert s["p50"] == 50 and s["p95"] == 95 and s["p99"] == 99
+    assert s["min"] == 1 and s["max"] == 100
+    assert t.rate_per_s(2.0) == 50.0
+    h = t.histogram()
+    assert h and h.isascii()       # ASCII sparkline (no ambiguous-width glyphs)
+
+
+def test_timings_empty_is_safe():
+    from rc_repro.perf import Timings
+    t = Timings()
+    assert t.summary() == {"count": 0}
+    assert t.pct(95) == 0.0 and t.histogram() == ""
+
+
+def test_fmt_ms():
+    from rc_repro.perf.timings import fmt_ms
+    assert fmt_ms(42) == "42ms" and fmt_ms(1500) == "1.50s"
+
+
+def test_resources_parsers():
+    from rc_repro.perf import resources as R
+    assert R._parse_cpu("78.34%") == 78.34
+    used, limit = R._parse_mem("540MiB / 2GiB")
+    assert round(used) == 540 * 1024**2 and round(limit) == 2 * 1024**3
+
+
+def test_resource_report_windows_and_peaks():
+    from rc_repro.perf.resources import ResourceMonitor
+    mon = ResourceMonitor("x")
+    # inject a synthetic series: (t, cpu, mem_used, mem_limit)
+    mon._series = {"rc": [(0.0, 4, 100, 2000), (1.0, 80, 500, 2000), (2.0, 30, 300, 2000)]}
+    rep = mon.report()["rc"]
+    assert rep.idle_cpu == 4 and rep.peak_cpu == 80 and rep.peak_cpu_t == 1.0
+    assert rep.peak_mem == 500
+    # windowed to just the last sample
+    assert mon.report(window=(1.5, 2.5))["rc"].peak_cpu == 30
+
+
+def test_seed_returns_durations_and_latency(monkeypatch):
+    # drive the seed body with a mock poster; no server needed.
+    from unittest.mock import MagicMock
+    from rc_repro import seed, rcapi
+    resp = MagicMock(ok=True); resp.json.return_value = {"message": {"_id": "m"}}
+    post = MagicMock(return_value=resp)
+    plan = seed.plan_from("small", users=2, channels=1, messages=3)
+    monkeypatch.setattr(rcapi, "login", lambda *a, **k: (_ for _ in ()).throw(Exception("no server")))
+    out = seed._seed_body("http://x", {"h": "1"}, plan, post, lambda m: None)
+    assert set(out["durations"]) == {"users", "channels", "messages", "dms"}
+    assert out["latency"]["count"] >= 1   # message latencies collected
+
+
+# --- benchmark (version comparison) -------------------------------------------
+
+
+def _bench_row(version, seed_s, p95, ok=True):
+    return {
+        "version": version, "ok": ok, "mongo": "8.0 (official)",
+        "image": f"registry.rocket.chat/rocketchat/rocket.chat:{version}",
+        "boot_s": 10.0, "seed_total_s": seed_s,
+        "users": 20, "user_rate": 6.5, "messages": 100, "msg_rate": 100 / seed_s,
+        "msg_p95_ms": p95, "msg_p99_ms": p95 * 2, "rc_cpu": 80, "mongo_cpu": 40, "rc_mem_mb": 1400,
+        "seed": {"users": 20, "channels": 8, "messages": 100, "dms": 5,
+                 "durations": {"users": 3.0, "channels": 0.4, "messages": seed_s, "dms": 0.5},
+                 "latency": {"count": 100, "mean": p95 / 2, "min": 10, "max": p95 * 2,
+                             "p50": p95 / 2, "p90": p95 * 0.9, "p95": p95, "p99": p95 * 2}},
+        "resources": {"rocketchat": {"idle_cpu": 5, "peak_cpu": 80, "idle_mem": 1e9,
+                                     "peak_mem": 1.4e9, "limit_mem": 2e9},
+                      "mongodb": {"idle_cpu": 2, "peak_cpu": 40, "idle_mem": 3e8,
+                                  "peak_mem": 4e8, "limit_mem": 2e9}},
+    }
+
+
+def test_benchmark_flags_regression():
+    from rc_repro.perf import report
+    a = _bench_row("8.5.1", 5.0, 100)
+    b = _bench_row("8.6.0", 9.0, 340)     # +80% seed, +240% p95 vs a
+    assert report.regression_flag(b, a, 25.0)          # flagged
+    assert report.regression_flag(a, None, 25.0) == "" # first version: no baseline
+    steady = _bench_row("8.6.1", 5.2, 105)
+    assert report.regression_flag(steady, a, 25.0) == ""  # within threshold
+
+
+def test_benchmark_table_and_markdown_render():
+    from rc_repro.perf import report
+    results = [_bench_row("8.5.1", 5.0, 100), _bench_row("8.6.0", 9.0, 340),
+               {"version": "9.9.9", "ok": False, "error": "no such version"}]
+    headers, rows, flags = report.table_rows(results, 25.0)
+    assert len(rows) == 3 and "regression" in flags[1]
+    host = {"os": "test", "cpu": 8, "docker": "27.0", "compose": "2.30"}
+    md = report.benchmark_markdown(results, "standard", 25.0, host)
+    # summary + workload explanation + per-version detail all present
+    assert "rc-repro benchmark report" in md and "8.6.0" in md and "FAILED" in md
+    assert "What the workload did" in md and "Per-version detail" in md
+    assert "Message latency" in md and "Resource peaks during seed" in md
+
+
+# --- perf (Phase 2: load test + SLO gate) -------------------------------------
+
+
+def test_slo_parse_units_and_ops():
+    from rc_repro.perf import slo
+    rules = slo.parse("p95=300ms,error=1%,rps=100,avg=1.5s")
+    by = {r[0]: r for r in rules}
+    assert by["p95"] == ("p95", "<=", 300.0, "300ms")
+    assert by["avg"][2] == 1500.0                 # 1.5s -> ms
+    assert by["error"] == ("error", "<=", 1.0, "1%")
+    assert by["rps"] == ("rps", ">=", 100.0, "100")
+
+
+def test_slo_rejects_unknown_metric():
+    from rc_repro.perf import slo
+    for bad in ("throughput=100", "p95"):         # unknown metric / missing '='
+        try:
+            slo.parse(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_slo_evaluate_pass_and_fail():
+    from rc_repro.perf import slo
+    summary = {"p95": 250.0, "error_rate": 0.005, "rps": 120.0}
+    rules = slo.parse("p95=300ms,error=1%,rps=100")
+    res = {r["key"]: r for r in slo.evaluate(rules, summary)}
+    assert res["p95"]["ok"] and res["error"]["ok"] and res["rps"]["ok"]
+    # now breach each bound
+    bad = {"p95": 400.0, "error_rate": 0.02, "rps": 50.0}
+    res2 = {r["key"]: r for r in slo.evaluate(rules, summary=bad)}
+    assert not res2["p95"]["ok"] and not res2["error"]["ok"] and not res2["rps"]["ok"]
+
+
+def test_slo_absent_metric_fails_not_measured():
+    # A metric missing from the summary must FAIL (not silently PASS at 0.0).
+    from rc_repro.perf import slo
+    res = slo.evaluate(slo.parse("p99=300ms"), summary={"p95": 100.0})[0]
+    assert res["measured"] is False and res["ok"] is False
+
+
+def test_loadtest_target_detection():
+    from rc_repro import cli
+    assert cli._loadtest_target({"services": {"rocketchat": {}, "mongodb": {}}}) == "http://rocketchat:3000"
+    assert cli._loadtest_target({"services": {"traefik": {}, "rocketchat-1": {}}}) == "http://traefik:80"
+    assert cli._loadtest_target({"services": {"rocketchat-1": {}, "rocketchat-2": {}}}) == "http://rocketchat-1:3000"
+
+
+def test_loadtest_markdown_renders():
+    from rc_repro.perf import report
+    ctx = {"name": "acme", "version": "8.5.1", "scenario": "messages", "vus": 50,
+           "duration": "60s", "ramp": "", "target": "http://rocketchat:3000"}
+    summary = {"count": 3000, "rps": 50.0, "p50": 40, "p90": 90, "p95": 120,
+               "p99": 200, "avg": 55, "min": 10, "max": 400,
+               "error_rate": 0.004, "checks_rate": 0.996}
+    from rc_repro.perf import slo
+    slo_res = slo.evaluate(slo.parse("p95=300ms,error=1%"), summary)
+    host = {"os": "test", "cpu": 8, "docker": "27.0", "compose": "2.30"}
+    md = report.loadtest_markdown(ctx, summary, slo_res, None, host)
+    assert "rc-repro load-test report" in md and "messages" in md
+    assert "SLO gate" in md and "throughput" in md and "50.0 req/s" in md
+
+
+def test_loadtest_scenarios_and_scripts_present():
+    from importlib import resources
+    from rc_repro.perf import k6
+    d = resources.files("rc_repro").joinpath("data", "loadtest")
+    assert "custom" in k6.SCENARIOS
+    for name in k6.SCENARIOS:
+        assert d.joinpath(f"{name}.js").is_file()
+    assert d.joinpath("common.js").is_file()
+
+
+def test_parse_endpoint():
+    from rc_repro import cli
+    assert cli._parse_endpoint("GET /api/v1/channels.list") == ("GET", "/api/v1/channels.list")
+    assert cli._parse_endpoint("post /api/v1/chat.postMessage") == ("POST", "/api/v1/chat.postMessage")
+    assert cli._parse_endpoint("/api/v1/me") == ("GET", "/api/v1/me")   # bare path defaults to GET
+    assert cli._parse_endpoint("GET /api/v1/x?count=100&a=b")[1] == "/api/v1/x?count=100&a=b"
+    for bad in ("", "GET channels.list", "  "):   # empty / non-absolute path
+        try:
+            cli._parse_endpoint(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_parse_endpoint_unsupported_method():
+    from rc_repro import cli
+    assert cli._parse_endpoint("PATCH /api/v1/x") == ("PATCH", "/api/v1/x")
+    try:
+        cli._parse_endpoint("HEAD /api/v1/me")
+    except ValueError as exc:
+        assert "unsupported method" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for HEAD")
+
+
+def test_parse_ramp():
+    from rc_repro import cli
+    assert cli._parse_ramp("10:200") == (10, 200)
+    for bad in ("10", "a:b", "5:0", "1:2:3"):
+        try:
+            cli._parse_ramp(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for ramp {bad!r}")
+
+
+def test_short_res_map_keeps_multi_instance_index():
+    # Multi-instance rocketchat-1/-2 must not collapse to one key (report data loss).
+    from rc_repro import cli
+    res = {"rcrepro-x-rocketchat-1": 1, "rcrepro-x-rocketchat-2": 2, "rcrepro-x-mongodb-1": 3}
+    assert sorted(cli._short_res_map(res, "x")) == ["mongodb", "rocketchat-1", "rocketchat-2"]
+    # Single instance still collapses to the clean base name.
+    single = {"rcrepro-y-rocketchat-1": 1, "rcrepro-y-mongodb-1": 2}
+    assert sorted(cli._short_res_map(single, "y")) == ["mongodb", "rocketchat"]
+
+
+def test_bind_ports_no_double_prefix_on_ip_qualified():
+    from rc_repro import compose
+    doc = {"services": {
+        "a": {"ports": ["8025:8025"]},            # bare -> prefixed
+        "b": {"ports": ["127.0.0.1:9000:9000"]},  # already IP -> untouched
+    }}
+    compose._bind_ports(doc, "127.0.0.1")
+    assert doc["services"]["a"]["ports"] == ["127.0.0.1:8025:8025"]
+    assert doc["services"]["b"]["ports"] == ["127.0.0.1:9000:9000"]
+
+
+def test_status_breakdown_non_zero_only():
+    from rc_repro import cli
+    from rc_repro.perf import report
+    summary = {"status": {"2xx": 1158, "429": 61, "4xx": 0, "5xx": 41, "other": 0}}
+    assert cli._status_breakdown(summary) == "2xx 1158 · 429 61 · 5xx 41"
+    assert report._status_breakdown(summary) == "2xx 1158 · 429 61 · 5xx 41"
+    assert cli._status_breakdown({}) == ""            # no status -> empty
+
+
 # --- seed ---------------------------------------------------------------------
 
 

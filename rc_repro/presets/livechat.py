@@ -16,9 +16,9 @@ generated page uses the `{{ROOT_URL}}` placeholder that runner.write substitutes
 
 Parameters (via `--set`):
   agents         number of agents to create + make available (default 1; admin
-                 is always made an agent, extras are agent1..agentN).
+                 is always made an agent, extras are agent2..agentN).
   registration   show the pre-chat registration form first (default false).
-  department     create an Omnichannel department (default false).
+  department     create an Omnichannel department (default true).
 """
 
 from __future__ import annotations

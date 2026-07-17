@@ -58,6 +58,10 @@ MONGO_OPLOG_URL = "mongodb://mongodb:27017/local?replicaSet=rs0"
 # rcapi.login can fetch email-2FA codes for rc-repro's own admin calls.
 EXTRA_MAILPIT_URL = "mailpit_url"
 
+# RC's REST rate limiter — disabled for the duration of a load test (and the
+# seed) so the offered load isn't throttled into a false result, then restored.
+RC_RATE_LIMITER_SETTING = "API_Enable_Rate_Limiter"
+
 # Environment overrides for config.yaml values (env wins over the file):
 #   RC_REPRO_REG_TOKEN  -> reg_token     RC_REPRO_RC_IMAGE -> rc_image
 #   RC_REPRO_BIND_HOST  -> bind_host     (RC_REPRO_HOME is handled in home())
@@ -81,6 +85,11 @@ def repros_dir() -> Path:
 
 def preset_dir() -> Path:
     return home() / "presets"
+
+
+def reports_dir() -> Path:
+    """Where benchmark/perf reports are written by default."""
+    return home() / "reports"
 
 
 def config_file() -> Path:

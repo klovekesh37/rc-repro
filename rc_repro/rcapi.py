@@ -122,15 +122,17 @@ def login(
 
     # Ask RC to (re)send the code, then fish it out of Mailpit. Filter by the
     # recipient so a code for another user (Mailpit is a catch-all inbox for
-    # every address) is never picked up by mistake.
+    # every address) is never picked up by mistake, and snapshot the inbox first
+    # so a leftover code from a previous login isn't mistaken for the fresh one.
+    to_email = user if "@" in user else (
+        config.ADMIN_EMAIL if user == config.ADMIN_USERNAME else None
+    )
+    baseline = newest_mail_stamp(mailpit_url, to_email=to_email)
     requests.post(
         f"{base}/users.2fa.sendEmailCode",
         json={"emailOrUsername": user}, timeout=timeout,
     )
-    to_email = user if "@" in user else (
-        config.ADMIN_EMAIL if user == config.ADMIN_USERNAME else None
-    )
-    code = fetch_email_otp(mailpit_url, to_email=to_email)
+    code = fetch_email_otp(mailpit_url, to_email=to_email, after=baseline)
     if not code:
         raise RuntimeError("email-2FA code did not arrive in Mailpit within the timeout")
     resp3 = requests.post(
@@ -154,13 +156,31 @@ def _addressed_to(item: dict, to_email: str | None) -> bool:
     return to_email.lower() in (a.lower() for a in addrs)
 
 
+def newest_mail_stamp(mailpit_url: str, to_email: str | None = None) -> str:
+    """The `Created` timestamp of the newest message (optionally addressed to
+    `to_email`), or "" if none. Snapshot this BEFORE triggering a new code so
+    fetch_email_otp can ignore stale codes still sitting in the catch-all inbox."""
+    base = mailpit_url.rstrip("/")
+    try:
+        r = requests.get(f"{base}/api/v1/messages", params={"limit": 10}, timeout=5)
+        if r.status_code == 200:
+            for item in r.json().get("messages") or []:   # newest first
+                if _addressed_to(item, to_email):
+                    return item.get("Created") or ""
+    except (requests.RequestException, ValueError):
+        pass
+    return ""
+
+
 def fetch_email_otp(
     mailpit_url: str, to_email: str | None = None,
-    timeout: float = 30.0, interval: float = 1.5,
+    timeout: float = 30.0, interval: float = 1.5, after: str = "",
 ) -> str | None:
     """Poll Mailpit's API for the newest message (optionally only those addressed
     to `to_email` — Mailpit is a catch-all inbox for every user) and extract a
-    6-digit code. Returns None if no code shows up within `timeout`.
+    6-digit code. `after` (a `newest_mail_stamp` snapshot) skips any message not
+    newer than it, so a code left over from a previous login is never reused.
+    Returns None if no code shows up within `timeout`.
     """
     base = mailpit_url.rstrip("/")
     deadline = time.monotonic() + timeout
@@ -172,6 +192,8 @@ def fetch_email_otp(
                     mid = item.get("ID")
                     if not mid or not _addressed_to(item, to_email):
                         continue
+                    if after and (item.get("Created") or "") <= after:
+                        continue   # stale — predates the code we just requested
                     msg = requests.get(f"{base}/api/v1/message/{mid}", timeout=5)
                     if msg.status_code != 200:
                         continue

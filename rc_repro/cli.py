@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
 import re
 import shutil
 import sys
@@ -14,8 +16,10 @@ from typing import Optional
 import requests
 import typer
 
-from rc_repro import compose, config, presets, rcapi, runner, ui, versions
+from rc_repro import compose, config, perf, presets, rcapi, runner, ui, versions
 from rc_repro import seed as seeder
+from rc_repro.perf import report as perf_report
+from rc_repro.perf.timings import fmt_ms
 
 app = typer.Typer(
     add_completion=False,
@@ -149,7 +153,7 @@ def _unknown_params(params: dict, pre: presets.Preset) -> list[str]:
 
 
 def _reuse_existing(repro_name: str, wait: bool, seed: bool, seed_profile: str,
-                    monitor: bool = False) -> None:
+                    monitor: bool = False, stats: bool = False) -> None:
     """The idempotent `up` path for an existing repro: `docker compose up -d`
     handles both a `stop`-paused repro (containers exist -> started) and a
     `down`ed one (containers removed, volume kept -> recreated with its data).
@@ -167,7 +171,7 @@ def _reuse_existing(repro_name: str, wait: bool, seed: bool, seed_profile: str,
     meta = runner.read_meta(repro_name)
     _post_up(meta, wait)
     if seed:
-        _run_seed(meta, seed_profile)
+        _run_seed(meta, seed_profile, stats=stats)
 
 
 def _own_ports(name: str) -> set[int]:
@@ -287,6 +291,7 @@ def up(
     fresh: bool = typer.Option(False, "--fresh", help="wipe this repro's volume first"),
     force: bool = typer.Option(False, "--force", help="overwrite an existing repro"),
     monitor: bool = typer.Option(False, "--monitor", help="also add Prometheus + Grafana (RC metrics dashboard)"),
+    stats: bool = typer.Option(False, "--stats", help="with --seed: report the CPU/RAM cost of seeding"),
 ) -> None:
     """Create and start a version-matched Rocket.Chat repro."""
     _require_docker()
@@ -327,7 +332,7 @@ def up(
     # Idempotent: an existing repro (unless --fresh/--force recreates it) is
     # simply brought back up with its data intact.
     if runner.exists(repro_name) and not force and not fresh:
-        _reuse_existing(repro_name, wait, seed, seed_profile, monitor=monitor)
+        _reuse_existing(repro_name, wait, seed, seed_profile, monitor=monitor, stats=stats)
         return
 
     _check_sidecar_ports(pre, exclude=repro_name)
@@ -413,11 +418,11 @@ def up(
 
     _post_up(meta, wait)
     if seed:
-        _run_seed(meta, seed_profile)
+        _run_seed(meta, seed_profile, stats=stats)
 
 
 def _run_seed(meta: runner.Metadata, profile: str,
-              users=None, channels=None, messages=None) -> None:
+              users=None, channels=None, messages=None, stats: bool = False) -> None:
     try:
         auth = _login(meta)
     except Exception as exc:  # noqa: BLE001
@@ -430,11 +435,71 @@ def _run_seed(meta: runner.Metadata, profile: str,
         f"Seeding {meta.name!r} (profile: {profile} — {plan.users} users, "
         f"{plan.channels} channels, {plan.messages} msgs/channel)…"
     )
-    s = seeder.seed(meta.root_url, auth, plan, log=lambda m: typer.echo(f"  {m}"))
-    ui.ok(
-        f"✓ seeded: {s['users']} users, {s['channels']} channels, "
-        f"~{s['messages']} messages, {s['dms']} DMs"
-    )
+    mon = perf.ResourceMonitor(meta.name).start() if stats else None
+    t0 = time.monotonic()
+    try:
+        s = seeder.seed(meta.root_url, auth, plan, log=lambda m: typer.echo(f"  {m}"))
+    finally:
+        resources = mon.stop() if mon else None   # stop the sampler thread even if seed raises
+    total = time.monotonic() - t0
+    _print_seed_result(s, total, resources, meta)
+
+
+def _short_container(full: str, repro_name: str, keep_index: bool = False) -> str:
+    """rcrepro-<name>-rocketchat-1 -> rocketchat (or rocketchat-1 if keep_index)."""
+    s = full
+    prefix = f"{config.PROJECT_PREFIX}{repro_name}-"
+    if s.startswith(prefix):
+        s = s[len(prefix):]
+    return s if keep_index else re.sub(r"-\d+$", "", s)
+
+
+def _short_res_map(resources: dict, repro_name: str) -> dict:
+    """Short-name-keyed resource map, keeping the instance index when a base name
+    repeats (multi-instance rocketchat-1/-2/-3) so no row overwrites another."""
+    bases = [_short_container(k, repro_name) for k in resources]
+    dup = {b for b in bases if bases.count(b) > 1}
+    out = {}
+    for k, v in resources.items():
+        base = _short_container(k, repro_name)
+        out[_short_container(k, repro_name, keep_index=True) if base in dup else base] = v
+    return out
+
+
+def _print_resources(report: dict, repro_name: str) -> None:
+    if not report:
+        return
+    typer.echo("")
+    ui.note("Resource cost (idle -> peak):")
+    labelled = _short_res_map(report, repro_name)
+    for name in sorted(labelled):
+        r = labelled[name]
+        mem_delta = (r.peak_mem - r.idle_mem) / 1e6
+        typer.echo(
+            f"  {name:<14} "
+            f"CPU {r.idle_cpu:.0f}% -> {r.peak_cpu:.0f}%   "
+            f"RAM {r.peak_mem/1e6:.0f} MB (+{mem_delta:.0f})"
+        )
+
+
+def _print_seed_result(s: dict, total: float, resources, meta: runner.Metadata) -> None:
+    d = s.get("durations", {})
+    lat = s.get("latency", {})
+    ui.ok(f"✓ seeded in {fmt_ms(total * 1000)}")
+
+    def row(label: str, count_num: int, dur_s: float, display: str = "", extra: str = "") -> None:
+        rate = f"{count_num / dur_s:.1f}/s" if dur_s > 0.05 and count_num else ""
+        typer.echo(f"  {label:<9} {(display or str(count_num)):>5}   {dur_s:4.1f}s   {rate:<8} {extra}")
+
+    lat_str = ""
+    if lat.get("count"):
+        lat_str = (f"p50 {fmt_ms(lat['p50'])} · p95 {fmt_ms(lat['p95'])} · "
+                   f"p99 {fmt_ms(lat['p99'])}  {s.get('latency_hist', '')}")
+    row("users", s["users"], d.get("users", 0.0))
+    row("channels", s["channels"], d.get("channels", 0.0))
+    row("messages", s["messages"], d.get("messages", 0.0), display=f"~{s['messages']}", extra=lat_str)
+    row("DMs", s["dms"], d.get("dms", 0.0))
+    _print_resources(resources or {}, meta.name)
 
 
 def _post_up(meta: runner.Metadata, wait: bool) -> None:
@@ -478,7 +543,8 @@ def _wait_serving(meta: runner.Metadata, timeout: float) -> dict:
     typer.echo(f"Waiting for {meta.name!r} to serve {meta.root_url} ...")
 
     def is_alive() -> bool:
-        return runner.rc_state(meta.name) in ("running", "restarting")
+        # "created"/"restarting" are still coming up — only a real exit means dead.
+        return runner.rc_state(meta.name) in ("running", "restarting", "created")
 
     def tick(elapsed: float) -> None:
         typer.echo(f"  ... still booting ({int(elapsed)}s)")
@@ -638,10 +704,17 @@ def _clear_default_if(name: str) -> None:
 def down(
     name: str = typer.Option("", "--name", "-n"),
     volumes: bool = typer.Option(False, "--volumes", help="also delete the data volume and forget the repro"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt (for scripts/CI)"),
 ) -> None:
     """Remove a repro's containers. Keeps data (and the record) unless --volumes."""
     _require_docker()
     target = _resolve_name(name)
+    if volumes and not yes:
+        # --volumes is irreversible (deletes the Mongo data + the record). Confirm.
+        typer.confirm(
+            f"This permanently deletes {target!r}'s data volume and record. Continue?",
+            abort=True,
+        )
     if runner.down(target, volumes=volumes) != 0:
         _err(f"`docker compose down` failed for {target!r} (see output above)")
     if volumes:
@@ -731,27 +804,36 @@ def monitor(
 
 
 @app.command()
-def prune() -> None:
-    """Delete all down repros (kept volumes + records). Skips pinned and running ones."""
+def prune(
+    yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt (for scripts/CI)"),
+) -> None:
+    """Delete every `down` repro — INCLUDING its data volume and record. Skips pinned and running ones."""
     _require_docker()
     states = runner.project_states()
     if states is None:
         # Can't tell "no containers" from "docker didn't answer" — deleting
         # volumes on that ambiguity would be destructive. Refuse.
         _err("couldn't query docker compose projects — not pruning (is Docker healthy?)")
+    # Only sweep repros whose containers are already gone (a plain `down`).
+    # Running or `stop`-paused repros still appear in project_states.
+    targets = [m.name for m in runner.list_meta()
+               if not m.pinned and m.project not in states]
+    if not targets:
+        typer.echo("Nothing to prune.")
+        return
+    if not yes:
+        typer.echo("These down repros will be deleted — containers, data volumes, and records:")
+        for t in targets:
+            typer.echo(f"  - {t}")
+        typer.confirm("Continue?", abort=True)
     removed = []
-    for m in runner.list_meta():
-        if m.pinned:
+    for name in targets:
+        if runner.down(name, volumes=True) != 0:
+            ui.warn(f"⚠ could not clean up {name!r} — skipping")
             continue
-        # Only sweep repros whose containers are already gone (a plain `down`).
-        # Running or `stop`-paused repros still appear in project_states.
-        if m.project not in states:
-            if runner.down(m.name, volumes=True) != 0:
-                ui.warn(f"⚠ could not clean up {m.name!r} — skipping")
-                continue
-            runner.remove(m.name)
-            _clear_default_if(m.name)
-            removed.append(m.name)
+        runner.remove(name)
+        _clear_default_if(name)
+        removed.append(name)
     if removed:
         ui.ok(f"✓ pruned {len(removed)}: {', '.join(removed)}")
     else:
@@ -876,14 +958,16 @@ def api(
         _err(f"--data is not valid JSON: {exc}")
 
     extra = rcapi.password_2fa_headers(config.ADMIN_PASSWORD) if two_fa else None
+    _t = time.monotonic()
     try:
         status, text = rcapi.call(m.root_url, method, path, auth=auth, data=body, extra_headers=extra)
     except requests.RequestException as exc:
         _err(f"request failed: {exc}")
+    elapsed = fmt_ms((time.monotonic() - _t) * 1000)
     tag = "PAT" if pat else "admin"
     if two_fa:
         tag += "+2fa"
-    typer.secho(f"HTTP {status}  [{tag}]", fg=typer.colors.GREEN if status < 400 else typer.colors.RED)
+    typer.secho(f"HTTP {status}  [{tag}]  in {elapsed}", fg=typer.colors.GREEN if status < 400 else typer.colors.RED)
     typer.echo(text)
 
 
@@ -912,11 +996,386 @@ def seed_cmd(
     users: Optional[int] = typer.Option(None, "--users", help="override user count"),
     channels: Optional[int] = typer.Option(None, "--channels", help="override channel count"),
     messages: Optional[int] = typer.Option(None, "--messages", help="override messages per channel"),
+    stats: bool = typer.Option(False, "--stats", help="also report CPU/RAM cost of the seed"),
 ) -> None:
     """Populate a repro with sample users, channels, DMs and messages."""
     _require_docker()
     m = runner.read_meta(_resolve_name(name))
-    _run_seed(m, profile, users, channels, messages)
+    _run_seed(m, profile, users, channels, messages, stats=stats)
+
+
+@app.command()
+def stats(
+    name: str = typer.Option("", "--name", "-n"),
+    for_: float = typer.Option(5.0, "--for", help="seconds to sample"),
+    watch: bool = typer.Option(False, "--watch", "-w", help="stream live (Ctrl-C to stop)"),
+) -> None:
+    """Sample a repro's container CPU/RAM (peak over a window, or --watch live)."""
+    _require_docker()
+    m = runner.read_meta(_resolve_name(name))
+    if watch:
+        typer.echo(f"Live stats for {m.name!r} (Ctrl-C to stop)…")
+        try:
+            while True:
+                ids = runner.container_ids(m.name)
+                out = runner.docker_stats(ids)
+                typer.echo("")
+                for line in out.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 3:
+                        typer.echo(f"  {_short_container(parts[0], m.name):<14} CPU {parts[1]:>7}   RAM {parts[2]}")
+                time.sleep(2)
+        except KeyboardInterrupt:
+            return
+    typer.echo(f"Sampling {m.name!r} for {for_:.0f}s…")
+    with perf.ResourceMonitor(m.name) as mon:
+        time.sleep(for_)
+    _print_resources(mon.report(), m.name)
+
+
+def _bench_metrics(resolved, boot_s: float, seed_total_s: float, s: dict, res: dict, name: str) -> dict:
+    lat, d = s.get("latency", {}), s.get("durations", {})
+    # Resources keyed by short container name (e.g. "rocketchat", "mongodb").
+    resources = {
+        _short_container(full, name): {
+            "idle_cpu": st.idle_cpu, "peak_cpu": st.peak_cpu,
+            "idle_mem": st.idle_mem, "peak_mem": st.peak_mem, "limit_mem": st.limit_mem,
+        }
+        for full, st in res.items()
+    }
+
+    def peak(short: str, key: str) -> float:
+        return resources.get(short, {}).get(key, 0.0)
+
+    msg_dur, user_dur = d.get("messages", 0.0), d.get("users", 0.0)
+    return {
+        "mongo": f"{resolved.mongo_tag} ({resolved.mongo_flavor})",
+        "image": f"{resolved.rc_image}:{resolved.rc_version}",
+        "boot_s": boot_s, "seed_total_s": seed_total_s,
+        "users": s["users"], "user_rate": s["users"] / user_dur if user_dur > 0.05 else 0.0,
+        "messages": s["messages"], "msg_rate": s["messages"] / msg_dur if msg_dur > 0.05 else 0.0,
+        "msg_p95_ms": lat.get("p95", 0.0), "msg_p99_ms": lat.get("p99", 0.0),
+        "rc_cpu": peak("rocketchat", "peak_cpu"), "mongo_cpu": peak("mongodb", "peak_cpu"),
+        "rc_mem_mb": peak("rocketchat", "peak_mem") / 1e6,
+        "seed": s, "resources": resources,   # full detail for the report
+    }
+
+
+def _bench_one(version: str, profile: str, offline: bool, no_pull: bool) -> dict:
+    """Boot one version, run the seed workload under resource monitoring, tear it
+    down, and return a metrics dict (ok=False + error on any failure)."""
+    result = {"version": version, "ok": False, "error": ""}
+    try:
+        resolved = versions.resolve(version, offline=offline)
+    except ValueError as exc:
+        result["error"] = str(exc)
+        return result
+
+    name = "bench-" + _sanitize(version)
+    if runner.exists(name):
+        # Only reclaim a workspace WE created (marked benchmark=True). Refuse to
+        # touch a real repro that happens to share the name — deleting it with
+        # its volume would be destructive.
+        existing = runner.read_meta(name)
+        if not (isinstance(existing.extra, dict) and existing.extra.get("benchmark")):
+            result["error"] = (f"a non-benchmark repro named {name!r} already exists — "
+                               f"rename or remove it before benchmarking {version}")
+            return result
+        runner.down(name, volumes=True)
+        runner.remove(name)
+    mon = None
+    try:
+        pre = presets.load("default")
+        host_port = runner.pick_port()
+        spec = compose.Spec.from_resolved(
+            resolved, project_name=runner.project_name(name),
+            root_url=f"http://localhost:{host_port}", host_port=host_port,
+            reg_token=None, preset=pre,
+        )
+        meta = runner.Metadata(
+            name=name, project=spec.project_name, rc_version=resolved.rc_version,
+            rc_image=resolved.rc_image, mongo_tag=resolved.mongo_tag,
+            mongo_flavor=resolved.mongo_flavor, preset="default",
+            root_url=spec.root_url, host_port=host_port, version_source=resolved.source,
+            extra={"benchmark": True},   # marks this workspace as ours to reclaim/clean up
+        )
+        runner.write(name, compose.to_yaml(compose.build(spec)), meta)
+        typer.secho(f"[{version}] booting on {meta.root_url} …", bold=True)
+        if runner.up(name, pull=not no_pull) != 0:
+            result["error"] = "docker compose up failed"
+            return result
+        t0 = time.monotonic()
+        rcapi.wait_ready(meta.root_url, timeout=300.0,
+                         is_alive=lambda: runner.rc_state(name) in ("running", "restarting", "created"))
+        boot_s = time.monotonic() - t0
+        auth = _finalize(meta) or rcapi.login(meta.root_url)
+        plan = seeder.plan_from(profile)
+        typer.echo(f"[{version}] seeding ({profile})…")
+        mon = perf.ResourceMonitor(name).start()
+        ts = time.monotonic()
+        s = seeder.seed(meta.root_url, auth, plan, log=lambda m: None)
+        seed_total = time.monotonic() - ts
+        res = mon.stop()
+        mon = None
+        result.update(_bench_metrics(resolved, boot_s, seed_total, s, res, name))
+        result["ok"] = True
+    except Exception as exc:  # noqa: BLE001 - record and move to the next version
+        result["error"] = str(exc)
+    finally:
+        if mon:
+            mon.stop()   # sampler thread must not outlive a failed version into the next
+        try:
+            runner.down(name, volumes=True)
+            runner.remove(name)
+        except Exception:  # noqa: BLE001 - a cleanup hiccup must not lose the other versions' results
+            pass
+    return result
+
+
+@app.command()
+def benchmark(
+    versions_: str = typer.Option(..., "--versions", help="comma-separated versions to compare, e.g. 8.4.1,8.5.1"),
+    seed_profile: str = typer.Option("standard", "--seed-profile", help="workload size: small | standard | large"),
+    regress_pct: float = typer.Option(25.0, "--regress-pct", help="flag a version if seed time or p95 rises more than this % vs the previous"),
+    offline: bool = typer.Option(False, "--offline"),
+    no_pull: bool = typer.Option(False, "--no-pull"),
+    report: bool = typer.Option(False, "--report", help=f"write a detailed markdown report to {config.reports_dir()}"),
+    report_path: str = typer.Option("", "--report-path", help="write the report to this file/dir instead (implies --report)"),
+) -> None:
+    """Boot several RC versions, run the identical seed workload against each, and
+    compare — a version performance-regression check unique to rc-repro."""
+    _require_docker()
+    vers = [v.strip() for v in versions_.split(",") if v.strip()]
+    if len(vers) < 2:
+        _err("give at least two --versions to compare, e.g. --versions 8.4.1,8.5.1")
+
+    typer.echo(f"Benchmarking {len(vers)} versions (workload: seed {seed_profile}, sequential)…\n")
+    results = [_bench_one(v, seed_profile, offline, no_pull) for v in vers]
+
+    typer.echo("")
+    headers, rows, flags = perf_report.table_rows(results, regress_pct)
+    typer.secho(headers[0], bold=True)
+    for row, flag in zip(rows, flags):
+        suffix = typer.style(f"   <- {flag}", fg=typer.colors.YELLOW) if flag else ""
+        typer.echo(row + suffix)
+    typer.echo("")
+    ui.note("Deltas between versions are the signal; absolute numbers are host-specific.")
+    if report or report_path:
+        host = {
+            "os": platform.platform(), "cpu": os.cpu_count() or "?",
+            "docker": runner.docker_server_version() or "?",
+            "compose": runner.compose_version() or "?",
+        }
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        path = perf_report.write_benchmark(
+            results, seed_profile, regress_pct, stamp, host, dest=report_path or None
+        )
+        ui.ok(f"✓ wrote {path}")
+
+
+_HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
+
+
+def _parse_endpoint(endpoint: str) -> tuple[str, str]:
+    """'GET /api/v1/x' -> ('GET', '/api/v1/x'); a bare '/api/v1/x' defaults to GET.
+    Raises ValueError on an empty/non-absolute path or an unsupported method."""
+    e = endpoint.strip()
+    if not e:
+        raise ValueError("empty endpoint")
+    parts = e.split(None, 1)
+    if len(parts) == 2 and parts[0].isalpha():
+        # First token looks like a method — it must be a supported one.
+        if parts[0].upper() not in _HTTP_METHODS:
+            raise ValueError(f"unsupported method {parts[0]!r} (use {', '.join(sorted(_HTTP_METHODS))})")
+        method, path = parts[0].upper(), parts[1].strip()
+    else:
+        method, path = "GET", e
+    if not path.startswith("/"):
+        raise ValueError(f"path must start with '/': {path!r}")
+    return method, path
+
+
+def _parse_ramp(ramp: str) -> tuple[int, int]:
+    """'10:200' -> (10, 200). Raises ValueError on a malformed spec."""
+    parts = ramp.split(":")
+    if len(parts) != 2:
+        raise ValueError("ramp must be START:END, e.g. 10:200")
+    try:
+        start, end = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError("ramp START and END must be integers, e.g. 10:200")
+    if start < 0 or end < 1:
+        raise ValueError("ramp needs START >= 0 and END >= 1, e.g. 10:200")
+    return start, end
+
+
+def _loadtest_target(doc: dict) -> str:
+    """The in-network URL k6 should hit. Multi-instance repros front RC with
+    Traefik; single-instance ones expose `rocketchat` (or `rocketchat-1`)."""
+    svcs = doc.get("services", {})
+    if "traefik" in svcs:
+        return "http://traefik:80"
+    rc = _rc_services_in(doc)
+    if "rocketchat" in rc:
+        return "http://rocketchat:3000"
+    if rc:
+        return f"http://{rc[0]}:3000"
+    return "http://rocketchat:3000"
+
+
+def _status_breakdown(summary: dict) -> str:
+    """'2xx 1158 · 429 61 · 5xx 41' from the summary's status buckets (non-zero only)."""
+    st = summary.get("status") or {}
+    order = [("2xx", "2xx"), ("429", "429"), ("4xx", "4xx"), ("5xx", "5xx"), ("other", "other")]
+    parts = [f"{lbl} {int(st[k])}" for k, lbl in order if st.get(k)]
+    return " · ".join(parts)
+
+
+def _print_loadtest(ctx: dict, summary: dict, slo_results: list[dict]) -> None:
+    from rc_repro.perf import slo as slo_mod
+    rows = [
+        ("throughput", f"{summary.get('rps', 0):.1f} req/s   ({summary.get('count', 0):.0f} requests)"),
+        ("latency", f"p50 {summary.get('p50', 0):.0f}ms  p90 {summary.get('p90', 0):.0f}ms  "
+                    f"p95 {summary.get('p95', 0):.0f}ms  p99 {summary.get('p99', 0):.0f}ms"),
+        ("", f"avg {summary.get('avg', 0):.0f}ms  min {summary.get('min', 0):.0f}ms  "
+             f"max {summary.get('max', 0):.0f}ms"),
+        ("errors", f"{summary.get('error_rate', 0) * 100:.2f}%   checks {summary.get('checks_rate', 0) * 100:.0f}% ok"),
+    ]
+    breakdown = _status_breakdown(summary)
+    if breakdown:
+        rows.append(("responses", breakdown))
+    load = (f"ramp {ctx['ramp']}" if ctx.get("ramp") else f"{ctx['vus']} VUs") + f" / {ctx['duration']}"
+    ui.panel(f"loadtest {ctx.get('label', ctx['scenario'])} ({load})", rows)
+    if slo_results:
+        typer.echo("")
+        passed = all(r["ok"] for r in slo_results)
+        for r in slo_results:
+            sym, color = ("✓", typer.colors.GREEN) if r["ok"] else ("✗", typer.colors.RED)
+            detail = ("not measured" if not r.get("measured", True)
+                      else f"actual {slo_mod.fmt_actual(r['key'], r['actual'])}")
+            typer.secho(f"  {sym} {r['key']} {r['op']} {r['raw']}  ({detail})", fg=color)
+        typer.secho(f"\nSLO gate: {'PASS' if passed else 'FAIL'}",
+                    fg=typer.colors.GREEN if passed else typer.colors.RED, bold=True)
+
+
+@app.command()
+def loadtest(
+    name: str = typer.Option("", "--name", "-n"),
+    scenario: str = typer.Option("messages", "--scenario", help="messages | login | read | mixed | custom"),
+    endpoint: str = typer.Option("", "--endpoint", help="custom scenario: the call to hit, e.g. \"GET /api/v1/channels.list?count=100\""),
+    body: str = typer.Option("", "--body", help="custom scenario: JSON request body for POST/PUT/PATCH"),
+    vus: int = typer.Option(10, "--vus", help="virtual users (concurrent connections, all as admin — not RC accounts)"),
+    duration: str = typer.Option("30s", "--duration", help="test duration, e.g. 60s, 2m"),
+    ramp: str = typer.Option("", "--ramp", help="ramp VUs start:end over --duration, e.g. 10:200"),
+    slo: str = typer.Option("", "--slo", help="pass/fail gate, e.g. p95=300ms,error=1%,rps=100"),
+    stats: bool = typer.Option(False, "--stats", help="also report container CPU/RAM during the test"),
+    report: bool = typer.Option(False, "--report", help=f"write a markdown report to {config.reports_dir()}"),
+    report_path: str = typer.Option("", "--report-path", help="write the report to this file/dir instead (implies --report)"),
+) -> None:
+    """Drive real HTTP load at a repro with k6 and check it against an SLO.
+
+    k6 runs on the repro's docker network (so it works even with loopback-only
+    binds); the REST rate limiter is disabled for the run and restored after.
+    Exits non-zero if a --slo rule is not met — usable as a CI gate.
+    """
+    _require_docker()
+    from rc_repro.perf import k6, slo as slo_mod
+    if scenario not in k6.SCENARIOS:
+        _err(f"unknown scenario {scenario!r} (choose: {', '.join(k6.SCENARIOS)})")
+    # Custom scenario: parse "METHOD /path" and pass it to the k6 script via env.
+    extra_env, method, path = None, "", ""
+    if scenario == "custom":
+        if not endpoint:
+            _err("--scenario custom needs --endpoint, e.g. --endpoint \"GET /api/v1/channels.list\"")
+        try:
+            method, path = _parse_endpoint(endpoint)
+        except ValueError as exc:
+            _err(f"bad --endpoint: {exc}")
+        if body and method in ("GET", "DELETE"):
+            _err(f"--body is not sent with a {method} request")
+        extra_env = {"RC_METHOD": method, "RC_PATH": path, "RC_BODY": body or None}
+    elif endpoint or body:
+        _err("--endpoint/--body only apply to --scenario custom")
+    if vus < 1:
+        _err("--vus must be >= 1")
+    if ramp:
+        try:
+            _parse_ramp(ramp)
+        except ValueError as exc:
+            _err(f"bad --ramp: {exc}")
+        if vus != 10:   # 10 is the --vus default; a non-default value is ignored under --ramp
+            ui.warn("  note: --vus is ignored when --ramp is given")
+    rules = []
+    if slo:
+        try:
+            rules = slo_mod.parse(slo)
+        except ValueError as exc:
+            _err(f"bad --slo: {exc}")
+
+    m = runner.read_meta(_resolve_name(name))
+    doc = runner.read_compose(m.name)
+    target = _loadtest_target(doc)
+
+    # Auth as a bypass-2FA PAT — exactly how a customer's script would hit the API.
+    try:
+        auth = _login(m)
+        token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD,
+                                   token_name="rc-repro-loadtest", bypass_2fa=True)
+    except Exception as exc:  # noqa: BLE001
+        _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
+
+    # Disable the API rate limiter for the run so the offered load isn't
+    # throttled into a false result. Restore it in a finally — always back ON
+    # unless it was already known-off (matches seed.py). An unreadable setting
+    # (get_setting -> None) restores to ON, never leaving it silently disabled.
+    limiter_was_off = rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                        config.RC_RATE_LIMITER_SETTING) is False
+    if not limiter_was_off and not rcapi.set_setting(
+        m.root_url, auth, config.ADMIN_PASSWORD, config.RC_RATE_LIMITER_SETTING, False
+    ):
+        ui.warn("  ⚠ could not disable the API rate limiter — results may be throttled (429s)")
+
+    label = f"custom {method} {path}" if scenario == "custom" else scenario
+    load = (f"ramp {ramp}" if ramp else f"{vus} VUs") + f" for {duration}"
+    typer.secho(f"Load test: {label} @ {load} -> {target} (via k6 on {m.name!r}'s network)\n", bold=True)
+    mon = perf.ResourceMonitor(m.name).start() if stats else None
+    resources = None
+    summary = None
+    try:
+        summary = k6.run(m.name, scenario, vus=vus, duration=duration, ramp=ramp or None,
+                         token=token, uid=auth.user_id, target=target, extra_env=extra_env)
+    except RuntimeError as exc:
+        _err(str(exc))   # raises typer.Exit; finally still runs (mon stopped, limiter restored)
+    finally:
+        if mon:
+            resources = mon.stop()
+        if not limiter_was_off:
+            try:
+                rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                  config.RC_RATE_LIMITER_SETTING, True)
+            except Exception:  # noqa: BLE001 - best-effort restore
+                ui.warn("  ⚠ could not restore the API rate limiter setting")
+
+    typer.echo("")
+    ctx = {"name": m.name, "version": m.rc_version, "scenario": scenario, "vus": vus,
+           "duration": duration, "ramp": ramp, "target": target, "label": label}
+    slo_results = slo_mod.evaluate(rules, summary) if rules else []
+    _print_loadtest(ctx, summary, slo_results)
+    _print_resources(resources or {}, m.name)
+
+    if report or report_path:
+        host = {"os": platform.platform(), "cpu": os.cpu_count() or "?",
+                "docker": runner.docker_server_version() or "?",
+                "compose": runner.compose_version() or "?"}
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        short_res = _short_res_map(resources, m.name) if resources else None
+        path = perf_report.write_loadtest(ctx, summary, slo_results, short_res, host,
+                                          stamp, dest=report_path or None)
+        typer.echo("")
+        ui.ok(f"✓ wrote {path}")
+
+    if slo_results and not all(r["ok"] for r in slo_results):
+        raise typer.Exit(1)
 
 
 @app.command()

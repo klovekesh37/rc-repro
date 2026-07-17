@@ -5,11 +5,12 @@ shows it in a web UI — nothing leaves the machine, so you can read a password
 reset link, invite, verification mail or 2FA code seconds after RC sends it,
 for ANY user, without owning a real mailbox.
 
-2FA is NOT forced on — enable it manually when a ticket needs it (Admin →
-Accounts → Two Factor Authentication, or per-user in My Account). Codes land in
-Mailpit like all other mail, and if email-2FA is enabled, rc-repro's own admin
-logins keep working: the preset records Mailpit's URL in the repro metadata
-(Preset.extra) and rcapi.login fetches the code from Mailpit automatically.
+Email-2FA is enabled globally, but RC only applies it to users with a *verified*
+email — seeded users (alice/alice, …) are verified, so they get the full OTP flow
+(code lands in Mailpit); the admin isn't verified, so it logs in plain until you
+verify it. rc-repro's own admin logins keep working either way: the preset records
+Mailpit's URL in the repro metadata (Preset.extra) and rcapi.login fetches a
+required code from Mailpit automatically.
 
 Pairs well with --seed: seeded users (alice/alice, …) have verified emails —
 ready for 2FA opt-in and for receiving notification mail.
@@ -82,9 +83,10 @@ def build(params: dict) -> Preset:
             f"Mailpit (EVERY email RC sends, for ALL users, lands here): {mailpit_url}",
             "  — one shared inbox; tell users apart by the To: column.",
             "Quick SMTP check: Admin → Email → 'Send test email', then open Mailpit.",
-            "Need the email-2FA flow? Enable it in Admin → Accounts → Two Factor",
-            "  Authentication — codes arrive in Mailpit, and rc-repro's own calls",
-            "  fetch the admin code automatically so token/api/seed keep working.",
+            "Email-2FA is ON globally, but RC only enforces it on VERIFIED emails:",
+            "  seeded users (alice/…) get the OTP flow (code in Mailpit); admin is",
+            "  unverified so it logs in plain. rc-repro's own token/api/seed calls",
+            "  fetch any required code from Mailpit automatically.",
             "Seeded users (--seed) are created with verified emails, ready for 2FA.",
         ],
     )

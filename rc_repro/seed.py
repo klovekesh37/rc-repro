@@ -10,11 +10,13 @@ toggled off during seeding, then restored.
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass
 
 import requests
 
 from rc_repro import config, rcapi
+from rc_repro.perf import Timings
 
 # Realistic pools; overflow gets a numeric suffix (e.g. alice, bob, …, alice2).
 # NOTE: deliberately avoids `userN` names, which the ldap/saml presets use.
@@ -103,8 +105,8 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
         except requests.RequestException:
             return None
 
-    def _set(setting_id: str, value) -> None:
-        rcapi.set_setting(root_url, admin, config.ADMIN_PASSWORD, setting_id, value)
+    def _set(setting_id: str, value) -> bool:
+        return rcapi.set_setting(root_url, admin, config.ADMIN_PASSWORD, setting_id, value)
 
     # Make seeding possible/fast: new users' logins aren't blocked by email-2FA,
     # and bulk calls aren't throttled. Both settings are restored to their PRIOR
@@ -116,7 +118,8 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
     email_2fa_was_on = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, email_2fa) is True
     limiter_was_off = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, rate_limiter) is False
     _set(email_2fa, False)
-    _set(rate_limiter, False)
+    if not limiter_was_off and not _set(rate_limiter, False):
+        log("  ⚠ could not disable the API rate limiter — seed rates may be throttled")
 
     try:
         return _seed_body(root_url, admin_hdr, plan, post, log)
@@ -129,10 +132,21 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
 
 def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
     """The actual content creation (users/channels/DMs/messages); split out so
-    seed() can guarantee setting restoration in a finally."""
+    seed() can guarantee setting restoration in a finally. Times each phase and
+    collects per-message latency for the seed timing breakdown."""
+    durs = {"users": 0.0, "channels": 0.0, "messages": 0.0, "dms": 0.0}
+    msg = Timings()   # primary chat.postMessage latencies
+
+    def timed(bucket: str, path: str, headers: dict, payload: dict):
+        t = time.monotonic()
+        r = post(path, headers, payload)
+        durs[bucket] += time.monotonic() - t
+        return r
+
     # 1. Users (idempotent: an existing user just gets logged into).
     tokens: dict[str, rcapi.Auth] = {}
     names = [username(i) for i in range(plan.users)]
+    _t = time.monotonic()
     for un in names:
         post("/api/v1/users.create", admin_hdr, {
             "name": un.capitalize(), "username": un, "email": f"{un}@example.com",
@@ -143,6 +157,7 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
             tokens[un] = rcapi.login(root_url, un, un)
         except Exception:  # noqa: BLE001 - fall back to admin authorship
             pass
+    durs["users"] = time.monotonic() - _t
     log(f"users: {len(names)} ({len(tokens)} usable as authors)")
 
     def hdr_for(members: list[str]) -> dict:
@@ -152,18 +167,22 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
     def post_messages(channel_ref: str, members: list[str], count: int) -> int:
         n = 0
         for _ in range(count):
+            t = time.monotonic()
             r = post("/api/v1/chat.postMessage", hdr_for(members),
                      {"channel": channel_ref, "text": random.choice(_MESSAGES)})
+            dt = time.monotonic() - t
+            durs["messages"] += dt
             if r is None or not r.ok:
                 continue
+            msg.add(dt * 1000)
             n += 1
             if plan.rich and random.random() < 0.2:
                 mid = (r.json().get("message") or {}).get("_id")
                 if mid:
-                    post("/api/v1/chat.postMessage", hdr_for(members),
-                         {"channel": channel_ref, "text": random.choice(_MESSAGES), "tmid": mid})
-                    post("/api/v1/chat.react", hdr_for(members),
-                         {"messageId": mid, "emoji": random.choice([":+1:", ":tada:", ":eyes:"])})
+                    timed("messages", "/api/v1/chat.postMessage", hdr_for(members),
+                          {"channel": channel_ref, "text": random.choice(_MESSAGES), "tmid": mid})
+                    timed("messages", "/api/v1/chat.react", hdr_for(members),
+                          {"messageId": mid, "emoji": random.choice([":+1:", ":tada:", ":eyes:"])})
         return n
 
     # 2. Public channels with a random member subset.
@@ -171,7 +190,7 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
     for i in range(plan.channels):
         cn = channel_name(i)
         members = random.sample(names, k=min(len(names), random.randint(3, 8))) if names else []
-        post("/api/v1/channels.create", admin_hdr, {"name": cn, "members": members})
+        timed("channels", "/api/v1/channels.create", admin_hdr, {"name": cn, "members": members})
         total_msgs += post_messages(f"#{cn}", members, plan.messages)
     log(f"channels: {plan.channels}")
 
@@ -179,7 +198,7 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
     if plan.rich and names:
         for gn in _GROUP_NAMES:
             members = random.sample(names, k=min(len(names), 4))
-            post("/api/v1/groups.create", admin_hdr, {"name": gn, "members": members})
+            timed("channels", "/api/v1/groups.create", admin_hdr, {"name": gn, "members": members})
             total_msgs += post_messages(f"#{gn}", members, max(3, plan.messages // 3))
 
     # 4. Messages into the default GENERAL channel (everyone is a member).
@@ -192,9 +211,12 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
             break
         u1, u2 = random.sample(names, 2)
         hdr = {**tokens[u1].headers(), "Content-Type": "application/json"} if u1 in tokens else admin_hdr
-        if post("/api/v1/im.create", hdr, {"username": u2}) is not None:
-            post("/api/v1/chat.postMessage", hdr, {"channel": f"@{u2}", "text": random.choice(_MESSAGES)})
+        if timed("dms", "/api/v1/im.create", hdr, {"username": u2}) is not None:
+            timed("dms", "/api/v1/chat.postMessage", hdr, {"channel": f"@{u2}", "text": random.choice(_MESSAGES)})
             dms += 1
     log(f"messages: ~{total_msgs}  DMs: {dms}")
 
-    return {"users": len(names), "channels": plan.channels, "messages": total_msgs, "dms": dms}
+    return {
+        "users": len(names), "channels": plan.channels, "messages": total_msgs, "dms": dms,
+        "durations": durs, "latency": msg.summary(), "latency_hist": msg.histogram(),
+    }

@@ -96,8 +96,8 @@ def build(params: dict) -> Preset:
         description=(
             f"Keycloak IdP with a generated SAML realm ({users} users user1..user"
             f"{users}, password=username). Click 'Keycloak SSO', log in as "
-            "user1/user1. Keycloak admin at http://localhost:8081 (admin/admin, "
-            "realm 'rcrepro')."
+            f"user1/user1. Keycloak admin at http://localhost:{_KC_PORT} "
+            "(admin/admin, realm 'rcrepro')."
         ),
         env=env,
         services=services,

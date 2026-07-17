@@ -315,8 +315,12 @@ def _bind_ports(doc: dict, bind: str) -> None:
         ports = svc.get("ports")
         if not ports:
             continue
+        # Prefix only a bare "port" or "host:container" mapping whose first field
+        # is numeric. A mapping already carrying an IP ("127.0.0.1:8025:8025",
+        # two colons) is left alone — otherwise it'd become a double-IP mapping.
         svc["ports"] = [
-            f"{bind}:{p}" if str(p).split(":", 1)[0].isdigit() else str(p)
+            f"{bind}:{p}" if str(p).count(":") < 2 and str(p).split(":", 1)[0].isdigit()
+            else str(p)
             for p in ports
         ]
 

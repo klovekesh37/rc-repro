@@ -7,6 +7,7 @@ generated docker-compose.yml and a repro.json metadata file.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -15,6 +16,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from rc_repro import config
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write via a temp file in the same dir + os.replace, so readers never see a
+    partially written file (rename is atomic on the same filesystem)."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 @dataclass
@@ -50,8 +59,11 @@ def write(name: str, compose_yaml: str, meta: Metadata,
           files: list[tuple[str, str]] | None = None) -> None:
     ws = workspace(name)
     ws.mkdir(parents=True, exist_ok=True)
-    (ws / "docker-compose.yml").write_text(compose_yaml, encoding="utf-8")
-    (ws / "repro.json").write_text(json.dumps(asdict(meta), indent=2), encoding="utf-8")
+    # Write atomically (temp + rename): an interruption mid-write must not leave a
+    # half-written repro.json that read_meta would choke on, nor a compose file
+    # out of sync with its metadata.
+    _atomic_write(ws / "docker-compose.yml", compose_yaml)
+    _atomic_write(ws / "repro.json", json.dumps(asdict(meta), indent=2))
     # Preset-generated files (e.g. a seeded LDIF that a service mounts).
     # `{{ROOT_URL}}` is substituted with the repro's URL — presets are built
     # before the host port is known, so a generated file that must reference the
@@ -236,6 +248,25 @@ def compose_exec(name: str, service: str, args: list[str]) -> int:
 def rm_services(name: str, services: list[str]) -> int:
     """Stop and remove specific services (docker compose rm -s -f <services>)."""
     return _compose(name, "rm", "-s", "-f", *services).returncode
+
+
+def container_ids(name: str) -> list[str]:
+    """Container ids of a repro's running services (docker compose ps -q)."""
+    proc = _compose(name, "ps", "-q", capture=True)
+    return [line for line in (proc.stdout or "").split() if line]
+
+
+def docker_stats(container_ids: list[str]) -> str:
+    """One `docker stats --no-stream` sample for the given containers, as
+    tab-separated `name<TAB>cpu%<TAB>mem-usage` lines ('' on error/none)."""
+    if not container_ids:
+        return ""
+    proc = subprocess.run(
+        ["docker", "stats", "--no-stream", "--format",
+         "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}", *container_ids],
+        capture_output=True, text=True,
+    )
+    return proc.stdout if proc.returncode == 0 else ""
 
 
 def ps(name: str) -> str:
