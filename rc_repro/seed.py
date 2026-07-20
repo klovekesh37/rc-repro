@@ -115,7 +115,10 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
     # honoured when we could actually read the setting; unknown -> restore on.)
     email_2fa = "Accounts_TwoFactorAuthentication_By_Email_Enabled"
     rate_limiter = "API_Enable_Rate_Limiter"
-    email_2fa_was_on = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, email_2fa) is True
+    # Prior values (None = couldn't read). Restore is keyed on the KNOWN-off
+    # state only: an unreadable setting must never leave 2FA disabled, so unknown
+    # (None) restores ON — matching the limiter's "unknown -> restore on" rule.
+    email_2fa_prev = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, email_2fa)
     limiter_was_off = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, rate_limiter) is False
     _set(email_2fa, False)
     if not limiter_was_off and not _set(rate_limiter, False):
@@ -126,7 +129,7 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
     finally:
         if not limiter_was_off:
             _set(rate_limiter, True)
-        if email_2fa_was_on:
+        if email_2fa_prev is not False:   # was on, or unknown -> restore on
             _set(email_2fa, True)
 
 
@@ -179,8 +182,12 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
             if plan.rich and random.random() < 0.2:
                 mid = (r.json().get("message") or {}).get("_id")
                 if mid:
-                    timed("messages", "/api/v1/chat.postMessage", hdr_for(members),
-                          {"channel": channel_ref, "text": random.choice(_MESSAGES), "tmid": mid})
+                    # The thread reply is a real extra message — count it so the
+                    # reported total isn't understated (the reaction is not).
+                    tr = timed("messages", "/api/v1/chat.postMessage", hdr_for(members),
+                               {"channel": channel_ref, "text": random.choice(_MESSAGES), "tmid": mid})
+                    if tr is not None and tr.ok:
+                        n += 1
                     timed("messages", "/api/v1/chat.react", hdr_for(members),
                           {"messageId": mid, "emoji": random.choice([":+1:", ":tada:", ":eyes:"])})
         return n

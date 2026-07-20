@@ -154,15 +154,26 @@ def restore(applied: list[Applied]) -> list[str]:
     for a in applied:
         cpus = (a.prior_nano / 1e9) if a.prior_nano else cap[0]
         mem = a.prior_mem if a.prior_mem else cap[1]
+        # Build the restore incrementally so a known CPU limit is still restored
+        # when memory capacity is unknown (docker info failed), instead of the
+        # whole restore being skipped and the test's cap left in place.
+        cmd = ["docker", "update"]
+        if cpus:
+            cmd += ["--cpus", f"{cpus:g}"]
+        if mem:
+            # Restore the real prior swap limit when both memory and swap were
+            # actual limits before; a previously-unlimited service matches swap
+            # to memory (what apply() set — no extra swap).
+            swap = a.prior_swap if (a.prior_mem and a.prior_swap) else int(mem)
+            cmd += ["--memory", str(int(mem)), "--memory-swap", str(swap)]
+        if len(cmd) == 2:   # nothing known to restore (docker info failed)
+            problems.append(f"{a.service}: could not determine capacity to restore")
+            continue
+        cmd.append(a.container)
         try:
-            if cpus and mem:
-                cmd = ["docker", "update", "--cpus", f"{cpus:g}",
-                       "--memory", str(mem), "--memory-swap", str(mem), a.container]
-                r = subprocess.run(cmd, capture_output=True, text=True)
-                if r.returncode != 0:
-                    raise RuntimeError(r.stderr.strip())
-            else:   # capacity unknown (docker info failed) — nothing sane to set
-                problems.append(f"{a.service}: could not determine capacity to restore")
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip())
         except RuntimeError as exc:
             problems.append(f"{a.service}: {exc}")
     return problems

@@ -195,7 +195,8 @@ def _as_condition_map(deps) -> dict:
     return {d: {"condition": "service_started"} for d in (deps or [])}
 
 
-def _instance_services(base: dict, n: int, host_port: int) -> dict:
+def _instance_services(base: dict, n: int, host_port: int,
+                       container_port: int = config.RC_CONTAINER_PORT) -> dict:
     """Clone the rocketchat service into N instances (rocketchat-1..N).
 
     Instances coordinate over NATS (the moleculer transporter), matching the
@@ -216,7 +217,7 @@ def _instance_services(base: dict, n: int, host_port: int) -> dict:
     for i in range(1, n + 1):
         name = f"rocketchat-{i}"
         inst = copy.deepcopy(base)
-        inst["ports"] = [f"{host_port + i}:{config.RC_CONTAINER_PORT}"]   # direct access
+        inst["ports"] = [f"{host_port + i}:{container_port}"]   # direct access
         inst["environment"]["TRANSPORTER"] = "monolith+nats://nats:4222"
         inst["healthcheck"] = copy.deepcopy(_RC_HEALTHCHECK)
         if i > 1:
@@ -259,7 +260,7 @@ def build(spec: Spec) -> dict:
     # instances: clone it into rocketchat-1..N behind a load balancer.
     rc_services: dict = (
         {"rocketchat": rocketchat} if n == 1
-        else _instance_services(rocketchat, n, spec.host_port)
+        else _instance_services(rocketchat, n, spec.host_port, spec.container_port)
     )
 
     services: dict = dict(rc_services)

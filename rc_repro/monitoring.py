@@ -188,6 +188,8 @@ def files(rc_services: list[str]) -> list[tuple[str, str]]:
         ("monitoring/grafana/dashboards/rocketchat-metrics.json", _dashboard("rocketchat-metrics.json")),
         ("monitoring/grafana/dashboards/node-exporter-full.json", _dashboard("node-exporter-full.json")),
         ("monitoring/grafana/dashboards/mongodb-exporter.json", _dashboard("mongodb-exporter.json")),
+        # Client-side load metrics streamed by `loadtest --live` (remote-write).
+        ("monitoring/grafana/dashboards/k6-loadtest.json", _dashboard("k6-loadtest.json")),
     ]
 
 
@@ -196,4 +198,6 @@ def notes() -> list[str]:
         f"Grafana:    http://localhost:{_GRAFANA_PORT}  (admin/admin; anonymous view enabled)",
         f"Prometheus: http://localhost:{_PROM_PORT}  (Status -> Targets: rocketchat, mongodb, node-exporter)",
         "Dashboards auto-provisioned: Rocket.Chat Metrics, MongoDB, Node Exporter Full.",
+        "k6 Load Test dashboard is provisioned too; it fills in while a "
+        "`loadtest --live` run streams metrics.",
     ]

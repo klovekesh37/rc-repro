@@ -617,6 +617,22 @@ def test_monitoring_ships_full_dashboards_and_exporter_targets():
     assert "node-exporter:9100" in files["monitoring/file_sd_configs/node-exporter.yml"]
 
 
+def test_monitoring_ships_k6_loadtest_dashboard():
+    # loadtest --live streams k6_* metrics via remote-write; a dashboard must be
+    # provisioned to actually SEE them (Explore alone is easy to miss).
+    from rc_repro import monitoring
+    files = dict(monitoring.files(["rocketchat"]))
+    raw = files.get("monitoring/grafana/dashboards/k6-loadtest.json")
+    assert raw, "k6 load-test dashboard not shipped"
+    dash = json.loads(raw)
+    assert dash["title"] == "k6 Load Test" and dash["panels"]
+    # its panels must actually query the k6_ metrics the --live push produces,
+    # against the provisioned Prometheus datasource.
+    body = json.dumps(dash)
+    assert "k6_http_reqs_total" in body and "k6_http_req_duration_p95" in body
+    assert "DS_PROMETHEUS" in body
+
+
 def test_no_monitoring_by_default():
     doc = compose.build(_spec("8.4.1"))
     assert "prometheus" not in doc["services"] and "grafana" not in doc["services"]

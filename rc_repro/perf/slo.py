@@ -58,7 +58,8 @@ def _summary_key(key: str) -> str:
 
 
 def _actual(key: str, summary: dict) -> float:
-    raw = float(summary.get(_summary_key(key), 0.0))
+    raw = summary.get(_summary_key(key))
+    raw = float(raw) if raw is not None else 0.0   # null value -> 0, don't crash
     return raw * 100 if key == "error" else raw
 
 
@@ -69,7 +70,9 @@ def evaluate(rules: list[tuple[str, str, float, str]], summary: dict) -> list[di
     and fails — a metric that wasn't captured must never silently PASS at 0.0."""
     out = []
     for key, op, threshold, raw in rules:
-        measured = _summary_key(key) in summary
+        # A present-but-null value is not a real measurement — it must fail as
+        # "not measured", never pass at 0.0 (and never crash float(None)).
+        measured = summary.get(_summary_key(key)) is not None
         actual = _actual(key, summary)
         ok = measured and (actual <= threshold if op == "<=" else actual >= threshold)
         out.append({"key": key, "op": op, "threshold": threshold, "raw": raw,

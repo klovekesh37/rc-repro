@@ -658,6 +658,9 @@ def _pr_keycloak_master_ssl_off(meta: runner.Metadata, auth: rcapi.Auth, action:
     )
     if runner.compose_exec(meta.name, svc, ["bash", "-lc", script]) == 0:
         typer.echo("  ✓ Keycloak admin console enabled over HTTP.")
+    else:
+        ui.warn("  ⚠ could not relax Keycloak master-realm sslRequired "
+                "(is Keycloak up yet?) — the admin console may reject HTTP")
 
 
 def _pr_create_oauth_provider(meta: runner.Metadata, auth: rcapi.Auth, action: dict) -> None:
@@ -720,9 +723,15 @@ _POST_READY_ACTIONS = {
 
 
 def _run_post_ready(meta: runner.Metadata, auth) -> None:
+    actions = meta.extra.get("post_ready", [])
     if auth is None:
+        # Login failed (custom-admin preset, un-satisfiable 2FA, …). Don't let
+        # the preset's self-config vanish silently behind a "ready" banner.
+        if actions:
+            ui.warn(f"  ⚠ preset self-config skipped — could not log in as admin; "
+                    f"re-run once reachable: rc-repro ready --name {meta.name}")
         return
-    for action in meta.extra.get("post_ready", []):
+    for action in actions:
         handler = _POST_READY_ACTIONS.get(action.get("action"))
         if handler:
             handler(meta, auth, action)
@@ -1021,6 +1030,10 @@ def api(
         tag += "+2fa"
     typer.secho(f"HTTP {status}  [{tag}]  in {elapsed}", fg=typer.colors.GREEN if status < 400 else typer.colors.RED)
     typer.echo(text)
+    # Exit non-zero on an HTTP error so `rc-repro api ... || handle` (the
+    # customer-script / CI use case) can detect it, not just transport failures.
+    if status >= 400:
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -1722,8 +1735,9 @@ def loadtest(
                         f"(via k6 on {m.name!r}'s network)\n", bold=True)
             if live:
                 grafana = f"http://localhost:{config.MONITOR_PORTS[1]}"
-                ui.note(f"  live: k6 metrics streaming into Prometheus — watch in Grafana "
-                        f"({grafana} → Explore → k6_*)")
+                ui.note(f"  live: k6 metrics streaming into Prometheus — open the "
+                        f"'k6 Load Test' dashboard in Grafana ({grafana}), "
+                        "or Explore -> k6_*")
 
         # Server-side diagnosis (Phase C): RC's own /metrics (event-loop lag) and
         # Mongo's query profiler, armed for the run. Both best-effort.

@@ -54,11 +54,14 @@ def analyze(summary: dict, *, rcmetrics: dict | None = None, mongo: dict | None 
                 f"RC event loop saturated: lag peaked at {fmt_ms(worst['max'] * 1000)} "
                 f"on {worst_svc} — the Node process is the bottleneck; more CPU or more "
                 "instances (multi-instance preset) will help.")
-        elif worst["max"] >= LAG_MEAN_WARN_S:
+        elif worst["mean"] >= LAG_MEAN_WARN_S:
+            # Degraded is judged on the SUSTAINED lag (mean), not a lone peak —
+            # a single ~100ms peak is routine and shouldn't read as "degraded".
             lag_found = True
             findings.append(
-                f"RC event loop degraded: lag peaks of {fmt_ms(worst['max'] * 1000)} on "
-                f"{worst_svc} — approaching CPU saturation at this load.")
+                f"RC event loop degraded: lag averaged {fmt_ms(worst['mean'] * 1000)} "
+                f"(peaks to {fmt_ms(worst['max'] * 1000)}) on {worst_svc} — "
+                "approaching CPU saturation at this load.")
 
     # 2. Mongo slow queries / missing indexes.
     if mongo:

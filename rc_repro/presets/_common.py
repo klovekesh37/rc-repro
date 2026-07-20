@@ -7,7 +7,7 @@ from __future__ import annotations
 def truthy_param(params: dict, key: str, default: bool = False) -> bool:
     """Read a boolean --set param ("1"/"true"/"yes"/"on", case-insensitive)."""
     val = params.get(key)
-    if val is None:
+    if val is None or str(val).strip() == "":   # absent or `--set key=` -> default
         return default
     return str(val).strip().lower() in ("1", "true", "yes", "on")
 

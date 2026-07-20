@@ -248,7 +248,15 @@ def generate_pat(
         json={"tokenName": token_name, "bypassTwoFactor": bypass_2fa},
         timeout=timeout,
     )
-    j = r.json()
+    def _json(resp) -> dict:
+        # A 5xx/HTML/empty body must fall through to the RuntimeError below, not
+        # escape as a raw JSONDecodeError.
+        try:
+            return resp.json()
+        except ValueError:
+            return {}
+
+    j = _json(r)
     if j.get("success") and j.get("token"):
         return j["token"]
     # Already exists → regenerate it (also 2FA-guarded).
@@ -258,7 +266,7 @@ def generate_pat(
         json={"tokenName": token_name},
         timeout=timeout,
     )
-    j2 = r2.json()
+    j2 = _json(r2)
     if j2.get("success") and j2.get("token"):
         return j2["token"]
     raise RuntimeError(f"could not create PAT: {r.text[:200]}")
@@ -322,6 +330,23 @@ def set_setting(root_url: str, auth: Auth, password: str, setting_id: str, value
         return False
 
 
+def _method_succeeded(resp) -> bool:
+    """Whether a /api/v1/method.call response reflects a SUCCESSFUL method run.
+
+    method.call returns HTTP 200 with top-level `success: true` even when the
+    Meteor method itself threw — the real outcome is a JSON-encoded string in the
+    `message` field (`{"msg":"result", ..., "error": {...}}` on failure). So the
+    outer flag alone reports false success; the inner envelope must be checked."""
+    try:
+        body = resp.json()
+        if resp.status_code != 200 or body.get("success") is not True:
+            return False
+        inner = json.loads(body.get("message") or "{}")
+    except (ValueError, TypeError):
+        return False
+    return "error" not in inner
+
+
 def add_oauth_service(root_url: str, auth: Auth, password: str, name: str, timeout: float = 15.0) -> bool:
     """Create a Custom OAuth provider via RC's `addOAuthService` method.
 
@@ -336,7 +361,7 @@ def add_oauth_service(root_url: str, auth: Auth, password: str, name: str, timeo
             f"{root_url.rstrip('/')}/api/v1/method.call/addOAuthService",
             headers=headers, json={"message": msg}, timeout=timeout,
         )
-        return resp.status_code == 200 and resp.json().get("success") is True
+        return _method_succeeded(resp)
     except (requests.RequestException, ValueError):
         return False
 
@@ -350,7 +375,7 @@ def _method_call(root_url: str, auth: Auth, password: str, method: str, params: 
             f"{root_url.rstrip('/')}/api/v1/method.call/{method}",
             headers=headers, json={"message": msg}, timeout=timeout,
         )
-        return resp.status_code == 200 and resp.json().get("success") is True
+        return _method_succeeded(resp)
     except (requests.RequestException, ValueError):
         return False
 
@@ -412,7 +437,9 @@ def ensure_livechat_department(root_url: str, auth: Auth, password: str, name: s
         if b.get("success"):
             return (b.get("department") or {}).get("_id")
         # Already exists (or strict-schema reject) — look it up by name.
-        existing = requests.get(f"{base}/livechat/department", headers=hdr, timeout=timeout).json()
+        # count=0 -> all departments, so a match past the default page isn't missed.
+        existing = requests.get(f"{base}/livechat/department", headers=hdr,
+                                params={"count": 0}, timeout=timeout).json()
         for d in existing.get("departments", []):
             if d.get("name") == name:
                 return d.get("_id")

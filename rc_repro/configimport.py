@@ -82,7 +82,9 @@ def build_plan(settings_json: Path, *, only: set[str] | None = None) -> Plan:
         sid = it.get("_id")
         if not isinstance(sid, str) or not sid or "value" not in it:
             continue
-        if it["value"] == it.get("packageValue"):     # unchanged from default
+        # Unchanged-from-default. With no packageValue we can't tell, so skip
+        # rather than import a setting that may just be sitting at its default.
+        if "packageValue" not in it or it["value"] == it["packageValue"]:
             continue
         if only and sid.split("_", 1)[0] not in only:
             continue

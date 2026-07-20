@@ -16,6 +16,10 @@ _LABEL_RE = re.compile(r"[^a-z0-9_-]+")
 # How much worse a latency/error metric may get before the delta is flagged.
 REGRESS_PCT = 25.0
 
+# Minimum ABSOLUTE error-rate move (fraction) before a delta counts: keeps a
+# 0.1% -> 0.2% blip from flagging while a 0% -> 5% jump does.
+ERROR_ABS_FLOOR = 0.005
+
 
 def sanitize_label(label: str) -> str:
     """Filesystem-safe baseline name; raises ValueError if nothing survives."""
@@ -48,14 +52,22 @@ def load(label: str) -> dict:
 
 
 def _delta(metric: str, before: float, after: float, higher_is_better: bool) -> dict:
+    # pct is undefined against a zero baseline (stays 0 for display); the
+    # worse/flag decision then falls back to the absolute move so a metric that
+    # was 0 in the baseline and regressed isn't silently reported as unchanged.
     pct = (after / before - 1) * 100 if before else 0.0
-    worse = (pct < 0) if higher_is_better else (pct > 0)
+    worse = (after < before) if higher_is_better else (after > before)
+    if "error" in metric:
+        # Errors need a MEANINGFUL absolute move (ignores 0.1% -> 0.2%) and,
+        # when there is a baseline to divide by, a real % jump too — but a 0%
+        # baseline going non-zero always counts.
+        flag = (worse and abs(after - before) >= ERROR_ABS_FLOOR
+                and (not before or abs(pct) > REGRESS_PCT))
+    else:
+        flag = worse and (not before or abs(pct) > REGRESS_PCT)
     return {
         "metric": metric, "before": before, "after": after, "pct": pct,
-        "worse": worse,
-        # Regression flag: meaningfully worse, not noise. Errors use an absolute
-        # bump too (0.1% -> 0.2% is +100% but rarely meaningful).
-        "flag": worse and abs(pct) > REGRESS_PCT,
+        "worse": worse, "flag": flag,
     }
 
 
