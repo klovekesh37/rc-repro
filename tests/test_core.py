@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from rc_repro import compose, config, presets, rcapi, runner, seed, versions
+from rc_repro import compose, config, configimport, presets, rcapi, runner, scaleseed, seed, versions
 
 
 # --- version resolution (offline / fallback map) ------------------------------
@@ -382,6 +382,123 @@ def test_multi_instance_bad_count_is_actionable():
         assert "--set instances=" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+# --- config import (support-dump settings.json) -------------------------------
+
+
+def _dump(tmp_path, items):
+    p = tmp_path / "settings.json"
+    p.write_text(json.dumps(items))
+    return p
+
+
+def test_config_import_keeps_only_customized(tmp_path):
+    plan = configimport.build_plan(_dump(tmp_path, [
+        {"_id": "A", "value": True, "packageValue": True},     # unchanged -> skip
+        {"_id": "B", "value": "x", "packageValue": "y"},       # changed -> apply
+    ]))
+    assert plan.apply == [("B", "x")]
+
+
+def test_config_import_skips_redacted(tmp_path):
+    plan = configimport.build_plan(_dump(tmp_path, [
+        {"_id": "SMTP_Password", "value": "XXXXXXXX", "packageValue": ""},
+        {"_id": "Some_Secret", "value": "********", "packageValue": ""},
+        {"_id": "Real", "value": "keep", "packageValue": ""},
+    ]))
+    assert [s for s, _ in plan.apply] == ["Real"]
+    assert set(plan.redacted) == {"SMTP_Password", "Some_Secret"}
+
+
+def test_config_import_denies_identity_settings(tmp_path):
+    plan = configimport.build_plan(_dump(tmp_path, [
+        {"_id": "Site_Url", "value": "https://cust", "packageValue": ""},
+        {"_id": "Enterprise_License", "value": "RCV3_x", "packageValue": ""},
+        {"_id": "Assets_logo", "value": {"url": "a"}, "packageValue": {}},
+        {"_id": "Message_MaxAllowedSize", "value": 9000, "packageValue": 5000},
+    ]))
+    assert [s for s, _ in plan.apply] == ["Message_MaxAllowedSize"]
+    assert set(plan.denied) == {"Site_Url", "Enterprise_License", "Assets_logo"}
+
+
+def test_config_import_detects_oauth_providers(tmp_path):
+    plan = configimport.build_plan(_dump(tmp_path, [
+        {"_id": "Accounts_OAuth_Custom-Ms_entra_id", "value": True, "packageValue": False},
+        {"_id": "Accounts_OAuth_Custom-Ms_entra_id-id", "value": "abc", "packageValue": ""},
+    ]))
+    assert plan.oauth_services == ["Ms_entra_id"]
+
+
+def test_config_import_only_filter(tmp_path):
+    items = [
+        {"_id": "Livechat_title", "value": "T", "packageValue": ""},
+        {"_id": "LDAP_Enable", "value": True, "packageValue": False},
+    ]
+    plan = configimport.build_plan(_dump(tmp_path, items), only={"Livechat"})
+    assert [s for s, _ in plan.apply] == ["Livechat_title"]
+
+
+def test_config_import_tolerates_malformed_entries(tmp_path):
+    # a hand-edited dump: a bare string, a dict with a numeric _id, a dict with
+    # no value — none should crash build_plan; the one good entry still applies.
+    plan = configimport.build_plan(_dump(tmp_path, [
+        "just a string",
+        {"_id": 123, "value": "x", "packageValue": "y"},
+        {"_id": "NoValue", "packageValue": "y"},
+        {"_id": "Good", "value": "new", "packageValue": "old"},
+    ]))
+    assert [s for s, _ in plan.apply] == ["Good"]
+
+
+def test_config_import_redaction_variants(tmp_path):
+    plan = configimport.build_plan(_dump(tmp_path, [
+        {"_id": "A", "value": "xxxxxxxx", "packageValue": ""},   # lowercase mask
+        {"_id": "B", "value": "●●●●●●", "packageValue": ""},      # bullet mask
+        {"_id": "C", "value": "########", "packageValue": ""},   # hash mask
+        {"_id": "D", "value": "real-value", "packageValue": ""},  # legit
+    ]))
+    assert [s for s, _ in plan.apply] == ["D"]
+    assert set(plan.redacted) == {"A", "B", "C"}
+
+
+def test_config_import_rejects_non_list(tmp_path):
+    p = tmp_path / "settings.json"
+    p.write_text('{"not": "a list"}')
+    try:
+        configimport.build_plan(p)
+    except ValueError as exc:
+        assert "list of settings" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+# --- data-scale prefill (--scale) ---------------------------------------------
+
+
+def test_parse_scale_users_and_messages():
+    assert scaleseed.parse_scale("users=50000,messages=800000@team-chat") == {
+        "users": 50000, "messages": (800000, "team-chat")}
+
+
+def test_parse_scale_users_only():
+    assert scaleseed.parse_scale("users=100") == {"users": 100}
+
+
+def test_parse_scale_messages_without_room_raises():
+    for bad in ("messages=100", "users=abc", "foo=1"):
+        try:
+            scaleseed.parse_scale(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_parse_scale_room_id_embedded_safely():
+    # room ref is repr()'d into the JS, so a quote can't break out of the string
+    js_room = repr("evil'; db.dropDatabase(); //")
+    assert js_room.startswith(("'", '"')) and "dropDatabase" in js_room
 
 
 def test_yaml_preset_notes_parsed(tmp_path, monkeypatch):

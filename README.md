@@ -16,7 +16,7 @@ rc-repro down --name TICKET-1234 --volumes              # bin it when done
 - [Getting started](#getting-started) — prerequisites, install, your first repro
 - [Everyday use](#everyday-use) — commands & lifecycle
 - [Scenarios](#scenarios) — presets (LDAP, SAML, email, …) & monitoring
-- [Data & performance](#data--performance) — sample data, benchmarking, load testing
+- [Data & performance](#data--performance) — sample data, data-scale prefill, config import, benchmarking, load testing
 - [API testing](#api-testing)
 - [Reference](#reference) — command list, version resolution, state, development
 
@@ -331,8 +331,57 @@ call's latency (`HTTP 200 [admin] in 11ms`).
 Seed users are `alice`, `bob`, … (password = username). While seeding, email-2FA
 and the API rate limiter are temporarily disabled so it can log in as each user
 and post at volume — both are **restored to their prior values afterward** (so
-seeding an `email` repro leaves its 2FA setting on). For huge *user* counts use
-the `ldap` preset instead.
+seeding an `email` repro leaves its 2FA setting on).
+
+### Data-scale prefill (`--scale`)
+
+The REST seed above is realistic but slow — a round-trip per message. For
+*scale* repros (*"50k users"*, *"a room with 800k messages won't load"*) use
+`--scale`, which bulk-inserts straight into MongoDB (tens of thousands/sec):
+
+```bash
+rc-repro seed --name test --scale users=50000                       # 50k users in seconds
+rc-repro seed --name test --scale messages=800000@general           # fill a room
+rc-repro seed --name test --scale users=50000,messages=800000@team-chat
+rc-repro seed --name test --clear-scale                             # remove everything --scale added
+```
+
+Every scale document is tagged, so `--clear-scale` removes exactly what was
+inserted (and fixes the room's message counter) without touching your REST-seeded
+or real content. The target room (`messages=N@room`) must already exist — use
+`general` or a REST-seeded channel.
+
+**Trade-off:** bulk documents bypass RC's application hooks — bulk users are
+**credential-less** (not loginable; log in as a REST-seeded user or `admin` to
+browse them) and messages fire no notifications/mentions/threading. Use `--scale`
+for scale/perf behaviour, the REST seed for feature behaviour.
+
+## Config import (`config-import`)
+
+Reproduce a *customer's* configuration, not a default one. Point `config-import`
+at the `*-settings.json` from a support dump and it applies the settings the
+customer actually changed:
+
+```bash
+rc-repro config-import ./support-dump/8.5.0-settings.json --name test
+rc-repro config-import ./8.5.0-settings.json --name test --dry-run     # preview the plan
+rc-repro config-import ./8.5.0-settings.json --name test --only Livechat,LDAP
+```
+
+It imports only settings that differ from their default, and deliberately
+**skips**:
+
+- **redacted secrets** (`XXXXXXXX` in the dump — SMTP/OAuth/token passwords); it
+  lists them so you can set them by hand,
+- **identity/environment settings** that would break or pollute a local repro —
+  `Site_Url`, `Enterprise_License`, `Assets_*`, deployment fingerprint, cloud
+  registration.
+
+Custom OAuth providers (e.g. Entra ID) are **pre-created** automatically so their
+settings apply. `--dry-run` prints the full apply/skip plan without changing
+anything. Some settings need `rc-repro restart` to fully take effect; a few
+Enterprise/module-gated settings will be reported as rejected on an unlicensed
+repro (they apply once a license is present).
 
 ## Version comparison (`benchmark`)
 
@@ -526,7 +575,8 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `list` | all repros: version, port, state, URL |
 | `info` | URL, admin creds, snippets, preset notes |
 | `token` / `api` / `pat` | REST auth + calls |
-| `seed` | populate a repro with sample users/channels/messages (`--stats` for CPU/RAM cost) |
+| `seed` | populate a repro with sample users/channels/messages (`--stats` for CPU/RAM cost; `--scale` for bulk Mongo data-scale prefill) |
+| `config-import` | apply a customer's exported settings (support-dump `*-settings.json`) to a repro; `--dry-run`, `--only` |
 | `stats` | sample a repro's container CPU/RAM (`--for N`, or `--watch` live) |
 | `benchmark` | boot several versions, run identical seed workload, compare (regression check) |
 | `loadtest` | drive concurrent HTTP load with k6 as real seeded users; per-step latency, SLO gate, `--save`/`--compare` baselines, `--spike`, `--live` |

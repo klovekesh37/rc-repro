@@ -12,12 +12,13 @@ import textwrap
 import time
 from dataclasses import asdict as dc_asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import requests
 import typer
 
-from rc_repro import compose, config, perf, presets, rcapi, runner, ui, versions
+from rc_repro import compose, config, configimport, presets, perf, rcapi, runner, scaleseed, ui, versions
 from rc_repro import seed as seeder
 from rc_repro.perf import report as perf_report
 from rc_repro.perf.timings import fmt_ms
@@ -444,6 +445,56 @@ def _run_seed(meta: runner.Metadata, profile: str,
         resources = mon.stop() if mon else None   # stop the sampler thread even if seed raises
     total = time.monotonic() - t0
     _print_seed_result(s, total, resources, meta)
+
+
+def _scale_result(out: str) -> dict | None:
+    """Last JSON line from a scaleseed mongosh run (banners may precede it)."""
+    for line in reversed((out or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    return None
+
+
+def _run_scale(meta: runner.Metadata, spec_str: str) -> None:
+    try:
+        spec = scaleseed.parse_scale(spec_str)
+    except ValueError as exc:
+        _err(str(exc))
+    if not spec:
+        _err("--scale had nothing to do (want users=N and/or messages=N@room)")
+    ui.warn("bulk Mongo prefill: users are credential-less and messages fire no "
+            "app hooks — for scale/perf repros, not feature testing.")
+    if "users" in spec:
+        typer.echo(f"Inserting {spec['users']:,} users…")
+        res = _scale_ok(*scaleseed.bulk_users(meta.name, spec["users"]), "user prefill")
+        ui.ok(f"✓ inserted {res.get('inserted', 0):,} users")
+    if "messages" in spec:
+        n, room = spec["messages"]
+        typer.echo(f"Inserting {n:,} messages into {room!r}…")
+        res = _scale_ok(*scaleseed.bulk_messages(meta.name, n, room), "message prefill",
+                        hint="create the room first (REST seed, or use `general`)")
+        ui.ok(f"✓ inserted {res.get('inserted', 0):,} messages into {room!r}")
+
+
+def _scale_ok(rc: int, out: str, what: str, *, hint: str = "") -> dict:
+    """Validate a scaleseed mongosh result: non-zero exit / no JSON => hard fail;
+    a JS-level {error} (surfaced on stdout by scaleseed._eval) => report it."""
+    res = _scale_result(out)
+    if rc != 0 or not res:
+        _err(f"{what} failed (is mongodb up?): {out.strip()[:200]}")
+    if res.get("error"):
+        _err(f"{what} failed: {res['error']}" + (f" — {hint}" if hint else ""))
+    return res
+
+
+def _clear_scale(meta: runner.Metadata) -> None:
+    res = _scale_ok(*scaleseed.clear(meta.name), "clear")
+    ui.ok(f"✓ removed {res.get('users', 0):,} scale users and "
+          f"{res.get('messages', 0):,} scale messages")
 
 
 def _short_container(full: str, repro_name: str, keep_index: bool = False) -> str:
@@ -998,11 +1049,85 @@ def seed_cmd(
     channels: Optional[int] = typer.Option(None, "--channels", help="override channel count"),
     messages: Optional[int] = typer.Option(None, "--messages", help="override messages per channel"),
     stats: bool = typer.Option(False, "--stats", help="also report CPU/RAM cost of the seed"),
+    scale: str = typer.Option(
+        None, "--scale",
+        help="bulk Mongo prefill for scale repros, e.g. users=50000,messages=800000@team-chat"),
+    clear_scale: bool = typer.Option(
+        False, "--clear-scale", help="remove data a prior --scale added, then exit"),
 ) -> None:
-    """Populate a repro with sample users, channels, DMs and messages."""
+    """Populate a repro with sample users, channels, DMs and messages.
+
+    --scale bulk-inserts users/messages straight into MongoDB (orders of
+    magnitude faster than the REST seed) to reproduce SCALE/perf behaviour.
+    Bulk users are credential-less and messages fire no app hooks; use the
+    default REST seed when you need real, loginable users.
+    """
     _require_docker()
     m = runner.read_meta(_resolve_name(name))
+    if clear_scale:
+        _clear_scale(m)
+        return
+    if scale:
+        _run_scale(m, scale)
+        return
     _run_seed(m, profile, users, channels, messages, stats=stats)
+
+
+@app.command(name="config-import")
+def config_import(
+    settings_file: str = typer.Argument(
+        ..., help="path to a support-dump *-settings.json"),
+    name: str = typer.Option("", "--name", "-n"),
+    only: str = typer.Option(
+        None, "--only", help="comma-separated id prefixes, e.g. Livechat,LDAP,Accounts"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="show the import plan without changing anything"),
+) -> None:
+    """Apply a customer's exported settings (from a support dump) to a repro.
+
+    Imports only settings the customer CHANGED from default, skipping secrets the
+    dump redacts and identity/environment settings (license, Site_Url, assets)
+    that would break or pollute a local repro.
+    """
+    _require_docker()
+    path = Path(settings_file)
+    if not path.is_file():
+        _err(f"no such file: {settings_file}")
+    try:
+        plan = configimport.build_plan(
+            path, only={p.strip() for p in only.split(",")} if only else None)
+    except (ValueError, json.JSONDecodeError) as exc:
+        _err(f"couldn't read settings file: {exc}")
+    m = runner.read_meta(_resolve_name(name))
+
+    lines = [f"apply    {len(plan.apply)} customized setting(s)",
+             f"skip     {len(plan.redacted)} redacted secret(s), "
+             f"{len(plan.denied)} identity/environment setting(s)"]
+    if plan.oauth_services:
+        lines.append(f"oauth    pre-create: {', '.join(plan.oauth_services)}")
+    typer.echo("")
+    ui.box("config import" + (" (dry run)" if dry_run else ""), lines, 64,
+           title_color=typer.colors.CYAN)
+    if plan.redacted:
+        ui.warn("  set these by hand (redacted in the dump): "
+                + ", ".join(plan.redacted))
+    if dry_run:
+        for sid, value in plan.apply:
+            v = repr(value)
+            typer.echo(f"    {sid:<48} = {v[:60] + '…' if len(v) > 60 else v}")
+        return
+
+    try:
+        auth = _login(m)
+    except Exception as exc:  # noqa: BLE001
+        _err(f"can't import — repro not ready (`rc-repro ready --name {m.name}`): {exc}")
+    res = configimport.apply(m.root_url, auth, plan, log=lambda s: typer.echo(s))
+    if res["failed"]:
+        ui.warn(f"  {res['failed']} setting(s) rejected: {', '.join(res['failures'][:10])}"
+                + (" …" if res["failed"] > 10 else ""))
+    ui.ok(f"✓ imported {res['applied']} setting(s), skipped {res['skipped']}")
+    ui.hint("  some settings need an RC restart to fully take effect: "
+            f"rc-repro restart --name {m.name}")
 
 
 @app.command()
