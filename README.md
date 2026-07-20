@@ -359,45 +359,137 @@ Runs are sequential on the same host; the deltas between versions are the signal
 Drive real concurrent HTTP load with [k6] and gate the result against an SLO:
 
 ```bash
-rc-repro loadtest --name test --scenario messages --vus 50 --duration 60s
+rc-repro loadtest --name test --scenario journey --vus 50 --duration 60s     # full user sessions
 rc-repro loadtest --name test --scenario mixed --ramp 10:200 --duration 2m --stats --report
 rc-repro loadtest --name test --scenario messages --slo p95=300ms,error=1%,rps=100   # CI gate
 
 # Hit the customer's *actual* slow call under load:
 rc-repro loadtest --name test --scenario custom --endpoint "GET /api/v1/channels.list?count=100" --vus 20
 rc-repro loadtest --name test --scenario custom --endpoint "POST /api/v1/chat.postMessage" --body '{"channel":"#general","text":"hi"}'
+
+# Before/after — did the fix/setting change actually help?
+rc-repro loadtest --name test --scenario journey --save before-fix
+rc-repro loadtest --name test --scenario journey --compare before-fix
+
+# Customer-sized hardware — what does *their* 2-CPU/2GB box handle?
+rc-repro loadtest --name test --scenario journey --constrain "rc=2cpu/2g,mongo=1cpu/1g" --compare before-fix
 ```
 ```
-+- loadtest custom GET /api/v1/channels.list?count=100 (20 VUs / 30s) -+
-|  throughput  42.0 req/s   (1260 requests)                            |
-|  latency     p50 340ms  p90 720ms  p95 980ms  p99 1400ms             |
-|  errors      8.10%   checks 92% ok                                   |
-|  responses   2xx 1158 · 429 61 · 5xx 41                              |
-+---------------------------------------------------------------------+
-  ✓ p95 <= 1000ms  (actual 980ms)    SLO gate: PASS
++- loadtest journey (50 VUs / 60s, 10 users) ---------+
+|  throughput  229 req/s   (1850 requests)            |
+|  latency     p50 7ms  p90 60ms  p95 66ms  p99 88ms  |
+|  errors      0.00%   checks 100% ok                 |
+|  responses   2xx 1850                               |
++-----------------------------------------------------+
+Per-step latency:
+  step      count       p50     p95     p99
+  login       370      60ms    86ms   111ms
+  open        370       6ms    17ms    26ms
+  post        370      24ms    61ms    77ms
+vs baseline 'before-fix' (journey, saved 2026-07-18):
+  p95                   66ms -> 190ms       +188%   <- regression
+  step post p95         61ms -> 180ms       +195%   <- regression
 ```
 
-**Scenarios:** `messages` (write path), `login` (auth), `read`
-(`channels.history`), `mixed` (60% read / 30% post / 10% login), and **`custom`**
-— any endpoint you name with `--endpoint "METHOD /path"` (`--body` for
-POST/PUT/PATCH), so you can reproduce the exact call a customer reports as slow.
+**Scenarios:** **`journey`** (a full user session per iteration — login → rooms →
+open → post → sync, **each step timed** so you see *which one* is slow), `messages`
+(write path), `login` (auth), `read` (`channels.history`), `mixed` (60/30/10 blend
+with per-endpoint latency), **`webhook`** (an incoming-webhook storm — the
+integration auto-created for the run), **`badbot`** (a badly-written script: tight
+unpaginated polling), and **`custom`** — any endpoint you name with
+`--endpoint "METHOD /path"` (`--body` for POST/PUT/PATCH).
+
+**Load shapes:** constant `--vus`, `--ramp 10:200`, or **`--spike 10:100`** —
+base load for a third, a sharp spike for a third, then a recovery window; the
+result reports **how long p95 took to recover** after load dropped (or that it
+didn't). Long runs with `--stats` also report the **RAM slope per hour** (the
+soak-test leak signal).
+
+**Watch it live:** with the monitoring add-on attached, `--live` streams k6's
+metrics into the same Prometheus — client-side load and RC server metrics on
+one Grafana timeline (`http://localhost:5050` → Explore → `k6_*`).
+
+**Real users:** load is spread across seeded users (`alice`, `bob`, … — `--users N`,
+default 10) so it carries real per-user identity, permissions and subscriptions;
+if the repro isn't seeded it falls back to the admin token with a warning
+(`--users 0` forces admin-only; `custom` always uses the admin PAT).
+
+**Before/after:** `--save LABEL` stores a run (`~/.rc-repro/loadtests/`);
+`--compare LABEL` diffs the current run against it — per-metric and per-step
+deltas, regressions flagged. The report also embeds a **workspace snapshot**
+(version, instances, users/rooms/messages in the DB) so results are comparable
+evidence, and `--json` prints a machine-readable result for CI.
+
+**Customer-sized hardware:** `--constrain "rc=2cpu/2g,mongo=1cpu/1g"` caps
+services for the duration of the test (live `docker update`, no restart —
+restored after), so results reflect the *customer's* box, not your laptop.
+`rc` covers every RC instance, `mongo` is MongoDB, or name any compose service;
+each takes a CPU count (`0.5cpu`) and/or memory cap (`512m`, `2g`). ⚠ A memory
+cap below the service's current usage can OOM-kill it — which *is* how an
+undersized box behaves, but expect errors in that run.
+
+**Diagnosis (on by default; `--no-diag` to skip):** every run also collects the
+*server side* of the story and ends with a plain-language **verdict**:
+
+- **RC internals** — RC's own Prometheus metrics sampled during the run
+  (enabled/restored automatically): **event-loop lag**, the Node saturation
+  signal — once the loop lags, every request queues behind it.
+- **Slow MongoDB queries** — Mongo's profiler is armed for the run (`--slowms`,
+  default 100ms) and the slowest queries are read back with their plan, flagging
+  **COLLSCAN** (missing index) — the single most useful line in a perf ticket.
+- **Latency over time** — an ASCII p95 timeline that shows degradation and pins
+  *when* errors started, not just how many.
+
+```
+Verdict:
+  - RC event loop saturated: lag peaked at 2.29s on rocketchat - the Node process
+      is the bottleneck; more CPU or more instances (multi-instance preset) will help.
+  - MongoDB ran 12 collection scan(s) (COLLSCAN) among the profiled slow queries -
+      likely a missing index.
+```
+
+## Capacity finder (`capacity`)
+
+How many concurrent users does this workspace (or *this customer's hardware*)
+actually sustain? `capacity` doubles VUs until your SLO breaks, bisects to the
+boundary, and tells you why it broke:
+
+```bash
+rc-repro capacity --name test --scenario journey --slo "p95=300ms,error=2%"
+rc-repro capacity --name test --constrain "rc=2cpu/2g" --report   # on their box
+```
+```
+   4 VUs             112.8 req/s   p95   111ms   err  0.00%   PASS
+   8 VUs             130.8 req/s   p95   166ms   err  0.00%   PASS
+  16 VUs             137.5 req/s   p95   260ms   err  0.00%   PASS
+  32 VUs             148.9 req/s   p95   547ms   err  0.00%   FAIL (p95 <= 300ms)
+  24 VUs (bisect)    140.3 req/s   p95   432ms   err  0.00%   FAIL
+  20 VUs (bisect)    138.8 req/s   p95   348ms   err  0.00%   FAIL
+
+Capacity: ~16 concurrent VUs (holds at 16, breaks at 20)
+  why it broke: at 20 VUs the RC event loop saturated (lag peaked at 815ms)
+```
+
+Tune the search with `--start` (first VU step, default 10), `--max` (stop
+doubling past this, default 640), and `--step-duration` (how long each step
+runs, default 20s); it also takes `--scenario`, `--users`, `--constrain`,
+`--report` and `--json` like `loadtest`.
 
 The **responses** line breaks failures down by class — `429` (rate-limited), `4xx`
 (client error), `5xx` (server error) — so you can tell *"slow **and** crashing"*
 from *"just being throttled"* at a glance.
 
 > **What "VUs" are:** virtual users are k6's concurrent workers — **not** Rocket.Chat
-> accounts. All VUs authenticate as the one admin token loadtest mints; none are
-> created or deleted. Note the *write* scenarios (`messages`, `mixed`, a custom
-> `POST`) leave real messages in `#general`; `read`/`login`/custom `GET` add nothing.
+> accounts (none are created or deleted). Write scenarios (`journey`, `messages`,
+> `mixed`, a custom `POST`) leave real messages in `#general`; `read`/`login`/custom
+> `GET` add nothing.
 
 k6 runs as a throwaway container **on the repro's own docker network**, so it hits
 the internal service address (works even with loopback-only binds and
-multi-instance repros, which it targets through Traefik). Load is offered via a
-bypass-2FA PAT — exactly how a customer script hits the API — and the rate limiter
-is disabled for the run, then restored. With `--slo`, the command **exits
-non-zero** if any rule fails, so it drops straight into CI. `--stats` adds the
-CPU/RAM cost; `--report` writes a shareable markdown report.
+multi-instance repros, which it targets through Traefik). The rate limiter is
+disabled for the run, then restored. With `--slo`, the command **exits non-zero**
+if any rule fails, so it drops straight into CI. `--stats` adds the CPU/RAM cost;
+`--report` writes a shareable markdown report.
 
 [k6]: https://k6.io
 
@@ -437,7 +529,8 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `seed` | populate a repro with sample users/channels/messages (`--stats` for CPU/RAM cost) |
 | `stats` | sample a repro's container CPU/RAM (`--for N`, or `--watch` live) |
 | `benchmark` | boot several versions, run identical seed workload, compare (regression check) |
-| `loadtest` | drive concurrent HTTP load with k6, check against an SLO (`--slo`, non-zero exit on breach) |
+| `loadtest` | drive concurrent HTTP load with k6 as real seeded users; per-step latency, SLO gate, `--save`/`--compare` baselines, `--spike`, `--live` |
+| `capacity` | double VUs until the SLO breaks, bisect the boundary — "handles ~N concurrent" + why it broke |
 | `monitor` | attach/detach Prometheus + Grafana on a running repro |
 | `logs` | tail a repro's logs |
 | `presets` | list available presets |
@@ -469,6 +562,7 @@ only for RC < 8 (deprecated in 8.x).
 ├── config.yaml               # default_repro, optional reg_token / rc_image
 ├── presets/                  # your custom/team presets
 ├── reports/                  # benchmark & loadtest markdown reports
+├── loadtests/                # saved loadtest baselines (--save / --compare)
 └── repros/<name>/
     ├── docker-compose.yml     # generated — don't hand-edit; re-run `up`
     ├── repro.json             # metadata

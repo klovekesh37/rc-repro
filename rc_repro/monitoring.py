@@ -96,6 +96,9 @@ def services() -> dict:
                 "--config.file=/etc/prometheus/prometheus.yml",
                 "--web.enable-lifecycle",
                 "--storage.tsdb.retention.time=15d",
+                # Accept pushed metrics: loadtest --live streams k6 results here,
+                # so client-side load sits next to RC metrics in Grafana.
+                "--web.enable-remote-write-receiver",
             ],
             "volumes": [
                 "./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro",

@@ -245,9 +245,36 @@ def compose_exec(name: str, service: str, args: list[str]) -> int:
     return _compose(name, "exec", "-T", service, *args).returncode
 
 
+def compose_exec_capture(name: str, service: str, args: list[str]) -> tuple[int, str]:
+    """Like compose_exec, but captures stdout: (returncode, stdout)."""
+    r = _compose(name, "exec", "-T", service, *args, capture=True)
+    return r.returncode, r.stdout or ""
+
+
 def rm_services(name: str, services: list[str]) -> int:
     """Stop and remove specific services (docker compose rm -s -f <services>)."""
     return _compose(name, "rm", "-s", "-f", *services).returncode
+
+
+def service_container_ids(name: str, service: str) -> list[str]:
+    """Container id(s) of one compose service in this repro (usually a single id)."""
+    r = _compose(name, "ps", "-q", service, capture=True)
+    if r.returncode != 0:
+        return []
+    return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+
+
+def docker_capacity() -> tuple[float, int] | None:
+    """(cpus, memory_bytes) available to the docker engine/VM, or None."""
+    r = subprocess.run(["docker", "info", "--format", "{{.NCPU}} {{.MemTotal}}"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    try:
+        ncpu, mem = r.stdout.split()
+        return float(ncpu), int(mem)
+    except ValueError:
+        return None
 
 
 def container_ids(name: str) -> list[str]:

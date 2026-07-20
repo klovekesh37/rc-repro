@@ -264,6 +264,36 @@ def generate_pat(
     raise RuntimeError(f"could not create PAT: {r.text[:200]}")
 
 
+def create_incoming_webhook(root_url: str, auth: Auth, password: str,
+                            channel: str = "#general",
+                            name: str = "rc-repro-loadtest-hook",
+                            timeout: float = 15.0) -> str | None:
+    """Create (or reuse) an incoming-webhook integration and return its POST path
+    (/hooks/<id>/<token>), or None. Used by the loadtest `webhook` scenario."""
+    base = f"{root_url.rstrip('/')}/api/v1"
+    hdr = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    payload = {
+        "type": "webhook-incoming", "name": name, "enabled": True,
+        "username": "rocket.cat", "channel": channel, "scriptEnabled": False,
+        "script": "", "alias": "loadtest", "avatar": "", "emoji": "",
+    }
+    try:
+        r = requests.post(f"{base}/integrations.create", headers=hdr, json=payload, timeout=timeout)
+        if r.status_code == 200 and r.json().get("success"):
+            i = r.json()["integration"]
+            return f"/hooks/{i['_id']}/{i['token']}"
+        # Likely already exists from a previous run — find it by name.
+        r2 = requests.get(f"{base}/integrations.list", headers=hdr,
+                          params={"count": 100}, timeout=timeout)
+        if r2.status_code == 200:
+            for i in r2.json().get("integrations") or []:
+                if i.get("name") == name and i.get("token"):
+                    return f"/hooks/{i['_id']}/{i['token']}"
+    except (requests.RequestException, ValueError, KeyError):
+        pass
+    return None
+
+
 def get_setting(root_url: str, auth: Auth, password: str, setting_id: str, timeout: float = 15.0):
     """Read a Rocket.Chat setting's current value, or None if unavailable."""
     headers = {**auth.headers(), **password_2fa_headers(password)}

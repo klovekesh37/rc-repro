@@ -10,6 +10,7 @@ import shutil
 import sys
 import textwrap
 import time
+from dataclasses import asdict as dc_asdict
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -1231,6 +1232,133 @@ def _status_breakdown(summary: dict) -> str:
     return " · ".join(parts)
 
 
+def _login_seed_users(m: runner.Metadata, count: int) -> list[dict]:
+    """Plain-login up to `count` seed users (alice, bob, …; password=username) and
+    return [{username, password, token, uid}] for those that succeed. Failures are
+    simply skipped (unseeded repro, or 2FA-guarded logins on the email preset)."""
+    users: list[dict] = []
+    url = m.root_url.rstrip("/") + "/api/v1/login"
+    for i in range(count):
+        uname = seeder.username(i)
+        try:
+            r = requests.post(url, json={"user": uname, "password": uname}, timeout=10)
+        except requests.RequestException:
+            break   # workspace unreachable — no point trying the rest
+        if r.status_code == 200:
+            d = r.json().get("data") or {}
+            if d.get("authToken"):
+                users.append({"username": uname, "password": uname,
+                              "token": d["authToken"], "uid": d["userId"]})
+    return users
+
+
+def _workspace_snapshot(m: runner.Metadata, auth: rcapi.Auth, instances: int) -> dict:
+    """Best-effort workspace context for the report/baseline: version, topology,
+    and dataset size — the numbers that make a perf result comparable."""
+    snap = {"rc_version": m.rc_version, "preset": m.preset, "instances": instances}
+    try:
+        # refresh=true: without it RC returns the last cron-generated stats,
+        # which are all zeros on a fresh workspace.
+        status, text = rcapi.call(m.root_url, "GET", "/api/v1/statistics?refresh=true", auth=auth)
+        if status == 200:
+            j = json.loads(text)
+            for key, field_ in (("users", "totalUsers"), ("rooms", "totalRooms"),
+                                ("messages", "totalMessages")):
+                if j.get(field_) is not None:
+                    snap[key] = j[field_]
+    except Exception:  # noqa: BLE001 - snapshot must never fail the run
+        pass
+    return snap
+
+
+def _print_steps(steps: dict) -> None:
+    if not steps:
+        return
+    from rc_repro.perf import baseline
+    typer.echo("")
+    ui.note("Per-step latency:")
+    typer.echo(f"  {'step':<8} {'count':>6}   {'p50':>7} {'p95':>7} {'p99':>7}")
+    for s in baseline.step_order(steps):
+        v = steps[s]
+        typer.echo(f"  {s:<8} {v.get('count', 0):>6.0f}   "
+                   f"{fmt_ms(v.get('p50') or 0):>7} {fmt_ms(v.get('p95') or 0):>7} "
+                   f"{fmt_ms(v.get('p99') or 0):>7}")
+
+
+def _fmt_compare_value(metric: str, v: float) -> str:
+    if "rps" in metric:
+        return f"{v:.1f}"
+    if "error" in metric:
+        return f"{v * 100:.2f}%"
+    return fmt_ms(v)
+
+
+def _print_compare(rows: list[dict], base: dict) -> None:
+    ctxb = base.get("ctx") or {}
+    typer.echo("")
+    ui.note(f"vs baseline {base.get('label', '?')!r} "
+            f"({ctxb.get('label', ctxb.get('scenario', '?'))}, saved {str(base.get('saved_at', ''))[:19]}):")
+    width = max((len(r["metric"]) for r in rows), default=0)
+    for r in rows:
+        before = _fmt_compare_value(r["metric"], r["before"])
+        after = _fmt_compare_value(r["metric"], r["after"])
+        line = f"  {r['metric']:<{width}}  {before:>8} -> {after:<8} {r['pct']:+6.0f}%"
+        if r["flag"]:
+            typer.secho(line + "   <- regression", fg=typer.colors.YELLOW)
+        elif not r["worse"] and abs(r["pct"]) > 25:
+            typer.secho(line, fg=typer.colors.GREEN)
+        else:
+            typer.echo(line)
+
+
+def _print_diag(rcm: dict, mongo_slow: dict | None, tl: dict | None,
+                verdict_lines: list[str], repro_name: str) -> None:
+    """Phase C console output: timeline, RC internals, slow queries, verdict."""
+    from rc_repro.perf import timeline as timeline_mod
+    if tl:
+        typer.echo("")
+        for line in timeline_mod.render_ascii(tl):
+            typer.echo(f"  {line}")
+    if rcm:
+        typer.echo("")
+        ui.note("RC internals during the test:")
+        for svc in sorted(rcm):
+            m = rcm[svc]
+            bits = []
+            # Histogram peak (per-interval) over the run; instantaneous as fallback.
+            peak = m.get("eventloop_lag_max_s") or m.get("eventloop_lag_s")
+            p99 = m.get("eventloop_lag_p99_s")
+            if peak:
+                lag_bit = f"event-loop lag peak {fmt_ms(peak['max'] * 1000)}"
+                if p99:
+                    lag_bit += f" / p99 {fmt_ms(p99['max'] * 1000)}"
+                bits.append(lag_bit)
+            heap = m.get("heap_used_bytes")
+            if heap:
+                bits.append(f"heap {heap['max'] / 1e6:.0f}MB")
+            ddp = m.get("ddp_users")
+            if ddp:
+                bits.append(f"ddp users {ddp['max']:.0f}")
+            if bits:
+                typer.echo(f"  {svc:<14} {'   '.join(bits)}")
+    if mongo_slow and mongo_slow.get("slow"):
+        typer.echo("")
+        ui.note(f"Slow MongoDB queries ({mongo_slow['total']} profiled, "
+                f"{mongo_slow['collscan']} COLLSCAN):")
+        for s in mongo_slow["slow"]:
+            plan = s.get("plan") or "?"
+            typer.echo(f"  {fmt_ms(s['millis']):>7}  {s['ns']}  {s['op']}  [{plan}]  "
+                       f"docs {s['docs']}/ret {s['ret']}")
+    if verdict_lines:
+        typer.echo("")
+        typer.secho("Verdict:", bold=True)
+        for line in verdict_lines:
+            wrapped = textwrap.wrap(_ascii(line), width=84, subsequent_indent="    ")
+            typer.secho("  - " + wrapped[0], fg=typer.colors.CYAN)
+            for cont in wrapped[1:]:
+                typer.secho("  " + cont, fg=typer.colors.CYAN)
+
+
 def _print_loadtest(ctx: dict, summary: dict, slo_results: list[dict]) -> None:
     from rc_repro.perf import slo as slo_mod
     rows = [
@@ -1244,8 +1372,13 @@ def _print_loadtest(ctx: dict, summary: dict, slo_results: list[dict]) -> None:
     breakdown = _status_breakdown(summary)
     if breakdown:
         rows.append(("responses", breakdown))
+    if ctx.get("constrained"):
+        rows.append(("constrained", ctx["constrained"]))
     load = (f"ramp {ctx['ramp']}" if ctx.get("ramp") else f"{ctx['vus']} VUs") + f" / {ctx['duration']}"
+    if ctx.get("users"):
+        load += f", {ctx['users']} users"
     ui.panel(f"loadtest {ctx.get('label', ctx['scenario'])} ({load})", rows)
+    _print_steps(summary.get("steps") or {})
     if slo_results:
         typer.echo("")
         passed = all(r["ok"] for r in slo_results)
@@ -1261,25 +1394,40 @@ def _print_loadtest(ctx: dict, summary: dict, slo_results: list[dict]) -> None:
 @app.command()
 def loadtest(
     name: str = typer.Option("", "--name", "-n"),
-    scenario: str = typer.Option("messages", "--scenario", help="messages | login | read | mixed | custom"),
+    scenario: str = typer.Option("messages", "--scenario", help="messages | login | read | mixed | journey | webhook | badbot | custom"),
     endpoint: str = typer.Option("", "--endpoint", help="custom scenario: the call to hit, e.g. \"GET /api/v1/channels.list?count=100\""),
     body: str = typer.Option("", "--body", help="custom scenario: JSON request body for POST/PUT/PATCH"),
-    vus: int = typer.Option(10, "--vus", help="virtual users (concurrent connections, all as admin — not RC accounts)"),
+    vus: int = typer.Option(10, "--vus", help="virtual users (k6 concurrent workers — not RC accounts)"),
+    users_n: int = typer.Option(10, "--users", help="spread load across up to N seeded users (alice, bob, …); 0 = admin token only"),
     duration: str = typer.Option("30s", "--duration", help="test duration, e.g. 60s, 2m"),
     ramp: str = typer.Option("", "--ramp", help="ramp VUs start:end over --duration, e.g. 10:200"),
+    spike: str = typer.Option("", "--spike", help="spike test base:peak over --duration (base 1/3, peak 1/3, recovery 1/3), e.g. 10:100 — reports recovery time"),
+    live: bool = typer.Option(False, "--live", help="stream k6 metrics into the attached monitoring stack's Prometheus (watch live in Grafana)"),
     slo: str = typer.Option("", "--slo", help="pass/fail gate, e.g. p95=300ms,error=1%,rps=100"),
+    constrain: str = typer.Option("", "--constrain", help="cap services to customer-sized hardware for the test, e.g. \"rc=2cpu/2g,mongo=1cpu/1g\" (live docker update; restored after)"),
+    diag: bool = typer.Option(True, "--diag/--no-diag", help="server-side diagnosis: RC event-loop lag, Mongo slow queries, latency-over-time, verdict"),
+    slowms: int = typer.Option(100, "--slowms", help="Mongo profiler threshold in ms (queries slower than this are captured)"),
     stats: bool = typer.Option(False, "--stats", help="also report container CPU/RAM during the test"),
+    save: str = typer.Option("", "--save", help="save this run as a named baseline (~/.rc-repro/loadtests/)"),
+    compare: str = typer.Option("", "--compare", help="compare this run against a saved baseline"),
+    json_out: bool = typer.Option(False, "--json", help="print the result as JSON (for CI/scripts); suppresses pretty output"),
     report: bool = typer.Option(False, "--report", help=f"write a markdown report to {config.reports_dir()}"),
     report_path: str = typer.Option("", "--report-path", help="write the report to this file/dir instead (implies --report)"),
 ) -> None:
     """Drive real HTTP load at a repro with k6 and check it against an SLO.
 
-    k6 runs on the repro's docker network (so it works even with loopback-only
-    binds); the REST rate limiter is disabled for the run and restored after.
-    Exits non-zero if a --slo rule is not met — usable as a CI gate.
+    Load is spread across seeded users when available (--users, default 10) so
+    it carries real per-user identity; the journey scenario times each step of a
+    realistic session. --save/--compare give before/after deltas across runs.
+    k6 runs on the repro's docker network (works with loopback-only binds); the
+    REST rate limiter is disabled for the run and restored after. Exits non-zero
+    if a --slo rule is not met — usable as a CI gate.
     """
     _require_docker()
-    from rc_repro.perf import k6, slo as slo_mod
+    from rc_repro import monitoring
+    from rc_repro.perf import (baseline, constrain as constrain_mod, k6, mongoprof,
+                               rcmetrics, slo as slo_mod, timeline as timeline_mod,
+                               verdict as verdict_mod)
     if scenario not in k6.SCENARIOS:
         _err(f"unknown scenario {scenario!r} (choose: {', '.join(k6.SCENARIOS)})")
     # Custom scenario: parse "METHOD /path" and pass it to the k6 script via env.
@@ -1298,13 +1446,49 @@ def loadtest(
         _err("--endpoint/--body only apply to --scenario custom")
     if vus < 1:
         _err("--vus must be >= 1")
+    if users_n < 0:
+        _err("--users must be >= 0")
+
+    # In --json mode informational warnings are collected into the JSON payload
+    # instead of printed, so stdout stays a single parseable object.
+    warnings: list[str] = []
+
+    def _warn(msg: str) -> None:
+        if json_out:
+            warnings.append(msg.strip().lstrip("⚠ "))
+        else:
+            ui.warn(msg)
+
+    if ramp and spike:
+        _err("--ramp and --spike are mutually exclusive load shapes")
     if ramp:
         try:
             _parse_ramp(ramp)
         except ValueError as exc:
             _err(f"bad --ramp: {exc}")
         if vus != 10:   # 10 is the --vus default; a non-default value is ignored under --ramp
-            ui.warn("  note: --vus is ignored when --ramp is given")
+            _warn("  note: --vus is ignored when --ramp is given")
+    if spike:
+        try:
+            s_base, s_peak = _parse_ramp(spike)   # same START:END grammar
+        except ValueError as exc:
+            _err(f"bad --spike: {exc}")
+        if s_peak <= s_base:
+            _err(f"--spike peak must exceed base ({spike!r})")
+        if vus != 10:
+            _warn("  note: --vus is ignored when --spike is given")
+    for lbl in (save, compare):
+        if lbl:
+            try:
+                baseline.sanitize_label(lbl)
+            except ValueError as exc:
+                _err(str(exc))
+    constraints = {}
+    if constrain:
+        try:
+            constraints = constrain_mod.parse(constrain)
+        except ValueError as exc:
+            _err(f"bad --constrain: {exc}")
     rules = []
     if slo:
         try:
@@ -1315,6 +1499,29 @@ def loadtest(
     m = runner.read_meta(_resolve_name(name))
     doc = runner.read_compose(m.name)
     target = _loadtest_target(doc)
+    if live:
+        if not (isinstance(m.extra, dict) and m.extra.get("monitoring")):
+            _err(f"--live needs the monitoring stack — attach it first: rc-repro monitor --name {m.name}")
+        # Monitoring attached before this version has a Prometheus without the
+        # remote-write receiver, so k6's push would be silently rejected.
+        prom_cmd = (doc.get("services", {}).get("prometheus") or {}).get("command", [])
+        if not any("remote-write-receiver" in str(c) for c in prom_cmd):
+            _err("--live needs Prometheus with remote-write enabled, but this repro's "
+                 "monitoring predates it. Re-attach it: "
+                 f"rc-repro monitor --name {m.name} --off && rc-repro monitor --name {m.name}")
+    per_service = {}
+    if constraints:
+        try:
+            per_service = constrain_mod.resolve_services(constraints, list(doc.get("services", {})))
+        except ValueError as exc:
+            _err(f"bad --constrain: {exc}")
+    # Load the baseline up front: a typo'd label must fail before the run, not after.
+    base = None
+    if compare:
+        try:
+            base = baseline.load(compare)
+        except (FileNotFoundError, ValueError) as exc:
+            _err(str(exc))
 
     # Auth as a bypass-2FA PAT — exactly how a customer's script would hit the API.
     try:
@@ -1324,29 +1531,99 @@ def loadtest(
     except Exception as exc:  # noqa: BLE001
         _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
 
-    # Disable the API rate limiter for the run so the offered load isn't
-    # throttled into a false result. Restore it in a finally — always back ON
-    # unless it was already known-off (matches seed.py). An unreadable setting
-    # (get_setting -> None) restores to ON, never leaving it silently disabled.
-    limiter_was_off = rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
-                                        config.RC_RATE_LIMITER_SETTING) is False
-    if not limiter_was_off and not rcapi.set_setting(
-        m.root_url, auth, config.ADMIN_PASSWORD, config.RC_RATE_LIMITER_SETTING, False
-    ):
-        ui.warn("  ⚠ could not disable the API rate limiter — results may be throttled (429s)")
+    # Real per-user identity: log in as seeded users and hand them to k6 so VUs
+    # round-robin across them. The custom scenario stays on the admin PAT —
+    # customer scripts are usually admin calls, and admin-only endpoints must
+    # keep working. No seeded logins -> fall back to the admin token (v1).
+    users: list[dict] = []
+    if users_n > 0 and scenario != "custom":
+        users = _login_seed_users(m, users_n)
+        if not users:
+            _warn("  ⚠ no seeded users could log in — using the admin token "
+                  "(run `rc-repro seed` first for realistic multi-user load)")
+    # The webhook scenario posts through a real incoming-webhook integration —
+    # create (or reuse) it now and hand its tokenized path to k6.
+    if scenario == "webhook":
+        hook_path = rcapi.create_incoming_webhook(m.root_url, auth, config.ADMIN_PASSWORD)
+        if not hook_path:
+            _err("could not create the incoming webhook integration (check admin permissions)")
+        extra_env = {**(extra_env or {}), "RC_HOOK_PATH": hook_path}
+    snapshot = _workspace_snapshot(m, auth, instances=max(1, len(_rc_services_in(doc))))
 
     label = f"custom {method} {path}" if scenario == "custom" else scenario
-    load = (f"ramp {ramp}" if ramp else f"{vus} VUs") + f" for {duration}"
-    typer.secho(f"Load test: {label} @ {load} -> {target} (via k6 on {m.name!r}'s network)\n", bold=True)
-    mon = perf.ResourceMonitor(m.name).start() if stats else None
+    load = (f"spike {spike}" if spike else f"ramp {ramp}" if ramp else f"{vus} VUs") + f" for {duration}"
+    identity = f"{len(users)} seeded users" if users else "admin token"
+    rc_services = _rc_services_in(doc) or ["rocketchat"]
+    # The timeline (k6 point stream) powers latency-over-time AND spike recovery,
+    # so collect it whenever diag is on OR a spike is requested.
+    want_timeline = diag or bool(spike)
+
+    # Everything below mutates workspace state (resource caps, rate limiter, the
+    # Prometheus setting, Mongo profiling) — all of it lives inside this try so a
+    # failure OR a Ctrl-C anywhere in setup or the run still hits the finally and
+    # restores. Restore-tracked vars are initialised first so the finally is
+    # always valid even if we abort before setting them.
+    applied_constraints: list = []
+    limiter_was_off = True
+    metrics_changed, mongo_prior, sampler, mon = False, None, None, None
     resources = None
     summary = None
+    rcm_report: dict = {}
+    since_ms = int(time.time() * 1000)
     try:
+        # Customer-sized hardware: cap the services first, so a failed apply
+        # can't leave later settings changed. apply() self-rolls-back mid-way.
+        if per_service:
+            try:
+                applied_constraints = constrain_mod.apply(m.name, per_service)
+            except RuntimeError as exc:
+                _err(f"could not apply --constrain: {exc}")
+            snapshot["constraints"] = constrain_mod.human(per_service)
+            if not json_out:
+                ui.note(f"  constrained: {snapshot['constraints']} (restored after the test)")
+
+        # Disable the API rate limiter so the offered load isn't throttled into a
+        # false result. Restored below — back ON unless it was already known-off
+        # (an unreadable setting -> None -> restores to ON, never left disabled).
+        limiter_was_off = rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                            config.RC_RATE_LIMITER_SETTING) is False
+        if not limiter_was_off and not rcapi.set_setting(
+            m.root_url, auth, config.ADMIN_PASSWORD, config.RC_RATE_LIMITER_SETTING, False
+        ):
+            _warn("  ⚠ could not disable the API rate limiter — results may be throttled (429s)")
+
+        if not json_out:
+            typer.secho(f"Load test: {label} @ {load} as {identity} -> {target} "
+                        f"(via k6 on {m.name!r}'s network)\n", bold=True)
+            if live:
+                grafana = f"http://localhost:{config.MONITOR_PORTS[1]}"
+                ui.note(f"  live: k6 metrics streaming into Prometheus — watch in Grafana "
+                        f"({grafana} → Explore → k6_*)")
+
+        # Server-side diagnosis (Phase C): RC's own /metrics (event-loop lag) and
+        # Mongo's query profiler, armed for the run. Both best-effort.
+        if diag:
+            if rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                 monitoring.RC_METRICS_SETTING) is not True:
+                metrics_changed = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                                    monitoring.RC_METRICS_SETTING, True)
+            mongo_prior = mongoprof.start(m.name, slowms)
+            if mongo_prior is None:
+                _warn("  ⚠ Mongo slow-query capture unavailable (profiler could not be enabled)")
+
+        mon = perf.ResourceMonitor(m.name).start() if stats else None
+        since_ms = int(time.time() * 1000)
+        if diag:
+            sampler = rcmetrics.RCMetricsSampler(m.name, rc_services).start()
         summary = k6.run(m.name, scenario, vus=vus, duration=duration, ramp=ramp or None,
-                         token=token, uid=auth.user_id, target=target, extra_env=extra_env)
+                         token=token, uid=auth.user_id, target=target, extra_env=extra_env,
+                         users=users or None, quiet=json_out, timeline=want_timeline,
+                         spike=spike or None, live=live)
     except RuntimeError as exc:
         _err(str(exc))   # raises typer.Exit; finally still runs (mon stopped, limiter restored)
     finally:
+        if sampler:
+            rcm_report = sampler.stop()
         if mon:
             resources = mon.stop()
         if not limiter_was_off:
@@ -1354,28 +1631,311 @@ def loadtest(
                 rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                   config.RC_RATE_LIMITER_SETTING, True)
             except Exception:  # noqa: BLE001 - best-effort restore
-                ui.warn("  ⚠ could not restore the API rate limiter setting")
+                _warn("  ⚠ could not restore the API rate limiter setting")
+        if metrics_changed:
+            try:
+                rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                  monitoring.RC_METRICS_SETTING, False)
+            except Exception:  # noqa: BLE001
+                _warn("  ⚠ could not restore the Prometheus metrics setting")
+        if mongo_prior:
+            mongoprof.stop(m.name, mongo_prior)
+        for problem in constrain_mod.restore(applied_constraints):
+            _warn(f"  ⚠ could not restore resource limits — {problem}")
+        # users.json holds seeded-user tokens — don't leave them on disk.
+        (runner.workspace(m.name) / "loadtest" / "users.json").unlink(missing_ok=True)
 
-    typer.echo("")
+    # Collect the diagnosis artifacts (profile entries survive the level reset).
+    mongo_slow = mongoprof.collect(m.name, since_ms) if (diag and mongo_prior) else None
+    tl = None
+    if want_timeline:
+        points = runner.workspace(m.name) / "loadtest" / "points.json"
+        tl = timeline_mod.parse(points)
+        points.unlink(missing_ok=True)   # can be tens of MB — don't leave it around
+
     ctx = {"name": m.name, "version": m.rc_version, "scenario": scenario, "vus": vus,
-           "duration": duration, "ramp": ramp, "target": target, "label": label}
+           "duration": duration, "ramp": ramp, "target": target, "label": label,
+           "users": len(users), "constrained": snapshot.get("constraints", "")}
     slo_results = slo_mod.evaluate(rules, summary) if rules else []
-    _print_loadtest(ctx, summary, slo_results)
-    _print_resources(resources or {}, m.name)
+    compare_rows = baseline.compare({"summary": summary}, base) if base else []
+    if base and (base.get("ctx") or {}).get("scenario") not in (None, scenario):
+        _warn(f"  ⚠ baseline {compare!r} was a {(base['ctx']or{}).get('scenario')!r} run — "
+              f"comparing across scenarios")
+    if base and (base.get("snapshot") or {}).get("constraints") != snapshot.get("constraints"):
+        _warn(f"  ⚠ baseline {compare!r} ran under different resource constraints "
+              f"({(base.get('snapshot') or {}).get('constraints') or 'none'} vs "
+              f"{snapshot.get('constraints') or 'none'}) — deltas reflect the hardware change")
+
+    short_res = _short_res_map(resources, m.name) if resources else None
+    spike_rec = timeline_mod.spike_recovery(tl) if (spike and tl) else None
+    # RAM slope over the run (only meaningful on long runs) — the soak signal.
+    soak = _short_res_map(mon.mem_slopes(), m.name) if mon else None
+    verdict_lines = (verdict_mod.analyze(summary, rcmetrics=rcm_report or None,
+                                         mongo=mongo_slow, resources=short_res, timeline=tl,
+                                         soak=soak or None, spike=spike_rec)
+                     if diag else [])
+    diag_payload = {"rcmetrics": rcm_report, "mongo": mongo_slow, "timeline": tl,
+                    "spike": spike_rec, "verdict": verdict_lines} if diag else None
+
+    if not json_out:
+        typer.echo("")
+        _print_loadtest(ctx, summary, slo_results)
+        if spike_rec:
+            rec = spike_rec["recovered_after_s"]
+            msg = (f"  spike: baseline p95 {fmt_ms(spike_rec['baseline_p95'])} -> peak "
+                   f"{fmt_ms(spike_rec['spike_p95'])} -> "
+                   + (f"recovered ~{rec}s after load dropped" if rec is not None
+                      else "NOT recovered within the run"))
+            (ui.ok if rec is not None and rec <= 30 else ui.warn)(msg)
+        if diag:
+            _print_diag(rcm_report, mongo_slow, tl, verdict_lines, m.name)
+        if compare_rows:
+            _print_compare(compare_rows, base)
+        _print_resources(resources or {}, m.name)
+
+    saved_to = report_file = ""
+    if save:
+        saved_to = baseline.save(save, {
+            "label": baseline.sanitize_label(save),
+            "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ctx": ctx, "summary": summary, "snapshot": snapshot,
+        })
+        if not json_out:
+            typer.echo("")
+            ui.ok(f"✓ saved baseline {baseline.sanitize_label(save)!r} "
+                  f"(compare later with --compare {baseline.sanitize_label(save)})")
 
     if report or report_path:
         host = {"os": platform.platform(), "cpu": os.cpu_count() or "?",
                 "docker": runner.docker_server_version() or "?",
                 "compose": runner.compose_version() or "?"}
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        short_res = _short_res_map(resources, m.name) if resources else None
-        path = perf_report.write_loadtest(ctx, summary, slo_results, short_res, host,
-                                          stamp, dest=report_path or None)
-        typer.echo("")
-        ui.ok(f"✓ wrote {path}")
+        report_file = perf_report.write_loadtest(
+            ctx, summary, slo_results, short_res, host, stamp,
+            dest=report_path or None, snapshot=snapshot,
+            compare={"label": base.get("label"), "saved_at": base.get("saved_at"),
+                     "rows": compare_rows} if base else None,
+            diag=diag_payload,
+        )
+        if not json_out:
+            typer.echo("")
+            ui.ok(f"✓ wrote {report_file}")
 
-    if slo_results and not all(r["ok"] for r in slo_results):
+    passed = (not slo_results) or all(r["ok"] for r in slo_results)
+    if json_out:
+        result = {"ctx": ctx, "summary": summary, "slo": slo_results, "passed": passed,
+                  "snapshot": snapshot, "warnings": warnings}
+        if diag_payload:
+            result["diag"] = diag_payload
+        if resources:
+            result["resources"] = {k: dc_asdict(v) for k, v in (short_res or {}).items()}
+        if base:
+            result["compare"] = {"baseline": base.get("label"), "rows": compare_rows}
+        if saved_to:
+            result["saved_baseline"] = saved_to
+        if report_file:
+            result["report"] = report_file
+        typer.echo(json.dumps(result, indent=2))
+
+    if not passed:
         raise typer.Exit(1)
+
+
+@app.command()
+def capacity(
+    name: str = typer.Option("", "--name", "-n"),
+    scenario: str = typer.Option("journey", "--scenario", help="which workload to scale: journey | messages | read | mixed | login | badbot"),
+    users_n: int = typer.Option(10, "--users", help="spread load across up to N seeded users; 0 = admin only"),
+    slo: str = typer.Option("p95=500ms,error=2%", "--slo", help="the limit that defines 'capacity'"),
+    start: int = typer.Option(10, "--start", help="first VU step"),
+    max_vus: int = typer.Option(640, "--max", help="stop doubling past this many VUs"),
+    step_duration: str = typer.Option("20s", "--step-duration", help="how long each step runs"),
+    constrain: str = typer.Option("", "--constrain", help="find capacity on customer-sized hardware, e.g. \"rc=2cpu/2g\" (restored after)"),
+    report: bool = typer.Option(False, "--report", help=f"write a markdown report to {config.reports_dir()}"),
+    report_path: str = typer.Option("", "--report-path", help="write the report to this file/dir instead (implies --report)"),
+    json_out: bool = typer.Option(False, "--json", help="print the result as JSON"),
+) -> None:
+    """Find how much concurrency a repro sustains before the SLO breaks.
+
+    Doubles VUs (start, 2x, 4x, …) running the scenario at each step until a
+    rule fails, then bisects between the last pass and first fail — ending with
+    "handles ~N concurrent VUs" plus why it broke (event-loop lag at the wall).
+    """
+    _require_docker()
+    from rc_repro import monitoring
+    from rc_repro.perf import constrain as constrain_mod, k6, rcmetrics, slo as slo_mod
+    if scenario not in k6.SCENARIOS or scenario in ("custom", "webhook"):
+        _err("capacity supports the built-in scenarios (journey/messages/read/mixed/login/badbot)")
+    try:
+        rules = slo_mod.parse(slo)
+    except ValueError as exc:
+        _err(f"bad --slo: {exc}")
+    if start < 1 or max_vus < start:
+        _err("--start must be >= 1 and --max >= --start")
+    constraints = {}
+    if constrain:
+        try:
+            constraints = constrain_mod.parse(constrain)
+        except ValueError as exc:
+            _err(f"bad --constrain: {exc}")
+
+    m = runner.read_meta(_resolve_name(name))
+    doc = runner.read_compose(m.name)
+    target = _loadtest_target(doc)
+    rc_services = _rc_services_in(doc) or ["rocketchat"]
+    per_service = {}
+    if constraints:
+        try:
+            per_service = constrain_mod.resolve_services(constraints, list(doc.get("services", {})))
+        except ValueError as exc:
+            _err(f"bad --constrain: {exc}")
+
+    try:
+        auth = _login(m)
+        token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD,
+                                   token_name="rc-repro-loadtest", bypass_2fa=True)
+    except Exception as exc:  # noqa: BLE001
+        _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
+    users = _login_seed_users(m, users_n) if users_n > 0 else []
+
+    # As in loadtest: every mutation (resource caps, rate limiter, the Prometheus
+    # setting) lives inside the try so a failure or Ctrl-C in setup or mid-search
+    # still restores. Restore-tracked vars are initialised first.
+    applied_constraints: list = []
+    limiter_was_off = True
+    metrics_changed = False
+    steps: list[dict] = []
+    last_pass = first_fail = None
+
+    def run_step(n: int, tag: str = "") -> dict:
+        sampler = rcmetrics.RCMetricsSampler(m.name, rc_services).start()
+        try:
+            s = k6.run(m.name, scenario, vus=n, duration=step_duration, ramp=None,
+                       token=token, uid=auth.user_id, target=target,
+                       users=users or None, quiet=True)
+        finally:
+            rcm = sampler.stop()
+        res = slo_mod.evaluate(rules, s)
+        lag_max = 0.0
+        for svc_m in rcm.values():
+            lag = svc_m.get("eventloop_lag_max_s") or svc_m.get("eventloop_lag_s")
+            if lag:
+                lag_max = max(lag_max, lag["max"])
+        row = {"vus": n, "rps": s.get("rps", 0.0), "p95": s.get("p95", 0.0),
+               "error_rate": s.get("error_rate", 0.0), "ok": all(r["ok"] for r in res),
+               "lag_max_s": lag_max,
+               "breached": [f"{r['key']} {r['op']} {r['raw']} "
+                            f"(actual {slo_mod.fmt_actual(r['key'], r['actual'])})"
+                            for r in res if not r["ok"]]}
+        steps.append(row)
+        if not json_out:
+            mark = typer.style("PASS", fg=typer.colors.GREEN) if row["ok"] else \
+                typer.style(f"FAIL ({'; '.join(row['breached'])})", fg=typer.colors.RED)
+            typer.echo(f"  {n:>4} VUs{tag:<9}  {row['rps']:>7.1f} req/s   "
+                       f"p95 {fmt_ms(row['p95']):>7}   err {row['error_rate'] * 100:>5.2f}%   {mark}")
+        return row
+
+    try:
+        if per_service:
+            try:
+                applied_constraints = constrain_mod.apply(m.name, per_service)
+            except RuntimeError as exc:
+                _err(f"could not apply --constrain: {exc}")
+        limiter_was_off = rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                            config.RC_RATE_LIMITER_SETTING) is False
+        if not limiter_was_off:
+            rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                              config.RC_RATE_LIMITER_SETTING, False)
+        if rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                             monitoring.RC_METRICS_SETTING) is not True:
+            metrics_changed = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                                monitoring.RC_METRICS_SETTING, True)
+        identity = f"{len(users)} seeded users" if users else "admin token"
+        if not json_out:
+            typer.secho(f"Capacity search: {scenario} as {identity}, SLO {slo} "
+                        f"(steps of {step_duration}"
+                        + (f", constrained {constrain_mod.human(per_service)}" if per_service else "")
+                        + ")\n", bold=True)
+        n = start
+        while n <= max_vus:
+            row = run_step(n)
+            if row["ok"]:
+                last_pass = n
+                n *= 2
+            else:
+                first_fail = n
+                break
+        if first_fail and last_pass:
+            lo, hi = last_pass, first_fail
+            for _ in range(2):   # two bisect rounds tighten the estimate enough
+                mid = (lo + hi) // 2
+                if mid <= lo or mid >= hi:
+                    break
+                row = run_step(mid, tag=" (bisect)")
+                if row["ok"]:
+                    lo = last_pass = mid
+                else:
+                    hi = first_fail = mid
+    finally:
+        if not limiter_was_off:
+            try:
+                rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                  config.RC_RATE_LIMITER_SETTING, True)
+            except Exception:  # noqa: BLE001
+                ui.warn("  ⚠ could not restore the API rate limiter setting")
+        if metrics_changed:
+            try:
+                rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                  monitoring.RC_METRICS_SETTING, False)
+            except Exception:  # noqa: BLE001
+                ui.warn("  ⚠ could not restore the Prometheus metrics setting")
+        for problem in constrain_mod.restore(applied_constraints):
+            ui.warn(f"  ⚠ could not restore resource limits — {problem}")
+        # users.json holds seeded-user tokens — don't leave them on disk.
+        (runner.workspace(m.name) / "loadtest" / "users.json").unlink(missing_ok=True)
+
+    if last_pass is None:
+        result = f"breaches the SLO even at {start} VUs — start lower (--start)"
+    elif first_fail is None:
+        result = f"holds the SLO up to {last_pass} VUs (never breached; raise --max to push further)"
+    else:
+        result = f"~{last_pass} concurrent VUs (holds at {last_pass}, breaks at {first_fail})"
+    why = ""
+    # Explain the breach at the refined boundary (post-bisect), not the first
+    # chronological fail — "breaks at 20" should be justified by the 20-VU step.
+    breach_row = next((r for r in steps if r["vus"] == first_fail), None) if first_fail \
+        else next((r for r in steps if not r["ok"]), None)
+    if breach_row:
+        if breach_row["lag_max_s"] >= 0.5:
+            why = (f"at {breach_row['vus']} VUs the RC event loop saturated "
+                   f"(lag peaked at {fmt_ms(breach_row['lag_max_s'] * 1000)})")
+        else:
+            why = f"at {breach_row['vus']} VUs: {'; '.join(breach_row['breached'])}"
+
+    if not json_out:
+        typer.echo("")
+        typer.secho(f"Capacity: {result}", bold=True,
+                    fg=typer.colors.GREEN if last_pass else typer.colors.RED)
+        if why:
+            ui.note(f"  why it broke: {why}")
+
+    ctx = {"name": m.name, "version": m.rc_version, "scenario": scenario,
+           "slo": slo, "users": len(users), "step_duration": step_duration,
+           "target": target, "constrained": constrain_mod.human(per_service) if per_service else ""}
+    if report or report_path:
+        host = {"os": platform.platform(), "cpu": os.cpu_count() or "?",
+                "docker": runner.docker_server_version() or "?",
+                "compose": runner.compose_version() or "?"}
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        path_ = perf_report.write_capacity(ctx, steps, result, why, host, stamp,
+                                           dest=report_path or None)
+        if not json_out:
+            typer.echo("")
+            ui.ok(f"✓ wrote {path_}")
+    if json_out:
+        typer.echo(json.dumps({"ctx": ctx, "steps": steps, "capacity_vus": last_pass,
+                               "breach_vus": first_fail, "result": result, "why": why},
+                              indent=2))
 
 
 @app.command()

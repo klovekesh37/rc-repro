@@ -38,11 +38,58 @@ export const authParams = {
   },
 };
 
-// p(99) is not in k6's default summaryTrendStats — request it so the report has it.
-const TREND = ["avg", "min", "med", "max", "p(90)", "p(95)", "p(99)"];
+// Pre-authenticated seeded users (alice, bob, …), written by rc-repro when
+// --users is in effect: [{username, password, token, uid}, …]. Each VU sticks
+// to one user (round-robin by VU number) so load carries real per-user
+// permissions and subscriptions instead of one shared admin token.
+const USERS = __ENV.RC_USERS_FILE ? JSON.parse(open(__ENV.RC_USERS_FILE)) : [];
+
+export function vuUser() {
+  return USERS.length ? USERS[(__VU - 1) % USERS.length] : null;
+}
+
+// Auth headers for this VU: its assigned seeded user, else the admin token.
+export function vuAuth() {
+  const u = vuUser();
+  return {
+    headers: {
+      "X-Auth-Token": u ? u.token : __ENV.RC_TOKEN,
+      "X-User-Id": u ? u.uid : __ENV.RC_UID,
+      "Content-Type": "application/json",
+    },
+  };
+}
+
+// p(99) and count are not in k6's default summaryTrendStats — request them so
+// the report has full percentiles and per-step call counts.
+const TREND = ["avg", "min", "med", "max", "p(90)", "p(95)", "p(99)", "count"];
+
+function seconds(s) {
+  const m = String(s || "60s").match(/^(\d+(?:\.\d+)?)(s|m|h)?$/);
+  if (!m) return 60;
+  const v = parseFloat(m[1]);
+  return m[2] === "m" ? v * 60 : m[2] === "h" ? v * 3600 : v;
+}
 
 export function buildOptions() {
   const ramp = __ENV.RAMP;
+  const spike = __ENV.SPIKE;
+  if (spike) {
+    // "base:peak" — hold base for a third, jump to peak for a third, drop back
+    // for a third (recovery window). 1s ramps keep the jumps sharp.
+    const [base, peak] = spike.split(":").map(Number);
+    const third = Math.max(2, Math.floor(seconds(__ENV.DURATION) / 3));
+    return {
+      startVUs: base, summaryTrendStats: TREND,
+      stages: [
+        { duration: `${third}s`, target: base },
+        { duration: "1s", target: peak },
+        { duration: `${third}s`, target: peak },
+        { duration: "1s", target: base },
+        { duration: `${third}s`, target: base },
+      ],
+    };
+  }
   if (ramp) {
     const [start, end] = ramp.split(":").map(Number);
     return {
@@ -82,5 +129,17 @@ export function handleSummary(data) {
       "other": _count(data.metrics, "status_other"),
     },
   };
+  // Per-step latency: any Trend named step_<name> (journey/mixed scenarios).
+  const steps = {};
+  for (const k of Object.keys(data.metrics)) {
+    if (k.indexOf("step_") === 0) {
+      const v = data.metrics[k].values;
+      steps[k.slice(5)] = {
+        count: v.count, avg: v.avg, p50: v.med,
+        p90: v["p(90)"], p95: v["p(95)"], p99: v["p(99)"],
+      };
+    }
+  }
+  if (Object.keys(steps).length) out.steps = steps;
   return { "/k6/summary.json": JSON.stringify(out) };
 }

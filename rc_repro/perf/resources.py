@@ -95,6 +95,20 @@ class ResourceMonitor:
     def __exit__(self, *exc) -> None:
         self.stop()
 
+    def mem_slopes(self, min_span_s: float = 600.0) -> dict[str, float]:
+        """Per-container RAM growth in bytes/hour over the sampled span (simple
+        endpoint slope) — the soak-test leak signal. Empty unless the monitor ran
+        for at least `min_span_s` (short runs say nothing about leaks)."""
+        out: dict[str, float] = {}
+        for name, series in self._series.items():
+            if len(series) < 2:
+                continue
+            span = series[-1][0] - series[0][0]
+            if span < min_span_s:
+                continue
+            out[name] = (series[-1][2] - series[0][2]) / span * 3600
+        return out
+
     def report(self, window: tuple[float, float] | None = None) -> dict:
         """Per-container ContainerStats, optionally restricted to a (t0,t1) window."""
         out: dict[str, ContainerStats] = {}

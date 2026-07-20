@@ -1,24 +1,39 @@
-// Realistic blend: mostly reads, some posts, occasional login.
+// Realistic blend: mostly reads, some posts, occasional login — with a
+// step_<name> Trend per endpoint so the summary shows which call is slow.
 import http from "k6/http";
 import { check } from "k6";
-import { URL, authParams, buildOptions, handleSummary, record } from "./common.js";
+import { Trend } from "k6/metrics";
+import { URL, buildOptions, handleSummary, record, vuAuth, vuUser } from "./common.js";
 
 export const options = buildOptions();
 export { handleSummary };
 
+const T = {
+  read: new Trend("step_read", true),
+  post: new Trend("step_post", true),
+  login: new Trend("step_login", true),
+};
+
 export default function () {
   const roll = Math.random();
-  let res;
+  let res, name;
   if (roll < 0.6) {
-    res = http.get(`${URL}/api/v1/channels.history?roomName=general&count=20`, authParams);
+    name = "read";
+    res = http.get(`${URL}/api/v1/channels.history?roomName=general&count=20`, vuAuth());
   } else if (roll < 0.9) {
+    name = "post";
     res = http.post(`${URL}/api/v1/chat.postMessage`,
-      JSON.stringify({ channel: "#general", text: `k6 mixed ${__VU}-${__ITER}` }), authParams);
+      JSON.stringify({ channel: "#general", text: `k6 mixed ${__VU}-${__ITER}` }), vuAuth());
   } else {
+    name = "login";
+    const u = vuUser();
     res = http.post(`${URL}/api/v1/login`,
-      JSON.stringify({ user: __ENV.RC_USER || "admin", password: __ENV.RC_PASS || "admin123" }),
+      JSON.stringify(u
+        ? { user: u.username, password: u.password }
+        : { user: __ENV.RC_USER || "admin", password: __ENV.RC_PASS || "admin123" }),
       { headers: { "Content-Type": "application/json" } });
   }
+  T[name].add(res.timings.duration);
   record(res);
   check(res, { "status 200": (r) => r.status === 200 });
 }

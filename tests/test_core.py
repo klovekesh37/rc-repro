@@ -753,6 +753,285 @@ def test_bind_ports_no_double_prefix_on_ip_qualified():
     assert doc["services"]["b"]["ports"] == ["127.0.0.1:9000:9000"]
 
 
+def test_baseline_label_and_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from rc_repro.perf import baseline
+    assert baseline.sanitize_label("Before Fix!") == "before-fix"
+    for bad in ("", "///", "!!!"):
+        try:
+            baseline.sanitize_label(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for label {bad!r}")
+    payload = {"label": "base", "ctx": {"scenario": "journey"},
+               "summary": {"rps": 50.0, "p95": 120.0}}
+    baseline.save("base", payload)
+    assert baseline.load("base")["summary"]["p95"] == 120.0
+    try:
+        baseline.load("missing")
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("expected FileNotFoundError")
+
+
+def test_baseline_compare_flags_regressions():
+    from rc_repro.perf import baseline
+    base = {"summary": {"rps": 100.0, "p50": 40.0, "p95": 100.0, "p99": 150.0,
+                        "error_rate": 0.001,
+                        "steps": {"login": {"p95": 100.0}, "post": {"p95": 50.0}}}}
+    cur = {"summary": {"rps": 90.0, "p50": 41.0, "p95": 300.0, "p99": 160.0,
+                       "error_rate": 0.001,
+                       "steps": {"login": {"p95": 310.0}, "post": {"p95": 49.0}}}}
+    rows = {r["metric"]: r for r in baseline.compare(cur, base)}
+    assert rows["p95"]["flag"] and rows["p95"]["pct"] > 100        # +200% -> regression
+    assert not rows["p50"]["flag"]                                 # +2.5% -> noise
+    assert not rows["throughput (rps)"]["flag"]                    # -10% worse but under threshold
+    assert rows["step login p95"]["flag"]                          # per-step regression caught
+    assert not rows["step post p95"]["worse"]                      # improvement
+
+
+def test_baseline_step_order_canonical():
+    from rc_repro.perf import baseline
+    steps = {"post": {}, "zeta": {}, "login": {}, "open": {}}
+    assert baseline.step_order(steps) == ["login", "open", "post", "zeta"]
+
+
+def test_loadtest_journey_scenario_registered():
+    from importlib import resources
+    from rc_repro.perf import k6
+    assert "journey" in k6.SCENARIOS
+    d = resources.files("rc_repro").joinpath("data", "loadtest")
+    assert d.joinpath("journey.js").is_file()
+    # journey + mixed emit per-step trends; common.js collects them into `steps`
+    assert "step_" in d.joinpath("journey.js").read_text(encoding="utf-8")
+    assert "step_" in d.joinpath("mixed.js").read_text(encoding="utf-8")
+    assert "steps" in d.joinpath("common.js").read_text(encoding="utf-8")
+
+
+def test_loadtest_report_renders_steps_snapshot_compare():
+    from rc_repro.perf import report
+    ctx = {"name": "acme", "version": "8.5.1", "scenario": "journey", "vus": 20,
+           "duration": "30s", "ramp": "", "target": "http://rocketchat:3000",
+           "users": 5, "label": "journey"}
+    summary = {"count": 900, "rps": 30.0, "p50": 40, "p90": 90, "p95": 120, "p99": 200,
+               "avg": 55, "min": 10, "max": 400, "error_rate": 0.0, "checks_rate": 1.0,
+               "steps": {"login": {"count": 180, "p50": 100, "p95": 180, "p99": 250},
+                         "post": {"count": 180, "p50": 30, "p95": 60, "p99": 90}}}
+    snapshot = {"rc_version": "8.5.1", "preset": "default", "instances": 1,
+                "users": 6, "rooms": 5, "messages": 40}
+    compare = {"label": "base", "saved_at": "2026-07-18T10:00:00",
+               "rows": [{"metric": "p95", "before": 100.0, "after": 120.0,
+                         "pct": 20.0, "worse": True, "flag": False}]}
+    host = {"os": "test", "cpu": 8, "docker": "27.0", "compose": "2.30"}
+    md = report.loadtest_markdown(ctx, summary, [], None, host,
+                                  snapshot=snapshot, compare=compare)
+    assert "5 seeded users" in md and "## Workspace" in md
+    assert "## Per-step latency" in md and "| login |" in md
+    assert "## vs baseline `base`" in md and "+20%" in md
+
+
+def test_constrain_parse():
+    from rc_repro.perf import constrain
+    c = constrain.parse("rc=2cpu/2g,mongo=0.5cpu/512m")
+    assert c["rc"] == {"cpus": 2.0, "mem": "2g"}
+    assert c["mongo"] == {"cpus": 0.5, "mem": "512m"}
+    assert constrain.parse("rc=1cpu")["rc"] == {"cpus": 1.0, "mem": None}
+    assert constrain.parse("mongo=1gb")["mongo"] == {"cpus": None, "mem": "1g"}
+    for bad in ("rc", "rc=", "rc=fast", "rc=0cpu", "rc=2cpu/2parsecs"):
+        try:
+            constrain.parse(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_constrain_resolve_aliases():
+    from rc_repro.perf import constrain
+    lim = {"cpus": 1.0, "mem": "1g"}
+    # single-instance: rc -> rocketchat; mongo -> mongodb
+    services = ["rocketchat", "mongodb", "mongo-init"]
+    r = constrain.resolve_services({"rc": lim, "mongo": lim}, services)
+    assert set(r) == {"rocketchat", "mongodb"}
+    # multi-instance: rc expands to every instance
+    multi = ["rocketchat-1", "rocketchat-2", "traefik", "nats", "mongodb"]
+    r2 = constrain.resolve_services({"rc": lim}, multi)
+    assert set(r2) == {"rocketchat-1", "rocketchat-2"}
+    # exact service names pass through; unknown ones are actionable errors
+    assert set(constrain.resolve_services({"traefik": lim}, multi)) == {"traefik"}
+    try:
+        constrain.resolve_services({"keycloak": lim}, services)
+    except ValueError as exc:
+        assert "keycloak" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for unknown service")
+
+
+def test_constrain_human():
+    from rc_repro.perf import constrain
+    assert constrain.human({"rc": {"cpus": 2.0, "mem": "2g"},
+                            "mongo": {"cpus": 0.5, "mem": None}}) == "rc=2cpu/2g, mongo=0.5cpu"
+
+
+def test_rcmetrics_prom_parser():
+    from rc_repro.perf import rcmetrics
+    text = (
+        "# HELP nodejs_eventloop_lag_seconds Lag of event loop in seconds.\n"
+        "# TYPE nodejs_eventloop_lag_seconds gauge\n"
+        "nodejs_eventloop_lag_seconds 0.0123\n"
+        "nodejs_heap_size_used_bytes 123456789\n"
+        'rocketchat_rest_api_count{method="GET",path="/x"} 5\n'
+        'rocketchat_rest_api_count{method="POST",path="/y"} 7\n'
+        "not a metric line\n"
+    )
+    parsed = rcmetrics.parse_prom(text)
+    assert parsed["nodejs_eventloop_lag_seconds"] == 0.0123
+    assert parsed["nodejs_heap_size_used_bytes"] == 123456789
+    assert parsed["rocketchat_rest_api_count"] == 12          # labeled series summed
+    # series accumulate and summarize
+    s = rcmetrics.ServiceSeries()
+    s.add(parsed)
+    s.add({"nodejs_eventloop_lag_seconds": 0.5})
+    lag = s.summary()["eventloop_lag_s"]
+    assert lag["max"] == 0.5 and lag["n"] == 2
+
+
+def test_timeline_bucketing(tmp_path):
+    import json as _json
+    from rc_repro.perf import timeline
+    # Synthetic k6 point stream: 60s of requests, latency degrading, errors late.
+    # k6 emits compact JSON (no spaces) — the parser's prefilter relies on that.
+    compact = {"separators": (",", ":")}
+    lines = []
+    for sec in range(60):
+        t = f"2026-07-19T10:00:{sec:02d}.123456789+00:00"
+        lines.append(_json.dumps({"type": "Point", "metric": "http_req_duration",
+                                  "data": {"time": t, "value": 50.0 + sec * 10}}, **compact))
+        if sec >= 45:
+            lines.append(_json.dumps({"type": "Point", "metric": "http_req_failed",
+                                      "data": {"time": t, "value": 1}}, **compact))
+    p = tmp_path / "points.json"
+    p.write_text("\n".join(lines), encoding="utf-8")
+    tl = timeline.parse(p)
+    assert tl and len(tl["buckets"]) <= timeline.TARGET_BUCKETS + 1
+    assert tl["buckets"][-1]["p95"] > tl["buckets"][0]["p95"]      # degradation visible
+    assert tl["first_error_s"] is not None and tl["first_error_s"] >= 40
+    art = timeline.render_ascii(tl)
+    assert "p95 over time" in art[0] and "errors" in art[1]
+    assert timeline.parse(tmp_path / "missing.json") is None
+
+
+def test_verdict_rules():
+    from rc_repro.perf import verdict
+    base = {"p95": 120.0, "rps": 50.0, "error_rate": 0.0}
+    # saturated event loop -> named finding
+    v = verdict.analyze(base, rcmetrics={"rocketchat": {
+        "eventloop_lag_s": {"mean": 0.3, "max": 1.2, "last": 0.9, "n": 5}}})
+    assert any("event loop saturated" in f for f in v)
+    # COLLSCAN -> missing index finding
+    v2 = verdict.analyze(base, mongo={"total": 8, "collscan": 3, "slow": [
+        {"ns": "rocketchat.rocketchat_message", "op": "query", "millis": 900,
+         "plan": "COLLSCAN", "docs": 50000, "keys": 0, "ret": 20, "cmd": ""}]})
+    assert any("COLLSCAN" in f and "missing index" in f for f in v2)
+    # errors with 429s + timeline start time
+    v3 = verdict.analyze({"p95": 100.0, "rps": 10.0, "error_rate": 0.2,
+                          "status": {"429": 50}}, timeline={"first_error_s": 42})
+    assert any("429" in f and "~42s" in f for f in v3)
+    # histogram lag key preferred; degraded tier
+    v5 = verdict.analyze(base, rcmetrics={"rocketchat": {
+        "eventloop_lag_max_s": {"mean": 0.15, "max": 0.23, "last": 0.2, "n": 6}}})
+    assert any("degraded" in f for f in v5)
+    # high client latency with no server signal -> queueing finding, not "headroom"
+    v6 = verdict.analyze({"p95": 1400.0, "rps": 15.0, "error_rate": 0.0})
+    assert any("queueing outside" in f for f in v6)
+    # clean run -> headroom statement
+    v4 = verdict.analyze(base)
+    assert len(v4) == 1 and "headroom" in v4[0]
+
+
+def test_spike_recovery_math():
+    from rc_repro.perf import timeline
+    # 90s run, 1s buckets: calm first third, spiked middle, recovering tail.
+    def bucket(t, p95):
+        return {"t0": t, "reqs": 10, "p50": p95 * 0.6, "p95": p95, "max": p95 * 2, "errors": 0}
+    buckets = ([bucket(t, 100.0) for t in range(0, 30)]
+               + [bucket(t, 900.0) for t in range(30, 60)]
+               + [bucket(t, 800.0) for t in range(60, 68)]      # still elevated
+               + [bucket(t, 120.0) for t in range(68, 90)])     # back under 1.5x baseline
+    tl = {"width_s": 1, "span_s": 89, "buckets": buckets, "first_error_s": None}
+    rec = timeline.spike_recovery(tl)
+    assert rec["baseline_p95"] == 100.0 and rec["spike_p95"] == 900.0
+    assert rec["recovered_after_s"] == 8
+    # never recovers -> None
+    stuck = {"width_s": 1, "span_s": 89, "first_error_s": None,
+             "buckets": buckets[:60] + [bucket(t, 900.0) for t in range(60, 90)]}
+    assert timeline.spike_recovery(stuck)["recovered_after_s"] is None
+
+
+def test_mem_slopes_requires_span():
+    from rc_repro.perf.resources import ResourceMonitor
+    mon = ResourceMonitor("x")
+    # 20 minutes of samples, RAM growing 1MB/min -> 60MB/h
+    mon._series["rcrepro-x-rocketchat-1"] = [
+        (t * 60.0, 50.0, 1e9 + t * 1e6, 8e9) for t in range(21)]
+    # only 2 minutes -> too short to say anything
+    mon._series["rcrepro-x-mongodb-1"] = [(0.0, 10.0, 2e8, 8e9), (120.0, 10.0, 3e8, 8e9)]
+    slopes = mon.mem_slopes()
+    assert round(slopes["rcrepro-x-rocketchat-1"] / 1e6) == 60
+    assert "rcrepro-x-mongodb-1" not in slopes
+
+
+def test_verdict_spike_and_soak_rules():
+    from rc_repro.perf import verdict
+    base = {"p95": 120.0, "rps": 50.0, "error_rate": 0.0}
+    v = verdict.analyze(base, spike={"baseline_p95": 100.0, "spike_p95": 900.0,
+                                     "recovered_after_s": None})
+    assert any("Did not recover" in f for f in v)
+    v2 = verdict.analyze(base, soak={"rocketchat": 75e6})
+    assert any("75MB/h" in f and "leak" in f for f in v2)
+    v3 = verdict.analyze(base, spike={"baseline_p95": 100.0, "spike_p95": 900.0,
+                                      "recovered_after_s": 4})
+    assert len(v3) == 1 and "headroom" in v3[0]   # quick recovery isn't a finding
+
+
+def test_new_scenarios_registered():
+    from importlib import resources
+    from rc_repro.perf import k6
+    d = resources.files("rc_repro").joinpath("data", "loadtest")
+    for s in ("webhook", "badbot"):
+        assert s in k6.SCENARIOS and d.joinpath(f"{s}.js").is_file()
+    assert "SPIKE" in d.joinpath("common.js").read_text(encoding="utf-8")
+
+
+def test_capacity_report_renders(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from pathlib import Path
+    from rc_repro.perf import report
+    ctx = {"name": "acme", "version": "8.5.1", "scenario": "journey", "slo": "p95=500ms",
+           "users": 5, "step_duration": "20s", "target": "http://rocketchat:3000",
+           "constrained": "rocketchat=2cpu"}
+    steps = [
+        {"vus": 10, "rps": 140.0, "p95": 90.0, "error_rate": 0.0, "ok": True,
+         "lag_max_s": 0.02, "breached": []},
+        {"vus": 20, "rps": 150.0, "p95": 620.0, "error_rate": 0.01, "ok": False,
+         "lag_max_s": 1.2, "breached": ["p95 <= 500ms (actual 620ms)"]},
+    ]
+    host = {"os": "t", "cpu": 8, "docker": "27", "compose": "2.30"}
+    out = report.write_capacity(ctx, steps, "~10 concurrent VUs",
+                                "at 20 VUs the RC event loop saturated", host, "TESTSTAMP")
+    md_text = Path(out).read_text(encoding="utf-8")
+    assert "capacity report" in md_text and "~10 concurrent VUs" in md_text
+    assert "**FAIL** — p95 <= 500ms" in md_text and "Resource caps" in md_text
+    assert "event loop saturated" in md_text
+
+
+def test_mongoprof_last_json():
+    from rc_repro.perf import mongoprof
+    out = "some banner\nWarning: x\n{\"was\": 0, \"slowms\": 100}\n"
+    assert mongoprof._last_json(out) == {"was": 0, "slowms": 100}
+    assert mongoprof._last_json("no json here") is None
+
+
 def test_status_breakdown_non_zero_only():
     from rc_repro import cli
     from rc_repro.perf import report
