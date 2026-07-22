@@ -30,17 +30,26 @@ from rc_repro.services import lifecycle as lc
 from rc_repro.web.jobs import JobManager
 
 
-def create_app(token: str = "") -> FastAPI:
+def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI:
     app = FastAPI(title="rc-repro", docs_url=None, redoc_url=None)
     jobs = JobManager()
     app.state.token = token
 
-    # --- security: loopback-only Host + token on the API (DNS-rebind/CSRF guard)
+    # Host allow-list (DNS-rebind/CSRF guard). Loopback always allowed; extra
+    # hosts (e.g. a reverse-proxy domain like *.iximiuz.com) opt in via
+    # --allow-host, and "*" trusts any Host.
+    allowed = {"localhost", "127.0.0.1", "::1", ""} | set(allow_hosts or [])
+    any_host = "*" in (allow_hosts or [])
+
+    def host_ok(hdr: str | None) -> bool:
+        return any_host or (hdr or "").split(":")[0] in allowed
+    app.state.host_ok = host_ok
+
+    # --- security: Host allow-list + token on the API
     @app.middleware("http")
     async def guard(request: Request, call_next):
-        host = (request.headers.get("host") or "").split(":")[0]
-        if host not in ("localhost", "127.0.0.1", "::1", ""):
-            return JSONResponse({"error": "host not allowed"}, status_code=403)
+        if not host_ok(request.headers.get("host")):
+            return JSONResponse({"error": "host not allowed (use serve --allow-host)"}, status_code=403)
         path = request.url.path
         if token and path.startswith("/api/") and path != "/api/health":
             given = request.headers.get("x-rc-repro-token") or request.query_params.get("t")
@@ -93,8 +102,7 @@ def create_app(token: str = "") -> FastAPI:
     @app.websocket("/api/repros/{name}/logs/stream")
     async def logs_stream(ws: WebSocket, name: str, tail: int = 300):
         # WS bypasses the http middleware, so enforce host + token here.
-        host = (ws.headers.get("host") or "").split(":")[0]
-        if host not in ("localhost", "127.0.0.1", "::1", ""):
+        if not app.state.host_ok(ws.headers.get("host")):
             await ws.close(code=1008); return
         if token and ws.query_params.get("t") != token:
             await ws.close(code=1008); return

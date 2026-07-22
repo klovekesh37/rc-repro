@@ -39,6 +39,16 @@ def test_non_localhost_host_rejected():
     assert r.status_code == 403
 
 
+def test_allow_host_permits_proxy_domain():
+    # reverse-proxy access (iximiuz/Codespaces): allow the proxy host, or '*'.
+    proxy = "https://x.iximiuz.com"
+    assert TestClient(create_app(token=""), base_url=proxy).get("/api/health").status_code == 403
+    assert TestClient(create_app(token="", allow_hosts=["x.iximiuz.com"]),
+                      base_url=proxy).get("/api/health").status_code == 200
+    assert TestClient(create_app(token="", allow_hosts=["*"]),
+                      base_url=proxy).get("/api/health").status_code == 200
+
+
 def test_list_repros(monkeypatch):
     monkeypatch.setattr(lc, "list_repros", lambda: [{"name": "x", "state": "running"}])
     r = client().get("/api/repros", headers=H)

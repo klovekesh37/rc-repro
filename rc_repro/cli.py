@@ -1650,11 +1650,19 @@ def doctor() -> None:
 @app.command()
 def serve(
     port: int = typer.Option(7070, "--port", help="host port for the web GUI"),
-    bind: str = typer.Option("127.0.0.1", "--bind", help="interface to bind (loopback by default)"),
+    bind: str = typer.Option("127.0.0.1", "--bind", help="interface to bind (loopback by default; use 0.0.0.0 behind a proxy/remote lab)"),
+    allow_host: list[str] = typer.Option(None, "--allow-host", help="extra Host header to accept, e.g. a reverse-proxy domain (repeatable; '*' = any host). Needed for iximiuz/Codespaces/remote access"),
     no_open: bool = typer.Option(False, "--no-open", help="don't open a browser"),
-    no_token: bool = typer.Option(False, "--no-token", help="disable the session token (loopback dev only)"),
+    no_token: bool = typer.Option(False, "--no-token", help="disable the session token (loopback dev / trusted proxy only)"),
 ) -> None:
-    """Launch the local web GUI (needs `pip install 'rc-repro[gui]'`)."""
+    """Launch the local web GUI (needs `pip install 'rc-repro[gui]'`).
+
+    Behind a reverse proxy (iximiuz Labs, Codespaces, ngrok, …): bind a reachable
+    interface and allow the proxy's hostname, e.g.
+      rc-repro serve --bind 0.0.0.0 --allow-host '*' --no-token
+    (in an ephemeral lab that's fine; otherwise keep the token and append
+    `?t=<token>` to the proxy URL, and pass the real --allow-host domain).
+    """
     try:
         import uvicorn
         from rc_repro.web.app import create_app
@@ -1663,16 +1671,22 @@ def serve(
     import secrets
     import webbrowser
 
+    allow = list(allow_host or [])
     token = "" if no_token else secrets.token_urlsafe(16)
-    if bind not in ("127.0.0.1", "localhost", "::1"):
+    loopback = bind in ("127.0.0.1", "localhost", "::1")
+    if not loopback:
         ui.warn(f"  ⚠ binding {bind} exposes docker control (create/delete repros + volumes) "
                 "to your network — use only if you mean to.")
+    if "*" in allow:
+        ui.warn("  ⚠ --allow-host '*' accepts ANY Host header — only on a trusted/ephemeral network.")
     url = f"http://localhost:{port}/" + (f"?t={token}" if token else "")
     typer.secho(f"rc-repro GUI: {url}", bold=True)
     if token:
         ui.hint("  (the ?t=... token authorizes this browser session)")
-    app_obj = create_app(token=token)
-    if not no_open:
+        if not loopback or allow:
+            ui.hint(f"  via a proxy? open the proxy URL with the token appended: ...<proxy-url>/?t={token}")
+    app_obj = create_app(token=token, allow_hosts=allow)
+    if not no_open and loopback:
         try:
             webbrowser.open(url)
         except Exception:  # noqa: BLE001 - headless / no browser is fine
