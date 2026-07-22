@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rc-repro</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="dollar">$</span> rc-repro</div>
+    <span id="docker-badge" class="chip">docker: ?</span>
+    <div class="topbar-actions">
+      <button id="btn-new" class="btn primary">+ New repro</button>
+      <button id="btn-bench" class="btn">Benchmark</button>
+      <button id="btn-refresh" class="btn">Refresh</button>
+      <button id="btn-prune" class="btn danger">Prune down</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="list">
+      <div class="toolbar">
+        <div class="toolbar-title">
+          <h1>Workspaces</h1>
+          <span id="running-pill" class="pill running">0 running</span>
+        </div>
+      </div>
+      <div class="toolbar-controls">
+        <input id="filter" class="input" placeholder="Filter repros...">
+        <select id="status-filter" class="input">
+          <option value="">All statuses</option>
+          <option value="running">Running</option>
+          <option value="stopped">Stopped</option>
+          <option value="down">Down</option>
+        </select>
+        <select id="sort-by" class="input">
+          <option value="name">Sort: name</option>
+          <option value="state">Sort: state</option>
+          <option value="port">Sort: port</option>
+        </select>
+      </div>
+      <section id="repros" class="cards"></section>
+    </section>
+    <aside id="detail" class="detail"></aside>
+  </main>
+
+  <footer class="statusbar">
+    <span id="sb-count">—</span>
+    <span id="sb-refreshed">Last refreshed: —</span>
+    <span class="sb-right" id="sb-docker">docker: ?</span>
+  </footer>
+
+  <!-- Create dialog -->
+  <dialog id="create-dialog">
+    <form id="create-form" method="dialog">
+      <h2>New repro</h2>
+      <label>Rocket.Chat version <input name="version" placeholder="8.5.1" required></label>
+      <label>Preset <select name="preset" id="preset-select"></select></label>
+      <p id="preset-desc" class="hint"></p>
+      <div id="preset-params"></div>
+      <label>Host port (blank = auto) <input name="port" type="number" min="1024" max="65535" placeholder="auto"></label>
+      <div class="checks">
+        <label><input type="checkbox" name="monitor"> Monitoring (Prometheus + Grafana)</label>
+        <label><input type="checkbox" name="seed"> Seed sample data</label>
+        <label><input type="checkbox" name="wait" checked> Wait until ready</label>
+      </div>
+      <details class="adv">
+        <summary>Advanced options</summary>
+        <label>Name (blank = derived) <input name="name" placeholder="e.g. rc8-5-1-ldap"></label>
+        <label>Registration token — EE license (--reg-token) <input name="reg_token" placeholder="cloud reg token"></label>
+        <label>MongoDB tag override (--mongo) <input name="mongo" placeholder="e.g. 8.0"></label>
+        <label>RC image override (--rc-image) <input name="rc_image" placeholder="registry/…/rocket.chat"></label>
+        <label>Bind host (--bind) <input name="bind" placeholder="127.0.0.1"></label>
+        <label>Root URL override (--root-url) <input name="root_url" placeholder="http://localhost:PORT"></label>
+        <div class="checks">
+          <label><input type="checkbox" name="pin"> Pin (persistent + set as default)</label>
+          <label><input type="checkbox" name="offline"> Offline (skip live version lookup)</label>
+          <label><input type="checkbox" name="no_pull"> Don't pull images first</label>
+        </div>
+      </details>
+      <menu>
+        <button value="cancel" type="button" id="create-cancel" class="btn">Cancel</button>
+        <button value="ok" class="btn primary" id="create-submit">Create</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Seed dialog -->
+  <dialog id="seed-dialog">
+    <form id="seed-form" method="dialog">
+      <h2 id="seed-title">Seed data</h2>
+      <label>Mode
+        <select name="mode" id="seed-mode">
+          <option value="profile">REST profile (real, loginable users)</option>
+          <option value="scale">Bulk --scale (fast Mongo prefill; no logins/hooks)</option>
+        </select>
+      </label>
+      <label id="seed-profile-row">Profile
+        <select name="profile"><option>small</option><option>standard</option><option>large</option></select>
+      </label>
+      <label id="seed-scale-row" hidden>Scale spec
+        <input name="scale" placeholder="users=50000,messages=800000@team-chat">
+      </label>
+      <p class="hint" id="seed-hint"></p>
+      <menu>
+        <button type="button" id="seed-cancel" class="btn">Cancel</button>
+        <button type="button" id="seed-clear" class="btn danger">Clear scale data</button>
+        <button type="button" class="btn primary" id="seed-submit">Seed</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Config-import dialog -->
+  <dialog id="import-dialog">
+    <form id="import-form" method="dialog">
+      <h2 id="import-title">Import customer config</h2>
+      <label>Support-dump settings file (*-settings.json)
+        <input type="file" name="file" id="import-file" accept=".json,application/json">
+      </label>
+      <label>Only these id prefixes (optional, comma-separated)
+        <input name="only" placeholder="Livechat,LDAP,Accounts">
+      </label>
+      <div id="import-plan" class="plan" hidden></div>
+      <menu>
+        <button type="button" id="import-cancel" class="btn">Cancel</button>
+        <button type="button" id="import-preview" class="btn">Preview plan</button>
+        <button type="button" class="btn primary" id="import-apply" disabled>Apply</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Load-test dialog -->
+  <dialog id="perf-dialog">
+    <form id="perf-form" method="dialog">
+      <h2 id="perf-title">Load test</h2>
+      <label>Scenario
+        <select name="scenario">
+          <option>messages</option><option>login</option><option>read</option>
+          <option>mixed</option><option>journey</option><option>badbot</option>
+        </select>
+      </label>
+      <div class="row2">
+        <label>VUs <input name="vus" type="number" min="1" value="10"></label>
+        <label>Duration <input name="duration" value="30s"></label>
+      </div>
+      <div class="row2">
+        <label>Seed users (0 = admin) <input name="users_n" type="number" min="0" value="10"></label>
+        <label>SLO (optional) <input name="slo" placeholder="p95=300ms,error=1%"></label>
+      </div>
+      <label>Constrain (optional) <input name="constrain" placeholder="rc=2cpu/2g,mongo=1cpu/1g"></label>
+      <div class="checks">
+        <label><input type="checkbox" name="diag" checked> Server-side diagnosis (lag, slow queries, verdict)</label>
+        <label><input type="checkbox" name="stats"> Container CPU/RAM</label>
+        <label id="perf-live-row"><input type="checkbox" name="live"> Stream to Grafana (needs monitoring)</label>
+      </div>
+      <menu>
+        <button type="button" id="perf-cancel" class="btn">Cancel</button>
+        <button type="button" class="btn primary" id="perf-submit">Run</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Capacity dialog -->
+  <dialog id="cap-dialog">
+    <form id="cap-form" method="dialog">
+      <h2 id="cap-title">Capacity search</h2>
+      <p class="hint">Doubles VUs until the SLO breaks, then bisects — "handles ~N concurrent VUs".</p>
+      <label>Scenario
+        <select name="scenario">
+          <option>journey</option><option>messages</option><option>read</option>
+          <option>mixed</option><option>login</option><option>badbot</option>
+        </select>
+      </label>
+      <label>SLO <input name="slo" value="p95=500ms,error=2%"></label>
+      <div class="row2">
+        <label>Start VUs <input name="start" type="number" min="1" value="10"></label>
+        <label>Max VUs <input name="max_vus" type="number" min="1" value="320"></label>
+      </div>
+      <div class="row2">
+        <label>Step duration <input name="step_duration" value="20s"></label>
+        <label>Seed users <input name="users_n" type="number" min="0" value="10"></label>
+      </div>
+      <label>Constrain (optional) <input name="constrain" placeholder="rc=2cpu/2g"></label>
+      <menu>
+        <button type="button" id="cap-cancel" class="btn">Cancel</button>
+        <button type="button" class="btn primary" id="cap-submit">Run search</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Benchmark dialog -->
+  <dialog id="bench-dialog">
+    <form id="bench-form" method="dialog">
+      <h2>Benchmark versions</h2>
+      <p class="hint">Boots each version in a throwaway sandbox, runs the identical seed workload, and compares. Sequential — can take a while.</p>
+      <label>Versions (comma-separated) <input name="versions" placeholder="8.4.1,8.5.1"></label>
+      <label>Seed profile
+        <select name="seed_profile"><option>small</option><option selected>standard</option><option>large</option></select>
+      </label>
+      <menu>
+        <button type="button" id="bench-cancel" class="btn">Cancel</button>
+        <button type="button" class="btn primary" id="bench-submit">Run benchmark</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Job/progress + logs dialog -->
+  <dialog id="job-dialog">
+    <h2 id="job-title">Working…</h2>
+    <pre id="job-log" class="log"></pre>
+    <menu><button id="job-close" class="btn">Close</button></menu>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

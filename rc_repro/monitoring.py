@@ -116,6 +116,8 @@ def services() -> dict:
                 # Anonymous read access so the dashboard opens with no login (local repro).
                 "GF_AUTH_ANONYMOUS_ENABLED": "true",
                 "GF_AUTH_ANONYMOUS_ORG_ROLE": "Viewer",
+                # Allow the rc-repro web GUI to embed the k6 dashboard in an iframe.
+                "GF_SECURITY_ALLOW_EMBEDDING": "true",
             },
             "volumes": [
                 "./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro",

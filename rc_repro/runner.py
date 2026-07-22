@@ -201,6 +201,29 @@ def _compose(name: str, *args: str, capture: bool = False) -> subprocess.Complet
     )
 
 
+def compose_stream(name: str, *args: str, on_line=None) -> int:
+    """Run `docker compose <args>` streaming combined stdout+stderr line-by-line
+    to `on_line` (for live progress in the web UI). Returns the exit code.
+
+    Uses Popen (not subprocess.run) so callers get output as it happens; the CLI
+    keeps the blocking `_compose` path, which inherits the terminal for docker's
+    own progress rendering."""
+    cmd = ["docker", "compose", *args]
+    proc = subprocess.Popen(
+        cmd, cwd=workspace(name), text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1,
+    )
+    try:
+        for line in proc.stdout or []:
+            line = line.rstrip("\n")
+            if on_line and line:
+                on_line(line)
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+    return proc.wait()
+
+
 def up(name: str, *, pull: bool = True) -> int:
     if pull:
         # A failed pull is deliberately non-fatal: cached images may satisfy
@@ -319,14 +342,11 @@ def rc_state(name: str) -> str:
     return "absent"
 
 
-def project_states() -> dict[str, str] | None:
-    """Map compose project name -> status string for ALL projects, in one call.
+def _compose_ls() -> list[dict] | None:
+    """Parsed `docker compose ls --all --format json`, or None if the query failed.
 
-    Uses `docker compose ls` so listing N repros costs one subprocess, not N.
-    Status looks like "running(3)" / "exited(2)"; a fully `down`ed repro (no
-    containers) is absent from the output. Returns None if the query itself
-    failed — callers that DELETE based on absence (prune) must not confuse
-    "no projects" with "couldn't ask docker".
+    Newer compose emits a JSON array; older versions emit NDJSON (one object per
+    line). Both are handled so callers work across compose versions.
     """
     proc = subprocess.run(
         ["docker", "compose", "ls", "--all", "--format", "json"],
@@ -336,13 +356,80 @@ def project_states() -> dict[str, str] | None:
         return None
     raw = (proc.stdout or "").strip()
     if not raw:
-        return {}
-    # Newer compose emits a JSON array; older versions emit NDJSON (one object
-    # per line). Handle both so `list` works across compose versions.
+        return []
     try:
         data = json.loads(raw)
-        if isinstance(data, dict):
-            data = [data]
+        return [data] if isinstance(data, dict) else data
+    except json.JSONDecodeError:
+        out = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return out
+
+
+def project_states() -> dict[str, str] | None:
+    """Map compose project name -> status string for ALL projects, in one call.
+
+    Status looks like "running(3)" / "exited(2)"; a fully `down`ed repro (no
+    containers) is absent from the output. Returns None if the query itself
+    failed — callers that DELETE based on absence (prune) must not confuse
+    "no projects" with "couldn't ask docker".
+    """
+    data = _compose_ls()
+    if data is None:
+        return None
+    return {item.get("Name", ""): item.get("Status", "") for item in data}
+
+
+def project_config_files() -> dict[str, str] | None:
+    """Map compose project name -> its ConfigFiles string (comma-joined paths).
+
+    Used to detect a project-name COLLISION: two repro workspaces (e.g. a real
+    one and a throwaway in a different RC_REPRO_HOME) derive the same project
+    name `rcrepro-<name>`, and `docker compose up` would then reconcile the wrong
+    workspace's containers. None if docker couldn't be queried.
+    """
+    data = _compose_ls()
+    if data is None:
+        return None
+    return {item.get("Name", ""): (item.get("ConfigFiles") or "") for item in data}
+
+
+def rc_status_by_project() -> dict[str, str]:
+    """Map compose project -> its rocketchat container `Status` string
+    ("Up 2 hours (healthy)"), in ONE `docker ps` call (cheap enough for the whole
+    dashboard). Used to show uptime/health per repro without an N-call fan-out."""
+    proc = subprocess.run(
+        ["docker", "ps", "--all", "--format",
+         '{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}\t{{.Status}}'],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[1] in ("rocketchat", "rocketchat-1"):
+            out[parts[0]] = parts[2]
+    return out
+
+
+def container_details(name: str) -> list[dict]:
+    """Per-container [{service, state, status, health}] for a repro (incl. stopped)."""
+    r = _compose(name, "ps", "--all", "--format", "json", capture=True)
+    if r.returncode != 0:
+        return []
+    raw = (r.stdout or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        data = [data] if isinstance(data, dict) else data
     except json.JSONDecodeError:
         data = []
         for line in raw.splitlines():
@@ -352,7 +439,9 @@ def project_states() -> dict[str, str] | None:
                     data.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-    return {item.get("Name", ""): item.get("Status", "") for item in data}
+    return [{"service": it.get("Service", ""), "state": it.get("State", ""),
+             "status": it.get("Status", ""), "health": it.get("Health", "")}
+            for it in data]
 
 
 def docker_available() -> bool:

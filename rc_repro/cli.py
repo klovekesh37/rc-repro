@@ -18,10 +18,13 @@ from typing import Optional
 import requests
 import typer
 
-from rc_repro import compose, config, configimport, presets, perf, rcapi, runner, scaleseed, ui, versions
+from rc_repro import compose, config, errors, presets, perf, rcapi, runner, ui, versions
 from rc_repro import seed as seeder
 from rc_repro.perf import report as perf_report
 from rc_repro.perf.timings import fmt_ms
+from rc_repro.services import data as datasvc
+from rc_repro.services import lifecycle as lcsvc
+from rc_repro.services.events import Event, null_emit
 
 app = typer.Typer(
     add_completion=False,
@@ -29,26 +32,10 @@ app = typer.Typer(
     help="Launch version-matched Rocket.Chat reproduction environments.",
 )
 
-_NAME_RE = re.compile(r"[^a-z0-9-]+")
-
-
 # --- helpers ------------------------------------------------------------------
 
 
 _err = ui.die  # error-exit (red on stderr + exit 1), kept under the local name
-
-
-def _sanitize(name: str) -> str:
-    name = name.lower().replace(".", "-")
-    name = _NAME_RE.sub("-", name)
-    return name.strip("-")
-
-
-def _derive_name(version: str, preset: str) -> str:
-    base = "rc" + version
-    if preset and preset != "default":
-        base += "-" + preset
-    return _sanitize(base)
 
 
 def _resolve_name(name: str | None) -> str:
@@ -76,51 +63,6 @@ def _login(meta: runner.Metadata) -> rcapi.Auth:
     return rcapi.login(meta.root_url, mailpit_url=meta.extra.get(config.EXTRA_MAILPIT_URL))
 
 
-def _check_sidecar_ports(pre: presets.Preset, exclude: str = "") -> None:
-    """Preset side services publish fixed host ports (config.PRESET_PORTS) —
-    error early, naming the owner, instead of a cryptic docker bind failure.
-    `exclude` is the repro being (re)created: its own claims don't count (a
-    --force/--fresh recreate tears the old stack down first)."""
-    if not pre.ports:
-        return
-    wanted = set(pre.ports)
-    own: set[int] = set()
-    for m in runner.list_meta():
-        claimed = set(m.extra.get("sidecar_ports") or []) if isinstance(m.extra, dict) else set()
-        if m.name == exclude:
-            own = claimed
-            continue
-        overlap = sorted(claimed & wanted)
-        if overlap:
-            # The claim lives in the repro's RECORD (survives a plain `down`),
-            # so the remedy must delete the record, not just the containers.
-            _err(
-                f"preset {pre.name!r} publishes port(s) {overlap}, already claimed by "
-                f"repro {m.name!r} — delete it first: rc-repro down --name {m.name} --volumes"
-            )
-    for p in sorted(wanted - own):
-        if not runner.port_free(p):
-            _err(f"preset {pre.name!r} needs host port {p}, which is already in use on this machine")
-
-
-def _check_monitor_ports(exclude: str = "") -> None:
-    """Preflight the Prometheus/Grafana ports for --monitor / attach."""
-    wanted = set(config.MONITOR_PORTS)
-    own: set[int] = set()
-    for m in runner.list_meta():
-        claimed = set(m.extra.get("monitoring_ports") or []) if isinstance(m.extra, dict) else set()
-        if m.name == exclude:
-            own = claimed
-            continue
-        overlap = sorted(claimed & wanted)
-        if overlap:
-            _err(f"monitoring needs port(s) {overlap}, already used by repro {m.name!r} "
-                 f"(its monitoring) — stop it first: rc-repro monitor --name {m.name} --off")
-    for p in sorted(wanted - own):
-        if not runner.port_free(p):
-            _err(f"monitoring needs host port {p}, which is already in use on this machine")
-
-
 def _pretty_state(status: str) -> str:
     """Friendly label from a `docker compose ls` status.
 
@@ -146,88 +88,6 @@ def _parse_set_params(set_: list[str] | None) -> dict[str, str]:
         k, v = item.split("=", 1)
         params[k.strip()] = v.strip()
     return params
-
-
-def _unknown_params(params: dict, pre: presets.Preset) -> list[str]:
-    """`--set` keys the preset doesn't accept (typos like `agent` for `agents`
-    were silently ignored before). Known keys = the preset's params_help."""
-    return sorted(set(params) - set(pre.params_help))
-
-
-def _reuse_existing(repro_name: str, wait: bool, seed: bool, seed_profile: str,
-                    monitor: bool = False, stats: bool = False) -> None:
-    """The idempotent `up` path for an existing repro: `docker compose up -d`
-    handles both a `stop`-paused repro (containers exist -> started) and a
-    `down`ed one (containers removed, volume kept -> recreated with its data).
-    `start` alone can't do the latter — "no container to start"."""
-    state = runner.rc_state(repro_name)
-    if state == "running":
-        typer.echo(f"{repro_name!r} is already running.")
-    else:
-        typer.echo(f"{repro_name!r} already exists — bringing it back up.")
-        if runner.up(repro_name, pull=False) != 0:
-            _err("`docker compose up` failed (see output above)")
-    typer.echo("  (creation flags like --set/--bind/--port are ignored on an existing repro; --force recreates)")
-    if monitor:
-        ui.hint(f"  add monitoring to this running repro: rc-repro monitor --name {repro_name}")
-    meta = runner.read_meta(repro_name)
-    _post_up(meta, wait)
-    if seed:
-        _run_seed(meta, seed_profile, stats=stats)
-
-
-def _own_ports(name: str) -> set[int]:
-    """All host ports an existing repro's record claims (RC + instance block +
-    sidecars) — subtracted when validating a --force/--fresh recreate of it."""
-    if not name or not runner.exists(name):
-        return set()
-    try:
-        m = runner.read_meta(name)
-    except Exception:  # noqa: BLE001 - half-written record
-        return set()
-    own = {m.host_port}
-    n = m.extra.get("instances") if isinstance(m.extra, dict) else None
-    if isinstance(n, int) and n > 1:
-        own.update(m.host_port + i for i in range(1, n + 1))
-    for key in ("sidecar_ports", "monitoring_ports"):
-        claimed = m.extra.get(key) if isinstance(m.extra, dict) else None
-        if isinstance(claimed, list):
-            own.update(int(p) for p in claimed if isinstance(p, int) or str(p).isdigit())
-    return own
-
-
-def _pick_host_port(port: int, pre: presets.Preset, exclude: str = "") -> int:
-    """Explicit --port is validated (whole block for multi-instance) against
-    other repros' claims and the host; else first free >= 3000. `exclude` is a
-    repro being recreated — its own claims/bindings don't count (torn down
-    before launch)."""
-    span = pre.instances + 1 if pre.instances > 1 else 1
-    if port:
-        if port + span - 1 > runner.PORT_MAX:
-            _err(f"--port {port}: a {pre.instances}-instance repro needs ports up to {port + span - 1} (past 65535)")
-        own = _own_ports(exclude)
-        used = runner.used_ports() - own
-        for p in range(port, port + span):
-            if p in used:
-                _err(f"--port {port}: port {p} is already claimed by another repro (see `rc-repro list`)")
-            if p not in own and not runner.port_free(p):
-                _err(f"--port {port}: port {p} is already in use on this machine")
-        return port
-    try:
-        return runner.pick_port_range(span) if span > 1 else runner.pick_port()
-    except RuntimeError as exc:
-        _err(str(exc))
-
-
-def _print_plan(repro_name: str, resolved, pre: presets.Preset, root: str, token: str) -> None:
-    # Compact one-liner before the (possibly slow) image pull; the full summary
-    # panel is shown once the repro is ready.
-    typer.echo(
-        f"Creating {repro_name!r} — RC {resolved.rc_version}, "
-        f"Mongo {resolved.mongo_tag} ({resolved.mongo_flavor}), preset {pre.name}…"
-    )
-    if pre.requires_license and not token:
-        ui.warn("  note: this preset needs an Enterprise license — pass --reg-token.")
 
 
 def _fmt_duration(secs: int) -> str:
@@ -272,6 +132,33 @@ def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | No
 # --- commands -----------------------------------------------------------------
 
 
+def _cli_emit(ev: Event) -> None:
+    """Print a service progress event on the terminal. Terminal/`done` events are
+    suppressed — the command wrapper prints the final panel itself."""
+    if ev.terminal or ev.phase == "done":
+        return
+    if ev.level in ("warn", "error"):
+        ui.warn("  " + ev.message)
+    else:
+        typer.echo(f"  {ev.message}")
+
+
+def _render_create_result(result: dict) -> None:
+    """Format a create_repro result the way `up` used to (panel + notes + hints)."""
+    meta = runner.read_meta(result["name"])
+    if result.get("waited"):
+        ui.ok("✓ ready")
+        extra = [("Booted in", _fmt_duration(result["booted_s"]))] if result.get("booted_s") is not None else None
+        _summary_panel(meta, extra_rows=extra)
+        ui.hint(f"  next: rc-repro logs --name {meta.name} -f")
+    else:
+        ui.ok("✓ starting")
+        _summary_panel(meta)
+        ui.hint(f"  ready when serving : rc-repro ready --name {meta.name}")
+        ui.hint(f"  follow logs        : rc-repro logs --name {meta.name} -f")
+    _print_notes(meta)
+
+
 @app.command()
 def up(
     version: str = typer.Option(..., "--version", "-v", help="Rocket.Chat version, e.g. 6.5.3"),
@@ -296,131 +183,24 @@ def up(
     stats: bool = typer.Option(False, "--stats", help="with --seed: report the CPU/RAM cost of seeding"),
 ) -> None:
     """Create and start a version-matched Rocket.Chat repro."""
-    _require_docker()
-    cfg = config.load_config()
-
-    try:
-        resolved = versions.resolve(version, offline=offline)
-    except ValueError as exc:
-        _err(str(exc))
-    # Image override precedence: --rc-image flag > config/env (RC_REPRO_RC_IMAGE).
-    if rc_image or cfg.get("rc_image"):
-        resolved.rc_image = rc_image or cfg["rc_image"]
-    if mongo:
-        versions.apply_mongo_override(resolved, mongo)
-
-    params = _parse_set_params(set_)
-    try:
-        pre = presets.load(preset, params)
-    except ValueError as exc:
-        _err(str(exc))
-    unknown = _unknown_params(params, pre)
-    if unknown:
-        valid = ", ".join(sorted(pre.params_help)) or "(this preset takes no --set params)"
-        _err(f"unknown --set param(s) for preset {preset!r}: {', '.join(unknown)} — valid: {valid}")
-
-    # Post-ready preset actions (e.g. Keycloak SAML) and --seed both need RC to
-    # be serving first, so imply --wait for them.
-    if (pre.post_ready or seed) and not wait:
-        wait = True
-        typer.echo("(waiting for readiness — preset self-config / --seed run after boot)")
-
-    repro_name = _sanitize(name) if name else _derive_name(version, preset)
-    if not repro_name:
-        _err(f"--name {name!r} contains no usable characters (want a-z, 0-9, '-')")
-    if port and not (1024 <= port <= 65535):
-        _err(f"--port {port} is out of range (want 1024-65535)")
-
-    # Idempotent: an existing repro (unless --fresh/--force recreates it) is
-    # simply brought back up with its data intact.
-    if runner.exists(repro_name) and not force and not fresh:
-        _reuse_existing(repro_name, wait, seed, seed_profile, monitor=monitor, stats=stats)
-        return
-
-    _check_sidecar_ports(pre, exclude=repro_name)
-    if monitor:
-        _check_monitor_ports(exclude=repro_name)
-    host_port = _pick_host_port(port, pre, exclude=repro_name)
-    root = root_url or f"http://localhost:{host_port}"
-    token = reg_token or cfg.get("reg_token") or ""
-    # Bind precedence: --bind flag > config/env (RC_REPRO_BIND_HOST) > loopback.
-    bind_host = bind or cfg.get("bind_host") or config.DEFAULT_BIND_HOST
-
-    spec = compose.Spec.from_resolved(
-        resolved,
-        project_name=runner.project_name(repro_name),
-        root_url=root,
-        host_port=host_port,
-        reg_token=token or None,
-        preset=pre,
-        bind_host=bind_host,
-        monitoring=monitor,
+    # Orchestration lives in the shared service layer (same code the web GUI
+    # runs); this wrapper just parses options, prints progress, and formats the
+    # result. --seed is applied after (with the CLI's richer --stats output), so
+    # `wait` is forced on when seeding, as before.
+    req = lcsvc.CreateReq(
+        version=version, preset=preset, name=name, port=port, root_url=root_url,
+        bind=bind, rc_image=rc_image, mongo=mongo, reg_token=reg_token,
+        params=_parse_set_params(set_), seed=False, pin=pin,
+        wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
+        force=force, monitor=monitor,
     )
-    doc = compose.build(spec)
-
-    meta = runner.Metadata(
-        name=repro_name,
-        project=spec.project_name,
-        rc_version=resolved.rc_version,
-        rc_image=resolved.rc_image,
-        mongo_tag=resolved.mongo_tag,
-        mongo_flavor=resolved.mongo_flavor,
-        preset=pre.name,
-        root_url=root,
-        host_port=host_port,
-        version_source=resolved.source,
-        pinned=pin,
-        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    )
-    if pre.post_ready:
-        meta.extra["post_ready"] = pre.post_ready
-    if pre.notes:
-        meta.extra["notes"] = pre.notes
-    if pre.instances > 1:
-        meta.extra["instances"] = pre.instances
-    if pre.extra:
-        meta.extra.update(pre.extra)
-    if pre.ports:
-        meta.extra["sidecar_ports"] = pre.ports
-    files = list(pre.files)
-    if monitor:
-        from rc_repro import monitoring
-        targets = compose.rc_service_names(pre.instances)
-        files += monitoring.files(targets)
-        meta.extra["monitoring"] = True
-        meta.extra["monitoring_ports"] = list(config.MONITOR_PORTS)
-        meta.extra.setdefault("notes", [])
-        meta.extra["notes"] = list(meta.extra["notes"]) + monitoring.notes()
-
-    # Recreate (--force/--fresh): tear the OLD release down BEFORE overwriting
-    # its compose file — the old file still describes the running services, so
-    # a preset-shape change can't leave orphan containers behind.
-    if runner.exists(repro_name):
-        if runner.down(repro_name, volumes=fresh) != 0:
-            _err(f"could not tear down the existing {repro_name!r} (see output above); not overwriting it")
-
-    runner.write(repro_name, compose.to_yaml(doc), meta, files=files)
-
-    if pin:
-        # Persist into the FILE only — never the env-merged view (with_env
-        # would write e.g. RC_REPRO_REG_TOKEN into config.yaml).
-        raw = config.load_config(with_env=False)
-        raw["default_repro"] = repro_name
-        config.save_config(raw)
-
-    _print_plan(repro_name, resolved, pre, root, token)
-
-    rc = runner.up(repro_name, pull=not no_pull)
-    if rc != 0:
-        _err(
-            "`docker compose up` failed (see output above). The workspace is kept "
-            f"for inspection — retry with `rc-repro up ... --name {repro_name} --force`, "
-            f"or discard it: rc-repro down --name {repro_name} --volumes"
-        )
-
-    _post_up(meta, wait)
+    try:
+        result = lcsvc.create_repro(req, emit=_cli_emit, stream_output=False)
+    except errors.ReproError as exc:
+        _err(str(exc))
+    _render_create_result(result)
     if seed:
-        _run_seed(meta, seed_profile, stats=stats)
+        _run_seed(runner.read_meta(result["name"]), seed_profile, stats=stats)
 
 
 def _run_seed(meta: runner.Metadata, profile: str,
@@ -447,54 +227,27 @@ def _run_seed(meta: runner.Metadata, profile: str,
     _print_seed_result(s, total, resources, meta)
 
 
-def _scale_result(out: str) -> dict | None:
-    """Last JSON line from a scaleseed mongosh run (banners may precede it)."""
-    for line in reversed((out or "").strip().splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                return json.loads(line)
-            except ValueError:
-                continue
-    return None
-
-
 def _run_scale(meta: runner.Metadata, spec_str: str) -> None:
-    try:
-        spec = scaleseed.parse_scale(spec_str)
-    except ValueError as exc:
-        _err(str(exc))
-    if not spec:
-        _err("--scale had nothing to do (want users=N and/or messages=N@room)")
+    # Delegates to the shared service (same code the web GUI runs); the CLI
+    # formats the result and prints its own headline warning.
     ui.warn("bulk Mongo prefill: users are credential-less and messages fire no "
             "app hooks — for scale/perf repros, not feature testing.")
-    if "users" in spec:
-        typer.echo(f"Inserting {spec['users']:,} users…")
-        res = _scale_ok(*scaleseed.bulk_users(meta.name, spec["users"]), "user prefill")
-        ui.ok(f"✓ inserted {res.get('inserted', 0):,} users")
-    if "messages" in spec:
-        n, room = spec["messages"]
-        typer.echo(f"Inserting {n:,} messages into {room!r}…")
-        res = _scale_ok(*scaleseed.bulk_messages(meta.name, n, room), "message prefill",
-                        hint="create the room first (REST seed, or use `general`)")
-        ui.ok(f"✓ inserted {res.get('inserted', 0):,} messages into {room!r}")
-
-
-def _scale_ok(rc: int, out: str, what: str, *, hint: str = "") -> dict:
-    """Validate a scaleseed mongosh result: non-zero exit / no JSON => hard fail;
-    a JS-level {error} (surfaced on stdout by scaleseed._eval) => report it."""
-    res = _scale_result(out)
-    if rc != 0 or not res:
-        _err(f"{what} failed (is mongodb up?): {out.strip()[:200]}")
-    if res.get("error"):
-        _err(f"{what} failed: {res['error']}" + (f" — {hint}" if hint else ""))
-    return res
+    try:
+        res = datasvc.run_scale(meta.name, spec_str, emit=null_emit)
+    except errors.ReproError as exc:
+        _err(str(exc))
+    if "users" in res:
+        ui.ok(f"✓ inserted {res['users']:,} users")
+    if "messages" in res:
+        ui.ok(f"✓ inserted {res['messages']:,} messages into {res['room']!r}")
 
 
 def _clear_scale(meta: runner.Metadata) -> None:
-    res = _scale_ok(*scaleseed.clear(meta.name), "clear")
-    ui.ok(f"✓ removed {res.get('users', 0):,} scale users and "
-          f"{res.get('messages', 0):,} scale messages")
+    try:
+        res = datasvc.clear_scale(meta.name, emit=null_emit)
+    except errors.ReproError as exc:
+        _err(str(exc))
+    ui.ok(f"✓ removed {res['users']:,} scale users and {res['messages']:,} scale messages")
 
 
 def _short_container(full: str, repro_name: str, keep_index: bool = False) -> str:
@@ -554,17 +307,6 @@ def _print_seed_result(s: dict, total: float, resources, meta: runner.Metadata) 
     _print_resources(resources or {}, meta.name)
 
 
-def _post_up(meta: runner.Metadata, wait: bool) -> None:
-    if wait:
-        _do_ready(meta)
-    else:
-        ui.ok("✓ starting")
-        _summary_panel(meta)
-        ui.hint(f"  ready when serving : rc-repro ready --name {meta.name}")
-        ui.hint(f"  follow logs        : rc-repro logs --name {meta.name} -f")
-    _print_notes(meta)
-
-
 def _print_notes(meta: runner.Metadata) -> None:
     notes = meta.extra.get("notes")
     if not notes:
@@ -586,27 +328,16 @@ def ready(
 ) -> None:
     """Block until Rocket.Chat is serving (polls /api/info)."""
     _require_docker()
-    target = _resolve_name(name)
-    _do_ready(runner.read_meta(target), timeout=timeout)
-
-
-def _wait_serving(meta: runner.Metadata, timeout: float) -> dict:
-    """Poll /api/info until RC serves (fail fast if the container died)."""
-    typer.echo(f"Waiting for {meta.name!r} to serve {meta.root_url} ...")
-
-    def is_alive() -> bool:
-        # "created"/"restarting" are still coming up — only a real exit means dead.
-        return runner.rc_state(meta.name) in ("running", "restarting", "created")
-
-    def tick(elapsed: float) -> None:
-        typer.echo(f"  ... still booting ({int(elapsed)}s)")
-
+    m = runner.read_meta(_resolve_name(name))
+    typer.echo(f"Waiting for {m.name!r} to serve {m.root_url} ...")
     try:
-        return rcapi.wait_ready(
-            meta.root_url, timeout=timeout, is_alive=is_alive, on_tick=tick
-        )
-    except rcapi.NotReady as exc:
+        result = lcsvc.wait_and_finalize(m, emit=_cli_emit, timeout=timeout)
+    except errors.ReproError as exc:
         _err(str(exc))
+    ui.ok("✓ ready")
+    _summary_panel(m, extra_rows=[("Booted in", _fmt_duration(result["booted_s"]))])
+    ui.hint(f"  next: rc-repro logs --name {m.name} -f")
+    _print_notes(m)
 
 
 def _finalize(meta: runner.Metadata):
@@ -620,138 +351,6 @@ def _finalize(meta: runner.Metadata):
         return auth
     except Exception:  # noqa: BLE001 - finalize is best-effort
         return None
-
-
-# --- post-ready actions: presets self-configure once RC is serving -------------
-
-
-def _pr_saml_idp_cert(meta: runner.Metadata, auth: rcapi.Auth, action: dict) -> None:
-    """Fetch Keycloak's SAML signing cert and apply it to RC — no manual exchange."""
-    typer.echo("  fetching IdP cert (Keycloak first boot can take ~30s)...")
-    cert = rcapi.fetch_saml_idp_cert(action["descriptor_url"])
-    if cert and rcapi.set_setting(
-        meta.root_url, auth, config.ADMIN_PASSWORD, action["setting"], cert
-    ):
-        # Reload the SAML provider so the login button registers: RC rejected it
-        # at boot (empty cert), so toggle the enable flag now the cert is present.
-        enable = action.get("enable_setting")
-        if enable:
-            rcapi.set_setting(meta.root_url, auth, config.ADMIN_PASSWORD, enable, False)
-            time.sleep(1)
-            rcapi.set_setting(meta.root_url, auth, config.ADMIN_PASSWORD, enable, True)
-        typer.echo("  ✓ IdP cert applied; SAML login button registered.")
-    else:
-        ui.warn("  ⚠ could not fetch/apply IdP cert (is the IdP up?)")
-
-
-def _pr_keycloak_master_ssl_off(meta: runner.Metadata, auth: rcapi.Auth, action: dict) -> None:
-    """The admin console authenticates against the master realm, which defaults
-    to sslRequired=external and rejects HTTP via the docker port-forward. Relax
-    it so the console is reachable over HTTP."""
-    svc = action.get("service", "keycloak")
-    port = action.get("port", 8080)   # Keycloak's internal HTTP port
-    kcadm = "/opt/keycloak/bin/kcadm.sh"
-    script = (
-        f'{kcadm} config credentials --server http://localhost:{port} '
-        f'--realm master --user admin --password admin >/dev/null && '
-        f'{kcadm} update realms/master -s sslRequired=NONE'
-    )
-    if runner.compose_exec(meta.name, svc, ["bash", "-lc", script]) == 0:
-        typer.echo("  ✓ Keycloak admin console enabled over HTTP.")
-    else:
-        ui.warn("  ⚠ could not relax Keycloak master-realm sslRequired "
-                "(is Keycloak up yet?) — the admin console may reject HTTP")
-
-
-def _pr_create_oauth_provider(meta: runner.Metadata, auth: rcapi.Auth, action: dict) -> None:
-    """Custom OAuth providers can't be configured via OVERWRITE env (their
-    settings don't exist until created) — create, then set."""
-    if rcapi.add_oauth_service(meta.root_url, auth, config.ADMIN_PASSWORD, action["name"]):
-        for sid, val in action["settings"].items():
-            rcapi.set_setting(meta.root_url, auth, config.ADMIN_PASSWORD, sid, val)
-        typer.echo("  ✓ OIDC provider created; login button registered.")
-    else:
-        ui.warn("  ⚠ could not create the OAuth provider")
-
-
-def _pr_livechat_setup(meta: runner.Metadata, auth: rcapi.Auth, action: dict) -> None:
-    """Full Omnichannel setup: make admin (+ agent1..N) available agents, create a
-    department and assign them all to it. Canned responses / business hours are
-    Enterprise-only — attempted best-effort, noted if the license isn't present."""
-    url, pw = meta.root_url, config.ADMIN_PASSWORD
-    # 1. Agents: admin always, plus agent1..N.
-    agents = [{"agentId": auth.user_id, "username": config.ADMIN_USERNAME}]
-    rcapi.add_livechat_agent(url, auth, pw, config.ADMIN_USERNAME)
-    for i in range(2, int(action.get("agents", 1)) + 1):
-        u = f"agent{i}"
-        rcapi.create_user(url, auth, pw, u)
-        rcapi.add_livechat_agent(url, auth, pw, u)
-        uid = rcapi.get_user_id(url, auth, u)
-        if uid:
-            agents.append({"agentId": uid, "username": u})
-    available = rcapi.set_livechat_available(url, auth, pw)
-
-    # 2. Department + assign every agent to it.
-    dept, dept_ok = action.get("department"), False
-    if dept:
-        dept_id = rcapi.ensure_livechat_department(url, auth, pw, dept)
-        if dept_id:
-            dept_ok = rcapi.assign_livechat_agents(url, auth, pw, dept_id, agents)
-
-    # 3. Canned response (Enterprise — best effort).
-    canned = rcapi.save_canned_response(url, auth, pw, "hello",
-                                        "Hi! Thanks for reaching out — how can I help?")
-
-    if available:
-        summary = f"  ✓ Omnichannel: {len(agents)} agent(s) available"
-        if dept_ok:
-            summary += f", '{dept}' department created + assigned"
-        typer.echo(summary + " — log into RC to go online.")
-    else:
-        ui.warn("  ⚠ set up the Omnichannel agent manually (Admin → Omnichannel → Agents)")
-    if not canned:
-        ui.note("  (canned responses & business hours are Enterprise features — pass "
-                "--reg-token to enable, else set them up manually)")
-
-
-_POST_READY_ACTIONS = {
-    "saml_idp_cert": _pr_saml_idp_cert,
-    "keycloak_master_ssl_off": _pr_keycloak_master_ssl_off,
-    "create_oauth_provider": _pr_create_oauth_provider,
-    "livechat_setup": _pr_livechat_setup,
-}
-
-
-def _run_post_ready(meta: runner.Metadata, auth) -> None:
-    actions = meta.extra.get("post_ready", [])
-    if auth is None:
-        # Login failed (custom-admin preset, un-satisfiable 2FA, …). Don't let
-        # the preset's self-config vanish silently behind a "ready" banner.
-        if actions:
-            ui.warn(f"  ⚠ preset self-config skipped — could not log in as admin; "
-                    f"re-run once reachable: rc-repro ready --name {meta.name}")
-        return
-    for action in actions:
-        handler = _POST_READY_ACTIONS.get(action.get("action"))
-        if handler:
-            handler(meta, auth, action)
-
-
-def _do_ready(meta: runner.Metadata, timeout: float = 300.0) -> None:
-    started = time.monotonic()
-    info = _wait_serving(meta, timeout)
-    elapsed = int(time.monotonic() - started)   # time to actually serve /api/info
-    auth = _finalize(meta)
-    _run_post_ready(meta, auth)
-
-    ui.ok("✓ ready")
-    _summary_panel(meta, extra_rows=[("Booted in", _fmt_duration(elapsed))])
-    ui.hint(f"  next: rc-repro logs --name {meta.name} -f")
-    # The public /api/info redacts the patch (returns only major.minor), so
-    # treat the running version as a prefix of the requested one.
-    running = info.get("version", "?")
-    if running != "?" and not meta.rc_version.startswith(running):
-        ui.warn(f"  note: running version {running} != requested {meta.rc_version}")
 
 
 def _clear_default_if(name: str) -> None:
@@ -768,7 +367,6 @@ def down(
     yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt (for scripts/CI)"),
 ) -> None:
     """Remove a repro's containers. Keeps data (and the record) unless --volumes."""
-    _require_docker()
     target = _resolve_name(name)
     if volumes and not yes:
         # --volumes is irreversible (deletes the Mongo data + the record). Confirm.
@@ -776,27 +374,17 @@ def down(
             f"This permanently deletes {target!r}'s data volume and record. Continue?",
             abort=True,
         )
-    if runner.down(target, volumes=volumes) != 0:
-        _err(f"`docker compose down` failed for {target!r} (see output above)")
+    try:
+        # confirm=True: the prompt above (or --yes) already gated it.
+        lcsvc.teardown(target, volumes=volumes, confirm=True)
+    except errors.ReproError as exc:
+        _err(str(exc))
     if volumes:
-        # Data is gone, so there's nothing to bring back — forget it entirely.
-        runner.remove(target)
-        _clear_default_if(target)
         ui.ok(f"✓ {target!r} removed (containers, data volume, and record).")
     else:
         ui.ok(f"✓ {target!r} down (data kept).")
         typer.echo(f"  bring it back: rc-repro up --version <same> --name {target}")
         typer.echo("  delete for good: add --volumes, or run `rc-repro prune`")
-
-
-def _detect_bind(doc: dict) -> str:
-    """Read the host bind interface from an existing published port (host:hp:cp)."""
-    for svc in doc.get("services", {}).values():
-        for p in svc.get("ports", []):
-            parts = str(p).split(":")
-            if len(parts) == 3:
-                return parts[0]
-    return config.DEFAULT_BIND_HOST
 
 
 def _rc_services_in(doc: dict) -> list[str]:
@@ -809,59 +397,21 @@ def monitor(
     off: bool = typer.Option(False, "--off", help="detach: remove Prometheus + Grafana"),
 ) -> None:
     """Attach (or --off to detach) Prometheus + Grafana on a running repro."""
-    _require_docker()
-    from rc_repro import monitoring
-    m = runner.read_meta(_resolve_name(name))
-    doc = runner.read_compose(m.name)
-
-    if off:
-        rcapi_ok = False
-        try:
-            auth = _login(m)
-            rcapi_ok = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
-                                         monitoring.RC_METRICS_SETTING, False)
-        except Exception:  # noqa: BLE001 - best-effort; the repro may be stopped
-            pass
-        runner.rm_services(m.name, list(monitoring.SERVICES))
-        for s in monitoring.SERVICES:
-            doc.get("services", {}).pop(s, None)
-        for v in monitoring.VOLUMES:
-            doc.get("volumes", {}).pop(v, None)
-        m.extra.pop("monitoring", None)
-        m.extra.pop("monitoring_ports", None)
-        m.extra["notes"] = [n for n in m.extra.get("notes", []) if n not in monitoring.notes()]
-        runner.write(m.name, compose.to_yaml(doc), m)
-        ui.ok(f"✓ monitoring detached from {m.name!r}"
-              + ("" if rcapi_ok else " (metrics setting left as-is — repro not reachable)"))
-        return
-
-    # Attach.
-    _check_monitor_ports(exclude=m.name)
-    # Enable RC metrics live via the API (persists in Mongo; no RC restart).
+    from rc_repro.services import monitor as monitorsvc
+    target = _resolve_name(name)
     try:
-        auth = _login(m)
-        if not rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD, monitoring.RC_METRICS_SETTING, True):
-            ui.warn("  ⚠ could not enable RC metrics via the API (is it ready?)")
-    except Exception as exc:  # noqa: BLE001
-        _err(f"repro not reachable to enable metrics (`rc-repro ready --name {m.name}` first): {exc}")
-
-    mon = monitoring.bind_ports(monitoring.services(), _detect_bind(doc))
-    doc.setdefault("services", {}).update(mon)
-    doc.setdefault("volumes", {}).update(monitoring.volumes())
-
-    m.extra["monitoring"] = True
-    m.extra["monitoring_ports"] = list(config.MONITOR_PORTS)
-    notes = [n for n in m.extra.get("notes", []) if n not in monitoring.notes()] + monitoring.notes()
-    m.extra["notes"] = notes
-    targets = _rc_services_in(doc) or ["rocketchat"]
-    runner.write(m.name, compose.to_yaml(doc), m, files=monitoring.files(targets))
-
-    if runner.up(m.name, pull=True) != 0:   # starts prometheus+grafana; RC unchanged -> not recreated
-        _err("`docker compose up` failed bringing up monitoring (see output above)")
-    ui.ok(f"✓ monitoring attached to {m.name!r}")
-    typer.echo("")
-    for line in monitoring.notes():
-        ui.note(line)
+        if off:
+            res = monitorsvc.detach(target, emit=_cli_emit)
+            ui.ok(f"✓ monitoring detached from {res['name']!r}"
+                  + ("" if res["rc_setting_reset"] else " (metrics setting left as-is — repro not reachable)"))
+        else:
+            res = monitorsvc.attach(target, emit=_cli_emit)
+            ui.ok(f"✓ monitoring attached to {res['name']!r}")
+            typer.echo("")
+            for line in res["notes"]:
+                ui.note(line)
+    except errors.ReproError as exc:
+        _err(str(exc))
 
 
 @app.command()
@@ -869,16 +419,10 @@ def prune(
     yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt (for scripts/CI)"),
 ) -> None:
     """Delete every `down` repro — INCLUDING its data volume and record. Skips pinned and running ones."""
-    _require_docker()
-    states = runner.project_states()
-    if states is None:
-        # Can't tell "no containers" from "docker didn't answer" — deleting
-        # volumes on that ambiguity would be destructive. Refuse.
-        _err("couldn't query docker compose projects — not pruning (is Docker healthy?)")
-    # Only sweep repros whose containers are already gone (a plain `down`).
-    # Running or `stop`-paused repros still appear in project_states.
-    targets = [m.name for m in runner.list_meta()
-               if not m.pinned and m.project not in states]
+    try:
+        targets = lcsvc.prunable()
+    except errors.ReproError as exc:
+        _err(str(exc))
     if not targets:
         typer.echo("Nothing to prune.")
         return
@@ -887,16 +431,12 @@ def prune(
         for t in targets:
             typer.echo(f"  - {t}")
         typer.confirm("Continue?", abort=True)
-    removed = []
-    for name in targets:
-        if runner.down(name, volumes=True) != 0:
-            ui.warn(f"⚠ could not clean up {name!r} — skipping")
-            continue
-        runner.remove(name)
-        _clear_default_if(name)
-        removed.append(name)
-    if removed:
-        ui.ok(f"✓ pruned {len(removed)}: {', '.join(removed)}")
+    try:
+        res = lcsvc.prune(confirm=True, emit=_cli_emit)
+    except errors.ReproError as exc:
+        _err(str(exc))
+    if res["removed"]:
+        ui.ok(f"✓ pruned {len(res['removed'])}: {', '.join(res['removed'])}")
     else:
         typer.echo("Nothing to prune.")
 
@@ -904,9 +444,10 @@ def prune(
 @app.command()
 def start(name: str = typer.Option("", "--name", "-n")) -> None:
     """Resume a stopped repro (fast, no rebuild)."""
-    _require_docker()
     target = _resolve_name(name)
-    if runner.start(target) != 0:
+    try:
+        lcsvc.set_state(target, "start")
+    except errors.ReproError:
         _err(f"could not start {target!r} — if it was `down`ed, use `rc-repro up` to recreate it")
     ui.ok(f"✓ {target!r} started.")
 
@@ -914,20 +455,22 @@ def start(name: str = typer.Option("", "--name", "-n")) -> None:
 @app.command()
 def stop(name: str = typer.Option("", "--name", "-n")) -> None:
     """Pause a repro, keeping its containers and data."""
-    _require_docker()
     target = _resolve_name(name)
-    if runner.stop(target) != 0:
-        _err(f"`docker compose stop` failed for {target!r} (see output above)")
+    try:
+        lcsvc.set_state(target, "stop")
+    except errors.ReproError as exc:
+        _err(str(exc))
     ui.ok(f"✓ {target!r} stopped (resume with `rc-repro start`).")
 
 
 @app.command()
 def restart(name: str = typer.Option("", "--name", "-n")) -> None:
     """Restart a repro."""
-    _require_docker()
     target = _resolve_name(name)
-    if runner.restart(target) != 0:
-        _err(f"`docker compose restart` failed for {target!r} (see output above)")
+    try:
+        lcsvc.set_state(target, "restart")
+    except errors.ReproError as exc:
+        _err(str(exc))
     ui.ok(f"✓ {target!r} restarted.")
 
 
@@ -945,21 +488,16 @@ def use(name: str = typer.Argument(..., help="repro to make the default")) -> No
 @app.command(name="list")
 def list_cmd() -> None:
     """List all repros with version, port, status and URL."""
-    metas = runner.list_meta()
-    if not metas:
+    repros = lcsvc.list_repros()
+    if not repros:
         typer.echo("No repros yet. Create one with `rc-repro up --version <X.Y.Z>`.")
         return
-    default = config.load_config().get("default_repro")
-    docker_up = runner.docker_available()
-    states = (runner.project_states() or {}) if docker_up else {}   # None -> unknown
-    header = f"{'NAME':<20} {'RC':<9} {'MONGO':<7} {'PORT':<6} {'STATE':<10} URL"
-    typer.echo(header)
-    for m in metas:
-        state = "?" if not docker_up else _pretty_state(states.get(m.project, ""))
-        flag = "*" if m.name == default else (" " if not m.pinned else "·")
+    typer.echo(f"{'NAME':<20} {'RC':<9} {'MONGO':<7} {'PORT':<6} {'STATE':<10} URL")
+    for r in repros:
+        flag = "*" if r["default"] else (" " if not r["pinned"] else "·")
         typer.echo(
-            f"{flag}{m.name:<19} {m.rc_version:<9} {m.mongo_tag:<7} "
-            f"{m.host_port:<6} {state:<10} {m.root_url}"
+            f"{flag}{r['name']:<19} {r['rc_version']:<9} {r['mongo_tag']:<7} "
+            f"{r['host_port']:<6} {r['state']:<10} {r['root_url']}"
         )
     typer.echo("\n* = default repro   · = pinned")
 
@@ -1106,38 +644,35 @@ def config_import(
     path = Path(settings_file)
     if not path.is_file():
         _err(f"no such file: {settings_file}")
-    try:
-        plan = configimport.build_plan(
-            path, only={p.strip() for p in only.split(",")} if only else None)
-    except (ValueError, json.JSONDecodeError) as exc:
-        _err(f"couldn't read settings file: {exc}")
     m = runner.read_meta(_resolve_name(name))
+    onlyset = {p.strip() for p in only.split(",")} if only else None
+    try:
+        plan = datasvc.import_plan(m.name, str(path), only=onlyset)
+    except errors.ReproError as exc:
+        _err(str(exc))
 
-    lines = [f"apply    {len(plan.apply)} customized setting(s)",
-             f"skip     {len(plan.redacted)} redacted secret(s), "
-             f"{len(plan.denied)} identity/environment setting(s)"]
-    if plan.oauth_services:
-        lines.append(f"oauth    pre-create: {', '.join(plan.oauth_services)}")
+    lines = [f"apply    {plan['counts']['apply']} customized setting(s)",
+             f"skip     {plan['counts']['redacted']} redacted secret(s), "
+             f"{plan['counts']['denied']} identity/environment setting(s)"]
+    if plan["oauth_services"]:
+        lines.append(f"oauth    pre-create: {', '.join(plan['oauth_services'])}")
     typer.echo("")
     ui.box("config import" + (" (dry run)" if dry_run else ""), lines, 64,
            title_color=typer.colors.CYAN)
-    if plan.redacted:
-        ui.warn("  set these by hand (redacted in the dump): "
-                + ", ".join(plan.redacted))
+    if plan["redacted"]:
+        ui.warn("  set these by hand (redacted in the dump): " + ", ".join(plan["redacted"]))
     if dry_run:
-        for sid, value in plan.apply:
-            v = repr(value)
-            typer.echo(f"    {sid:<48} = {v[:60] + '…' if len(v) > 60 else v}")
+        for item in plan["apply"]:
+            typer.echo(f"    {item['id']:<48} = {item['value']}")
         return
 
     try:
-        auth = _login(m)
-    except Exception as exc:  # noqa: BLE001
-        _err(f"can't import — repro not ready (`rc-repro ready --name {m.name}`): {exc}")
-    res = configimport.apply(m.root_url, auth, plan, log=lambda s: typer.echo(s))
+        res = datasvc.import_apply(m.name, str(path), only=onlyset, emit=_cli_emit)
+    except errors.ReproError as exc:
+        _err(str(exc))
     if res["failed"]:
         ui.warn(f"  {res['failed']} setting(s) rejected: {', '.join(res['failures'][:10])}"
-                + (" …" if res["failed"] > 10 else ""))
+                + (" ..." if res["failed"] > 10 else ""))
     ui.ok(f"✓ imported {res['applied']} setting(s), skipped {res['skipped']}")
     ui.hint("  some settings need an RC restart to fully take effect: "
             f"rc-repro restart --name {m.name}")
@@ -1172,105 +707,6 @@ def stats(
     _print_resources(mon.report(), m.name)
 
 
-def _bench_metrics(resolved, boot_s: float, seed_total_s: float, s: dict, res: dict, name: str) -> dict:
-    lat, d = s.get("latency", {}), s.get("durations", {})
-    # Resources keyed by short container name (e.g. "rocketchat", "mongodb").
-    resources = {
-        _short_container(full, name): {
-            "idle_cpu": st.idle_cpu, "peak_cpu": st.peak_cpu,
-            "idle_mem": st.idle_mem, "peak_mem": st.peak_mem, "limit_mem": st.limit_mem,
-        }
-        for full, st in res.items()
-    }
-
-    def peak(short: str, key: str) -> float:
-        return resources.get(short, {}).get(key, 0.0)
-
-    msg_dur, user_dur = d.get("messages", 0.0), d.get("users", 0.0)
-    return {
-        "mongo": f"{resolved.mongo_tag} ({resolved.mongo_flavor})",
-        "image": f"{resolved.rc_image}:{resolved.rc_version}",
-        "boot_s": boot_s, "seed_total_s": seed_total_s,
-        "users": s["users"], "user_rate": s["users"] / user_dur if user_dur > 0.05 else 0.0,
-        "messages": s["messages"], "msg_rate": s["messages"] / msg_dur if msg_dur > 0.05 else 0.0,
-        "msg_p95_ms": lat.get("p95", 0.0), "msg_p99_ms": lat.get("p99", 0.0),
-        "rc_cpu": peak("rocketchat", "peak_cpu"), "mongo_cpu": peak("mongodb", "peak_cpu"),
-        "rc_mem_mb": peak("rocketchat", "peak_mem") / 1e6,
-        "seed": s, "resources": resources,   # full detail for the report
-    }
-
-
-def _bench_one(version: str, profile: str, offline: bool, no_pull: bool) -> dict:
-    """Boot one version, run the seed workload under resource monitoring, tear it
-    down, and return a metrics dict (ok=False + error on any failure)."""
-    result = {"version": version, "ok": False, "error": ""}
-    try:
-        resolved = versions.resolve(version, offline=offline)
-    except ValueError as exc:
-        result["error"] = str(exc)
-        return result
-
-    name = "bench-" + _sanitize(version)
-    if runner.exists(name):
-        # Only reclaim a workspace WE created (marked benchmark=True). Refuse to
-        # touch a real repro that happens to share the name — deleting it with
-        # its volume would be destructive.
-        existing = runner.read_meta(name)
-        if not (isinstance(existing.extra, dict) and existing.extra.get("benchmark")):
-            result["error"] = (f"a non-benchmark repro named {name!r} already exists — "
-                               f"rename or remove it before benchmarking {version}")
-            return result
-        runner.down(name, volumes=True)
-        runner.remove(name)
-    mon = None
-    try:
-        pre = presets.load("default")
-        host_port = runner.pick_port()
-        spec = compose.Spec.from_resolved(
-            resolved, project_name=runner.project_name(name),
-            root_url=f"http://localhost:{host_port}", host_port=host_port,
-            reg_token=None, preset=pre,
-        )
-        meta = runner.Metadata(
-            name=name, project=spec.project_name, rc_version=resolved.rc_version,
-            rc_image=resolved.rc_image, mongo_tag=resolved.mongo_tag,
-            mongo_flavor=resolved.mongo_flavor, preset="default",
-            root_url=spec.root_url, host_port=host_port, version_source=resolved.source,
-            extra={"benchmark": True},   # marks this workspace as ours to reclaim/clean up
-        )
-        runner.write(name, compose.to_yaml(compose.build(spec)), meta)
-        typer.secho(f"[{version}] booting on {meta.root_url} …", bold=True)
-        if runner.up(name, pull=not no_pull) != 0:
-            result["error"] = "docker compose up failed"
-            return result
-        t0 = time.monotonic()
-        rcapi.wait_ready(meta.root_url, timeout=300.0,
-                         is_alive=lambda: runner.rc_state(name) in ("running", "restarting", "created"))
-        boot_s = time.monotonic() - t0
-        auth = _finalize(meta) or rcapi.login(meta.root_url)
-        plan = seeder.plan_from(profile)
-        typer.echo(f"[{version}] seeding ({profile})…")
-        mon = perf.ResourceMonitor(name).start()
-        ts = time.monotonic()
-        s = seeder.seed(meta.root_url, auth, plan, log=lambda m: None)
-        seed_total = time.monotonic() - ts
-        res = mon.stop()
-        mon = None
-        result.update(_bench_metrics(resolved, boot_s, seed_total, s, res, name))
-        result["ok"] = True
-    except Exception as exc:  # noqa: BLE001 - record and move to the next version
-        result["error"] = str(exc)
-    finally:
-        if mon:
-            mon.stop()   # sampler thread must not outlive a failed version into the next
-        try:
-            runner.down(name, volumes=True)
-            runner.remove(name)
-        except Exception:  # noqa: BLE001 - a cleanup hiccup must not lose the other versions' results
-            pass
-    return result
-
-
 @app.command()
 def benchmark(
     versions_: str = typer.Option(..., "--versions", help="comma-separated versions to compare, e.g. 8.4.1,8.5.1"),
@@ -1289,7 +725,8 @@ def benchmark(
         _err("give at least two --versions to compare, e.g. --versions 8.4.1,8.5.1")
 
     typer.echo(f"Benchmarking {len(vers)} versions (workload: seed {seed_profile}, sequential)…\n")
-    results = [_bench_one(v, seed_profile, offline, no_pull) for v in vers]
+    from rc_repro.services import perf as perfsvc
+    results = [perfsvc.bench_one(v, seed_profile, offline, no_pull, emit=_cli_emit) for v in vers]
 
     typer.echo("")
     headers, rows, flags = perf_report.table_rows(results, regress_pct)
@@ -2208,6 +1645,39 @@ def doctor() -> None:
         typer.secho("Usable, with warnings above.", fg=typer.colors.YELLOW)
     else:
         typer.secho("All good — rc-repro is ready.", fg=typer.colors.GREEN)
+
+
+@app.command()
+def serve(
+    port: int = typer.Option(7070, "--port", help="host port for the web GUI"),
+    bind: str = typer.Option("127.0.0.1", "--bind", help="interface to bind (loopback by default)"),
+    no_open: bool = typer.Option(False, "--no-open", help="don't open a browser"),
+    no_token: bool = typer.Option(False, "--no-token", help="disable the session token (loopback dev only)"),
+) -> None:
+    """Launch the local web GUI (needs `pip install 'rc-repro[gui]'`)."""
+    try:
+        import uvicorn
+        from rc_repro.web.app import create_app
+    except ImportError:
+        _err("the web GUI needs extra deps — install them with: pip install 'rc-repro[gui]'")
+    import secrets
+    import webbrowser
+
+    token = "" if no_token else secrets.token_urlsafe(16)
+    if bind not in ("127.0.0.1", "localhost", "::1"):
+        ui.warn(f"  ⚠ binding {bind} exposes docker control (create/delete repros + volumes) "
+                "to your network — use only if you mean to.")
+    url = f"http://localhost:{port}/" + (f"?t={token}" if token else "")
+    typer.secho(f"rc-repro GUI: {url}", bold=True)
+    if token:
+        ui.hint("  (the ?t=... token authorizes this browser session)")
+    app_obj = create_app(token=token)
+    if not no_open:
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001 - headless / no browser is fine
+            pass
+    uvicorn.run(app_obj, host=bind, port=port, log_level="warning")
 
 
 if __name__ == "__main__":

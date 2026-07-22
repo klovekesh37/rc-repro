@@ -206,11 +206,11 @@ def test_livechat_preset_shape():
 
 def test_unknown_set_param_rejected():
     # `--set agent=5` (typo for `agents`) was silently ignored before.
-    from rc_repro import cli
+    from rc_repro.services import lifecycle as lc
     p = presets.load("livechat")
-    assert cli._unknown_params({"agent": "5"}, p) == ["agent"]      # typo caught
-    assert cli._unknown_params({"agents": "5"}, p) == []            # correct key accepted
-    assert cli._unknown_params({"x": "1"}, presets.load("default")) == ["x"]  # no-param preset
+    assert lc._unknown_params({"agent": "5"}, p) == ["agent"]      # typo caught
+    assert lc._unknown_params({"agents": "5"}, p) == []            # correct key accepted
+    assert lc._unknown_params({"x": "1"}, presets.load("default")) == ["x"]  # no-param preset
 
 
 def test_root_url_substitution(tmp_path, monkeypatch):
@@ -514,10 +514,10 @@ def test_yaml_preset_notes_parsed(tmp_path, monkeypatch):
 
 
 def test_sanitize_can_produce_empty_name():
-    # cli.up guards this: an all-symbols --name would otherwise write into the
-    # repros root itself.
-    from rc_repro.cli import _sanitize
-    assert _sanitize("!!!") == ""
+    # create_repro guards this: an all-symbols name would otherwise write into
+    # the repros root itself.
+    from rc_repro.services.lifecycle import sanitize
+    assert sanitize("!!!") == ""
 
 
 # --- config / runner (12-factor items) -----------------------------------------
