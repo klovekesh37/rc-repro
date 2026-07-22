@@ -336,6 +336,10 @@ rc-repro up --version 8.5.1 --preset multi-instance --set instances=3 --monitor
 - **Grafana**: `http://localhost:5050` (`admin`/`admin`, anonymous view enabled) —
   the official **"Rocket.Chat Metrics"** dashboard is auto-provisioned.
 - **Prometheus**: `http://localhost:9090` (Status → Targets shows RC up).
+- **Logs → Loki**: an OpenTelemetry collector tails **this repro's** containers and
+  ships their logs to Loki, queryable in Grafana (Explore → Loki, e.g.
+  `{k8s_namespace_name="rcrepro-<name>"}`). The collector is scoped to the repro's
+  compose project, so it never ingests your other repros.
 
 Attach or detach on an **already-running** repro (RC is not restarted — metrics are
 enabled live via the API):

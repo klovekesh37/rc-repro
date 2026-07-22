@@ -45,7 +45,7 @@ def attach(name: str, emit: Emit = null_emit) -> dict:
     m.extra["monitoring_ports"] = list(config.MONITOR_PORTS)
     m.extra["notes"] = [n for n in m.extra.get("notes", []) if n not in monitoring.notes()] + monitoring.notes()
     targets = _rc_services_in(doc) or ["rocketchat"]
-    runner.write(m.name, compose.to_yaml(doc), m, files=monitoring.files(targets))
+    runner.write(m.name, compose.to_yaml(doc), m, files=monitoring.files(targets, project=m.project))
 
     info(emit, "attaching monitoring (pulling images if needed)...", phase="boot")
     if runner.up(m.name, pull=True) != 0:

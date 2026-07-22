@@ -400,6 +400,21 @@ def project_config_files() -> dict[str, str] | None:
     return {item.get("Name", ""): (item.get("ConfigFiles") or "") for item in data}
 
 
+def rc_restart_count(name: str) -> int:
+    """How many times the repro's rocketchat container has restarted — a nonzero
+    and climbing value signals a crash-loop (usually resource pressure). 0 if
+    unknown."""
+    ids = service_container_ids(name, "rocketchat") or service_container_ids(name, "rocketchat-1")
+    if not ids:
+        return 0
+    r = subprocess.run(["docker", "inspect", "--format", "{{.RestartCount}}", ids[0]],
+                       capture_output=True, text=True)
+    try:
+        return int((r.stdout or "0").strip())
+    except ValueError:
+        return 0
+
+
 def rc_status_by_project() -> dict[str, str]:
     """Map compose project -> its rocketchat container `Status` string
     ("Up 2 hours (healthy)"), in ONE `docker ps` call (cheap enough for the whole

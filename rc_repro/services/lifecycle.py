@@ -264,7 +264,7 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
     if req.monitor:
         from rc_repro import monitoring
         targets = compose.rc_service_names(pre.instances)
-        files += monitoring.files(targets)
+        files += monitoring.files(targets, project=spec.project_name)
         meta.extra["monitoring"] = True
         meta.extra["monitoring_ports"] = list(config.MONITOR_PORTS)
         meta.extra.setdefault("notes", [])
@@ -331,17 +331,31 @@ def _up(name: str, *, pull: bool, emit: Emit, stream_output: bool) -> int:
 # --- readiness / finalize -----------------------------------------------------
 
 def wait_serving(meta: runner.Metadata, emit: Emit, timeout: float) -> dict:
+    seen = {"restarts": 0}
+
     def is_alive() -> bool:
         return runner.rc_state(meta.name) in ("running", "restarting", "created")
 
     def tick(elapsed: float) -> None:
+        # Surface a crash-loop: if RC keeps restarting, boot is slow for a reason
+        # (usually CPU/RAM pressure or a boot error), not just "taking a while".
+        rc = runner.rc_restart_count(meta.name)
+        if rc >= 2 and rc > seen["restarts"]:
+            warn(emit, f"Rocket.Chat has restarted {rc}x - likely resource pressure "
+                       "(free some repros / raise Docker's CPU+RAM) or a boot error; "
+                       "check Logs.", phase="wait")
+        seen["restarts"] = max(seen["restarts"], rc)
         pct = max(0.0, min(99.0, elapsed / timeout * 100)) if timeout else None
         info(emit, f"still booting ({int(elapsed)}s)", phase="wait", pct=pct)
 
     try:
         return rcapi.wait_ready(meta.root_url, timeout=timeout, is_alive=is_alive, on_tick=tick)
     except rcapi.NotReady as exc:
-        raise NotReadyError(str(exc)) from exc
+        hint = ""
+        if seen["restarts"] >= 2:
+            hint = (f" - Rocket.Chat restarted {seen['restarts']}x; likely resource pressure "
+                    f"(free repros / raise Docker CPU+RAM), then `rc-repro ready --name {meta.name}`")
+        raise NotReadyError(str(exc) + hint) from exc
 
 
 def finalize(meta: runner.Metadata, emit: Emit):

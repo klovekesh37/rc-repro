@@ -12,9 +12,15 @@ import asyncio
 import json
 from importlib import resources
 
-from fastapi import Body, FastAPI, File, Form, Request, UploadFile
+import subprocess
+import threading
+
+from fastapi import (Body, FastAPI, File, Form, Request, UploadFile, WebSocket,
+                     WebSocketDisconnect)
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+
+from rc_repro.errors import ReproError as _ReproError
 
 from rc_repro import presets as presets_mod
 from rc_repro import runner
@@ -83,6 +89,48 @@ def create_app(token: str = "") -> FastAPI:
                 used, _ = R._parse_mem(parts[2])
                 mem += used
         return {"cpu": round(cpu, 1), "mem_mb": round(mem / 1e6, 1)}
+
+    @app.websocket("/api/repros/{name}/logs/stream")
+    async def logs_stream(ws: WebSocket, name: str, tail: int = 300):
+        # WS bypasses the http middleware, so enforce host + token here.
+        host = (ws.headers.get("host") or "").split(":")[0]
+        if host not in ("localhost", "127.0.0.1", "::1", ""):
+            await ws.close(code=1008); return
+        if token and ws.query_params.get("t") != token:
+            await ws.close(code=1008); return
+        await ws.accept()
+        try:
+            target = lc.resolve_name(name)
+        except _ReproError as exc:
+            await ws.send_json({"error": str(exc)}); await ws.close(); return
+
+        loop = asyncio.get_event_loop()
+        q: asyncio.Queue = asyncio.Queue()
+        proc = subprocess.Popen(
+            ["docker", "compose", "logs", "-f", "--no-color", "--tail", str(tail)],
+            cwd=runner.workspace(target), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+        def pump():
+            for line in proc.stdout or []:
+                loop.call_soon_threadsafe(q.put_nowait, line.rstrip("\n"))
+            loop.call_soon_threadsafe(q.put_nowait, None)
+
+        threading.Thread(target=pump, daemon=True).start()
+        try:
+            while True:
+                line = await q.get()
+                if line is None:
+                    break
+                await ws.send_text(line)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     @app.get("/api/repros/{name}/logs")
     def logs(name: str, tail: int = 200):

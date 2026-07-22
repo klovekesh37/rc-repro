@@ -123,6 +123,20 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 .dtable th { text-align: left; color: var(--muted); font-weight: 500; padding: .4rem .5rem; border-bottom: 1px solid var(--line); }
 .dtable td { padding: .4rem .5rem; border-bottom: 1px solid var(--line); word-break: break-all; }
 .dtable td.v { color: var(--muted); }
+.logctl { display: flex; gap: .5rem; align-items: center; margin-bottom: .6rem; flex-wrap: wrap; }
+.logctl .input { padding: .3rem .5rem; font-size: .78rem; }
+.logfollow { display: inline-flex; align-items: center; gap: .3rem; font-family: var(--mono); font-size: .78rem; color: var(--muted); }
+.logview { background: #05070b; border: 1px solid var(--line); border-radius: 8px; padding: .5rem;
+  max-height: 56vh; overflow: auto; font-family: var(--mono); font-size: .78rem; line-height: 1.5; }
+.logrow { display: flex; gap: .6rem; padding: .05rem 0; white-space: pre-wrap; word-break: break-word; }
+.logrow .lt { color: var(--dim); flex: 0 0 auto; }
+.logrow .ll { flex: 0 0 46px; font-weight: 700; }
+.logrow .ls { flex: 0 0 92px; color: var(--muted); }
+.logrow .lm { flex: 1; color: #c9d1d9; }
+.ll.lv-error, .ll.lv-fatal { color: var(--red); } .logrow.lv-error .lm, .logrow.lv-fatal .lm { color: #ffb4b0; }
+.ll.lv-warn { color: var(--amber); }
+.ll.lv-info { color: var(--green); }
+.ll.lv-debug, .ll.lv-trace { color: var(--dim); }
 
 /* new-repro placeholder */
 .card.new { align-items: center; justify-content: center; text-align: center; border: 1.5px dashed var(--line2);

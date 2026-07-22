@@ -178,6 +178,16 @@ def test_perf_capacity_benchmark_validate(monkeypatch):
         perf.run_benchmark(["8.5.1"])          # needs >= 2 versions
 
 
+def test_rc_restart_count(monkeypatch):
+    import types
+    from rc_repro import runner
+    monkeypatch.setattr(runner, "service_container_ids", lambda n, s: ["abc"] if s == "rocketchat" else [])
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: types.SimpleNamespace(stdout="7\n", returncode=0))
+    assert runner.rc_restart_count("x") == 7
+    monkeypatch.setattr(runner, "service_container_ids", lambda n, s: [])
+    assert runner.rc_restart_count("x") == 0   # no container -> 0, no crash
+
+
 def test_uptime_health_parsing():
     assert lc._uptime_health("Up 2 hours (healthy)") == ("2 hours", "healthy")
     assert lc._uptime_health("Up 47 minutes") == ("47 minutes", "")

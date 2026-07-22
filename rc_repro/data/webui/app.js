@@ -121,6 +121,7 @@ async function selectRepro(name) {
 function closeDetail() {
   SELECTED = null; dstate.detail = null;
   if (dstate.statsTimer) { clearInterval(dstate.statsTimer); dstate.statsTimer = null; }
+  closeLogs();
   render();
 }
 function switchTab(t) { dstate.tab = t; renderDetail(); }
@@ -158,8 +159,10 @@ function renderDetail() {
   renderTab();
 }
 
+function closeLogs() { if (dstate.logsWS) { try { dstate.logsWS.close(); } catch (_) {} dstate.logsWS = null; } }
 function renderTab() {
   const d = dstate.detail, body = $("#d-body"); if (!body) return;
+  closeLogs();
   body.innerHTML = "";
   if (dstate.tab === "overview") {
     const kv = (k, v, cls = "") => el("div", { class: "kv" }, el("div", { class: "k" }, k), el("div", { class: "v " + cls }, v));
@@ -187,9 +190,7 @@ function renderTab() {
       el("button", { class: "copy", onclick: () => { navigator.clipboard.writeText(d.root_url); toast("copied"); } }, "copy"));
     body.append(url);
   } else if (dstate.tab === "logs") {
-    body.append(el("pre", { class: "log", id: "d-logs" }, "loading…"));
-    api(`/api/repros/${d.name}/logs?tail=200`).then((x) => { const p = $("#d-logs"); if (p) p.textContent = x.logs || "(no output)"; })
-      .catch((e) => { const p = $("#d-logs"); if (p) p.textContent = "error: " + e.message; });
+    renderLogs(body, d);
   } else if (dstate.tab === "containers") {
     const t = el("table", { class: "dtable" }, el("tr", {}, el("th", {}, "service"), el("th", {}, "state"), el("th", {}, "status")));
     for (const c of (d.containers || [])) t.append(el("tr", {}, el("td", {}, c.service), el("td", {}, c.state), el("td", { class: "v" }, c.status || c.health || "")));
@@ -199,6 +200,85 @@ function renderTab() {
     for (const e of (d.env || [])) t.append(el("tr", {}, el("td", {}, e.key), el("td", { class: "v" }, e.value)));
     body.append(t);
   }
+}
+
+// ---- logs viewer ------------------------------------------------------------
+const LEVELS = ["trace", "debug", "info", "warn", "error", "fatal"];
+const PINO = { 10: "trace", 20: "debug", 30: "info", 40: "warn", 50: "error", 60: "fatal" };
+const MONGOSEV = { D: "debug", I: "info", W: "warn", E: "error", F: "fatal" };
+const logv = { buf: [], min: "info", svc: "", q: "", follow: true };
+
+function parseLogLine(line) {
+  const bar = line.indexOf("|");
+  let service = "", content = line;
+  if (bar > 0 && bar < 40) { service = line.slice(0, bar).trim().replace(/-\d+$/, ""); content = line.slice(bar + 1).trim(); }
+  let level = "info", msg = content, ts = "";
+  const b = content.indexOf("{");
+  if (b >= 0) {
+    try {
+      const o = JSON.parse(content.slice(b));
+      msg = o.msg || o.message || content;
+      if (typeof o.level === "number") level = PINO[o.level] || "info";
+      else if (o.s) level = MONGOSEV[o.s] || "info";
+      else if (typeof o.level === "string" && LEVELS.includes(o.level.toLowerCase())) level = o.level.toLowerCase();
+      const t = o.time || (o.t && o.t.$date);
+      if (t) { const d = new Date(t); if (!isNaN(d)) ts = d.toLocaleTimeString(); }
+      if (o.name) msg = `[${o.name}] ${msg}`;
+    } catch (_) { /* not JSON — keep raw */ }
+  }
+  return { service, level, msg, ts, raw: line };
+}
+function passes(e) {
+  return LEVELS.indexOf(e.level) >= LEVELS.indexOf(logv.min)
+    && (!logv.svc || e.service === logv.svc)
+    && (!logv.q || e.msg.toLowerCase().includes(logv.q));
+}
+function logRow(e) {
+  return el("div", { class: "logrow lv-" + e.level },
+    el("span", { class: "lt" }, e.ts || ""),
+    el("span", { class: "ll lv-" + e.level }, e.level.toUpperCase()),
+    el("span", { class: "ls" }, e.service || ""),
+    el("span", { class: "lm" }, e.msg));
+}
+function renderLogList() {
+  const box = $("#logview"); if (!box) return;
+  box.innerHTML = "";
+  for (const e of logv.buf) if (passes(e)) box.append(logRow(e));
+  // refresh service dropdown options
+  const sel = $("#log-svc"); if (sel) {
+    const svcs = [...new Set(logv.buf.map((e) => e.service).filter(Boolean))].sort();
+    const cur = logv.svc;
+    sel.innerHTML = `<option value="">all services</option>` + svcs.map((s) => `<option${s === cur ? " selected" : ""}>${s}</option>`).join("");
+  }
+  if (logv.follow) box.scrollTop = box.scrollHeight;
+}
+function renderLogs(body, d) {
+  logv.buf = [];
+  const ctl = el("div", { class: "logctl" });
+  const levelSel = el("select", { class: "input", onchange: (e) => { logv.min = e.target.value; renderLogList(); } },
+    ...["trace", "debug", "info", "warn", "error"].map((l) => el("option", { value: l }, l + "+")));
+  levelSel.value = logv.min;
+  const svcSel = el("select", { id: "log-svc", class: "input", onchange: (e) => { logv.svc = e.target.value; renderLogList(); } }, el("option", { value: "" }, "all services"));
+  const search = el("input", { class: "input", placeholder: "search…", oninput: (e) => { logv.q = e.target.value.trim().toLowerCase(); renderLogList(); } });
+  const followCb = el("input", { type: "checkbox", onchange: (e) => { logv.follow = e.target.checked; renderLogList(); } });
+  followCb.checked = logv.follow;
+  const follow = el("label", { class: "logfollow" }, followCb, " follow");
+  const clear = el("button", { class: "btn small", onclick: () => { logv.buf = []; renderLogList(); } }, "Clear");
+  ctl.append(levelSel, svcSel, search, follow, clear);
+  if (d.grafana_url) ctl.append(el("a", { class: "linkchip monitor", href: d.grafana_url + "/d/rcrepro-logs", target: "_blank" }, "Logs in Grafana (Loki)"));
+  const box = el("div", { class: "logview", id: "logview" });
+  body.append(ctl, box);
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/api/repros/${d.name}/logs/stream?t=${encodeURIComponent(TOKEN)}&tail=300`);
+  dstate.logsWS = ws;
+  ws.onmessage = (m) => {
+    const e = parseLogLine(m.data);
+    logv.buf.push(e);
+    if (logv.buf.length > 3000) logv.buf.shift();
+    if (passes(e)) { $("#logview").append(logRow(e)); if (logv.follow) { const b = $("#logview"); b.scrollTop = b.scrollHeight; } }
+  };
+  ws.onclose = () => { if (dstate.logsWS === ws) dstate.logsWS = null; };
 }
 
 function startStats() {

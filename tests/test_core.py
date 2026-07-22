@@ -638,6 +638,21 @@ def test_no_monitoring_by_default():
     assert "prometheus" not in doc["services"] and "grafana" not in doc["services"]
 
 
+def test_monitoring_ships_logs_stack():
+    # Loki + OTel collector, mirroring RocketChat/rocketchat-compose; the
+    # collector must be SCOPED to this repro's project so it never tails others.
+    from rc_repro import monitoring
+    svcs = monitoring.services()
+    assert "loki" in svcs and "opentelemetry-logs-collector" in svcs
+    assert "loki_data" in monitoring.VOLUMES
+    fs = dict(monitoring.files(["rocketchat"], project="rcrepro-demo"))
+    assert "monitoring/loki/config.yaml" in fs
+    assert "monitoring/grafana/provisioning/datasources/loki.yml" in fs
+    otel = fs["monitoring/otel/config.yaml"]
+    assert "http://loki:3100/otlp" in otel              # exports to Loki
+    assert 'com.docker.compose.project"] == "rcrepro-demo"' in otel  # scoped to this repro
+
+
 def test_monitoring_bind_ports_handles_portless_exporters():
     # Regression: the attach path binds ports over ALL monitoring services;
     # node-exporter/mongodb-exporter have no 'ports' key -> must not KeyError.
