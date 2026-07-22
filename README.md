@@ -63,8 +63,15 @@ rc-repro doctor
 ```
 
 > **Web GUI (optional):** the `rc-repro serve` dashboard needs a couple of extra
-> deps. Install them with the `gui` extra — `pipx install 'git+https://github.com/klovekesh37/rc-repro#egg=rc-repro[gui]'`
-> or, in a venv, `pip install -e '.[gui]'`. The core CLI stays dependency-light without it.
+> deps (the `gui` extra). With pipx use the PEP 508 `name[extra] @ URL` form:
+>
+> ```bash
+> pipx install 'rc-repro[gui] @ git+https://github.com/klovekesh37/rc-repro'
+> # already installed? add the extra by reinstalling:
+> pipx install --force 'rc-repro[gui] @ git+https://github.com/klovekesh37/rc-repro'
+> ```
+>
+> In a venv: `pip install -e '.[gui]'`. The core CLI stays dependency-light without it.
 
 <details>
 <summary><b>Updating to the latest version</b></summary>
