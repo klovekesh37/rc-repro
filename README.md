@@ -11,10 +11,14 @@ rc-repro up --version 8.5.1 --name TICKET-1234 --wait   # boot it
 rc-repro down --name TICKET-1234 --volumes              # bin it when done
 ```
 
+Prefer a UI? `rc-repro serve` opens a local web dashboard for everything below
+(create, seed, config-import, load-test, monitoring). See [Web GUI](#web-gui-rc-repro-serve).
+
 ## Contents
 
 - [Getting started](#getting-started) — prerequisites, install, your first repro
 - [Everyday use](#everyday-use) — commands & lifecycle
+- [Web GUI](#web-gui-rc-repro-serve) — `rc-repro serve`, a local dashboard
 - [Scenarios](#scenarios) — presets (LDAP, SAML, email, …) & monitoring
 - [Data & performance](#data--performance) — sample data, data-scale prefill, config import, benchmarking, load testing
 - [API testing](#api-testing)
@@ -57,6 +61,10 @@ connectivity and ports. Fix any ✗ before continuing:
 ```bash
 rc-repro doctor
 ```
+
+> **Web GUI (optional):** the `rc-repro serve` dashboard needs a couple of extra
+> deps. Install them with the `gui` extra — `pipx install 'git+https://github.com/klovekesh37/rc-repro#egg=rc-repro[gui]'`
+> or, in a venv, `pip install -e '.[gui]'`. The core CLI stays dependency-light without it.
 
 <details>
 <summary><b>Updating to the latest version</b></summary>
@@ -133,6 +141,38 @@ rc-repro stop         # each evening — nothing lost
 
 Once a repro is pinned (or set with `rc-repro use <name>`), commands with no
 `--name` act on it: `rc-repro start`, `rc-repro logs -f`, etc.
+
+---
+
+# Web GUI (`rc-repro serve`)
+
+A local, browser-based dashboard over the same engine as the CLI — useful when
+you'd rather click than type. Needs the `gui` extra (see [Install](#install)).
+
+```bash
+rc-repro serve            # prints a http://localhost:7070/?t=... URL and opens it
+rc-repro serve --port 8080 --no-open
+```
+
+It binds **loopback only** by default and prints a one-time session token in the
+URL (repros run weak fixed credentials, so the control plane must not be exposed
+to your network — `--bind 0.0.0.0` requires an explicit opt-in and warns).
+
+What you can do from it:
+
+- **Dashboard** — every repro as a card (version, port, state, uptime/health),
+  with filter / status / sort. Click a card for a **detail panel**: Overview
+  (RC/Mongo/port/uptime/health), **Logs / Containers / Env-vars** tabs, clickable
+  **links** to RC and preset sidecars (MinIO, Keycloak, Mailpit, Grafana), a live
+  **CPU/Mem chart**, and a copyable local URL.
+- **Create** a repro (with an Advanced section for `--reg-token`, `--mongo`,
+  `--rc-image`, `--bind`, pin/offline/no-pull), **seed** (profile / bulk `--scale`
+  / clear), **config-import** (upload a support-dump `*-settings.json` → preview
+  the plan → apply), attach/detach **monitoring**, and run the **perf** suite
+  (load test with an embedded k6 Grafana dashboard, capacity, benchmark).
+
+Long operations stream live progress in the browser. Everything the GUI does is
+also a CLI command — same code underneath.
 
 ---
 
@@ -582,6 +622,7 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `loadtest` | drive concurrent HTTP load with k6 as real seeded users; per-step latency, SLO gate, `--save`/`--compare` baselines, `--spike`, `--live` |
 | `capacity` | double VUs until the SLO breaks, bisect the boundary — "handles ~N concurrent" + why it broke |
 | `monitor` | attach/detach Prometheus + Grafana on a running repro |
+| `serve` | launch the local [web GUI](#web-gui-rc-repro-serve) (needs `pip install 'rc-repro[gui]'`) |
 | `logs` | tail a repro's logs |
 | `presets` | list available presets |
 | `versions <X.Y.Z>` | show the resolved MongoDB pairing (without launching) |
