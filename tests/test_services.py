@@ -188,6 +188,34 @@ def test_rc_restart_count(monkeypatch):
     assert runner.rc_restart_count("x") == 0   # no container -> 0, no crash
 
 
+def test_kernel_major_minor_parsing():
+    from rc_repro import cli
+    assert cli._kernel_major_minor("6.19.7-200.fc43.aarch64") == (6, 19)
+    assert cli._kernel_major_minor("5.15.0-generic") == (5, 15)
+    assert cli._kernel_major_minor("6.19") == (6, 19)
+    assert cli._kernel_major_minor(None) is None
+    assert cli._kernel_major_minor("not-a-kernel") is None
+
+
+def test_hub_logged_in(monkeypatch, tmp_path):
+    from rc_repro import runner
+    # no auth files readable anywhere -> can't tell (None)
+    monkeypatch.delenv("REGISTRY_AUTH_FILE", raising=False)
+    monkeypatch.delenv("DOCKER_CONFIG", raising=False)
+    monkeypatch.setattr(runner.Path, "home", staticmethod(lambda: tmp_path / "nohome"))
+    assert runner.hub_logged_in() is None
+
+    # a config with a Hub auth entry -> True
+    cfg = tmp_path / "config.json"
+    cfg.write_text('{"auths": {"https://index.docker.io/v1/": {"auth": "x"}}}')
+    monkeypatch.setenv("REGISTRY_AUTH_FILE", str(cfg))
+    assert runner.hub_logged_in() is True
+
+    # a readable config with only a non-Hub registry -> False
+    cfg.write_text('{"auths": {"ghcr.io": {"auth": "x"}}}')
+    assert runner.hub_logged_in() is False
+
+
 def test_uptime_health_parsing():
     assert lc._uptime_health("Up 2 hours (healthy)") == ("2 hours", "healthy")
     assert lc._uptime_health("Up 47 minutes") == ("47 minutes", "")

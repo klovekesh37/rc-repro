@@ -1567,6 +1567,12 @@ def versions_cmd(
         typer.echo(f"  note         : {r.note}")
 
 
+def _kernel_major_minor(kv: str | None) -> tuple[int, int] | None:
+    """(major, minor) from a kernel string like '6.19.7-200.fc43.aarch64', or None."""
+    m = re.match(r"(\d+)\.(\d+)", kv or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 @app.command()
 def doctor() -> None:
     """Preflight: check Docker, Compose, disk, connectivity and ports."""
@@ -1599,6 +1605,27 @@ def doctor() -> None:
         line("warn", f"docker compose {cv} — rc-repro expects Compose v2")
     else:
         line("warn", "couldn't detect `docker compose` — install Compose v2")
+
+    # Engine/VM kernel vs Mongo 8 (SERVER-121912): mongod 8.0 hard-exits on
+    # kernel >= 6.19, which recent RC versions require. Common on fresh Podman /
+    # FCOS machines and easy to misread as a volume/permission failure.
+    if docker_up:
+        kv = runner.docker_kernel_version()
+        mm = _kernel_major_minor(kv) if kv else None
+        if mm and mm >= (6, 19):
+            line("warn", f"engine kernel {kv} — MongoDB 8.0 will not start (SERVER-121912); "
+                         "use an engine on kernel < 6.19 for RC versions that require Mongo 8")
+        elif kv:
+            line("ok", f"engine kernel {kv}")
+
+    # Docker Hub auth: anonymous pulls hit Hub's rate limit (registry.rocket.chat
+    # counts against Hub too), which shows up as a silent, container-less `down`.
+    hub = runner.hub_logged_in()
+    if hub is True:
+        line("ok", "logged in to Docker Hub (avoids anonymous pull-rate limits)")
+    elif hub is False:
+        line("warn", "not logged in to Docker Hub — anonymous pulls can hit the rate "
+                     "limit; run `docker login`. registry.rocket.chat counts against Hub too")
 
     # Disk headroom (RC images are ~1.5 GB each).
     try:

@@ -484,3 +484,50 @@ def docker_server_version() -> str | None:
 
 def compose_version() -> str | None:
     return _first_line(["docker", "compose", "version", "--short"])
+
+
+def docker_kernel_version() -> str | None:
+    """Kernel of the engine host/VM (e.g. Podman machine), or None. This is the
+    kernel MongoDB actually runs on - not the macOS/Windows host kernel."""
+    return _first_line(["docker", "info", "--format", "{{.KernelVersion}}"])
+
+
+def compose_logs_capture(name: str, *, tail: int = 200) -> str:
+    """Captured (not streamed) combined logs for a repro - for post-mortem
+    diagnosis of a failed `up`. '' on error."""
+    r = _compose(name, "logs", "--no-color", "--tail", str(tail), capture=True)
+    return (r.stdout or "") + (r.stderr or "")
+
+
+def compose_pull_capture(name: str) -> str:
+    """Captured output of `docker compose pull` (stdout+stderr) - used to surface
+    registry errors when a repro never started any container. '' on error."""
+    r = _compose(name, "pull", capture=True)
+    return (r.stdout or "") + (r.stderr or "")
+
+
+def hub_logged_in() -> bool | None:
+    """Best-effort: is the client authenticated to Docker Hub? True/False, or None
+    when no auth file is readable (can't tell). Checks Docker and Podman auth
+    files, honouring REGISTRY_AUTH_FILE / DOCKER_CONFIG."""
+    candidates: list[Path] = []
+    for env in ("REGISTRY_AUTH_FILE", "DOCKER_CONFIG"):
+        val = os.environ.get(env)
+        if val:
+            p = Path(val)
+            candidates.append(p if p.suffix == ".json" else p / "config.json")
+    candidates += [Path.home() / ".docker" / "config.json",
+                   Path.home() / ".config" / "containers" / "auth.json"]
+    hub_keys = ("https://index.docker.io/v1/", "index.docker.io",
+                "registry-1.docker.io", "docker.io")
+    seen = False
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        seen = True
+        auths = data.get("auths") or {}
+        if any(k in auths for k in hub_keys):
+            return True
+    return False if seen else None

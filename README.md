@@ -38,6 +38,18 @@ Prefer a UI? `rc-repro serve` opens a local web dashboard for everything below
 > i.e. RC < 8) is amd64-only and runs under emulation, so those boots are slower.
 > Everything else (Rocket.Chat, official MongoDB 8+, OpenLDAP, Keycloak) is native.
 
+> **Podman / non-Docker engines:** rc-repro talks to any Docker-compatible API, so
+> Podman works via the `docker.sock` helper (`podman-mac-helper`). Two known traps:
+> - **Kernel ≥ 6.19 can't run MongoDB 8.0** ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)),
+>   which recent RC versions require — common on fresh Podman machines / Fedora
+>   CoreOS. `rc-repro doctor` warns when it detects this; use an engine on kernel
+>   < 6.19 until MongoDB ships a fix.
+> - **Docker Hub anonymous pull-rate limits** (`registry.rocket.chat` counts against
+>   Hub too) — run `docker login` (Hub username + a Personal Access Token).
+>
+> When a boot fails from either cause, `up` now names it directly instead of a bare
+> "`docker compose up` failed".
+
 ## Install
 
 **Recommended — with [pipx](https://pipx.pypa.io)** (isolated, adds `rc-repro` to your PATH):
@@ -637,7 +649,7 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `logs` | tail a repro's logs |
 | `presets` | list available presets |
 | `versions <X.Y.Z>` | show the resolved MongoDB pairing (without launching) |
-| `doctor` | preflight checks (Docker, Compose, disk, ports, connectivity) |
+| `doctor` | preflight checks (Docker, Compose, engine kernel, Hub auth, disk, ports, connectivity) |
 | `prune` | delete all `down` repros (confirms first, `--yes` to skip) |
 
 Run `rc-repro <command> --help` for flags.

@@ -16,7 +16,7 @@ from rc_repro import compose, config, presets, rcapi, runner, versions
 from rc_repro import seed as seeder
 from rc_repro.errors import (ConflictError, DockerError, NotFoundError,
                              NotReadyError, ValidationError)
-from rc_repro.services import postready
+from rc_repro.services import diagnose, postready
 from rc_repro.services.events import Emit, Event, info, null_emit, warn
 
 _NAME_RE = re.compile(r"[^a-z0-9-]+")
@@ -286,9 +286,11 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
 
     rc = _up(repro_name, pull=not req.no_pull, emit=emit, stream_output=stream_output)
     if rc != 0:
+        cause = diagnose.diagnose_failure(repro_name)
+        head = f"`docker compose up` failed - {cause}" if cause else "`docker compose up` failed."
         raise DockerError(
-            f"`docker compose up` failed. Workspace kept for inspection - retry with "
-            f"--force, or discard: rc-repro down --name {repro_name} --volumes")
+            f"{head} Workspace kept for inspection - retry with --force, or discard: "
+            f"rc-repro down --name {repro_name} --volumes")
 
     result = _summary(meta)
     result["reused"] = False
