@@ -814,3 +814,92 @@ def wait_ready(name: str, *, timeout: float = 600.0, emit: Emit = null_emit,
     from rc_repro.services import lifecycle
     result = lifecycle.wait_serving(meta, emit, timeout)
     return {"name": name, **result, "port_forward": forward_state(meta)}
+
+
+def exec_in(name: str, service: str, args: list[str],
+            run: _Runner | None = None) -> int:
+    """Run a command inside a repro's pod, mirroring `compose exec <service>`.
+
+    `service` is a deployment name without the release prefix ("rocketchat",
+    "account"), so a caller uses the same word it would on the Compose path rather
+    than needing to know the chart's naming.
+    """
+    run = run or _Runner()
+    meta = runner.read_meta(name)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    ctx, ns = extra.get(_CONTEXT, ""), extra.get(_NAMESPACE, "")
+    if not ctx or not ns:
+        raise ValidationError(f"{name!r} has no Kubernetes context recorded")
+    target = service if service.startswith("rc-") else f"rc-{service}"
+    return subprocess.call(["kubectl", "--context", ctx, "-n", ns, "exec", "-i",
+                            f"deployment/{target}", "--", *args])
+
+
+def owned_namespaces(ctx: str, run: _Runner | None = None) -> list[str]:
+    """Namespaces rc-repro created, found by label rather than by name pattern."""
+    run = run or _Runner()
+    res = _kubectl(run, ctx, "get", "namespaces", "-l", OWNER_LABEL,
+                   "-o", "jsonpath={range .items[*]}{.metadata.name} ", check=False)
+    return sorted((res.stdout or "").split())
+
+
+def cluster_is_ours(ctx: str, run: _Runner | None = None) -> bool:
+    """Whether rc-repro created this cluster, so it may be deleted.
+
+    kind names its own clusters, and an existing cluster a user opted into must never
+    be deleted, so this checks the cluster is in kind's list under rc-repro's name
+    rather than trusting the context string.
+    """
+    return cluster_exists(run)
+
+
+def prune_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> dict:
+    """Delete the rc-repro-owned cluster once no owned namespaces remain.
+
+    Matches how `prune` already reclaims down repros on the Compose path. Refuses
+    while any owned namespace is left, because deleting the cluster would take
+    running repros with it.
+    """
+    run = run or _Runner()
+    ctx = f"kind-{CLUSTER_NAME}"
+    if not cluster_is_ours(ctx, run):
+        return {"deleted": False, "reason": "no rc-repro-owned cluster"}
+    remaining = owned_namespaces(ctx, run)
+    if remaining:
+        return {"deleted": False, "reason": "repros still present",
+                "namespaces": remaining}
+    events.info(emit, f"deleting the empty cluster {CLUSTER_NAME}", phase="teardown")
+    # kind's delete is idempotent by design, so no pre-existence check is needed.
+    run.run(["kind", "delete", "cluster", "--name", CLUSTER_NAME], check=False)
+    return {"deleted": True, "cluster": CLUSTER_NAME}
+
+
+def collect_logs(name: str, run: _Runner | None = None,
+                 tail: int = 2000) -> dict[str, str]:
+    """Per-pod logs, for an evidence bundle. {pod_name: text}.
+
+    Bounded by `tail` on purpose: an evidence bundle someone attaches to a case
+    should not be unboundedly large, and the tail is where a failure shows.
+
+    A pod whose logs cannot be read contributes an explicit note rather than being
+    omitted, so a reader can tell "nothing was logged" from "this was not collected".
+    """
+    run = run or _Runner()
+    meta = runner.read_meta(name)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    ctx, ns = extra.get(_CONTEXT, ""), extra.get(_NAMESPACE, "")
+    if not ctx or not ns:
+        return {}
+    out: dict[str, str] = {}
+    for pod in pods(name, run):
+        pod_name = pod["service"]
+        if not pod_name:
+            continue
+        res = _kubectl(run, ctx, "-n", ns, "logs", pod_name, "--all-containers=true",
+                       f"--tail={tail}", check=False)
+        if res.returncode == 0 and (res.stdout or "").strip():
+            out[pod_name] = res.stdout
+        else:
+            out[pod_name] = ("[no logs collected: " +
+                             ((res.stderr or "").strip()[:200] or "empty") + "]\n")
+    return out

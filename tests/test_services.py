@@ -763,3 +763,126 @@ def test_write_meta_leaves_the_rendered_artifact_alone(tmp_path, monkeypatch):
     runner.write_meta("r2", m)
     assert hashlib.sha256(art.read_bytes()).hexdigest() == before
     assert runner.read_meta("r2").extra["k8s_forward_pid"] == 999999
+
+
+def test_gate_registry_matches_what_the_code_actually_raises(tmp_path, monkeypatch):
+    """A declared registry is only useful if it cannot drift from reality.
+
+    AuthorityGateError takes its code as an argument, so nothing structural stops a
+    call site inventing one that `capabilities` never advertises. This pins the gates
+    that are actually raised today.
+    """
+    from rc_repro import errors
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    raised = set()
+    try:
+        onboarding.require_onboarded()
+    except errors.AuthorityGateError as exc:
+        raised.add(exc.code)
+    onboarding.complete(grants=[])
+    try:
+        onboarding.require_grant("engine-resize")
+    except errors.AuthorityGateError as exc:
+        raised.add(exc.code)
+    assert raised <= set(errors.GATE_CODES), raised - set(errors.GATE_CODES)
+    assert raised == {"GATE_NOT_ONBOARDED", "GATE_ENGINE_RESIZE"}
+
+
+def test_k8s_exec_uses_the_compose_service_word(tmp_path, monkeypatch):
+    # A caller says "rocketchat", the same word it would use on the Compose path,
+    # and does not need to know the chart's release prefix.
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("x1", "8.6.1", offline=True, port=31700, run=_FakeRun())
+    seen = {}
+
+    def fake_call(argv):
+        seen["argv"] = argv
+        return 0
+
+    monkeypatch.setattr(k8s.subprocess, "call", fake_call)
+    assert k8s.exec_in("x1", "rocketchat", ["sh", "-c", "echo hi"]) == 0
+    argv = seen["argv"]
+    assert "deployment/rc-rocketchat" in argv
+    assert argv[argv.index("--") + 1:] == ["sh", "-c", "echo hi"]
+    assert "--context" in argv          # never the ambient context
+
+
+def test_k8s_prune_refuses_while_repros_remain():
+    from rc_repro.services import k8s
+
+    class WithNamespaces(_FakeRun):
+        def __init__(self, ns_out, **kw):
+            super().__init__(clusters=k8s.CLUSTER_NAME, **kw)
+            self.ns_out = ns_out
+
+        def run(self, argv, *, check=True):
+            import subprocess
+            if "namespaces" in argv and "-l" in argv:
+                self.calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, self.ns_out, "")
+            return super().run(argv, check=check)
+
+    busy = WithNamespaces("rc-repro-a rc-repro-b")
+    out = k8s.prune_cluster(run=busy)
+    assert out["deleted"] is False and out["namespaces"] == ["rc-repro-a", "rc-repro-b"]
+    # deleting the cluster would take running repros with it
+    assert not any(c[:3] == ["kind", "delete", "cluster"] for c in busy.calls)
+
+    empty = WithNamespaces("")
+    out2 = k8s.prune_cluster(run=empty)
+    assert out2["deleted"] is True
+    assert any(c[:3] == ["kind", "delete", "cluster"] for c in empty.calls)
+
+
+def test_k8s_prune_does_nothing_without_an_owned_cluster():
+    from rc_repro.services import k8s
+    out = k8s.prune_cluster(run=_FakeRun(clusters=""))
+    assert out["deleted"] is False and "no rc-repro-owned cluster" in out["reason"]
+
+
+def test_evidence_bundle_captures_one_log_file_per_pod(tmp_path, monkeypatch):
+    # One file per pod, not one concatenated log: nine interleaved components are
+    # unreadable, and the failing one is what a reader wants.
+    import json as _j
+    from rc_repro.services import evidence, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    class WithLogs(_FakeRun):
+        def run(self, argv, *, check=True):
+            import subprocess
+            if argv[-1] == "json" and "pods" in argv:
+                self.calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, _j.dumps({"items": [
+                    {"metadata": {"name": "rc-rocketchat-a"}, "status": {
+                        "phase": "Running",
+                        "containerStatuses": [{"ready": True, "restartCount": 0}]}},
+                    {"metadata": {"name": "mongo-0"}, "status": {
+                        "phase": "Running",
+                        "containerStatuses": [{"ready": True, "restartCount": 0}]}},
+                ]}), "")
+            if "logs" in argv and "--all-containers=true" in argv:
+                self.calls.append(argv)
+                pod = argv[argv.index("logs") + 1]
+                if pod == "mongo-0":
+                    # unreadable logs must be noted, not omitted, so a reader can
+                    # tell "nothing logged" from "not collected"
+                    return subprocess.CompletedProcess(argv, 1, "", "container starting")
+                return subprocess.CompletedProcess(argv, 0, f"log line from {pod}\n", "")
+            return super().run(argv, check=check)
+
+    fake = WithLogs()
+    k8s.create_repro("b1", "8.6.1", offline=True, port=31800, run=fake)
+    monkeypatch.setattr(k8s, "_Runner", lambda: fake)
+
+    rec = evidence.record("b1")
+    out = evidence.write_bundle("b1", tmp_path / "bundle", rec)
+    assert "logs/rc-rocketchat-a.log" in out["files"]
+    assert "logs/mongo-0.log" in out["files"]
+    body = (tmp_path / "bundle" / "logs" / "rc-rocketchat-a.log").read_text()
+    assert "log line from rc-rocketchat-a" in body
+    note = (tmp_path / "bundle" / "logs" / "mongo-0.log").read_text()
+    assert "no logs collected" in note and "container starting" in note
+    # the tail is bounded, so a bundle attached to a case cannot be unbounded
+    assert any("--tail=2000" in " ".join(c) for c in fake.calls)

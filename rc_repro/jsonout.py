@@ -192,6 +192,10 @@ def _error_codes() -> list[str]:
             walk(sub)
 
     walk(errors.ReproError)
+    # AuthorityGateError carries its specific code as an argument, so the class walk
+    # only finds the base "GATE". The declared registry supplies the rest, otherwise
+    # a caller could not anticipate a gate it is required to stop on.
+    seen.update(errors.GATE_CODES)
     return sorted(seen)
 
 

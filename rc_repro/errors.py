@@ -109,6 +109,21 @@ class AuthorityGateError(ReproError):
                 "approve_with": self.approve_with}
 
 
+#: Every authority gate rc-repro can raise, declared rather than invented at the
+#: call site. AuthorityGateError takes its code as an argument, so without this
+#: registry the published error-code set could only advertise the base "GATE" and a
+#: caller could not know what to expect. Adding a gate means adding it here, which
+#: is the point: a gate a caller cannot anticipate is one it cannot handle.
+GATE_CODES: dict[str, str] = {
+    "GATE_NOT_ONBOARDED": "rc-repro has not been onboarded on this machine",
+    "GATE_ENGINE_RESIZE": "resizing the container engine was not authorised",
+    "GATE_UNAPPROVED_CLUSTER": "the target Kubernetes cluster is not an approved one",
+    "GATE_DELETE_UNOWNED": "the resource was not created by rc-repro",
+    "GATE_PUBLIC_EXPOSURE": "the request would expose a repro beyond loopback",
+    "GATE_RETENTION": "retaining this run was not authorised",
+}
+
+
 #: Every exit code this taxonomy can produce, with a short machine-readable
 #: label. Front-ends publish this rather than hardcoding the numbers, so the map
 #: has exactly one definition.

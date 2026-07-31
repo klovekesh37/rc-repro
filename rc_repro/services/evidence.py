@@ -183,12 +183,17 @@ def write_bundle(name: str, dest: str | Path, payload: dict) -> dict:
     logs_dir.mkdir(exist_ok=True)
     try:
         if payload["repro"]["topology"] == "kubernetes":
-            text = ""      # k8s logs stream to the terminal; not captured here yet
+            from rc_repro.services import k8s
+            # One file per pod: a single concatenated log is unreadable when nine
+            # components are interleaved, and the failing one is what a reader wants.
+            for pod, text in k8s.collect_logs(name).items():
+                (logs_dir / f"{pod}.log").write_text(text, encoding="utf-8")
+                written.append(f"logs/{pod}.log")
         else:
             text = runner.ps(name)
-        if text:
-            (logs_dir / "services.txt").write_text(text, encoding="utf-8")
-            written.append("logs/services.txt")
+            if text:
+                (logs_dir / "services.txt").write_text(text, encoding="utf-8")
+                written.append("logs/services.txt")
     except Exception:  # noqa: BLE001 - a bundle must not fail on a missing engine
         pass
     return {"path": str(out), "files": sorted(written)}
