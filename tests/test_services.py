@@ -1001,3 +1001,68 @@ def test_create_passes_port_and_honours_wait(tmp_path, monkeypatch):
                                        name="t15", port=31916, wait=True))
     assert got["port"] == 31916                    # no longer dropped
     assert res["waited"] is True and res["booted_s"] == 5
+
+
+def test_require_compose_topology_refuses_rather_than_no_ops(tmp_path, monkeypatch):
+    # The design's rule: a command accepted and then doing nothing is the
+    # afternoon-wasting failure rc-repro exists to remove.
+    from rc_repro import errors
+    from rc_repro.services import lifecycle as lc
+    _make_k8s_repro("g1", 31920, monkeypatch, tmp_path)
+    with pytest.raises(errors.ValidationError) as ei:
+        lc.require_compose_topology("g1", "stats", "It reads container stats.")
+    msg = str(ei.value)
+    assert "not supported on the kubernetes topology" in msg
+    assert "It reads container stats." in msg      # says why, not just no
+    assert "rc-repro info" in msg                  # offers the nearest thing
+    assert errors.ValidationError.exit_code == 2
+
+
+def test_require_compose_topology_is_silent_for_compose(tmp_path, monkeypatch):
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(lc, "topology_of_repro", lambda n: "compose")
+    lc.require_compose_topology("anything", "stats")      # no raise
+
+
+def test_ensure_reachable_revives_the_forward_and_persists_it(tmp_path, monkeypatch):
+    # Every HTTP-using verb needs this: on Kubernetes the URL is a port-forward that
+    # dies with whatever started it, so otherwise those verbs fail for a reason
+    # unrelated to what was asked.
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    _make_k8s_repro("g2", 31921, monkeypatch, tmp_path)
+    fake = _FakeRun()
+    monkeypatch.setattr(k8s, "_Runner", lambda: fake)
+    monkeypatch.setattr(k8s, "ensure_port_forward", lambda m, e=None, r=None: 777777)
+    lc.ensure_reachable("g2")
+    assert runner.read_meta("g2").extra["k8s_forward_pid"] == 777777
+
+
+def test_ensure_reachable_is_a_no_op_for_compose(tmp_path, monkeypatch):
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(lc, "topology_of_repro", lambda n: "compose")
+    lc.ensure_reachable("whatever")        # must not raise or touch anything
+
+
+def test_logs_dispatches_to_kubectl(tmp_path, monkeypatch):
+    """Regression: `logs` was in the design's parity table and never wired, so it ran
+    `compose logs` against a repro with no compose project."""
+    from typer.testing import CliRunner
+    from rc_repro import cli
+    from rc_repro.cli import app
+    from rc_repro.services import k8s
+    _make_k8s_repro("g3", 31922, monkeypatch, tmp_path)
+    monkeypatch.setattr(cli.runner, "docker_available", lambda: True)
+    seen = {}
+
+    def fake_logs(name, *, follow=False, tail=None, run=None):
+        seen.update(name=name, follow=follow, tail=tail)
+        return 0
+
+    monkeypatch.setattr(k8s, "logs", fake_logs)
+    res = CliRunner().invoke(app, ["logs", "--name", "g3", "--tail", "50"])
+    assert res.exit_code == 0
+    assert seen == {"name": "g3", "follow": False, "tail": 50}

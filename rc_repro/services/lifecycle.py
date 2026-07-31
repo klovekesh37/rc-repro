@@ -704,3 +704,45 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         removed.append(name)
         info(emit, f"pruned {name!r}", phase="done")
     return {"targets": targets, "removed": removed}
+
+
+# --- cross-topology preconditions ----------------------------------------------
+#
+# The parity table in the design enumerated eleven verbs, but the CLI has
+# twenty-five. The fourteen it omitted still touch a repro, so each needs one of two
+# things: reachability fixed up before it talks HTTP, or an honest refusal. Silently
+# running a compose-shaped command against a Kubernetes repro is the failure mode
+# these two helpers exist to prevent.
+
+def ensure_reachable(name: str, emit: Emit = null_emit) -> None:
+    """Make a repro's URL usable before something talks HTTP to it.
+
+    On Compose the published port is always there. On Kubernetes it is a port-forward
+    that dies with whatever started it, so every HTTP-using verb has to revive it
+    first or it fails for a reason that has nothing to do with what was asked.
+    """
+    if topology_of_repro(name) != "kubernetes":
+        return
+    from rc_repro.services import k8s
+    meta = runner.read_meta(name)
+    pid = k8s.ensure_port_forward(meta, emit)
+    if pid and pid != (meta.extra or {}).get("k8s_forward_pid"):
+        meta.extra = {**(meta.extra or {}), "k8s_forward_pid": pid}
+        runner.write_meta(name, meta)
+
+
+def require_compose_topology(name: str, verb: str, why: str = "") -> None:
+    """Refuse a Compose-only verb on a non-Compose repro, naming the reason.
+
+    Per the contract: a flag or command that is accepted and then does nothing is
+    the afternoon-wasting failure rc-repro exists to remove. Refusing with exit 2 is
+    the honest answer until a Kubernetes equivalent exists.
+    """
+    topology = topology_of_repro(name)
+    if topology == "compose":
+        return
+    detail = f" {why}" if why else ""
+    raise ValidationError(
+        f"`{verb}` is not supported on the {topology} topology yet.{detail} "
+        f"Use a Compose preset for this, or `rc-repro info --name {name} --json` "
+        f"to inspect the repro instead.")

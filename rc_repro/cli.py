@@ -399,7 +399,11 @@ def ready(
         jsonout.emit(jsonout.envelope("ready", {"name": m.name, **result}))
         return
     _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     typer.echo(f"Waiting for {m.name!r} to serve {m.root_url} ...")
     try:
         result = lcsvc.wait_and_finalize(m, emit=_cli_emit, timeout=timeout)
@@ -624,7 +628,11 @@ def info(
 def token(name: str = typer.Option("", "--name", "-n")) -> None:
     """Mint an API auth token (X-Auth-Token / X-User-Id headers)."""
     _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     try:
         auth = _login(m)
     except Exception as exc:  # noqa: BLE001 - surface any auth/connection failure
@@ -649,7 +657,11 @@ def api(
       rc-repro api POST /api/v1/users.update --2fa -d '{"userId":"ID","data":{"name":"X"}}'
     """
     _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     try:
         auth = _login(m)
         if pat:
@@ -689,7 +701,11 @@ def pat(
 ) -> None:
     """Mint a Personal Access Token and print ready-to-use headers (curl/Postman)."""
     _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     try:
         auth = _login(m)
         token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, token_name=label, bypass_2fa=bypass_2fa)
@@ -721,7 +737,11 @@ def seed_cmd(
     default REST seed when you need real, loginable users.
     """
     _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     if clear_scale:
         _clear_scale(m)
         return
@@ -751,7 +771,11 @@ def config_import(
     path = Path(settings_file)
     if not path.is_file():
         _err(f"no such file: {settings_file}")
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     onlyset = {p.strip() for p in only.split(",")} if only else None
     try:
         plan = datasvc.import_plan(m.name, str(path), only=onlyset)
@@ -793,7 +817,14 @@ def stats(
 ) -> None:
     """Sample a repro's container CPU/RAM (peak over a window, or --watch live)."""
     _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Refuse rather than silently report nothing: a command that is
+    # accepted and then does nothing is the failure rc-repro exists to remove.
+    lcsvc.require_compose_topology(_target, 'stats', 'It reads container stats from the compose project; the Kubernetes equivalent needs metrics-server.')
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     if watch:
         typer.echo(f"Live stats for {m.name!r} (Ctrl-C to stop)…")
         try:
@@ -1178,7 +1209,14 @@ def loadtest(
         except ValueError as exc:
             _err(f"bad --slo: {exc}")
 
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Refuse rather than silently report nothing: a command that is
+    # accepted and then does nothing is the failure rc-repro exists to remove.
+    lcsvc.require_compose_topology(_target, 'loadtest', 'It measures resource cost through the compose project, so results would be missing on Kubernetes.')
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     doc = runner.read_compose(m.name)
     target = _loadtest_target(doc)
     if live:
@@ -1462,7 +1500,14 @@ def capacity(
         except ValueError as exc:
             _err(f"bad --constrain: {exc}")
 
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Refuse rather than silently report nothing: a command that is
+    # accepted and then does nothing is the failure rc-repro exists to remove.
+    lcsvc.require_compose_topology(_target, 'capacity', 'It measures resource cost through the compose project, so results would be missing on Kubernetes.')
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     doc = runner.read_compose(m.name)
     target = _loadtest_target(doc)
     rc_services = _rc_services_in(doc) or ["rocketchat"]
@@ -1630,6 +1675,9 @@ def logs(
     """Tail a repro's logs."""
     _require_docker()
     target = _resolve_name(name)
+    if lcsvc.topology_of_repro(target) == "kubernetes":
+        from rc_repro.services import k8s as k8ssvc
+        raise typer.Exit(k8ssvc.logs(target, follow=follow, tail=tail or None))
     runner.logs(target, follow=follow, tail=tail or None)
 
 
@@ -1915,6 +1963,28 @@ def doctor() -> None:
         states = runner.project_states() or {}
         running = sum(1 for m in metas if _pretty_state(states.get(m.project, "")) == "running")
         typer.echo(f"  repros: {len(metas)} total, {running} running")
+
+    # Kubernetes topology readiness. Reported rather than required: the Kubernetes
+    # preset is opt-in, so a missing toolchain is a warning for the Docker user and
+    # only becomes an error when `up --preset microservices` actually asks for it.
+    from rc_repro.services import k8s as _k8s
+    k8s_tools = {t: shutil.which(t) for t in ("kind", "kubectl", "helm")}
+    missing_k8s = [t for t, path in k8s_tools.items() if not path]
+    if missing_k8s:
+        line("warn", "Kubernetes presets need " + ", ".join(missing_k8s) +
+                     " on PATH (not needed for Docker presets)")
+    else:
+        line("ok", "kind, kubectl and helm present (Kubernetes presets available)")
+        mem_gib, cpus = _k8s.engine_capacity()
+        if mem_gib or cpus:
+            floor_ok = mem_gib >= _k8s.FLOOR_MEMORY_GIB and cpus >= _k8s.FLOOR_CPUS
+            msg = (f"engine has {mem_gib:.1f} GiB and {cpus} CPUs; the microservices "
+                   f"preset needs {_k8s.FLOOR_MEMORY_GIB:g} GiB and {_k8s.FLOOR_CPUS}")
+            # CPU is the binding constraint during start-up, so it is named too: a
+            # memory-only report would look fine on a host that then crawls.
+            line("ok" if floor_ok else "warn", msg)
+        if _k8s.cluster_exists():
+            line("ok", f"rc-repro cluster {_k8s.CLUSTER_NAME} exists (reused, so `up` is faster)")
 
     typer.echo("")
     if counts["fail"]:
