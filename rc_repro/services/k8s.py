@@ -34,9 +34,10 @@ import yaml
 from dataclasses import dataclass, field
 
 from rc_repro import runner, versions
-from rc_repro.errors import CreateFailedError, DockerError, ValidationError
+from rc_repro.errors import (CreateFailedError, DockerError, NotReadyError,
+                             ValidationError)
 from rc_repro.services import events
-from rc_repro.services.events import Emit, null_emit
+from rc_repro.services.events import Emit, info, null_emit
 
 #: The official chart. Never vendored: the chart is the topology's source of truth.
 HELM_REPO_NAME = "rocketchat"
@@ -791,29 +792,99 @@ def check_capacity(run: _Runner | None = None, emit: Emit = null_emit,
     events.info(emit, f"engine now has {mem_gib:.1f} GiB", phase="preflight")
 
 
+#: Pod conditions that no amount of waiting will fix, mapped to a stable error code.
+#: These are exactly the two the earlier fail-fast decision named and the measurement
+#: work observed on arm64, plus the scheduling case. Each is a fact about the request
+#: or the environment, so classifying it terminal and aborting (exit 7) is right where
+#: waiting out the timeout (exit 5) is the waste the decision existed to remove.
+_TERMINAL_POD_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("no match for platform", "IMAGE_PLATFORM_MISMATCH"),
+    ("no matching manifest", "IMAGE_PLATFORM_MISMATCH"),
+    ("manifest unknown", "IMAGE_NOT_FOUND"),
+    ("not found", "IMAGE_NOT_FOUND"),
+    ("denied", "IMAGE_PULL_AUTH"),
+    ("unauthorized", "IMAGE_PULL_AUTH"),
+    ("forbidden", "IMAGE_PULL_AUTH"),
+)
+
+
+def detect_terminal_pod_failure(name: str, run: _Runner | None = None) -> tuple[str, str] | None:
+    """Scan a repro's pods for a condition that can never succeed.
+
+    Returns (pod, message) on the first terminal condition, else None. Reads the
+    waiting-state reason from each container status, which is where a pull failure
+    surfaces: ImagePullBackOff alone is not terminal (a slow registry looks the
+    same), so it is the reason string that discriminates, exactly as the decision
+    said.
+    """
+    run = run or _Runner()
+    meta = runner.read_meta(name)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    ctx, ns = extra.get(_CONTEXT, ""), extra.get(_NAMESPACE, "")
+    if not ctx or not ns:
+        return None
+    res = _kubectl(run, ctx, "-n", ns, "get", "pods", "-o", "json", check=False)
+    try:
+        items = json.loads(res.stdout or "{}").get("items", [])
+    except ValueError:
+        return None
+    for item in items:
+        pod = item.get("metadata", {}).get("name", "")
+        status = item.get("status", {})
+        # Unschedulable with no matching node is terminal for a fixed cluster.
+        for cond in status.get("conditions", []):
+            if cond.get("reason") == "Unschedulable":
+                return pod, f"IMAGE/SCHEDULE: {cond.get('message', 'unschedulable')}"
+        for cs in status.get("containerStatuses", []) or []:
+            waiting = (cs.get("state", {}) or {}).get("waiting") or {}
+            blob = f"{waiting.get('reason', '')} {waiting.get('message', '')}".lower()
+            for needle, code in _TERMINAL_POD_PATTERNS:
+                if needle in blob:
+                    return pod, f"{code}: {waiting.get('message', '').strip()[:200]}"
+    return None
+
+
 def wait_ready(name: str, *, timeout: float = 600.0, emit: Emit = null_emit,
                run: _Runner | None = None) -> dict:
-    """Block until the repro serves, reviving the port-forward if it has died.
+    """Block until the repro serves, aborting early on a terminal pod condition.
 
-    Readiness is an HTTP fact, not a Kubernetes one, so this reuses the same
-    wait_serving the Compose path uses rather than polling pod conditions. Pods being
-    Ready is not the same as Rocket.Chat answering, and the second is what a caller
-    actually needs.
+    Readiness is an HTTP fact, so success is Rocket.Chat answering, not pods being
+    Ready. But a stuck image pull would make an HTTP-only wait sit out the whole
+    timeout, so each tick also asks whether a pod has hit a condition that can never
+    succeed, and raises CreateFailedError (exit 7) if so, distinct from the exit 5 a
+    real timeout gives. That distinction is the entire point of the decision.
     """
+    from rc_repro import rcapi
     run = run or _Runner()
     meta = runner.read_meta(name)
     # The forward is reconcilable state: probe and revive before waiting, rather
     # than timing out against a tunnel that closed.
     pid = ensure_port_forward(meta, emit, run)
     if pid and pid != (meta.extra or {}).get(_FORWARD_PID):
-        # Persist the new pid so a later `down` kills the forward that is actually
-        # running rather than a stale one.
         meta.extra = {**(meta.extra or {}), _FORWARD_PID: pid}
         runner.write_meta(name, meta)
 
-    from rc_repro.services import lifecycle
-    result = lifecycle.wait_serving(meta, emit, timeout)
-    return {"name": name, **result, "port_forward": forward_state(meta)}
+    deadline_ticks = max(1, int(timeout / _MONGO_READY_INTERVAL))
+    for i in range(deadline_ticks):
+        info_doc = rcapi.api_info(meta.root_url)
+        if info_doc:
+            booted = int(i * _MONGO_READY_INTERVAL)
+            info(emit, "Rocket.Chat is serving", phase="done", pct=100)
+            return {"name": name, "booted_s": booted,
+                    "version": info_doc.get("version", "?"),
+                    "port_forward": forward_state(meta)}
+        terminal = detect_terminal_pod_failure(name, run)
+        if terminal:
+            pod, msg = terminal
+            raise CreateFailedError(
+                f"{name!r} cannot become ready: pod {pod} hit a terminal condition "
+                f"that waiting will not fix ({msg})")
+        info(emit, f"waiting for Rocket.Chat ({int(i * _MONGO_READY_INTERVAL)}s)",
+             phase="wait", pct=min(99.0, i / deadline_ticks * 100))
+        run.sleep(_MONGO_READY_INTERVAL)
+    raise NotReadyError(
+        f"{name!r} did not serve within {int(timeout)}s "
+        f"(`rc-repro logs --name {name}` to see why)")
 
 
 def exec_in(name: str, service: str, args: list[str],

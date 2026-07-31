@@ -193,16 +193,81 @@ def login(meta: runner.Metadata) -> rcapi.Auth:
     return rcapi.login(meta.root_url, mailpit_url=meta.extra.get(config.EXTRA_MAILPIT_URL))
 
 
+#: Compose-only create flags and why each has no Kubernetes equivalent. Refused
+#: rather than silently ignored: a flag accepted and then doing nothing is the exact
+#: failure the contract exists to remove, and each of these could only be honoured by
+#: guessing at a mapping that is not the same object. Refusing names the reason and
+#: leaves the door open to implement a real equivalent later.
+_COMPOSE_ONLY_FLAGS: dict[str, str] = {
+    "fresh": "discards the compose data volume; the Kubernetes data lives in a PVC, "
+             "which is a different object. Use `down --volumes` then recreate.",
+    "force": "recreates over a compose project; a Kubernetes namespace collision is a "
+             "different failure. Pick another --name, or `down` the existing repro.",
+    "monitor": "attaches the Prometheus/Grafana compose sidecars on fixed host ports; "
+               "nothing renders them into a cluster yet.",
+}
+
+
+def _reject_compose_only_flags(req: CreateReq) -> None:
+    set_flags = [f for f in _COMPOSE_ONLY_FLAGS if getattr(req, f, False)]
+    if not set_flags:
+        return
+    reasons = "; ".join(f"--{f} {_COMPOSE_ONLY_FLAGS[f]}" for f in set_flags)
+    raise ValidationError(
+        f"{', '.join('--' + f for f in set_flags)} "
+        f"{'is' if len(set_flags) == 1 else 'are'} not supported on the Kubernetes "
+        f"topology: {reasons}")
+
+
+def warn_if_unlicensed(req: CreateReq, emit: Emit = null_emit) -> bool:
+    """Warn when an enterprise preset is created without a licence.
+
+    Returns whether the warning fired, so a caller (and a test) can tell. The code
+    LICENSE_ABSENT_EE_PRESET is stable; the message is not. A registration token may
+    arrive on the request or from the RC_REPRO_REG_TOKEN env override, so both count
+    as a licence being supplied.
+    """
+    try:
+        pre = presets.load(req.preset)
+    except Exception:  # noqa: BLE001 - a bad preset is reported later, not here
+        return False
+    if not getattr(pre, "requires_license", False):
+        return False
+    supplied = bool(req.reg_token or config.load_config().get("reg_token"))
+    if supplied:
+        return False
+    warn(emit, f"{req.preset!r} is an enterprise feature and no licence was supplied; "
+               "it will run but may not function as licensed "
+               "(pass --reg-token, or see cloud.rocket.chat)",
+         phase="preflight", code="LICENSE_ABSENT_EE_PRESET")
+    return True
+
+
 def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool = False) -> dict:
     """Create-or-reuse a repro. Returns a result dict (meta + boot/seed info).
 
     `stream_output=True` streams docker's line output through `emit` (for the web
     job log); False leaves docker's own progress on the terminal (CLI default).
     """
+    # Licence signal, before dispatch so it fires for every topology and every EE
+    # preset. The chart does not validate a licence, so an unlicensed microservices
+    # run comes up present but not necessarily functioning as licensed; a warn event
+    # with a stable code lets an agent branch on it without reading prose, and it is
+    # a warning rather than a refusal because the chart itself installs without one.
+    warn_if_unlicensed(req, emit)
+
     # Topology dispatch. One line, delegating wholesale, so the Compose body below
     # stays exactly as it was and the web GUI gets the same routing as the CLI.
     if _topology_of(req.preset) == "kubernetes":
-        from rc_repro.services import k8s
+        from rc_repro.services import k8s, onboarding
+        # The gate lives on the Kubernetes path, not on every command: the Docker
+        # default has always worked with zero config and must keep doing so (the map
+        # makes Docker the default), while the microservices path can resize the
+        # engine and provision a cluster, which is exactly the authority onboarding
+        # exists to have a human grant once. An un-onboarded agent gets exit 6 here
+        # with the command to ask a human to run, rather than inventing a baseline.
+        onboarding.require_onboarded()
+        _reject_compose_only_flags(req)
         name = req.name or derive_name(req.version, req.preset)
         result = k8s.create_repro(name, req.version, offline=req.offline,
                                   rc_image=req.rc_image or "", mongo=req.mongo or "",

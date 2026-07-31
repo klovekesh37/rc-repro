@@ -729,23 +729,66 @@ def test_k8s_capacity_will_not_resize_docker_desktop(tmp_path, monkeypatch):
 
 
 def test_k8s_wait_ready_revives_the_forward_and_persists_the_new_pid(tmp_path, monkeypatch):
-    # Readiness is an HTTP fact, so this reuses wait_serving rather than polling pod
-    # conditions: pods being Ready is not the same as Rocket.Chat answering.
-    from rc_repro import runner
+    # Readiness is an HTTP fact, so success is Rocket.Chat answering (api_info),
+    # while the forward is revived first because it may have died with its starter.
+    from rc_repro import rcapi, runner
     from rc_repro.services import k8s
-    from rc_repro.services import lifecycle as lc
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
     fake = _FakeRun()
     k8s.create_repro("r1", "8.6.1", offline=True, port=31600, run=fake)
     before = runner.read_meta("r1").extra["k8s_forward_pid"]
 
-    monkeypatch.setattr(lc, "wait_serving", lambda m, e, t: {"booted_s": 7})
+    monkeypatch.setattr(rcapi, "api_info", lambda url, timeout=5.0: {"version": "8.6.1"})
     out = k8s.wait_ready("r1", run=fake)
-    assert out["booted_s"] == 7 and out["name"] == "r1"
+    assert out["version"] == "8.6.1" and out["name"] == "r1"
     # the dead forward was re-established and the new pid recorded, so a later
     # `down` kills the forward that is actually running
     assert runner.read_meta("r1").extra["k8s_forward_pid"] == before
     assert fake.forwards[-1] == ("rc-repro-r1", 31600)
+
+
+def test_k8s_wait_ready_aborts_on_a_terminal_pod_failure(tmp_path, monkeypatch):
+    """Regression for #11: a stuck pull must abort with exit 7, not sit out the
+    timeout. This is the arm64 case the measurement work observed."""
+    from rc_repro import errors, rcapi
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    fake = _FakeRun()
+    k8s.create_repro("r1b", "8.6.1", offline=True, port=31607, run=fake)
+    monkeypatch.setattr(rcapi, "api_info", lambda url, timeout=5.0: None)  # never serves
+    monkeypatch.setattr(k8s, "detect_terminal_pod_failure",
+                        lambda name, run=None: ("mongo-0", "IMAGE_PLATFORM_MISMATCH: no match for platform"))
+    with pytest.raises(errors.CreateFailedError) as ei:
+        k8s.wait_ready("r1b", timeout=30, run=fake)
+    assert errors.CreateFailedError.exit_code == 7
+    assert "terminal condition" in str(ei.value)
+
+
+def test_detect_terminal_pod_failure_reads_the_waiting_reason(tmp_path, monkeypatch):
+    # ImagePullBackOff alone is not terminal (a slow registry looks the same); it is
+    # the reason string that discriminates, exactly as the decision said.
+    import json as _j
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    class WithPods(_FakeRun):
+        def __init__(self, waiting_msg, **kw):
+            super().__init__(**kw); self.waiting_msg = waiting_msg
+        def run(self, argv, *, check=True):
+            import subprocess
+            if argv[-1] == "json" and "pods" in argv:
+                return subprocess.CompletedProcess(argv, 0, _j.dumps({"items": [
+                    {"metadata": {"name": "mongo-0"}, "status": {"containerStatuses": [
+                        {"state": {"waiting": {"reason": "ImagePullBackOff",
+                                               "message": self.waiting_msg}}}]}}]}), "")
+            return super().run(argv, check=check)
+
+    k8s.create_repro("r1c", "8.6.1", offline=True, port=31608, run=_FakeRun())
+    # a platform mismatch is terminal
+    hit = k8s.detect_terminal_pod_failure("r1c", WithPods("no match for platform in manifest"))
+    assert hit and "IMAGE_PLATFORM_MISMATCH" in hit[1]
+    # a plain transient backoff is not
+    assert k8s.detect_terminal_pod_failure("r1c", WithPods("Back-off pulling image")) is None
 
 
 def test_write_meta_leaves_the_rendered_artifact_alone(tmp_path, monkeypatch):
@@ -988,7 +1031,11 @@ def test_create_passes_port_and_honours_wait(tmp_path, monkeypatch):
     silently ignored and --wait returned an unready repro with no error."""
     from rc_repro.services import k8s
     from rc_repro.services import lifecycle as lc
+    from rc_repro.services import onboarding
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    # The Kubernetes path now gates on onboarding, so satisfy it: this test is about
+    # port and wait, not the gate (which has its own test below).
+    onboarding.complete(grants=["engine-resize"])
     got = {}
 
     def fake_create(name, version, **kw):
@@ -1091,3 +1138,76 @@ def test_web_stats_is_guarded_like_the_cli():
     i = src.find("ids = runner.container_ids(target)")
     assert i > 0
     assert "require_compose_topology" in src[max(0, i - 500):i]
+
+
+# --- reopened decisions, now carried out ---------------------------------------
+
+
+def test_onboarding_gate_fires_on_the_kubernetes_path(tmp_path, monkeypatch):
+    """#7: require_onboarded was dead code. It now gates the Kubernetes create path,
+    while the Docker default stays zero-config."""
+    from rc_repro import errors
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    with pytest.raises(errors.AuthorityGateError) as ei:
+        lc.create_repro(lc.CreateReq(version="8.6.1", preset="microservices", name="og"))
+    assert ei.value.code == "GATE_NOT_ONBOARDED" and ei.value.exit_code == 6
+
+
+def test_docker_default_needs_no_onboarding(tmp_path, monkeypatch):
+    # The gate must not touch the Docker default, which has always worked with no
+    # config. It should fail on the engine being down, not on onboarding.
+    from rc_repro import errors
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(lc.runner, "docker_available", lambda: False)
+    with pytest.raises(errors.ReproError) as ei:
+        lc.create_repro(lc.CreateReq(version="8.6.1", preset="default", name="dd"))
+    assert not isinstance(ei.value, errors.AuthorityGateError)
+
+
+def test_compose_only_flags_are_refused_on_kubernetes(tmp_path, monkeypatch):
+    """#15: --fresh/--force/--monitor were accepted and silently ignored."""
+    from rc_repro import errors
+    from rc_repro.services import lifecycle as lc
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=["engine-resize"])
+    for flag in ("fresh", "force", "monitor"):
+        req = lc.CreateReq(version="8.6.1", preset="microservices", name="ff", **{flag: True})
+        with pytest.raises(errors.ValidationError) as ei:
+            lc.create_repro(req)
+        assert f"--{flag}" in str(ei.value)
+        assert "not supported on the Kubernetes topology" in str(ei.value)
+
+
+def test_licence_warning_fires_for_an_unlicensed_ee_preset(tmp_path, monkeypatch):
+    """#13: the create-time warning was never emitted."""
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    seen = []
+    assert lc.warn_if_unlicensed(
+        lc.CreateReq(version="8.6.1", preset="microservices"), seen.append) is True
+    assert seen[0].level == "warn" and seen[0].data["code"] == "LICENSE_ABSENT_EE_PRESET"
+    # silent with a token, and silent for a non-EE preset
+    assert lc.warn_if_unlicensed(
+        lc.CreateReq(version="8.6.1", preset="microservices", reg_token="t")) is False
+    assert lc.warn_if_unlicensed(lc.CreateReq(version="8.6.1", preset="default")) is False
+
+
+def test_doctor_json_is_an_envelope_and_exits_3_when_not_ready(tmp_path, monkeypatch):
+    """#6: doctor had no --json. It is the agent's preflight call, so it returns the
+    envelope with per-check ids and exits 3 (preflight) on any fail."""
+    import json as _j
+    from typer.testing import CliRunner
+    from rc_repro import cli
+    from rc_repro.cli import app
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli.runner, "docker_available", lambda: False)
+    res = CliRunner().invoke(app, ["doctor", "--json"])
+    payload = _j.loads(res.stdout)
+    assert payload["schema"] == "rc-repro.doctor.v1"
+    assert any(c["check"] == "docker-daemon" and c["status"] == "fail"
+               for c in payload["data"]["checks"])
+    assert payload["data"]["ready"] is False
+    assert res.exit_code == 3            # preflight, so an agent stops before `up`

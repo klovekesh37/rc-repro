@@ -1874,28 +1874,43 @@ def _kernel_major_minor(kv: str | None) -> tuple[int, int] | None:
 
 
 @app.command()
-def doctor() -> None:
-    """Preflight: check Docker, Compose, disk, connectivity and ports."""
-    import shutil
+def doctor(
+    json_out: bool = typer.Option(False, "--json", help="emit the stable preflight record instead of a report"),
+) -> None:
+    """Preflight: check Docker, Compose, disk, connectivity and ports.
 
+    This is the call an agent makes before committing to a create, so `--json`
+    returns the same envelope every other verb uses, with one entry per check
+    carrying a stable id and ok|warn|fail, and exits 3 (preflight) on any fail so
+    the agent stops before attempting `up`.
+    """
     counts = {"ok": 0, "warn": 0, "fail": 0}
     marks = {
         "ok": ("✓", typer.colors.GREEN),
         "warn": ("⚠", typer.colors.YELLOW),
         "fail": ("✗", typer.colors.RED),
     }
+    checks: list[dict] = []
 
-    def line(status: str, msg: str) -> None:
+    def line(status: str, msg: str, check: str = "") -> None:
         counts[status] += 1
+        # A stable id per check so an agent branches on the id, not the prose. If a
+        # call site gives none, derive a slug from the message's first words — good
+        # enough to be stable across reworded tails, and every load-bearing check
+        # passes one explicitly below.
+        cid = check or "-".join(re.findall(r"[a-z0-9]+", msg.lower())[:3])
+        checks.append({"check": cid, "status": status, "message": msg})
+        if json_out:
+            return
         sym, color = marks[status]
         typer.secho(f"{sym} {msg}", fg=color)
 
     # Docker daemon (everything else that needs Docker degrades gracefully).
     docker_up = runner.docker_available()
     if docker_up:
-        line("ok", f"Docker daemon running ({runner.docker_server_version() or '?'})")
+        line("ok", f"Docker daemon running ({runner.docker_server_version() or '?'})", "docker-daemon")
     else:
-        line("fail", "Docker daemon not running — start Docker Desktop / dockerd")
+        line("fail", "Docker daemon not running — start Docker Desktop / dockerd", "docker-daemon")
 
     # docker compose v2
     cv = runner.compose_version()
@@ -1914,7 +1929,8 @@ def doctor() -> None:
         mm = _kernel_major_minor(kv) if kv else None
         if mm and mm >= (6, 19):
             line("warn", f"engine kernel {kv} — MongoDB 8.0 will not start (SERVER-121912); "
-                         "use an engine on kernel < 6.19 for RC versions that require Mongo 8")
+                         "use an engine on kernel < 6.19 for RC versions that require Mongo 8",
+                 "kernel-mongo8")
         elif kv:
             line("ok", f"engine kernel {kv}")
 
@@ -1972,9 +1988,9 @@ def doctor() -> None:
     missing_k8s = [t for t, path in k8s_tools.items() if not path]
     if missing_k8s:
         line("warn", "Kubernetes presets need " + ", ".join(missing_k8s) +
-                     " on PATH (not needed for Docker presets)")
+                     " on PATH (not needed for Docker presets)", "k8s-tools")
     else:
-        line("ok", "kind, kubectl and helm present (Kubernetes presets available)")
+        line("ok", "kind, kubectl and helm present (Kubernetes presets available)", "k8s-tools")
         mem_gib, cpus = _k8s.engine_capacity()
         if mem_gib or cpus:
             floor_ok = mem_gib >= _k8s.FLOOR_MEMORY_GIB and cpus >= _k8s.FLOOR_CPUS
@@ -1982,14 +1998,24 @@ def doctor() -> None:
                    f"preset needs {_k8s.FLOOR_MEMORY_GIB:g} GiB and {_k8s.FLOOR_CPUS}")
             # CPU is the binding constraint during start-up, so it is named too: a
             # memory-only report would look fine on a host that then crawls.
-            line("ok" if floor_ok else "warn", msg)
+            line("ok" if floor_ok else "warn", msg, "k8s-floor")
         if _k8s.cluster_exists():
             line("ok", f"rc-repro cluster {_k8s.CLUSTER_NAME} exists (reused, so `up` is faster)")
+
+    if json_out:
+        payload = {"checks": checks, "counts": counts,
+                   "ready": counts["fail"] == 0}
+        jsonout.emit(jsonout.envelope("doctor", payload))
+        # Exit 3 (preflight) on any fail, so an agent stops before `up`. A warn is
+        # usable, so it does not change the exit code.
+        if counts["fail"]:
+            raise typer.Exit(errors.DockerError.exit_code)
+        return
 
     typer.echo("")
     if counts["fail"]:
         typer.secho("Not ready — fix the ✗ item(s) above.", fg=typer.colors.RED)
-        raise typer.Exit(1)
+        raise typer.Exit(errors.DockerError.exit_code)
     if counts["warn"]:
         typer.secho("Usable, with warnings above.", fg=typer.colors.YELLOW)
     else:

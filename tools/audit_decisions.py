@@ -244,11 +244,16 @@ def d12_floor():
 
 
 def d13_licence_gate():
-    src = read("rc_repro/cli.py") + read("rc_repro/services/k8s.py")
-    warns = "LICENSE_ABSENT" in src
+    # The warning lives in the shared create path (lifecycle), before topology
+    # dispatch, so it fires for every EE preset. Earlier this check read only
+    # cli/k8s and missed it: a check looking in the wrong file is a false FAIL, the
+    # mirror of the false PASS the contract warns about.
+    src = read("rc_repro/services/lifecycle.py")
+    warns = "LICENSE_ABSENT_EE_PRESET" in src and "warn_if_unlicensed" in src
+    reachable = "warn_if_unlicensed(req, emit)" in src
     in_evidence = '"license"' in read("rc_repro/services/evidence.py")
-    return (warns and in_evidence), "licence signalling", \
-        f"warning_at_create={warns} recorded_in_evidence={in_evidence}"
+    return (warns and reachable and in_evidence), "licence signalling", \
+        f"warning_defined={warns} called_in_create={reachable} in_evidence={in_evidence}"
 
 
 DECISIONS = [
