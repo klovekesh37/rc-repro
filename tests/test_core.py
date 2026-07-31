@@ -1332,3 +1332,123 @@ def test_info_json_missing_repro_emits_error_envelope(tmp_path, monkeypatch):
     payload = _json.loads(res.stdout)
     assert payload["ok"] is False
     assert payload["error"]["code"] == "NOT_FOUND"
+
+
+# --- NDJSON progress stream ----------------------------------------------------
+
+
+def _ev(**kw):
+    from rc_repro.services.events import Event
+    kw.setdefault("message", "m")
+    return Event(**kw)
+
+
+def test_event_writer_normalises_unpublished_phases():
+    from rc_repro import jsonout
+    w = jsonout.EventWriter()
+    # a published phase passes through
+    assert w.event(_ev(phase="pull"))["phase"] == "pull"
+    # an unpublished one becomes "info" so the published set really is closed,
+    # and the original is preserved rather than discarded
+    out = w.event(_ev(phase="k6"))
+    assert out["phase"] == "info"
+    assert out["detail"]["phase_raw"] == "k6"
+
+
+def test_event_writer_pct_is_monotonic():
+    from rc_repro import jsonout
+    w = jsonout.EventWriter()
+    assert w.event(_ev(pct=10))["pct"] == 10
+    assert w.event(_ev(pct=40))["pct"] == 40
+    # a service reporting out of order must not make progress go backwards
+    assert w.event(_ev(pct=25))["pct"] == 40
+    assert w.event(_ev(pct=None))["pct"] is None   # unknown stays unknown
+
+
+def test_event_writer_drops_terminal_events(capsys):
+    from rc_repro import jsonout
+    w = jsonout.EventWriter()
+    w.emit(_ev(phase="pull"))
+    w.emit(_ev(phase="done", terminal=True))   # wrapper emits the envelope itself
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 1
+
+
+def test_event_schema_and_published_phases():
+    from rc_repro import jsonout
+    out = jsonout.EventWriter().event(_ev(phase="wait", level="warn", pct=5))
+    assert out["schema"] == "rc-repro.event.v1"
+    assert out["contract"] == jsonout.CONTRACT
+    assert out["level"] == "warn"
+    # the phases the existing Event model already used must all stay published,
+    # or the GUI's current stream would start normalising to "info"
+    for legacy in ("pull", "boot", "wait", "post_ready", "seed", "restore", "done"):
+        assert legacy in jsonout.PHASES
+
+
+def test_json_mode_writes_only_objects_to_stdout(tmp_path, monkeypatch):
+    # Contract: under --json, stdout carries envelope/event objects only. Prose
+    # belongs on stderr. Engine is unavailable here, so this exercises the error
+    # path, which is the one most likely to leak a human-readable line.
+    import json as _json
+    from typer.testing import CliRunner
+    from rc_repro.cli import app
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    res = CliRunner().invoke(app, ["up", "--version", "8.6.1", "--json"])
+    lines = res.stdout.strip().splitlines()
+    assert lines, "expected at least one object"
+    for ln in lines:
+        _json.loads(ln)          # every stdout line must parse as JSON
+    last = _json.loads(lines[-1])
+    assert last["ok"] is False and last["error"]["code"]
+    assert res.exit_code == last_exit_for(last["error"]["code"])
+
+
+def last_exit_for(code: str) -> int:
+    from rc_repro import errors
+    for cls in (errors.ValidationError, errors.ConflictError, errors.NotFoundError,
+                errors.NotReadyError, errors.DockerError, errors.CreateFailedError):
+        if cls.code == code:
+            return cls.exit_code
+    return 1
+
+
+def test_up_json_streams_events_then_exactly_one_envelope(tmp_path, monkeypatch, capsys):
+    # The happy path, without needing an engine: stand in for the service call and
+    # assert the wire contract holds — events first, exactly one envelope, and it
+    # is last. A real `up` cannot verify this reliably on every host.
+    import json as _json
+    from typer.testing import CliRunner
+    from rc_repro import cli
+    from rc_repro.cli import app
+    from rc_repro.services.events import Event
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    def fake_create(req, emit=None, stream_output=False):
+        for ph, pct in (("preflight", 0), ("resolve", 5), ("pull", 40),
+                        ("boot", 60), ("wait", 80)):
+            emit(Event(f"{ph} step", phase=ph, pct=pct))
+        emit(Event("warn about something", phase="wait", level="warn"))
+        emit(Event("done", phase="done", terminal=True, data={"name": "rc-x"}))
+        return {"name": "rc-x", "waited": True, "booted_s": 12}
+
+    monkeypatch.setattr(cli.lcsvc, "create_repro", fake_create)
+    res = CliRunner().invoke(app, ["up", "--version", "8.6.1", "--json"])
+    assert res.exit_code == 0
+
+    lines = [_json.loads(l) for l in res.stdout.strip().splitlines()]
+    envelopes = [d for d in lines if d["schema"] != "rc-repro.event.v1"]
+    events_ = [d for d in lines if d["schema"] == "rc-repro.event.v1"]
+
+    assert len(envelopes) == 1, "exactly one envelope"
+    assert lines[-1] is envelopes[0], "the envelope must be the last line"
+    assert lines[-1]["schema"] == "rc-repro.up.v1"
+    assert lines[-1]["data"]["name"] == "rc-x"
+    # the terminal event is not published as an event; the envelope replaces it
+    assert len(events_) == 6
+    assert [e["phase"] for e in events_][:5] == ["preflight", "resolve", "pull", "boot", "wait"]
+    # pct never decreases across the stream
+    pcts = [e["pct"] for e in events_ if e["pct"] is not None]
+    assert pcts == sorted(pcts)
+    assert any(e["level"] == "warn" for e in events_)

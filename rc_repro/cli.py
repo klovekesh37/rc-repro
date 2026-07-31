@@ -24,6 +24,7 @@ from rc_repro.perf import report as perf_report
 from rc_repro.perf.timings import fmt_ms
 from rc_repro.services import data as datasvc
 from rc_repro.services import lifecycle as lcsvc
+from rc_repro.services import events
 from rc_repro.services.events import Event, null_emit
 
 app = typer.Typer(
@@ -193,6 +194,7 @@ def up(
     force: bool = typer.Option(False, "--force", help="overwrite an existing repro"),
     monitor: bool = typer.Option(False, "--monitor", help="also add Prometheus + Grafana (RC metrics dashboard)"),
     stats: bool = typer.Option(False, "--stats", help="with --seed: report the CPU/RAM cost of seeding"),
+    json_out: bool = typer.Option(False, "--json", help="stream NDJSON progress, then one result envelope"),
 ) -> None:
     """Create and start a version-matched Rocket.Chat repro."""
     # Orchestration lives in the shared service layer (same code the web GUI
@@ -206,6 +208,21 @@ def up(
         wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
         force=force, monitor=monitor,
     )
+    if json_out:
+        writer = jsonout.EventWriter()
+        try:
+            result = lcsvc.create_repro(req, emit=writer.emit, stream_output=False)
+        except errors.ReproError as exc:
+            jsonout.fail(exc)
+        if seed:
+            # Seed through the same writer so its progress is part of one stream,
+            # rather than a second burst after the envelope.
+            summary = _run_seed(runner.read_meta(result["name"]), seed_profile,
+                                stats=False, emit=writer.emit)
+            if summary:
+                result = {**result, "seed": summary}
+        jsonout.emit(jsonout.envelope("up", result))
+        return
     try:
         result = lcsvc.create_repro(req, emit=_cli_emit, stream_output=False)
     except errors.ReproError as exc:
@@ -216,7 +233,16 @@ def up(
 
 
 def _run_seed(meta: runner.Metadata, profile: str,
-              users=None, channels=None, messages=None, stats: bool = False) -> None:
+              users=None, channels=None, messages=None, stats: bool = False,
+              emit=None) -> dict | None:
+    """Seed a repro.
+
+    `emit` routes progress through the service event stream instead of printing
+    prose. That matters under --json: stdout is reserved for envelope and event
+    objects, so a stray `typer.echo` here would corrupt the stream. When `emit` is
+    given, the caller gets the seed summary back to fold into its envelope rather
+    than a printed panel.
+    """
     try:
         auth = _login(meta)
     except Exception as exc:  # noqa: BLE001
@@ -225,18 +251,30 @@ def _run_seed(meta: runner.Metadata, profile: str,
         plan = seeder.plan_from(profile, users, channels, messages)
     except ValueError as exc:
         _err(str(exc))
-    typer.echo(
-        f"Seeding {meta.name!r} (profile: {profile} — {plan.users} users, "
-        f"{plan.channels} channels, {plan.messages} msgs/channel)…"
-    )
+    headline = (f"Seeding {meta.name!r} (profile: {profile} — {plan.users} users, "
+                f"{plan.channels} channels, {plan.messages} msgs/channel)…")
+    if emit is not None:
+        events.info(emit, headline, phase="seed")
+    else:
+        typer.echo(headline)
     mon = perf.ResourceMonitor(meta.name).start() if stats else None
     t0 = time.monotonic()
+    if emit is not None:
+        def _log(m: str) -> None:
+            events.info(emit, m, phase="seed")
+    else:
+        def _log(m: str) -> None:
+            typer.echo(f"  {m}")
     try:
-        s = seeder.seed(meta.root_url, auth, plan, log=lambda m: typer.echo(f"  {m}"))
+        s = seeder.seed(meta.root_url, auth, plan, log=_log)
     finally:
         resources = mon.stop() if mon else None   # stop the sampler thread even if seed raises
     total = time.monotonic() - t0
+    if emit is not None:
+        return {"users": plan.users, "channels": plan.channels,
+                "messages": plan.messages, "elapsed_s": round(total, 1)}
     _print_seed_result(s, total, resources, meta)
+    return None
 
 
 def _run_scale(meta: runner.Metadata, spec_str: str) -> None:
@@ -337,8 +375,21 @@ def _print_notes(meta: runner.Metadata) -> None:
 def ready(
     name: str = typer.Option("", "--name", "-n"),
     timeout: float = typer.Option(300.0, "--timeout", help="seconds to wait"),
+    json_out: bool = typer.Option(False, "--json", help="stream NDJSON progress, then one result envelope"),
 ) -> None:
     """Block until Rocket.Chat is serving (polls /api/info)."""
+    if json_out:
+        writer = jsonout.EventWriter()
+        try:
+            lcsvc.require_docker()
+            m = runner.read_meta(lcsvc.resolve_name(name))
+            result = lcsvc.wait_and_finalize(m, emit=writer.emit, timeout=timeout)
+        except errors.ReproError as exc:
+            # NotReadyError here is exit 5: the clock ran out with the outcome
+            # still unknown, which is distinct from a known-dead create (7).
+            jsonout.fail(exc)
+        jsonout.emit(jsonout.envelope("ready", {"name": m.name, **result}))
+        return
     _require_docker()
     m = runner.read_meta(_resolve_name(name))
     typer.echo(f"Waiting for {m.name!r} to serve {m.root_url} ...")
@@ -377,8 +428,25 @@ def down(
     name: str = typer.Option("", "--name", "-n"),
     volumes: bool = typer.Option(False, "--volumes", help="also delete the data volume and forget the repro"),
     yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt (for scripts/CI)"),
+    json_out: bool = typer.Option(False, "--json", help="emit the stable JSON result envelope"),
 ) -> None:
     """Remove a repro's containers. Keeps data (and the record) unless --volumes."""
+    if json_out:
+        writer = jsonout.EventWriter()
+        try:
+            target = lcsvc.resolve_name(name)
+            if volumes and not yes:
+                # There is nobody to prompt in JSON mode, and silently keeping the
+                # volume would contradict the flag. Refuse instead of guessing.
+                raise errors.ValidationError(
+                    "--volumes is irreversible; pass --yes to confirm it non-interactively")
+            result = lcsvc.teardown(target, volumes=volumes, confirm=True,
+                                    emit=writer.emit)
+        except errors.ReproError as exc:
+            jsonout.fail(exc)
+        jsonout.emit(jsonout.envelope(
+            "down", {"name": target, "volumes_removed": bool(volumes), **(result or {})}))
+        return
     target = _resolve_name(name)
     if volumes and not yes:
         # --volumes is irreversible (deletes the Mongo data + the record). Confirm.

@@ -89,6 +89,78 @@ def error_envelope(exc: errors.ReproError) -> dict:
     }
 
 
+#: The closed progress vocabulary. Deliberately the informal names already used by
+#: services/events.py (pull, boot, wait, post_ready, seed, restore, done) plus the
+#: phases that only exist once preflight and non-Compose topologies are real, so
+#: the diff against current behaviour stays small and the web GUI's stream keeps
+#: working.
+#:
+#: A caller may branch on any name here. A name NOT here is normalised to "info"
+#: (with the original preserved in detail.phase_raw) so the published set really is
+#: closed: callers never have to handle a phase that appeared without a contract
+#: bump. Load-test phases such as "k6" go through that path on purpose; those verbs
+#: have their own JSON output and are outside the lifecycle contract.
+PHASES: tuple[str, ...] = (
+    "preflight",    # engine, versions, disk, ports, connectivity checks
+    "resolve",      # version / preset / image resolution
+    "provision",    # create or verify the execution target itself
+    "pull",         # fetching images
+    "boot",         # starting components
+    "wait",         # waiting for readiness or health
+    "post_ready",   # settings applied after Rocket.Chat serves
+    "seed",         # seeding users, channels, messages
+    "restore",      # restoring data into a repro
+    "teardown",     # stopping and removing
+    "done",         # finished successfully
+    "failed",       # terminal failure; carries detail.code
+    "info",         # uncategorised progress; never branch on it
+)
+
+
+class EventWriter:
+    """Serialises progress events as NDJSON, one object per line on stdout.
+
+    Holds the small amount of state the contract's guarantees need: `pct` must be
+    monotonic non-decreasing within a run, because a bar that goes backwards makes
+    a caller think a new attempt started.
+    """
+
+    def __init__(self) -> None:
+        self._max_pct: float | None = None
+
+    def event(self, ev: Any) -> dict:
+        """Build the wire object for one services.events.Event."""
+        phase = ev.phase if ev.phase in PHASES else "info"
+        detail = dict(ev.data or {})
+        if phase != ev.phase:
+            # Keep the original rather than discard it: useful for debugging, and
+            # it means normalising to "info" loses nothing.
+            detail["phase_raw"] = ev.phase
+        pct = ev.pct
+        if pct is not None:
+            # Clamp rather than drop: a caller can still see progress, and the
+            # monotonic promise holds even if a service reports out of order.
+            if self._max_pct is not None and pct < self._max_pct:
+                pct = self._max_pct
+            self._max_pct = pct
+        return {
+            "schema": "rc-repro.event.v1",
+            "contract": CONTRACT,
+            "phase": phase,
+            "level": ev.level,
+            "pct": pct,
+            "message": ev.message,   # prose for humans; never branch on it
+            "detail": detail,
+        }
+
+    def emit(self, ev: Any) -> None:
+        # Terminal events are dropped here: the command wrapper emits the final
+        # envelope itself, and the contract promises exactly one envelope, last.
+        if getattr(ev, "terminal", False):
+            return
+        emit(self.event(ev))
+
+
 def emit(payload: dict) -> None:
     """Print one envelope on stdout as a single line.
 
