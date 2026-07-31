@@ -903,3 +903,17 @@ def collect_logs(name: str, run: _Runner | None = None,
             out[pod_name] = ("[no logs collected: " +
                              ((res.stderr or "").strip()[:200] or "empty") + "]\n")
     return out
+
+
+def restart(name: str, emit: Emit = null_emit, run: _Runner | None = None) -> int:
+    """Roll the repro's deployments, the Kubernetes analogue of `compose restart`."""
+    run = run or _Runner()
+    meta = runner.read_meta(name)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    ctx, ns = extra.get(_CONTEXT, ""), extra.get(_NAMESPACE, "")
+    if not ctx or not ns:
+        raise ValidationError(f"{name!r} has no Kubernetes context recorded")
+    events.info(emit, "rolling the deployments", phase="boot")
+    res = _kubectl(run, ctx, "-n", ns, "rollout", "restart", "deployment", "--all",
+                   check=False)
+    return res.returncode

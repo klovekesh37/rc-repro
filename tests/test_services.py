@@ -886,3 +886,118 @@ def test_evidence_bundle_captures_one_log_file_per_pod(tmp_path, monkeypatch):
     assert "no logs collected" in note and "container starting" in note
     # the tail is bounded, so a bundle attached to a case cannot be unbounded
     assert any("--tail=2000" in " ".join(c) for c in fake.calls)
+
+
+# --- topology dispatch coverage -------------------------------------------------
+#
+# Every one of these was a live bug that the previous 221 tests passed straight
+# through, because they exercised services/k8s.py directly and never asked whether
+# the shared lifecycle verbs routed to it.
+
+
+def _make_k8s_repro(name, port, monkeypatch, tmp_path):
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro(name, "8.6.1", offline=True, port=port, run=_FakeRun())
+
+
+def test_teardown_dispatches_to_kubernetes(tmp_path, monkeypatch):
+    """Regression: `down` demanded Docker and ran `compose down` on a repro that has
+    no compose project, so a Kubernetes repro could not be removed through the CLI."""
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    _make_k8s_repro("t9", 31910, monkeypatch, tmp_path)
+    # docker deliberately absent: the Kubernetes path must not require it
+    monkeypatch.setattr(lc.runner, "docker_available", lambda: False)
+    monkeypatch.setattr(k8s, "_Runner", lambda: _FakeRun())
+    out = lc.teardown("t9", volumes=True, confirm=True)
+    assert out["removed_ok"] is True
+    assert "namespace/rc-repro-t9" in out["removed"]
+    assert not lc.runner.exists("t9")
+
+
+def test_teardown_still_requires_confirmation_for_volumes(tmp_path, monkeypatch):
+    from rc_repro import errors
+    from rc_repro.services import lifecycle as lc
+    _make_k8s_repro("t10", 31911, monkeypatch, tmp_path)
+    with pytest.raises(errors.ValidationError):
+        lc.teardown("t10", volumes=True, confirm=False)
+
+
+def test_prune_never_deletes_a_live_kubernetes_repro(tmp_path, monkeypatch):
+    """Regression, and the most dangerous one found: a Kubernetes repro's project is
+    its namespace, which is never in the compose project list, so the compose rule
+    classified a RUNNING repro as prunable and would have deleted it."""
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    _make_k8s_repro("t11", 31912, monkeypatch, tmp_path)
+    monkeypatch.setattr(lc.runner, "docker_available", lambda: True)
+    monkeypatch.setattr(lc.runner, "project_states", lambda: {})
+
+    monkeypatch.setattr(k8s, "pods", lambda name, run=None: [
+        {"service": "rc-rocketchat-a", "state": "running", "status": "1/1 ready"}])
+    assert lc.prunable() == []                     # live: must not be prunable
+
+    monkeypatch.setattr(k8s, "pods", lambda name, run=None: [])
+    assert lc.prunable() == ["t11"]                # genuinely empty: prunable
+
+    def boom(name, run=None):
+        raise RuntimeError("cluster unreachable")
+    monkeypatch.setattr(k8s, "pods", boom)
+    assert lc.prunable() == []                     # ambiguity is never prunable
+
+
+def test_list_reports_real_state_for_kubernetes_repros(tmp_path, monkeypatch):
+    """Regression: state came from compose, so every Kubernetes repro showed '?'."""
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    _make_k8s_repro("t12", 31913, monkeypatch, tmp_path)
+    monkeypatch.setattr(lc.runner, "docker_available", lambda: False)
+    monkeypatch.setattr(k8s, "pods", lambda name, run=None: [
+        {"service": "rc-rocketchat-a", "state": "running", "status": "1/1 ready"}])
+    row = next(r for r in lc.list_repros() if r["name"] == "t12")
+    assert row["state"] == "running"               # not "?"
+    assert row["root_url"] == "http://localhost:31913"
+
+
+def test_start_and_stop_are_refused_rather_than_silently_wrong(tmp_path, monkeypatch):
+    # Scaling to zero is not the same as stopping a container, and doing something
+    # different under the same word is worse than refusing.
+    from rc_repro import errors
+    from rc_repro.services import lifecycle as lc
+    _make_k8s_repro("t13", 31914, monkeypatch, tmp_path)
+    for action in ("start", "stop"):
+        with pytest.raises(errors.ValidationError) as ei:
+            lc.set_state("t13", action)
+        assert "not supported on the Kubernetes topology" in str(ei.value)
+
+
+def test_restart_dispatches_to_a_rollout(tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    _make_k8s_repro("t14", 31915, monkeypatch, tmp_path)
+    seen = {}
+    monkeypatch.setattr(k8s, "restart",
+                        lambda n, emit=None, run=None: seen.setdefault("name", n) and 0 or 0)
+    lc.set_state("t14", "restart")
+    assert seen["name"] == "t14"
+
+
+def test_create_passes_port_and_honours_wait(tmp_path, monkeypatch):
+    """Regression: the dispatch dropped req.port and ignored req.wait, so --port was
+    silently ignored and --wait returned an unready repro with no error."""
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    got = {}
+
+    def fake_create(name, version, **kw):
+        got.update(kw, name=name)
+        return {"name": name}
+
+    monkeypatch.setattr(k8s, "create_repro", fake_create)
+    monkeypatch.setattr(k8s, "wait_ready", lambda n, emit=None: {"booted_s": 5})
+    res = lc.create_repro(lc.CreateReq(version="8.6.1", preset="microservices",
+                                       name="t15", port=31916, wait=True))
+    assert got["port"] == 31916                    # no longer dropped
+    assert res["waited"] is True and res["booted_s"] == 5

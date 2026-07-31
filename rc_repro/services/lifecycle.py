@@ -204,9 +204,15 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
     if _topology_of(req.preset) == "kubernetes":
         from rc_repro.services import k8s
         name = req.name or derive_name(req.version, req.preset)
-        return k8s.create_repro(name, req.version, offline=req.offline,
-                                rc_image=req.rc_image or "", mongo=req.mongo or "",
-                                emit=emit)
+        result = k8s.create_repro(name, req.version, offline=req.offline,
+                                  rc_image=req.rc_image or "", mongo=req.mongo or "",
+                                  port=req.port, emit=emit)
+        if req.wait:
+            # --wait must mean the same thing on both topologies, or a caller that
+            # asked to block gets an unready repro and no error.
+            result.update(k8s.wait_ready(name, emit=emit))
+            result["waited"] = True
+        return result
     require_docker()
     cfg = config.load_config()
 
@@ -496,6 +502,22 @@ def list_repros() -> list[dict]:
     status_map = runner.rc_status_by_project() if docker_up else {}
     out = []
     for m in metas:
+        if (m.extra or {}).get("topology") == "kubernetes" if isinstance(m.extra, dict) else False:
+            # Ask Kubernetes, not compose: a compose lookup returns nothing for these
+            # and `list` would show every Kubernetes repro as unknown forever.
+            from rc_repro.services import k8s
+            try:
+                state = k8s.aggregate_state(k8s.pods(m.name))
+            except Exception:  # noqa: BLE001 - cluster gone or unreachable
+                state = "?"
+            uptime, health = "", ""
+            out.append({"name": m.name, "rc_version": m.rc_version, "mongo_tag": m.mongo_tag,
+                        "host_port": m.host_port, "root_url": m.root_url, "state": state,
+                        "preset": m.preset, "pinned": m.pinned, "default": m.name == default,
+                        "monitoring": False, "created_at": m.created_at,
+                        "uptime": uptime, "health": health, "grafana_url": None,
+                        "links": [{"label": "Rocket.Chat", "url": m.root_url}]})
+            continue
         state = "?" if not docker_up else _pretty_state(states.get(m.project, ""))
         uptime, health = _uptime_health(status_map.get(m.project, ""))
         monitored = bool(isinstance(m.extra, dict) and m.extra.get("monitoring"))
@@ -550,6 +572,18 @@ def detail(name: str) -> dict:
 
 def set_state(name: str, action: str) -> None:
     target = resolve_name(name)
+    if topology_of_repro(target) == "kubernetes":
+        from rc_repro.services import k8s
+        if action != "restart":
+            # start/stop have no clean Kubernetes analogue: scaling to zero and back
+            # is not the same as stopping a container, and silently doing something
+            # different is worse than saying so.
+            raise ValidationError(
+                f"{action!r} is not supported on the Kubernetes topology; use "
+                f"`rc-repro down --name {target}` and recreate, or `restart`")
+        if k8s.restart(target, emit=null_emit) != 0:
+            raise DockerError(f"rollout restart failed for {target!r}")
+        return
     fn = {"start": runner.start, "stop": runner.stop, "restart": runner.restart}.get(action)
     if fn is None:
         raise ValidationError(f"unknown action {action!r} (want start|stop|restart)")
@@ -562,6 +596,22 @@ def _clear_default_if(name: str) -> None:
     if cfg.get("default_repro") == name:
         cfg.pop("default_repro", None)
         config.save_config(cfg)
+
+
+def topology_of_repro(name: str) -> str:
+    """An existing repro's topology, read from its record.
+
+    Separate from _topology_of, which answers for a preset before a repro exists.
+    Every verb that touches a live repro dispatches on this, because a Kubernetes
+    repro has no compose project and running `docker compose` against it either
+    fails or, worse, silently does nothing.
+    """
+    try:
+        meta = runner.read_meta(name)
+    except Exception:  # noqa: BLE001 - half-written or absent record
+        return "compose"
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    return extra.get("topology", "compose") or "compose"
 
 
 def _topology_of(preset_name: str) -> str:
@@ -578,8 +628,19 @@ def _topology_of(preset_name: str) -> str:
 
 
 def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: Emit = null_emit) -> dict:
-    require_docker()
     target = resolve_name(name)
+    if topology_of_repro(target) == "kubernetes":
+        from rc_repro.services import k8s
+        if volumes and not confirm:
+            raise ValidationError(f"deleting {target!r}'s data and record is irreversible - "
+                                  "pass confirm=true")
+        result = k8s.teardown(target, volumes=volumes, emit=emit)
+        if volumes:
+            _clear_default_if(target)
+        # residual is authoritative: a partial teardown must not report success.
+        result["removed_ok"] = not result.get("residual")
+        return result
+    require_docker()
     if volumes and not confirm:
         raise ValidationError(f"deleting {target!r}'s data volume and record is irreversible - "
                               "pass confirm=true")
@@ -592,6 +653,10 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
     return {"name": target, "removed": volumes}
 
 
+def _is_kubernetes(meta) -> bool:
+    return isinstance(meta.extra, dict) and meta.extra.get("topology") == "kubernetes"
+
+
 def prunable() -> list[str]:
     """Names of repros that are safe to prune: not pinned and with no containers
     (a plain `down`). Raises DockerError if docker can't be queried — deleting on
@@ -600,7 +665,27 @@ def prunable() -> list[str]:
     states = runner.project_states()
     if states is None:
         raise DockerError("couldn't query docker compose projects - not pruning (is Docker healthy?)")
-    return [m.name for m in runner.list_meta() if not m.pinned and m.project not in states]
+    out = []
+    for m in runner.list_meta():
+        if m.pinned:
+            continue
+        if _is_kubernetes(m):
+            # A Kubernetes repro's `project` is its namespace, which is never in the
+            # compose project list, so the compose rule below would classify a
+            # RUNNING repro as prunable and delete it. Ask Kubernetes instead, and
+            # treat any uncertainty as "not prunable": deleting on ambiguity is the
+            # one mistake prune must never make.
+            try:
+                from rc_repro.services import k8s
+                if k8s.pods(m.name):
+                    continue          # still has pods: live, do not prune
+            except Exception:  # noqa: BLE001 - cluster unreachable: cannot tell
+                continue
+            out.append(m.name)
+            continue
+        if m.project not in states:
+            out.append(m.name)
+    return out
 
 
 def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
