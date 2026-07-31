@@ -89,6 +89,11 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
     def stats(name: str):
         from rc_repro.perf import resources as R
         target = lc.resolve_name(name)
+        # Same guard as the CLI's `stats`: this reads container stats from the
+        # compose project, so on Kubernetes it would report zeros rather than fail,
+        # and a panel confidently showing 0% CPU is worse than an empty one.
+        lc.require_compose_topology(target, "stats",
+                                    "It reads container stats from the compose project.")
         ids = runner.container_ids(target)
         cpu = mem = 0.0
         for line in runner.docker_stats(ids).splitlines():

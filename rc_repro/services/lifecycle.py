@@ -387,6 +387,17 @@ def finalize(meta: runner.Metadata, emit: Emit):
 
 
 def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: float = 300.0) -> dict:
+    """Wait until the repro serves, then run the post-ready steps.
+
+    Dispatches here rather than at each call site: the CLI's `ready`, its `--json`
+    variant, and the web GUI all call this, and guarding three callers separately is
+    how one of them gets missed. On Kubernetes the URL is a port-forward that may
+    have died, so it is revived before waiting rather than timed out against.
+    """
+    if isinstance(meta.extra, dict) and meta.extra.get("topology") == "kubernetes":
+        from rc_repro.services import k8s
+        ensure_reachable(meta.name, emit)
+        meta = runner.read_meta(meta.name)
     started = time.monotonic()
     served = wait_serving(meta, emit, timeout)
     elapsed = int(time.monotonic() - started)

@@ -1066,3 +1066,28 @@ def test_logs_dispatches_to_kubectl(tmp_path, monkeypatch):
     res = CliRunner().invoke(app, ["logs", "--name", "g3", "--tail", "50"])
     assert res.exit_code == 0
     assert seen == {"name": "g3", "follow": False, "tail": 50}
+
+
+def test_wait_and_finalize_dispatches_for_every_caller(tmp_path, monkeypatch):
+    """Regression: dispatch lived in the CLI's `ready --json` branch only, so the
+    non-json CLI path and the web GUI both called the compose-shaped path. Guarding
+    three call sites separately is how one gets missed, so it dispatches in the
+    service function instead."""
+    from rc_repro import runner
+    from rc_repro.services import lifecycle as lc
+    _make_k8s_repro("w1", 31930, monkeypatch, tmp_path)
+    revived = []
+    monkeypatch.setattr(lc, "ensure_reachable", lambda n, e=None: revived.append(n))
+    monkeypatch.setattr(lc, "wait_serving", lambda m, e, t: {"version": "8.6.1"})
+    monkeypatch.setattr(lc, "finalize", lambda m, e: None)
+    monkeypatch.setattr(lc.postready, "run_post_ready", lambda m, a, e: None)
+    lc.wait_and_finalize(runner.read_meta("w1"))
+    assert revived == ["w1"]          # the forward was revived, not timed out against
+
+
+def test_web_stats_is_guarded_like_the_cli():
+    # The GUI calls the same service layer, so it inherits the same class of bug.
+    src = open("rc_repro/web/app.py", encoding="utf-8").read()
+    i = src.find("ids = runner.container_ids(target)")
+    assert i > 0
+    assert "require_compose_topology" in src[max(0, i - 500):i]
