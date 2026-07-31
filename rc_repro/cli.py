@@ -24,6 +24,7 @@ from rc_repro.perf import report as perf_report
 from rc_repro.perf.timings import fmt_ms
 from rc_repro.services import data as datasvc
 from rc_repro.services import lifecycle as lcsvc
+from rc_repro.services import onboarding as onboardsvc
 from rc_repro.services import events
 from rc_repro.services.events import Event, null_emit
 
@@ -1645,6 +1646,56 @@ def presets_cmd() -> None:
         ui.box(title, lines, inner)
         typer.echo("")
     ui.hint("run: rc-repro up --version <X.Y.Z> --preset <name> [--set key=value]")
+
+
+@app.command()
+def onboard(
+    accept_defaults: bool = typer.Option(False, "--accept-defaults",
+                                         help="take every default without prompting (for scripts/CI)"),
+    grant: list[str] = typer.Option(None, "--grant",
+                                    help="authority to hand over, repeatable (see --help)"),
+    retain_runs: bool = typer.Option(False, "--retain-runs",
+                                     help="keep repros after evidence capture instead of tearing down"),
+    json_out: bool = typer.Option(False, "--json", help="emit the resulting state as JSON"),
+) -> None:
+    """Answer rc-repro's setup questions once. Later runs never re-ask them.
+
+    Interactive without flags; fully non-interactive with --accept-defaults, so a
+    human can authorise a machine in one command and an agent then runs silently.
+    """
+    grants = list(grant or [])
+    prefs: dict = {}
+    if not accept_defaults and not json_out:
+        # Interactive: a thin collector calling the same writer the flags call, so
+        # the two front doors cannot drift.
+        typer.echo("rc-repro setup — asked once, then never again.\n")
+        if "engine-resize" not in grants:
+            typer.echo("Some presets need more memory than your container engine has.")
+            ui.warn("  Resizing restarts the engine, which stops unrelated containers.")
+            if typer.confirm("May rc-repro stop, resize, and restart it when needed?",
+                             default=False):
+                grants.append("engine-resize")
+        prefs["retain_runs"] = typer.confirm(
+            "Keep repros after capturing evidence (instead of tearing them down)?",
+            default=False)
+    else:
+        prefs["retain_runs"] = retain_runs
+
+    try:
+        result = onboardsvc.complete(grants=grants, preferences=prefs)
+    except errors.ReproError as exc:
+        jsonout.fail(exc) if json_out else _fail(exc)
+
+    if json_out:
+        jsonout.emit(jsonout.envelope("onboard", result))
+        return
+    ui.ok("✓ onboarding recorded")
+    for name in sorted(onboardsvc.GRANTS):
+        key = name.replace("-", "_")
+        mark = "granted" if result["grants"].get(key) else "not granted"
+        typer.echo(f"  {name}: {mark}")
+    typer.echo(f"  retain runs: {result['preferences']['retain_runs']}")
+    ui.hint("  change any answer by running `rc-repro onboard` again")
 
 
 @app.command()

@@ -233,6 +233,18 @@ def _commands(app: Any) -> list[dict]:
     return sorted(out, key=lambda e: e["name"])
 
 
+def _onboarding_state() -> dict:
+    try:
+        from rc_repro.services import onboarding
+        st = onboarding.state()
+        return {"completed": st["completed"], "grants": st["grants"],
+                "preferences": st["preferences"],
+                "onboard_with": onboarding.ONBOARD_COMMAND}
+    except Exception:  # noqa: BLE001 - discovery must not fail on a bad config
+        return {"completed": False, "grants": {}, "preferences": {},
+                "onboard_with": "rc-repro onboard --accept-defaults"}
+
+
 def capabilities(app: Any) -> dict:
     """What this build can do, for a version-matched agent skill.
 
@@ -257,6 +269,11 @@ def capabilities(app: Any) -> dict:
         "error_codes": _error_codes(),
         "exit_codes": {str(k): v for k, v in sorted(errors.EXIT_CODES.items())},
         "presets": preset_names,
+        # Whether a human has onboarded this machine, and which authority was
+        # handed over. A skill reads this instead of parsing config.yaml, which
+        # keeps the config file an implementation detail rather than a second
+        # contract.
+        "onboarding": _onboarding_state(),
         "topologies": topologies,
         # Presets whose topology is not compose, so a skill can tell which ones
         # need a cluster before it tries.

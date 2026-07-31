@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from rc_repro import compose, config, configimport, presets, rcapi, runner, scaleseed, seed, versions
 
 
@@ -1541,3 +1543,93 @@ def test_lifecycle_dispatches_on_topology(monkeypatch):
     # an unknown preset must not be guessed into the Kubernetes path; the Compose
     # body raises a proper ValidationError for it moments later
     assert lc._topology_of("does-not-exist") == "compose"
+
+
+# --- onboarding ----------------------------------------------------------------
+
+
+def test_onboarding_absent_is_an_authority_gate(tmp_path, monkeypatch):
+    # An agent on a fresh machine must not invent its own baseline. It stops with
+    # exit 6 and the exact command to ask a human to run.
+    from rc_repro import errors
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    assert onboarding.state()["completed"] is False
+    with pytest.raises(errors.AuthorityGateError) as ei:
+        onboarding.require_onboarded()
+    exc = ei.value
+    assert exc.exit_code == 6 and exc.code == "GATE_NOT_ONBOARDED"
+    assert exc.as_gate()["approve_with"] == onboarding.ONBOARD_COMMAND
+
+
+def test_onboarding_persists_and_stops_asking(tmp_path, monkeypatch):
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    st = onboarding.complete(grants=["engine-resize"], preferences={"retain_runs": True})
+    assert st["completed"] and st["grants"]["engine_resize"] is True
+    assert st["preferences"]["retain_runs"] is True
+    onboarding.require_onboarded()                 # no raise, ever again
+    onboarding.require_grant("engine-resize")      # granted
+
+
+def test_missing_grant_is_a_gate_but_onboarding_is_not_reasked(tmp_path, monkeypatch):
+    # A missing grant is an unanswered question, which is different from a settled
+    # one. Onboarding stops re-asking what was answered; it does not make rc-repro
+    # silent about authority it was never given.
+    from rc_repro import errors
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=[])                 # onboarded, nothing granted
+    onboarding.require_onboarded()                 # settled: silent
+    with pytest.raises(errors.AuthorityGateError) as ei:
+        onboarding.require_grant("engine-resize")
+    assert ei.value.code == "GATE_ENGINE_RESIZE"
+    assert "--grant engine-resize" in ei.value.as_gate()["approve_with"]
+
+
+def test_onboarding_is_additive_and_keeps_existing_keys(tmp_path, monkeypatch):
+    # Never rename or retype an existing key: a config written before onboarding
+    # existed must survive untouched.
+    from rc_repro import config
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    config.save_config({"default_repro": "rc8", "bind_host": "127.0.0.1"})
+    onboarding.complete(grants=["engine-resize"])
+    cfg = config.load_config()
+    assert cfg["default_repro"] == "rc8" and cfg["bind_host"] == "127.0.0.1"
+    assert "config_version" not in cfg          # additive-only, no migration
+    # an unknown preference in the file is ignored rather than honoured
+    cfg["preferences"]["not_a_real_pref"] = True
+    config.save_config(cfg)
+    assert "not_a_real_pref" not in onboarding.state()["preferences"]
+
+
+def test_onboarding_rejects_unknown_grants(tmp_path, monkeypatch):
+    from rc_repro import errors
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    with pytest.raises(errors.ValidationError) as ei:
+        onboarding.complete(grants=["delete-everything"])
+    assert "engine-resize" in str(ei.value)      # names what is available
+
+
+def test_onboarding_never_persists_a_secret(tmp_path, monkeypatch):
+    # A registration token keeps its ephemeral route; onboarding must not bake it in.
+    from rc_repro import config
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("RC_REPRO_REG_TOKEN", "SUPERSECRET")
+    onboarding.complete(grants=[])
+    assert "SUPERSECRET" not in config.config_file().read_text()
+
+
+def test_capabilities_reports_onboarding_state(tmp_path, monkeypatch):
+    from rc_repro import jsonout
+    from rc_repro.cli import app
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    cap = jsonout.capabilities(app)
+    assert cap["onboarding"]["completed"] is False
+    assert cap["onboarding"]["onboard_with"] == onboarding.ONBOARD_COMMAND
+    onboarding.complete(grants=["engine-resize"])
+    assert jsonout.capabilities(app)["onboarding"]["completed"] is True
