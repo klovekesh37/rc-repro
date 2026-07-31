@@ -8,6 +8,10 @@ building — the parts that don't touch Docker or the network.
 from __future__ import annotations
 
 import json
+import os
+import stat
+
+import pytest
 
 from rc_repro import compose, config, configimport, presets, rcapi, runner, scaleseed, seed, versions
 
@@ -568,6 +572,31 @@ def test_env_values_never_persisted_to_config_file(tmp_path, monkeypatch):
     assert "SECRET" not in config.config_file().read_text()
     # ...while readers still see the env value
     assert config.load_config()["reg_token"] == "SECRET"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_config_file_is_owner_only(tmp_path, monkeypatch):
+    # config.yaml can hold reg_token (a Cloud registration token applying an EE
+    # license), so the default umask's 0644 would expose it to every local user.
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    config.save_config({"reg_token": "SECRET"})
+    assert stat.S_IMODE(config.config_file().stat().st_mode) == 0o600
+    assert stat.S_IMODE(config.home().stat().st_mode) == 0o700
+    # no temp file left behind
+    assert not config.config_file().with_suffix(".yaml.tmp").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_config_file_permissions_tightened_on_rewrite(tmp_path, monkeypatch):
+    # A file written by an older rc-repro is already 0644; saving must fix it
+    # rather than preserve the loose mode.
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    config.home().mkdir(parents=True)
+    config.config_file().write_text("default_repro: old\n", encoding="utf-8")
+    os.chmod(config.config_file(), 0o644)
+    config.save_config({"default_repro": "new"})
+    assert stat.S_IMODE(config.config_file().stat().st_mode) == 0o600
+    assert config.load_config()["default_repro"] == "new"
 
 
 def test_version_single_source():

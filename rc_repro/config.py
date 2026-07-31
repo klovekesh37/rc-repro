@@ -72,6 +72,25 @@ _ENV_OVERRIDES = {
 }
 
 
+# config.yaml can hold a Cloud registration token (see _ENV_OVERRIDES), so both
+# the file and the state dir are owner-only. No-ops on Windows, where chmod
+# cannot express POSIX bits.
+FILE_MODE = 0o600
+DIR_MODE = 0o700
+
+
+def _chmod_quietly(path: Path, mode: int) -> None:
+    """chmod, ignoring platforms/filesystems that don't support it.
+
+    A failure here must not break saving config: the write is the user's intent,
+    the mode is a hardening measure.
+    """
+    try:
+        os.chmod(path, mode)
+    except (OSError, NotImplementedError):
+        pass
+
+
 def home() -> Path:
     """Root state directory, created on demand."""
     root = os.environ.get("RC_REPRO_HOME")
@@ -118,5 +137,36 @@ def load_config(with_env: bool = True) -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    home().mkdir(parents=True, exist_ok=True)
-    config_file().write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    """Persist config.yaml with owner-only permissions.
+
+    config.yaml can hold `reg_token` (a Rocket.Chat Cloud registration token that
+    applies an EE license), so it must not be world-readable. The default umask
+    would produce 0644, hence the explicit modes here.
+
+    Written via a temp file opened 0600 and then renamed, so the content is never
+    briefly visible at wider permissions and readers never see a partial file.
+    Same rename-is-atomic reasoning as runner._atomic_write.
+    """
+    root = home()
+    root.mkdir(parents=True, exist_ok=True)
+    _chmod_quietly(root, DIR_MODE)
+
+    path = config_file()
+    tmp = path.with_name(path.name + ".tmp")
+    body = yaml.safe_dump(cfg, sort_keys=False)
+    # os.open with mode=0600 so the file is never readable by others, even for an
+    # instant. O_TRUNC because a previous crash may have left a stale temp file.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    # os.open only applies FILE_MODE when creating; an existing temp file keeps
+    # its old mode, so set it explicitly before the rename publishes it.
+    _chmod_quietly(tmp, FILE_MODE)
+    os.replace(tmp, path)
+    # Tighten a file that predates this behaviour (rename carries the temp file's
+    # mode, so this is belt-and-braces for odd filesystems).
+    _chmod_quietly(path, FILE_MODE)
