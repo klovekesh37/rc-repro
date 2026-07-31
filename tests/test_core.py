@@ -1272,3 +1272,63 @@ def test_ui_die_defaults_to_one_and_honours_override():
             assert exc.exit_code == expected
         else:
             raise AssertionError("ui.die must raise typer.Exit")
+
+
+# --- machine-readable output contract -----------------------------------------
+
+
+def test_envelope_shape_and_versions():
+    from rc_repro import jsonout
+    env = jsonout.envelope("info", {"name": "x"})
+    assert set(env) == {"schema", "contract", "rc_repro_version", "generated_at",
+                        "ok", "data", "warnings", "error"}
+    assert env["schema"] == "rc-repro.info.v1"
+    assert env["contract"] == jsonout.CONTRACT == 1
+    assert env["ok"] is True and env["error"] is None
+    # warnings is always a list so callers can iterate without a None check
+    assert env["warnings"] == []
+
+
+def test_error_envelope_uses_the_taxonomy_code():
+    from rc_repro import errors, jsonout
+    env = jsonout.error_envelope(errors.NotFoundError("no repro named 'x'"))
+    assert env["ok"] is False and env["data"] is None
+    assert env["schema"] == "rc-repro.error.v1"
+    assert env["error"]["code"] == "NOT_FOUND"      # stable; message is not
+    assert "gate" not in env["error"]               # only gates carry one
+
+
+def test_error_envelope_carries_gate_for_authority_errors():
+    from rc_repro import errors, jsonout
+    exc = errors.AuthorityGateError("not approved", kind="cluster",
+                                    subject="prod-eu",
+                                    approve_with="rc-repro use --cluster prod-eu",
+                                    code="GATE_UNAPPROVED_CLUSTER")
+    env = jsonout.error_envelope(exc)
+    assert env["error"]["code"] == "GATE_UNAPPROVED_CLUSTER"
+    assert env["error"]["gate"]["approve_with"] == "rc-repro use --cluster prod-eu"
+
+
+def test_list_json_is_one_line_and_empty_is_not_an_error(tmp_path, monkeypatch):
+    import json as _json
+    from typer.testing import CliRunner
+    from rc_repro.cli import app
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    res = CliRunner().invoke(app, ["list", "--json"])
+    assert res.exit_code == 0
+    assert len(res.stdout.strip().splitlines()) == 1   # one object per line
+    payload = _json.loads(res.stdout)
+    assert payload["schema"] == "rc-repro.list.v1"
+    assert payload["data"]["repros"] == []             # [] not a prose line
+
+
+def test_info_json_missing_repro_emits_error_envelope(tmp_path, monkeypatch):
+    import json as _json
+    from typer.testing import CliRunner
+    from rc_repro.cli import app
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    res = CliRunner().invoke(app, ["info", "--name", "no-such-repro", "--json"])
+    assert res.exit_code == 4                          # NOT_FOUND, not a flat 1
+    payload = _json.loads(res.stdout)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "NOT_FOUND"

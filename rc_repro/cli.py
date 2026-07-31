@@ -18,7 +18,7 @@ from typing import NoReturn, Optional
 import requests
 import typer
 
-from rc_repro import compose, config, errors, presets, perf, rcapi, runner, ui, versions
+from rc_repro import compose, config, errors, jsonout, presets, perf, rcapi, runner, ui, versions
 from rc_repro import seed as seeder
 from rc_repro.perf import report as perf_report
 from rc_repro.perf.timings import fmt_ms
@@ -498,9 +498,16 @@ def use(name: str = typer.Argument(..., help="repro to make the default")) -> No
 
 
 @app.command(name="list")
-def list_cmd() -> None:
+def list_cmd(
+    json_out: bool = typer.Option(False, "--json", help="emit the stable JSON record instead of a table"),
+) -> None:
     """List all repros with version, port, status and URL."""
     repros = lcsvc.list_repros()
+    if json_out:
+        # Empty is a valid answer, not an error: an agent asking "what exists"
+        # gets [] rather than having to special-case a prose line.
+        jsonout.emit(jsonout.envelope("list", {"repros": repros}))
+        return
     if not repros:
         typer.echo("No repros yet. Create one with `rc-repro up --version <X.Y.Z>`.")
         return
@@ -515,8 +522,20 @@ def list_cmd() -> None:
 
 
 @app.command()
-def info(name: str = typer.Option("", "--name", "-n")) -> None:
+def info(
+    name: str = typer.Option("", "--name", "-n"),
+    json_out: bool = typer.Option(False, "--json", help="emit the stable JSON record instead of a panel"),
+) -> None:
     """Show a repro's URL, admin credentials and a curl snippet."""
+    if json_out:
+        # Resolve inside the try so a missing repro is reported as an error
+        # envelope with its code, not as a bare traceback or a prose line.
+        try:
+            target = lcsvc.resolve_name(name)
+            jsonout.emit(jsonout.envelope("info", lcsvc.detail(target)))
+        except errors.ReproError as exc:
+            jsonout.fail(exc)
+        return
     target = _resolve_name(name)
     m = runner.read_meta(target)
     _summary_panel(m)
