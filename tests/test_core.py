@@ -1452,3 +1452,54 @@ def test_up_json_streams_events_then_exactly_one_envelope(tmp_path, monkeypatch,
     pcts = [e["pct"] for e in events_ if e["pct"] is not None]
     assert pcts == sorted(pcts)
     assert any(e["level"] == "warn" for e in events_)
+
+
+# --- capabilities discovery ----------------------------------------------------
+
+
+def test_capabilities_is_derived_not_hardcoded():
+    from rc_repro import errors, jsonout
+    from rc_repro.cli import app
+    cap = jsonout.capabilities(app)
+    assert cap["contract_versions"] == [jsonout.CONTRACT]
+    # phases and exit codes come straight from their definitions, so they cannot
+    # drift from what the code actually emits
+    assert cap["phases"] == list(jsonout.PHASES)
+    assert cap["exit_codes"] == {str(k): v for k, v in sorted(errors.EXIT_CODES.items())}
+    # every error code in the taxonomy is discoverable
+    assert "NOT_FOUND" in cap["error_codes"]
+    assert "CREATE_FAILED" in cap["error_codes"]
+    # presets are read from the catalog, not a literal list
+    assert "default" in cap["presets"]
+
+
+def test_capabilities_reports_which_verbs_speak_json():
+    from rc_repro import jsonout
+    from rc_repro.cli import app
+    cap = jsonout.capabilities(app)
+    by_name = {c["name"]: c for c in cap["commands"]}
+    for verb in ("up", "ready", "down", "list", "info"):
+        assert by_name[verb]["json"] is True, verb
+        assert by_name[verb]["schema"] == f"rc-repro.{verb}.v1"
+    # only the long-running verbs stream events
+    assert by_name["up"]["streams"] is True
+    assert by_name["list"]["streams"] is False
+    # a verb without --json is reported honestly rather than omitted
+    assert by_name["logs"]["json"] is False
+    assert "--name" in by_name["up"]["flags"]
+
+
+def test_capabilities_needs_no_engine(tmp_path, monkeypatch):
+    # A skill calls this before it knows the environment works, so it must answer
+    # with no engine present. Engine checks belong to `doctor`.
+    import json as _json
+    from typer.testing import CliRunner
+    from rc_repro import cli
+    from rc_repro.cli import app
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli.runner, "docker_available", lambda: False)
+    res = CliRunner().invoke(app, ["capabilities"])
+    assert res.exit_code == 0
+    payload = _json.loads(res.stdout)
+    assert payload["schema"] == "rc-repro.capabilities.v1"
+    assert payload["ok"] is True

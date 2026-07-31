@@ -1647,6 +1647,19 @@ def presets_cmd() -> None:
     ui.hint("run: rc-repro up --version <X.Y.Z> --preset <name> [--set key=value]")
 
 
+@app.command()
+def capabilities() -> None:
+    """Report what this rc-repro build can do, for scripts and agent skills.
+
+    No --json flag: the record is JSON by definition, and a flag that is accepted
+    and then ignored is worse than no flag.
+
+    Answers offline and without a container engine on purpose: a caller asks this
+    before it knows whether the environment works. Engine checks live in `doctor`.
+    """
+    jsonout.emit(jsonout.envelope("capabilities", jsonout.capabilities(app)))
+
+
 @app.command(name="versions")
 def versions_cmd(
     version: str = typer.Argument(..., help="Rocket.Chat version, e.g. 7.4.1"),

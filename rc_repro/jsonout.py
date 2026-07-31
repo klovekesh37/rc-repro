@@ -38,7 +38,7 @@ from typing import Any
 
 import typer
 
-from rc_repro import __version__, errors
+from rc_repro import __version__, errors, presets
 
 #: Wire contract generation. See the module docstring before changing this.
 CONTRACT = 1
@@ -174,3 +174,85 @@ def fail(exc: errors.ReproError) -> None:
     """Emit an error envelope and exit with the code its class defines."""
     emit(error_envelope(exc))
     raise typer.Exit(exc.exit_code)
+
+
+def _error_codes() -> list[str]:
+    """Every stable error code this build can emit.
+
+    Walked from the exception hierarchy rather than listed by hand, so a new
+    ReproError subclass cannot be forgotten here.
+    """
+    seen: set[str] = set()
+
+    def walk(cls: type) -> None:
+        code = getattr(cls, "code", None)
+        if code:
+            seen.add(code)
+        for sub in cls.__subclasses__():
+            walk(sub)
+
+    walk(errors.ReproError)
+    return sorted(seen)
+
+
+def _commands(app: Any) -> list[dict]:
+    """Describe the CLI surface by introspecting the registered commands.
+
+    Derived, not hardcoded: a hand-written list would silently drift from the real
+    flags, and the whole point of this call is that an agent can trust it. Only
+    option flags are reported, since those are what a caller composes.
+    """
+    import inspect
+
+    out: list[dict] = []
+    for cmd in getattr(app, "registered_commands", []):
+        cb = cmd.callback
+        if cb is None:
+            continue
+        # typer defaults a command's name to the function name with underscores
+        # turned into dashes; an explicit name= wins.
+        name = cmd.name or cb.__name__.replace("_", "-")
+        flags: list[str] = []
+        streams = False
+        supports_json = False
+        for param in inspect.signature(cb).parameters.values():
+            decls = getattr(param.default, "param_decls", None)
+            if not decls:
+                continue
+            flags.extend(d for d in decls if d.startswith("--"))
+            if param.name in ("json_out", "json_output"):
+                supports_json = True
+                # A verb that takes an emit-driven service call streams events.
+                streams = name in ("up", "ready", "down")
+        entry: dict[str, Any] = {"name": name, "flags": sorted(set(flags)),
+                                 "json": supports_json}
+        if supports_json:
+            entry["schema"] = f"rc-repro.{name}.v1"
+            entry["streams"] = streams
+        out.append(entry)
+    return sorted(out, key=lambda e: e["name"])
+
+
+def capabilities(app: Any) -> dict:
+    """What this build can do, for a version-matched agent skill.
+
+    Must answer offline and without a working container engine: a caller asks this
+    *before* it knows whether the environment works, so anything requiring the
+    engine belongs in `doctor` instead.
+    """
+    try:
+        preset_names = sorted(p.name for p in presets.list_presets())
+    except Exception:  # noqa: BLE001 - discovery must not fail on a bad user preset
+        preset_names = []
+    return {
+        "contract_versions": [CONTRACT],
+        "rc_repro_version": __version__,
+        "commands": _commands(app),
+        "phases": list(PHASES),
+        "error_codes": _error_codes(),
+        "exit_codes": {str(k): v for k, v in sorted(errors.EXIT_CODES.items())},
+        "presets": preset_names,
+        # Only Compose exists today. Kubernetes appears here when the preset does,
+        # so a skill discovers the topology rather than assuming it.
+        "topologies": ["compose"],
+    }
