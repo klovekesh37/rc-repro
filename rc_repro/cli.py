@@ -25,6 +25,7 @@ from rc_repro.perf.timings import fmt_ms
 from rc_repro.services import data as datasvc
 from rc_repro.services import lifecycle as lcsvc
 from rc_repro.services import onboarding as onboardsvc
+from rc_repro.services import evidence as evidencesvc
 from rc_repro.services import skill as skillsvc
 from rc_repro.services import events
 from rc_repro.services.events import Event, null_emit
@@ -1751,6 +1752,34 @@ def skill_status(
         (ui.ok if r["state"] == "current" else ui.warn)(line)
     if any(r["state"] != "current" for r in rows):
         ui.hint("  repair with: rc-repro skill install")
+
+
+@app.command()
+def evidence(
+    name: str = typer.Option("", "--name", "-n"),
+    bundle: str = typer.Option("", "--bundle", help="also write logs and the rendered artifact to this directory"),
+    json_out: bool = typer.Option(True, "--json/--no-json", help="the record is JSON; --no-json prints a summary"),
+) -> None:
+    """Emit a secret-safe record of what was deployed and how it is behaving.
+
+    Safe to attach to a support case: the root URL is reduced to its origin and no
+    token, licence, or password appears anywhere.
+    """
+    try:
+        payload = evidencesvc.record(name)
+        if bundle:
+            payload["bundle"] = evidencesvc.write_bundle(payload["repro"]["name"],
+                                                         bundle, payload)
+    except errors.ReproError as exc:
+        jsonout.fail(exc) if json_out else _fail(exc)
+    if json_out:
+        jsonout.emit(jsonout.envelope("evidence", payload))
+        return
+    r = payload["repro"]
+    typer.echo(f"{r['name']}  {r['rc_version']}  {r['topology']}  {payload['runtime']['state']}")
+    typer.echo(f"  artifact  {payload['artifact']['name']} sha256:{payload['artifact']['sha256'][:12]}")
+    typer.echo(f"  licensed  required={payload['license']['required']} supplied={payload['license']['supplied']}")
+    typer.echo(f"  cleanup   {payload['retention']['cleanup']}")
 
 
 @app.command()

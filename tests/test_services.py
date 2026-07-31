@@ -560,3 +560,84 @@ def test_lifecycle_detail_dispatches_to_kubernetes(tmp_path, monkeypatch):
     # would raise on a Compose-only path (no docker-compose.yml exists here)
     d = lc.detail("p2")
     assert d["topology"] == "kubernetes"
+
+
+# --- evidence -------------------------------------------------------------------
+
+
+def test_evidence_redacts_the_root_url():
+    # Credentials in a URL are the classic accidental leak, and a path can carry a
+    # ticket id or customer name. Only the origin is kept.
+    from rc_repro.services import evidence
+    assert evidence.safe_origin("http://admin:pw@localhost:3000/channel/x?t=1") == \
+        "http://localhost:3000"
+    assert evidence.safe_origin("https://[::1]:8443/p") == "https://[::1]:8443"
+    for bad in ("ftp://x", "", "not a url", "file:///etc/passwd"):
+        assert evidence.safe_origin(bad) == "REDACTED"
+
+
+def test_evidence_is_backend_neutral(tmp_path, monkeypatch):
+    # The repro block must have the same shape on both topologies, so a consumer
+    # never branches on topology to read it.
+    from rc_repro.services import evidence, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("e1", "8.6.1", offline=True, port=31400, run=_FakeRun())
+    rec = evidence.record("e1")
+
+    assert set(rec) == {"repro", "runtime", "artifact", "ownership", "license",
+                        "retention", "generated_at"}
+    assert set(rec["repro"]) == {"name", "preset", "topology", "rc_version",
+                                 "rc_image", "mongo_tag", "mongo_flavor",
+                                 "root_url", "host_port", "version_source",
+                                 "created_at"}
+    assert rec["repro"]["topology"] == "kubernetes"
+    assert rec["repro"]["root_url"] == "http://localhost:31400"
+    # the rendered artifact is hashed, whichever one the topology produced
+    assert rec["artifact"]["name"] == "values.yaml"
+    assert len(rec["artifact"]["sha256"]) == 64
+    # ownership is stated so a teardown decision is auditable
+    assert rec["ownership"]["proof"] == "label"
+    assert rec["ownership"]["namespace"] == "rc-repro-e1"
+
+
+def test_evidence_records_the_licence_state_without_the_value(tmp_path, monkeypatch):
+    # An unlicensed microservices repro can look healthy while not behaving as
+    # licensed, so citing it as proof without this caveat is the actual harm.
+    from rc_repro.services import evidence, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("e2", "8.6.1", offline=True, port=31401, run=_FakeRun())
+    rec = evidence.record("e2")
+    assert rec["license"] == {"required": True, "supplied": False, "source": None}
+
+
+def test_evidence_cleanup_is_a_pasteable_command(tmp_path, monkeypatch):
+    # A literal command, not a descriptor: an agent relays something a human can
+    # paste months later without knowing the topology.
+    from rc_repro.services import evidence, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("e3", "8.6.1", offline=True, port=31402, run=_FakeRun())
+    rec = evidence.record("e3")
+    assert rec["retention"]["cleanup"] == "rc-repro down --name e3 --volumes --yes"
+
+
+def test_evidence_never_contains_a_secret(tmp_path, monkeypatch):
+    import json as _j
+    from rc_repro.services import evidence, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("RC_REPRO_REG_TOKEN", "SUPERSECRETTOKEN")
+    k8s.create_repro("e4", "8.6.1", offline=True, port=31403, run=_FakeRun())
+    blob = _j.dumps(evidence.record("e4"))
+    assert "SUPERSECRETTOKEN" not in blob
+    assert "admin123" not in blob          # the default admin password
+
+
+def test_evidence_bundle_writes_manifest_and_artifact(tmp_path, monkeypatch):
+    import json as _j
+    from rc_repro.services import evidence, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("e5", "8.6.1", offline=True, port=31404, run=_FakeRun())
+    rec = evidence.record("e5")
+    out = evidence.write_bundle("e5", tmp_path / "bundle", rec)
+    assert "manifest.json" in out["files"] and "values.yaml" in out["files"]
+    manifest = _j.loads((tmp_path / "bundle" / "manifest.json").read_text())
+    assert manifest["repro"]["name"] == "e5"
