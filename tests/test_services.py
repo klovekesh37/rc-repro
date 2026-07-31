@@ -46,9 +46,15 @@ def test_createreq_defaults():
 
 
 def test_require_docker_raises_when_down(monkeypatch):
+    # DockerError, not NotReadyError: an absent engine is a preflight problem the
+    # caller must fix (exit 3), not a "still starting, poll again" state (exit 5).
+    # Callers catching ReproError are unaffected; the web API status for this case
+    # moves 409 -> 502, which is the more accurate answer for a dependency being
+    # unavailable.
     monkeypatch.setattr(lc.runner, "docker_available", lambda: False)
-    with pytest.raises(errors.NotReadyError):
+    with pytest.raises(errors.DockerError):
         lc.require_docker()
+    assert errors.DockerError.exit_code == 3
 
 
 def test_resolve_name_errors(monkeypatch):

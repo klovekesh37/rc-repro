@@ -1210,3 +1210,65 @@ def test_seed_usernames_avoid_userN_collision():
 def test_seed_channel_names_unique():
     names = [seed.channel_name(i) for i in range(30)]
     assert len(set(names)) == len(names)
+
+
+# --- error taxonomy / exit codes ----------------------------------------------
+
+
+def test_error_taxonomy_codes_and_exit_codes_are_distinct():
+    from rc_repro import errors
+    subs = [errors.ValidationError, errors.ConflictError, errors.NotFoundError,
+            errors.NotReadyError, errors.DockerError, errors.CreateFailedError,
+            errors.AuthorityGateError]
+    codes = [c.code for c in subs]
+    exits = [c.exit_code for c in subs]
+    assert len(set(codes)) == len(codes), "error codes must be unique"
+    assert len(set(exits)) == len(exits), "exit codes must be unique per cause"
+    # every subclass stays a ReproError so existing handlers keep catching it
+    assert all(issubclass(c, errors.ReproError) for c in subs)
+    # exit 0 is success and must never be an error's code
+    assert 0 not in exits
+    # every exit code is documented in the published map
+    assert all(e in errors.EXIT_CODES for e in exits)
+
+
+def test_not_ready_and_create_failed_stay_distinct():
+    # 5 means "still unknown, clock ran out"; 7 means "known dead, stop now".
+    # Collapsing them is what makes callers wait out an already-failed run.
+    from rc_repro import errors
+    assert errors.NotReadyError.exit_code == 5
+    assert errors.CreateFailedError.exit_code == 7
+
+
+def test_authority_gate_carries_approve_with():
+    from rc_repro import errors
+    exc = errors.AuthorityGateError(
+        "cluster 'prod-eu' is not approved", kind="cluster", subject="prod-eu",
+        approve_with="rc-repro use --cluster prod-eu",
+        code="GATE_UNAPPROVED_CLUSTER")
+    assert exc.exit_code == 6
+    assert exc.code == "GATE_UNAPPROVED_CLUSTER"   # per-gate code overrides
+    assert exc.as_gate() == {"kind": "cluster", "subject": "prod-eu",
+                             "approve_with": "rc-repro use --cluster prod-eu"}
+    assert errors.AuthorityGateError.code == "GATE"  # class default untouched
+
+
+def test_http_status_still_intact():
+    # The web API maps on http_status; adding exit codes must not disturb it.
+    from rc_repro import errors
+    assert errors.ValidationError.http_status == 400
+    assert errors.NotFoundError.http_status == 404
+    assert errors.ConflictError.http_status == 409
+    assert errors.DockerError.http_status == 502
+
+
+def test_ui_die_defaults_to_one_and_honours_override():
+    import typer
+    from rc_repro import ui
+    for expected, kwargs in ((1, {}), (6, {"exit_code": 6})):
+        try:
+            ui.die("boom", **kwargs)
+        except typer.Exit as exc:
+            assert exc.exit_code == expected
+        else:
+            raise AssertionError("ui.die must raise typer.Exit")

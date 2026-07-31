@@ -13,7 +13,7 @@ import time
 from dataclasses import asdict as dc_asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 import requests
 import typer
@@ -38,23 +38,35 @@ app = typer.Typer(
 _err = ui.die  # error-exit (red on stderr + exit 1), kept under the local name
 
 
+def _fail(exc: errors.ReproError) -> NoReturn:
+    """Exit on a domain error, using the exit code its class defines.
+
+    One line per handler instead of a per-site mapping, so the taxonomy in
+    errors.py stays the only place exit codes are decided.
+    """
+    ui.die(str(exc), exit_code=exc.exit_code)
+
+
 def _resolve_name(name: str | None) -> str:
-    """Return the target repro name: explicit, else the configured default."""
-    if name:
-        if not runner.exists(name):
-            _err(f"no repro named {name!r} (run `rc-repro list`)")
-        return name
-    default = config.load_config().get("default_repro")
-    if not default:
-        _err("no --name given and no default repro set (use `rc-repro use <name>`)")
-    if not runner.exists(default):
-        _err(f"default repro {default!r} no longer exists; set another with `rc-repro use`")
-    return default
+    """Return the target repro name: explicit, else the configured default.
+
+    Delegates to the service so the exit code comes from the error taxonomy
+    (missing repro -> 4, no default set -> 2) instead of a flat 1, and so this
+    doesn't drift from the identical service-layer rule.
+    """
+    try:
+        return lcsvc.resolve_name(name)
+    except errors.ReproError as exc:
+        _fail(exc)
 
 
 def _require_docker() -> None:
-    if not runner.docker_available():
-        _err("Docker isn't running. Start Docker Desktop and try again.")
+    # Delegates so "engine down" exits 3 (preflight) rather than a flat 1. This is
+    # the most common failure there is, so it is the one most worth classifying.
+    try:
+        lcsvc.require_docker()
+    except errors.ReproError as exc:
+        _fail(exc)
 
 
 def _login(meta: runner.Metadata) -> rcapi.Auth:
@@ -197,7 +209,7 @@ def up(
     try:
         result = lcsvc.create_repro(req, emit=_cli_emit, stream_output=False)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     _render_create_result(result)
     if seed:
         _run_seed(runner.read_meta(result["name"]), seed_profile, stats=stats)
@@ -235,7 +247,7 @@ def _run_scale(meta: runner.Metadata, spec_str: str) -> None:
     try:
         res = datasvc.run_scale(meta.name, spec_str, emit=null_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if "users" in res:
         ui.ok(f"✓ inserted {res['users']:,} users")
     if "messages" in res:
@@ -246,7 +258,7 @@ def _clear_scale(meta: runner.Metadata) -> None:
     try:
         res = datasvc.clear_scale(meta.name, emit=null_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok(f"✓ removed {res['users']:,} scale users and {res['messages']:,} scale messages")
 
 
@@ -333,7 +345,7 @@ def ready(
     try:
         result = lcsvc.wait_and_finalize(m, emit=_cli_emit, timeout=timeout)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok("✓ ready")
     _summary_panel(m, extra_rows=[("Booted in", _fmt_duration(result["booted_s"]))])
     ui.hint(f"  next: rc-repro logs --name {m.name} -f")
@@ -378,7 +390,7 @@ def down(
         # confirm=True: the prompt above (or --yes) already gated it.
         lcsvc.teardown(target, volumes=volumes, confirm=True)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if volumes:
         ui.ok(f"✓ {target!r} removed (containers, data volume, and record).")
     else:
@@ -411,7 +423,7 @@ def monitor(
             for line in res["notes"]:
                 ui.note(line)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
 
 
 @app.command()
@@ -422,7 +434,7 @@ def prune(
     try:
         targets = lcsvc.prunable()
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if not targets:
         typer.echo("Nothing to prune.")
         return
@@ -434,7 +446,7 @@ def prune(
     try:
         res = lcsvc.prune(confirm=True, emit=_cli_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if res["removed"]:
         ui.ok(f"✓ pruned {len(res['removed'])}: {', '.join(res['removed'])}")
     else:
@@ -459,7 +471,7 @@ def stop(name: str = typer.Option("", "--name", "-n")) -> None:
     try:
         lcsvc.set_state(target, "stop")
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok(f"✓ {target!r} stopped (resume with `rc-repro start`).")
 
 
@@ -470,7 +482,7 @@ def restart(name: str = typer.Option("", "--name", "-n")) -> None:
     try:
         lcsvc.set_state(target, "restart")
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok(f"✓ {target!r} restarted.")
 
 
@@ -649,7 +661,7 @@ def config_import(
     try:
         plan = datasvc.import_plan(m.name, str(path), only=onlyset)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
 
     lines = [f"apply    {plan['counts']['apply']} customized setting(s)",
              f"skip     {plan['counts']['redacted']} redacted secret(s), "
@@ -669,7 +681,7 @@ def config_import(
     try:
         res = datasvc.import_apply(m.name, str(path), only=onlyset, emit=_cli_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if res["failed"]:
         ui.warn(f"  {res['failed']} setting(s) rejected: {', '.join(res['failures'][:10])}"
                 + (" ..." if res["failed"] > 10 else ""))

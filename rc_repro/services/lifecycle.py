@@ -39,8 +39,10 @@ def derive_name(version: str, preset: str) -> str:
 # --- preconditions ------------------------------------------------------------
 
 def require_docker() -> None:
+    # DockerError, not NotReadyError: an absent engine is a preflight problem the
+    # caller must fix (exit 3), not a "still starting, poll again" state (exit 5).
     if not runner.docker_available():
-        raise NotReadyError("Docker isn't running. Start Docker Desktop and try again.")
+        raise DockerError("Docker isn't running. Start Docker Desktop and try again.")
 
 
 def resolve_name(name: str | None) -> str:
