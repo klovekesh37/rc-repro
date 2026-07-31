@@ -241,9 +241,14 @@ def capabilities(app: Any) -> dict:
     engine belongs in `doctor` instead.
     """
     try:
-        preset_names = sorted(p.name for p in presets.list_presets())
+        catalog = list(presets.list_presets())
     except Exception:  # noqa: BLE001 - discovery must not fail on a bad user preset
-        preset_names = []
+        catalog = []
+    preset_names = sorted(p.name for p in catalog)
+    # Derived from the catalog, so a new topology becomes discoverable the moment a
+    # preset uses it. "compose" is always available as the default path.
+    topologies = sorted({getattr(p, "topology", "compose") or "compose"
+                         for p in catalog} | {"compose"})
     return {
         "contract_versions": [CONTRACT],
         "rc_repro_version": __version__,
@@ -252,7 +257,12 @@ def capabilities(app: Any) -> dict:
         "error_codes": _error_codes(),
         "exit_codes": {str(k): v for k, v in sorted(errors.EXIT_CODES.items())},
         "presets": preset_names,
-        # Only Compose exists today. Kubernetes appears here when the preset does,
-        # so a skill discovers the topology rather than assuming it.
-        "topologies": ["compose"],
+        "topologies": topologies,
+        # Presets whose topology is not compose, so a skill can tell which ones
+        # need a cluster before it tries.
+        "presets_by_topology": {
+            t: sorted(p.name for p in catalog
+                      if (getattr(p, "topology", "compose") or "compose") == t)
+            for t in topologies
+        },
     }

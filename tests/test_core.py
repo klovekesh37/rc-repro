@@ -1503,3 +1503,41 @@ def test_capabilities_needs_no_engine(tmp_path, monkeypatch):
     payload = _json.loads(res.stdout)
     assert payload["schema"] == "rc-repro.capabilities.v1"
     assert payload["ok"] is True
+
+
+def test_capabilities_discovers_the_kubernetes_topology():
+    # Derived from the catalog, so a preset declaring a new topology becomes
+    # discoverable without touching the capability record.
+    from rc_repro import jsonout
+    from rc_repro.cli import app
+    cap = jsonout.capabilities(app)
+    assert cap["topologies"] == ["compose", "kubernetes"]
+    assert cap["presets_by_topology"]["kubernetes"] == ["microservices"]
+    assert "default" in cap["presets_by_topology"]["compose"]
+
+
+def test_microservices_preset_declares_its_topology_and_licence():
+    from rc_repro import presets
+    p = presets.load("microservices")
+    assert p.topology == "kubernetes"
+    # Microservices are an enterprise feature; the flag is advisory, and evidence
+    # records the actual licence state rather than blocking the run.
+    assert p.requires_license is True
+    # Compose-shaped fields stay empty: this preset builds Helm values.
+    assert p.services == {} and p.env == {}
+
+
+def test_every_other_preset_stays_on_compose():
+    from rc_repro import presets
+    for p in presets.list_presets():
+        if p.name != "microservices":
+            assert p.topology == "compose", p.name
+
+
+def test_lifecycle_dispatches_on_topology(monkeypatch):
+    from rc_repro.services import lifecycle as lc
+    assert lc._topology_of("microservices") == "kubernetes"
+    assert lc._topology_of("default") == "compose"
+    # an unknown preset must not be guessed into the Kubernetes path; the Compose
+    # body raises a proper ValidationError for it moments later
+    assert lc._topology_of("does-not-exist") == "compose"

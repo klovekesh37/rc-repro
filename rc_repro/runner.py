@@ -52,17 +52,31 @@ def workspace(name: str) -> Path:
 
 
 def exists(name: str) -> bool:
-    return (workspace(name) / "docker-compose.yml").exists()
+    """Whether a repro exists, judged by its metadata record.
+
+    repro.json rather than docker-compose.yml: the record is topology-neutral (a
+    Kubernetes repro renders values.yaml instead), and `write` writes it last, so
+    its presence also means the workspace finished being written.
+    """
+    return (workspace(name) / "repro.json").exists()
 
 
 def write(name: str, compose_yaml: str, meta: Metadata,
-          files: list[tuple[str, str]] | None = None) -> None:
+          files: list[tuple[str, str]] | None = None,
+          artifact_name: str = "docker-compose.yml") -> None:
+    """Persist a repro's workspace: its rendered artifact plus repro.json.
+
+    `artifact_name` is the rendered deployment artifact. Compose repros write
+    docker-compose.yml (the default, so every existing caller is unchanged);
+    Kubernetes repros write values.yaml. Evidence hashes whichever one is there,
+    so reproducibility works the same either way.
+    """
     ws = workspace(name)
     ws.mkdir(parents=True, exist_ok=True)
     # Write atomically (temp + rename): an interruption mid-write must not leave a
     # half-written repro.json that read_meta would choke on, nor a compose file
     # out of sync with its metadata.
-    _atomic_write(ws / "docker-compose.yml", compose_yaml)
+    _atomic_write(ws / artifact_name, compose_yaml)
     _atomic_write(ws / "repro.json", json.dumps(asdict(meta), indent=2))
     # Preset-generated files (e.g. a seeded LDIF that a service mounts).
     # `{{ROOT_URL}}` is substituted with the repro's URL — presets are built

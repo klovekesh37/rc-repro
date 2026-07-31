@@ -199,6 +199,14 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
     `stream_output=True` streams docker's line output through `emit` (for the web
     job log); False leaves docker's own progress on the terminal (CLI default).
     """
+    # Topology dispatch. One line, delegating wholesale, so the Compose body below
+    # stays exactly as it was and the web GUI gets the same routing as the CLI.
+    if _topology_of(req.preset) == "kubernetes":
+        from rc_repro.services import k8s
+        name = req.name or derive_name(req.version, req.preset)
+        return k8s.create_repro(name, req.version, offline=req.offline,
+                                rc_image=req.rc_image or "", mongo=req.mongo or "",
+                                emit=emit)
     require_docker()
     cfg = config.load_config()
 
@@ -510,6 +518,12 @@ def detail(name: str) -> dict:
     containers + the RC service's env vars."""
     target = resolve_name(name)
     m = runner.read_meta(target)
+    # Topology dispatch, same one-line pattern as create_repro. The Kubernetes
+    # record uses the identical {service, state, status} container shape, so a
+    # caller reads it without knowing which topology produced it.
+    if isinstance(m.extra, dict) and m.extra.get("topology") == "kubernetes":
+        from rc_repro.services import k8s
+        return k8s.detail(target)
     d = _summary(m)
     containers = runner.container_details(target)
     rc = [c for c in containers if c["service"] == "rocketchat" or c["service"].startswith("rocketchat-")]
@@ -548,6 +562,19 @@ def _clear_default_if(name: str) -> None:
     if cfg.get("default_repro") == name:
         cfg.pop("default_repro", None)
         config.save_config(cfg)
+
+
+def _topology_of(preset_name: str) -> str:
+    """The preset's topology, defaulting to compose if it cannot be loaded.
+
+    A failure to load is not this function's problem to report: the Compose path
+    raises a proper ValidationError for an unknown preset a few lines later, and
+    guessing "kubernetes" here would route a typo into the wrong lifecycle.
+    """
+    try:
+        return getattr(presets.load(preset_name), "topology", "compose") or "compose"
+    except Exception:  # noqa: BLE001
+        return "compose"
 
 
 def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: Emit = null_emit) -> dict:

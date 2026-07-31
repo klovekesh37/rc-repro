@@ -55,6 +55,11 @@ class Preset:
     # Declared so port allocation/preflight can see them — two repros publishing
     # the same sidecar port would collide at `docker compose up`.
     ports: list[int] = field(default_factory=list)
+    # Deployment topology this preset runs on. "compose" is Docker Compose, the
+    # default and the only value every existing preset uses, so nothing changes
+    # for them. A non-compose value routes create/ready/teardown to that
+    # topology's service module instead of the Compose path.
+    topology: str = "compose"
 
 
 def _parse(text: str, source: str) -> Preset:
@@ -77,6 +82,7 @@ def _parse(text: str, source: str) -> Preset:
         extra=raw.get("extra") or {},
         volumes=raw.get("volumes") or {},
         ports=[int(p) for p in raw.get("ports") or []],
+        topology=raw.get("topology", "compose") or "compose",
     )
 
 
