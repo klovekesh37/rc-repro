@@ -245,6 +245,14 @@ def _onboarding_state() -> dict:
                 "onboard_with": "rc-repro onboard --accept-defaults"}
 
 
+def _skill_state() -> dict:
+    try:
+        from rc_repro.services import skill
+        return skill.state_for_capabilities()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def capabilities(app: Any) -> dict:
     """What this build can do, for a version-matched agent skill.
 
@@ -274,6 +282,9 @@ def capabilities(app: Any) -> dict:
         # keeps the config file an implementation detail rather than a second
         # contract.
         "onboarding": _onboarding_state(),
+        # Whether the installed agent skill matches this build, so a skill learns
+        # it is stale through the contract it already reads.
+        "skill": _skill_state(),
         "topologies": topologies,
         # Presets whose topology is not compose, so a skill can tell which ones
         # need a cluster before it tries.

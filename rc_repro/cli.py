@@ -25,6 +25,7 @@ from rc_repro.perf.timings import fmt_ms
 from rc_repro.services import data as datasvc
 from rc_repro.services import lifecycle as lcsvc
 from rc_repro.services import onboarding as onboardsvc
+from rc_repro.services import skill as skillsvc
 from rc_repro.services import events
 from rc_repro.services.events import Event, null_emit
 
@@ -1696,6 +1697,60 @@ def onboard(
         typer.echo(f"  {name}: {mark}")
     typer.echo(f"  retain runs: {result['preferences']['retain_runs']}")
     ui.hint("  change any answer by running `rc-repro onboard` again")
+
+
+skill_app = typer.Typer(help="Install the rc-repro agent skill into an agent host.")
+app.add_typer(skill_app, name="skill")
+
+
+@skill_app.command("install")
+def skill_install(
+    host: str = typer.Option("all", "--host", help="claude | codex | all"),
+    scope: str = typer.Option("user", "--scope", help="user | project"),
+    force: bool = typer.Option(False, "--force", help="overwrite a locally edited skill"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Install the skill that shipped with this rc-repro.
+
+    The bundle lives inside the package, so the installed skill always describes
+    the rc-repro you are actually running. Idempotent: re-run it to repair drift.
+    """
+    try:
+        results = (skillsvc.install_all(scope, force=force) if host == "all"
+                   else [skillsvc.install(host, scope, force=force)])
+    except errors.ReproError as exc:
+        jsonout.fail(exc) if json_out else _fail(exc)
+    payload = [{"host": r.host, "scope": r.scope, "path": str(r.path),
+                "state": r.state, "version": r.installed_version} for r in results]
+    if json_out:
+        jsonout.emit(jsonout.envelope("skill-install", {"installed": payload}))
+        return
+    for r in payload:
+        ui.ok(f"✓ {r['host']}: {r['path']}")
+    # Cursor and Copilot read these same directories, so they need no separate copy.
+    ui.hint("  cursor and copilot read these directories too — nothing more to do")
+
+
+@skill_app.command("status")
+def skill_status(
+    scope: str = typer.Option("user", "--scope", help="user | project"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Report whether each host's installed skill matches this rc-repro."""
+    rows = []
+    for h in sorted(skillsvc.HOSTS):
+        st = skillsvc.status(h, scope)
+        rows.append({"host": h, "scope": st.scope, "path": str(st.path),
+                     "state": st.state, "installed_version": st.installed_version})
+    if json_out:
+        jsonout.emit(jsonout.envelope(
+            "skill-status", {"bundled_version": skillsvc.__version__, "installs": rows}))
+        return
+    for r in rows:
+        line = f"  {r['host']:8} {r['state']:9} {r['path']}"
+        (ui.ok if r["state"] == "current" else ui.warn)(line)
+    if any(r["state"] != "current" for r in rows):
+        ui.hint("  repair with: rc-repro skill install")
 
 
 @app.command()

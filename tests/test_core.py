@@ -1633,3 +1633,88 @@ def test_capabilities_reports_onboarding_state(tmp_path, monkeypatch):
     assert cap["onboarding"]["onboard_with"] == onboarding.ONBOARD_COMMAND
     onboarding.complete(grants=["engine-resize"])
     assert jsonout.capabilities(app)["onboarding"]["completed"] is True
+
+
+# --- the agent skill bundle ----------------------------------------------------
+
+
+def test_committed_host_copies_match_the_packaged_bundle():
+    """The whole point of one canonical bundle is that copies cannot diverge.
+
+    Without this test the repo's committed .claude/ and .agents/ copies drift from
+    the packaged one, which is exactly the divergent-copy problem the skill design
+    exists to prevent.
+    """
+    from pathlib import Path
+    from rc_repro.services import skill
+    canonical = skill.bundle_text()
+    for rel in (".claude/skills/rc-repro/SKILL.md", ".agents/skills/rc-repro/SKILL.md"):
+        p = Path(rel)
+        assert p.exists(), f"{rel} is missing; copy rc_repro/data/skill/SKILL.md there"
+        assert p.read_text(encoding="utf-8") == canonical, (
+            f"{rel} has drifted from rc_repro/data/skill/SKILL.md")
+
+
+def test_skill_frontmatter_is_restricted_to_the_spec_fields():
+    # Host-only fields stay out of the canonical body: the superset host is the fork
+    # risk here, not a gap.
+    from rc_repro.services import skill
+    text = skill.bundle_text()
+    assert text.startswith("---\n")
+    front = text.split("---", 2)[1]
+    keys = {ln.split(":", 1)[0].strip() for ln in front.strip().splitlines()
+            if ":" in ln and not ln.startswith(" ")}
+    assert keys == {"name", "description"}, keys
+    # description drives activation, so it must name situations, not the tool
+    assert "reproduce" in front.lower()
+
+
+def test_skill_body_delegates_rather_than_duplicating_the_contract():
+    # It must not restate flags or error codes: a skill that disagrees with the
+    # binary is worse than no skill.
+    from rc_repro.services import skill
+    text = skill.bundle_text()
+    assert "rc-repro capabilities" in text          # points at the authority
+    assert "exit 6" in text                         # teaches the gate rule
+    for leaked in ("VALIDATION_FAILED", "ENGINE_UNAVAILABLE", "exit_codes"):
+        assert leaked not in text, f"{leaked} duplicates the contract"
+
+
+def test_skill_install_is_idempotent_and_detects_drift(tmp_path, monkeypatch):
+    from rc_repro import errors
+    from rc_repro.services import skill
+    monkeypatch.setenv("HOME", str(tmp_path))          # never touch the real ~/.claude
+    assert skill.status("claude").state == "absent"
+    st = skill.install("claude")
+    assert st.state == "current"
+    assert skill.install("claude").state == "current"  # idempotent
+
+    # a human edit is detected and never silently overwritten
+    (st.path / "SKILL.md").write_text("locally edited", encoding="utf-8")
+    assert skill.status("claude").state == "modified"
+    with pytest.raises(errors.ConflictError):
+        skill.install("claude")
+    assert skill.install("claude", force=True).state == "current"
+
+
+def test_skill_stale_when_the_recorded_version_differs(tmp_path, monkeypatch):
+    import json as _j
+    from rc_repro.services import skill
+    monkeypatch.setenv("HOME", str(tmp_path))
+    st = skill.install("claude")
+    side = st.path / ".rc-repro-skill.json"
+    data = _j.loads(side.read_text())
+    data["rc_repro_version"] = "0.0.1-old"
+    side.write_text(_j.dumps(data))
+    assert skill.status("claude").state == "stale"
+
+
+def test_cursor_and_copilot_need_no_separate_install():
+    # They read the Claude Code and Codex directories, so a separate copy would be
+    # a divergent copy for no benefit.
+    from rc_repro import errors
+    from rc_repro.services import skill
+    for host, covered_by in (("cursor", "claude"), ("copilot", "codex")):
+        with pytest.raises(errors.ValidationError) as ei:
+            skill.target_dir(host)
+        assert covered_by in str(ei.value)
