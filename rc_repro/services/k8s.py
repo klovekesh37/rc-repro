@@ -413,6 +413,9 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     run = run or _Runner()
     require_tools(run)
 
+    events.info(emit, "checking engine capacity", phase="preflight", pct=2)
+    check_capacity(run, emit)
+
     events.info(emit, "resolving versions and chart", phase="resolve", pct=5)
     plan = build_values(rc_version, offline=offline, rc_image=rc_image, mongo=mongo)
     plan.name, plan.namespace = name, namespace_for(name)
@@ -692,3 +695,122 @@ def logs(name: str, *, follow: bool = False, tail: int | None = None,
     if tail is not None:
         argv.append(f"--tail={tail}")
     return subprocess.call(argv)
+
+
+# --- capacity preflight ---------------------------------------------------------
+
+def engine_capacity(run: _Runner | None = None) -> tuple[float, int]:
+    """(memory GiB, CPUs) the container engine can give a cluster.
+
+    Read from the engine rather than the host: on macOS the cluster runs inside the
+    Podman or Docker VM, so the host's 16 GiB is irrelevant if the VM has 2.
+    """
+    run = run or _Runner()
+    res = run.run(["docker", "info", "--format", "{{.MemTotal}} {{.NCPU}}"], check=False)
+    parts = (res.stdout or "").split()
+    if len(parts) < 2:
+        return (0.0, 0)
+    try:
+        return (int(parts[0]) / (1024 ** 3), int(parts[1]))
+    except ValueError:
+        return (0.0, 0)
+
+
+def _resize_command(mib: int) -> str:
+    """The exact command that raises the engine's memory, for a human to run."""
+    return (f"podman machine stop && podman machine set --memory {mib} "
+            f"&& podman machine start")
+
+
+def check_capacity(run: _Runner | None = None, emit: Emit = null_emit,
+                   cfg: dict | None = None) -> None:
+    """Refuse, or silently fix, an engine too small for the microservices topology.
+
+    The floor is measured, not guessed: peak working set 3.49 GiB and ~3.5 of 4
+    cores during convergence, so 6 GiB and 4 CPUs is the lowest defensible floor and
+    CPU is the binding constraint. A memory-only check would pass a 2-core host that
+    then crawls and trips its own readiness probes.
+
+    Resizing stops the engine, which stops unrelated containers, so it happens only
+    under the standing grant a human gave once at onboarding. Without that grant this
+    is a preflight failure (exit 3) naming the exact command, and it does not re-ask:
+    re-asking a settled question is what onboarding exists to prevent.
+    """
+    run = run or _Runner()
+    mem_gib, cpus = engine_capacity(run)
+    if mem_gib == 0.0 and cpus == 0:
+        # Engine unreachable: require_tools and require_docker report that better
+        # than a capacity check can.
+        return
+    if mem_gib >= FLOOR_MEMORY_GIB and cpus >= FLOOR_CPUS:
+        return
+
+    shortfall = []
+    if mem_gib < FLOOR_MEMORY_GIB:
+        shortfall.append(f"{mem_gib:.1f} GiB memory (need {FLOOR_MEMORY_GIB:g})")
+    if cpus < FLOOR_CPUS:
+        shortfall.append(f"{cpus} CPUs (need {FLOOR_CPUS})")
+    detail = " and ".join(shortfall)
+
+    from rc_repro.services import onboarding
+    granted = onboarding.state(cfg)["grants"].get("engine_resize")
+
+    if cpus < FLOOR_CPUS:
+        # CPU cannot be raised by the memory resize, and guessing a CPU count for
+        # someone's machine is not rc-repro's call.
+        raise ValidationError(
+            f"the microservices preset needs {FLOOR_CPUS} CPUs and "
+            f"{FLOOR_MEMORY_GIB:g} GiB; this engine has {detail}. Raise the engine's "
+            f"CPU allocation, or use a Compose preset instead.")
+
+    if not granted:
+        raise ValidationError(
+            f"the microservices preset needs {FLOOR_MEMORY_GIB:g} GiB; this engine "
+            f"has {detail}. Either raise it yourself with "
+            f"`{_resize_command(int(FLOOR_MEMORY_GIB * 1024))}`, or grant rc-repro "
+            f"permission to do it with `rc-repro onboard --grant engine-resize` "
+            f"(note that restarting the engine stops unrelated containers).")
+
+    # Granted: act, but report it as an event rather than doing it silently. The
+    # grant covers the action, not hiding it.
+    events.warn(emit, f"engine has {detail}; resizing it now, which restarts the "
+                      f"engine and stops unrelated containers", phase="preflight")
+    if not run.which("podman"):
+        raise ValidationError(
+            "rc-repro may resize the engine, but only a Podman machine can be "
+            "resized from the CLI. Raise Docker Desktop's memory in its settings.")
+    target = str(int(FLOOR_MEMORY_GIB * 1024))
+    run.run(["podman", "machine", "stop"], check=False)
+    run.run(["podman", "machine", "set", "--memory", target], check=False)
+    run.run(["podman", "machine", "start"], check=False)
+    mem_gib, cpus = engine_capacity(run)
+    if mem_gib < FLOOR_MEMORY_GIB:
+        raise CreateFailedError(
+            f"resized the engine but it still reports {mem_gib:.1f} GiB; "
+            f"raise it manually with `{_resize_command(int(FLOOR_MEMORY_GIB * 1024))}`")
+    events.info(emit, f"engine now has {mem_gib:.1f} GiB", phase="preflight")
+
+
+def wait_ready(name: str, *, timeout: float = 600.0, emit: Emit = null_emit,
+               run: _Runner | None = None) -> dict:
+    """Block until the repro serves, reviving the port-forward if it has died.
+
+    Readiness is an HTTP fact, not a Kubernetes one, so this reuses the same
+    wait_serving the Compose path uses rather than polling pod conditions. Pods being
+    Ready is not the same as Rocket.Chat answering, and the second is what a caller
+    actually needs.
+    """
+    run = run or _Runner()
+    meta = runner.read_meta(name)
+    # The forward is reconcilable state: probe and revive before waiting, rather
+    # than timing out against a tunnel that closed.
+    pid = ensure_port_forward(meta, emit, run)
+    if pid and pid != (meta.extra or {}).get(_FORWARD_PID):
+        # Persist the new pid so a later `down` kills the forward that is actually
+        # running rather than a stale one.
+        meta.extra = {**(meta.extra or {}), _FORWARD_PID: pid}
+        runner.write_meta(name, meta)
+
+    from rc_repro.services import lifecycle
+    result = lifecycle.wait_serving(meta, emit, timeout)
+    return {"name": name, **result, "port_forward": forward_state(meta)}

@@ -93,6 +93,16 @@ def read_meta(name: str) -> Metadata:
     return Metadata(**blob)
 
 
+def write_meta(name: str, meta: Metadata) -> None:
+    """Rewrite just repro.json, leaving the rendered artifact alone.
+
+    For updating a fact that changes during a repro's life (a re-established
+    port-forward's pid) without re-rendering the deployment artifact, which would
+    make evidence's hash churn for no reason.
+    """
+    _atomic_write(workspace(name) / "repro.json", json.dumps(asdict(meta), indent=2))
+
+
 def read_compose(name: str) -> dict:
     """Load a repro's generated docker-compose.yml as a dict (for in-place edits
     like attaching/detaching the monitoring stack)."""

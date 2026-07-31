@@ -247,9 +247,11 @@ class _FakeRun:
 
     def __init__(self, *, tools=("kind", "kubectl", "helm"), clusters="",
                  kernel="6.8.0-generic", labels='{"app.kubernetes.io/managed-by":"rc-repro"}',
-                 mongo_ready="true", rs_ok="1", index=None):
+                 mongo_ready="true", rs_ok="1", index=None,
+                 mem_gib=8.0, cpus=4):
         self.tools, self.clusters, self.kernel, self.labels = tools, clusters, kernel, labels
         self.mongo_ready, self.rs_ok = mongo_ready, rs_ok
+        self.mem_bytes, self.cpus = int(mem_gib * 1024 ** 3), cpus
         # A realistic slice of `helm search repo --versions -o json`, including the
         # sparse appVersion coverage the real index has.
         self.index = index if index is not None else [
@@ -274,7 +276,9 @@ class _FakeRun:
         if argv[:3] == ["kind", "get", "clusters"]:
             out = self.clusters
         elif argv[:2] == ["docker", "info"]:
-            out = self.kernel
+            # two different probes share the command; the format tells them apart
+            out = (f"{self.mem_bytes} {self.cpus}" if "MemTotal" in argv[-1]
+                   else self.kernel)
         elif "jsonpath={.metadata.labels}" in argv:
             out = self.labels
         elif "jsonpath={.status.containerStatuses[0].ready}" in argv:
@@ -641,3 +645,121 @@ def test_evidence_bundle_writes_manifest_and_artifact(tmp_path, monkeypatch):
     assert "manifest.json" in out["files"] and "values.yaml" in out["files"]
     manifest = _j.loads((tmp_path / "bundle" / "manifest.json").read_text())
     assert manifest["repro"]["name"] == "e5"
+
+
+# --- capacity preflight ----------------------------------------------------------
+
+
+def test_k8s_capacity_passes_when_the_engine_is_big_enough():
+    from rc_repro.services import k8s
+    k8s.check_capacity(_FakeRun(mem_gib=8.0, cpus=4))          # no raise
+    assert k8s.engine_capacity(_FakeRun(mem_gib=6.0, cpus=4))[1] == 4
+
+
+def test_k8s_capacity_refuses_a_small_engine_without_a_grant(tmp_path, monkeypatch):
+    # Podman's 2 GiB default cannot fit six Deployments and two StatefulSets. The
+    # error must name the exact command, and must not re-ask a settled question.
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    with pytest.raises(errors.ValidationError) as ei:
+        k8s.check_capacity(_FakeRun(mem_gib=2.0, cpus=5))
+    msg = str(ei.value)
+    assert "podman machine set --memory 6144" in msg
+    assert "--grant engine-resize" in msg
+    assert "stops unrelated containers" in msg      # the real cost, stated
+    assert errors.ValidationError.exit_code == 2
+
+
+def test_k8s_capacity_resizes_when_granted_and_says_so(tmp_path, monkeypatch):
+    # The grant covers the action, not hiding it: the resize is reported as a warn
+    # event because it restarts the engine.
+    from rc_repro.services import k8s
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=["engine-resize"])
+
+    class Resizes(_FakeRun):
+        """Small until resized, then big enough."""
+        def run(self, argv, *, check=True):
+            if argv[:3] == ["podman", "machine", "set"]:
+                self.mem_bytes = 8 * 1024 ** 3
+            return super().run(argv, check=check)
+
+    fake = Resizes(mem_gib=2.0, cpus=4,
+                   tools=("kind", "kubectl", "helm", "podman"))
+    seen = []
+    k8s.check_capacity(fake, emit=seen.append)
+    assert any(e.level == "warn" and "stops unrelated containers" in e.message
+               for e in seen)
+    flat = [" ".join(c) for c in fake.calls]
+    assert any("podman machine set --memory 6144" in c for c in flat)
+    assert any("podman machine stop" in c for c in flat)
+    assert any("podman machine start" in c for c in flat)
+
+
+def test_k8s_capacity_never_guesses_a_cpu_count(tmp_path, monkeypatch):
+    # CPU is the binding constraint and cannot be fixed by the memory resize.
+    # Choosing a CPU allocation for someone's machine is not rc-repro's call, so
+    # this refuses even when the resize grant exists.
+    from rc_repro.services import k8s
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=["engine-resize"])
+    with pytest.raises(errors.ValidationError) as ei:
+        k8s.check_capacity(_FakeRun(mem_gib=8.0, cpus=2))
+    assert "CPU" in str(ei.value)
+
+
+def test_k8s_capacity_skips_when_the_engine_is_unreachable():
+    # require_docker reports an absent engine better than a capacity check can.
+    from rc_repro.services import k8s
+    k8s.check_capacity(_FakeRun(mem_gib=0.0, cpus=0))          # no raise
+
+
+def test_k8s_capacity_will_not_resize_docker_desktop(tmp_path, monkeypatch):
+    # Only a Podman machine can be resized from the CLI, so with Docker Desktop the
+    # grant cannot be acted on and rc-repro says which knob to turn instead.
+    from rc_repro.services import k8s
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=["engine-resize"])
+    with pytest.raises(errors.ValidationError) as ei:
+        k8s.check_capacity(_FakeRun(mem_gib=2.0, cpus=4))      # no podman on PATH
+    assert "Docker Desktop" in str(ei.value)
+
+
+def test_k8s_wait_ready_revives_the_forward_and_persists_the_new_pid(tmp_path, monkeypatch):
+    # Readiness is an HTTP fact, so this reuses wait_serving rather than polling pod
+    # conditions: pods being Ready is not the same as Rocket.Chat answering.
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    fake = _FakeRun()
+    k8s.create_repro("r1", "8.6.1", offline=True, port=31600, run=fake)
+    before = runner.read_meta("r1").extra["k8s_forward_pid"]
+
+    monkeypatch.setattr(lc, "wait_serving", lambda m, e, t: {"booted_s": 7})
+    out = k8s.wait_ready("r1", run=fake)
+    assert out["booted_s"] == 7 and out["name"] == "r1"
+    # the dead forward was re-established and the new pid recorded, so a later
+    # `down` kills the forward that is actually running
+    assert runner.read_meta("r1").extra["k8s_forward_pid"] == before
+    assert fake.forwards[-1] == ("rc-repro-r1", 31600)
+
+
+def test_write_meta_leaves_the_rendered_artifact_alone(tmp_path, monkeypatch):
+    # Updating a pid must not re-render values.yaml, or evidence's artifact hash
+    # would churn for no reason.
+    import hashlib
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("r2", "8.6.1", offline=True, port=31601, run=_FakeRun())
+    art = runner.workspace("r2") / "values.yaml"
+    before = hashlib.sha256(art.read_bytes()).hexdigest()
+    m = runner.read_meta("r2")
+    m.extra = {**m.extra, "k8s_forward_pid": 999999}
+    runner.write_meta("r2", m)
+    assert hashlib.sha256(art.read_bytes()).hexdigest() == before
+    assert runner.read_meta("r2").extra["k8s_forward_pid"] == 999999
