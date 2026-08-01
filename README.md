@@ -20,8 +20,10 @@ Prefer a UI? `rc-repro serve` opens a local web dashboard for everything below
 - [Everyday use](#everyday-use) — commands & lifecycle
 - [Web GUI](#web-gui-rc-repro-serve) — `rc-repro serve`, a local dashboard
 - [Scenarios](#scenarios) — presets (LDAP, SAML, email, …) & monitoring
+- [Kubernetes microservices preset](#kubernetes-microservices-preset) — the opt-in `kind` topology
 - [Data & performance](#data--performance) — sample data, data-scale prefill, config import, benchmarking, load testing
 - [API testing](#api-testing)
+- [Agent & JSON interface](#agent--json-interface) — `--json`, `capabilities`, exit codes, onboarding, the agent skill
 - [Reference](#reference) — command list, version resolution, state, development
 
 ---
@@ -649,10 +651,70 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `logs` | tail a repro's logs |
 | `presets` | list available presets |
 | `versions <X.Y.Z>` | show the resolved MongoDB pairing (without launching) |
-| `doctor` | preflight checks (Docker, Compose, engine kernel, Hub auth, disk, ports, connectivity) |
+| `doctor` | preflight checks (Docker, Compose, engine kernel, Hub auth, disk, ports, connectivity; `--json` for the machine-readable record) |
 | `prune` | delete all `down` repros (confirms first, `--yes` to skip) |
+| `evidence` | a secret-safe, backend-neutral record of what was deployed and how it is behaving; `--bundle <dir>` also writes logs and the rendered artifact |
+| `capabilities` | what this build can do (contract version, commands, phases, error/exit codes, presets, topologies); the discovery call an agent reads first |
+| `onboard` | answer setup once (engine-resize consent, retention default); needed before the Kubernetes preset, `--accept-defaults` for scripts |
+| `skill install` / `skill status` | install the versioned rc-repro agent skill into an agent host (`claude`, `codex`; Cursor and Copilot read those) |
 
 Run `rc-repro <command> --help` for flags.
+
+`up`, `ready`, `down`, `list`, `info`, `evidence`, `doctor` and `capabilities`
+accept `--json` for scripts and agents (see [Agent & JSON interface](#agent--json-interface)).
+
+## Kubernetes microservices preset
+
+Docker Compose stays rc-repro's default. The `microservices` preset is an opt-in
+Kubernetes topology that runs Rocket.Chat's microservices from the official Helm
+chart on a local `kind` cluster, with the same create, readiness, inspect, evidence
+and teardown lifecycle as every other repro:
+
+```bash
+rc-repro onboard --accept-defaults          # once per machine
+rc-repro up --preset microservices --version 8.6.1
+rc-repro info --name <name>                 # URL, pods, port-forward state
+rc-repro down --name <name> --volumes --yes
+```
+
+Needs `kind`, `kubectl` and `helm` on `PATH`. rc-repro owns one local cluster
+(`rc-repro-local`) with a namespace per repro, so several microservices repros
+coexist. MongoDB is always external (a single-node replica set from the official
+image, since the chart's bundled MongoDB is amd64-only and its default tag predates
+what recent Rocket.Chat requires). Reachability is a `kubectl port-forward`, so
+`root_url` behaves exactly as on Docker.
+
+Measured floor: **6 GiB memory and 4 CPUs** (8 recommended); CPU is the binding
+constraint during start-up. `rc-repro doctor` reports whether the toolchain and the
+floor are met. Rocket.Chat 8.2+ requires MongoDB 8.0, which cannot start on an engine
+kernel 6.19 or newer ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912));
+on such a host use a 7.x line, and rc-repro refuses the impossible combination up
+front rather than timing out. Microservices are an enterprise feature: an unlicensed
+repro comes up but may not function as licensed, so rc-repro warns and records the
+licence state in evidence (pass `--reg-token` to supply a Cloud registration token).
+
+## Agent & JSON interface
+
+rc-repro exposes a stable machine-readable surface so scripts and agents drive it
+without scraping human output or importing internals.
+
+- **Discovery.** `rc-repro capabilities` returns, as JSON, the contract version, every
+  command with its schema and flags, the progress phases, the error and exit codes,
+  the presets and the topologies. It answers offline, before you know the environment
+  works. `rc-repro doctor --json` is the preflight call and exits `3` on any failure.
+- **One envelope.** Every `--json` reply is `{schema, contract, ok, data, warnings,
+  error}`, so success, data and errors are always in the same place. Long-running
+  verbs (`up`, `ready`, `down`) stream NDJSON progress events, then one final envelope.
+- **Exit codes**, so a caller can tell states apart without parsing prose: `0` ok,
+  `2` usage, `3` preflight, `4` not found, `5` not ready (may poll), `6` a human
+  authority gate (stop and ask), `7` create failed (known dead, stop), `8` conflict.
+  Each error also carries a stable `code`.
+- **Authority.** One-time `onboard` persists consent (for example, resizing the
+  container engine for the Kubernetes preset). An un-onboarded agent hitting the
+  Kubernetes path gets exit `6` with the exact command to ask a human to run, rather
+  than inventing a baseline.
+- **The skill.** `rc-repro skill install` drops the versioned agent skill into an
+  agent host, so the skill always matches the rc-repro you are running.
 
 ## How version → MongoDB resolution works
 
