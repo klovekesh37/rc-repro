@@ -275,6 +275,8 @@ class _FakeRun:
         out = ""
         if argv[:3] == ["kind", "get", "clusters"]:
             out = self.clusters
+        elif "config" in argv and "current-context" in argv:
+            out = "kind-rc-repro-local"
         elif argv[:2] == ["docker", "info"]:
             # two different probes share the command; the format tells them apart
             out = (f"{self.mem_bytes} {self.cpus}" if "MemTotal" in argv[-1]
@@ -296,7 +298,9 @@ class _FakeRun:
         self.applied.append(manifest)
 
     def install(self, ctx, ns, values, chart_version=""):
+        import subprocess
         self.installed.append({"values": values, "chart_version": chart_version})
+        return subprocess.CompletedProcess(["helm", "install"], 0, "", "")
 
     def sleep(self, seconds):
         pass          # never actually wait in tests
@@ -351,12 +355,130 @@ def test_k8s_create_labels_for_ownership_and_installs_the_chart():
     # ownership is asserted at creation, so teardown can prove what it may delete
     assert any("label namespace rc-repro-t1" in c and "managed-by=rc-repro" in c
                for c in flat)
-    # every kubectl call passes an explicit context: the ambient one is never used
-    assert all("--context" in c for c in fake.calls if c[0] == "kubectl")
+    # Every kubectl call names rc-repro's kubeconfig. Workload calls also name the
+    # context; only `config current-context` reads it from that owned file.
+    kubectl_calls = [c for c in fake.calls if c[0] == "kubectl"]
+    assert all("--kubeconfig" in c for c in kubectl_calls)
+    assert all("--context" in c for c in kubectl_calls if "current-context" not in c)
     assert fake.applied and "replSet" in fake.applied[0]   # replica set, not standalone
     assert fake.installed and fake.installed[0]["values"]["mongodb"]["enabled"] is False
     # the chart is pinned, not left to helm's "latest"
     assert fake.installed[0]["chart_version"] == "7.0.2"
+
+
+def test_k8s_client_state_is_owned_and_ambient_paths_are_ignored(tmp_path, monkeypatch):
+    """A contaminated login home must neither break nor redirect rc-repro."""
+    from rc_repro.services import k8s
+    owned = tmp_path / "owned"
+    monkeypatch.setenv("RC_REPRO_HOME", str(owned))
+    monkeypatch.setenv("KUBECONFIG", "/ambient/.kube/config")
+    monkeypatch.setenv("HELM_CACHE_HOME", "/ambient/.cache/helm")
+    monkeypatch.setenv("HELM_CONFIG_HOME", "/ambient/.config/helm")
+    monkeypatch.setenv("HELM_DATA_HOME", "/ambient/.local/share/helm")
+    monkeypatch.setenv("HELM_REPOSITORY_CONFIG", "/ambient/repositories.yaml")
+    monkeypatch.setenv("HELM_REPOSITORY_CACHE", "/ambient/repository")
+
+    state = k8s.client_state()
+    env = k8s._client_env()
+    assert env["KUBECONFIG"] == str(state.kubeconfig)
+    assert env["HELM_CACHE_HOME"] == str(state.helm_cache_home)
+    assert env["HELM_CONFIG_HOME"] == str(state.helm_config_home)
+    assert env["HELM_DATA_HOME"] == str(state.helm_data_home)
+    assert env["HELM_REPOSITORY_CONFIG"] == str(state.helm_repository_config)
+    assert env["HELM_REPOSITORY_CACHE"] == str(state.helm_repository_cache)
+    assert all(str(owned) in env[key] for key in (
+        "KUBECONFIG", "HELM_CACHE_HOME", "HELM_CONFIG_HOME", "HELM_DATA_HOME",
+        "HELM_REPOSITORY_CONFIG", "HELM_REPOSITORY_CACHE"))
+
+    fake = _FakeRun()
+    k8s.create_repro("isolated", "8.6.1", offline=True, run=fake)
+    kubeconfig = str(state.kubeconfig)
+    repo_config = str(state.helm_repository_config)
+    repo_cache = str(state.helm_repository_cache)
+    assert any(c[:3] == ["kind", "create", "cluster"] and
+               c[c.index("--kubeconfig") + 1] == kubeconfig for c in fake.calls)
+    assert any(c[:3] == ["kind", "export", "kubeconfig"] and
+               c[c.index("--kubeconfig") + 1] == kubeconfig for c in fake.calls)
+    for call in (c for c in fake.calls if c[0] == "kubectl"):
+        assert call[call.index("--kubeconfig") + 1] == kubeconfig
+    for call in (c for c in fake.calls if c[0] == "helm"):
+        assert call[call.index("--kubeconfig") + 1] == kubeconfig
+        assert call[call.index("--repository-config") + 1] == repo_config
+        assert call[call.index("--repository-cache") + 1] == repo_cache
+    assert "/ambient/" not in "\n".join(" ".join(c) for c in fake.calls)
+
+
+def test_k8s_real_helm_install_receives_owned_flags_and_environment(tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "owned"))
+    monkeypatch.setenv("KUBECONFIG", "/ambient/config")
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        import subprocess
+        seen.update(argv=argv, kwargs=kwargs)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s.subprocess, "run", fake_run)
+    out = k8s._Runner().install("ctx", "ns", {"image": {"tag": "8.6.1"}}, "7.0.2")
+    state = k8s.client_state()
+    assert out.returncode == 0
+    assert seen["argv"][seen["argv"].index("--kubeconfig") + 1] == str(state.kubeconfig)
+    assert seen["argv"][seen["argv"].index("--repository-config") + 1] == \
+        str(state.helm_repository_config)
+    assert seen["argv"][seen["argv"].index("--repository-cache") + 1] == \
+        str(state.helm_repository_cache)
+    assert seen["kwargs"]["env"]["KUBECONFIG"] == str(state.kubeconfig)
+
+
+def test_k8s_create_reports_unwritable_owned_state_as_preflight(tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "owned"))
+
+    def denied():
+        raise PermissionError("owned client directory is read-only")
+
+    monkeypatch.setattr(k8s, "prepare_client_state", denied)
+    with pytest.raises(errors.DockerError) as ei:
+        k8s.create_repro("unwritable", "8.6.1", offline=True, run=_FakeRun())
+    assert ei.value.code == "ENGINE_UNAVAILABLE" and ei.value.exit_code == 3
+    assert "owned client directory is read-only" in str(ei.value)
+
+
+def test_k8s_repository_failure_is_terminal_and_preserves_the_cause():
+    from rc_repro.services import k8s
+
+    class RepoFail(_FakeRun):
+        def run(self, argv, *, check=True):
+            import subprocess
+            if argv[:3] == ["helm", "repo", "update"]:
+                self.calls.append(argv)
+                noise = "progress\n" * 400
+                return subprocess.CompletedProcess(
+                    argv, 1, noise, "permission denied writing repositories.lock")
+            return super().run(argv, check=check)
+
+    fake = RepoFail()
+    with pytest.raises(errors.CreateFailedError) as ei:
+        k8s.create_repro("repo-fail", "8.6.1", offline=True, run=fake)
+    assert ei.value.code == "CREATE_FAILED" and ei.value.exit_code == 7
+    assert "permission denied writing repositories.lock" in str(ei.value)
+    assert not any(c[:3] == ["kind", "create", "cluster"] for c in fake.calls)
+
+
+def test_k8s_chart_install_failure_is_structured():
+    from rc_repro.services import k8s
+
+    class InstallFail(_FakeRun):
+        def install(self, ctx, ns, values, chart_version=""):
+            import subprocess
+            self.installed.append({"values": values, "chart_version": chart_version})
+            return subprocess.CompletedProcess(
+                ["helm", "install"], 1, "", "chart rendering failed")
+
+    with pytest.raises(errors.CreateFailedError) as ei:
+        k8s.create_repro("install-fail", "8.6.1", offline=True, run=InstallFail())
+    assert "chart rendering failed" in str(ei.value)
 
 
 def test_k8s_teardown_refuses_a_namespace_it_does_not_own():
@@ -503,18 +625,17 @@ def test_k8s_chart_resolution_floors_when_no_exact_match():
     assert k8s.resolve_chart_version("8.5.0", _FakeRun()) == "7.0.0"
 
 
-def test_k8s_chart_resolution_never_hard_fails():
+def test_k8s_chart_resolution_refuses_an_unreadable_or_empty_index():
     from rc_repro.services import k8s
     # nothing at or below the request: newest chart, with a warning
     events_seen = []
     assert k8s.resolve_chart_version("1.0.0", _FakeRun(),
                                      emit=events_seen.append) == "7.0.2"
     assert any(e.level == "warn" for e in events_seen)
-    # unreadable index: fall back to letting helm choose rather than failing
-    events_seen.clear()
-    assert k8s.resolve_chart_version("8.6.1", _FakeRun(index=[]),
-                                     emit=events_seen.append) == ""
-    assert any("not fully pinned" in e.message for e in events_seen)
+    # An empty index must not silently turn the install into "latest".
+    with pytest.raises(errors.CreateFailedError) as ei:
+        k8s.resolve_chart_version("8.6.1", _FakeRun(index=[]))
+    assert "refusing an unpinned install" in str(ei.value)
 
 
 def test_k8s_pods_map_to_the_compose_container_shape(tmp_path, monkeypatch):
@@ -840,8 +961,9 @@ def test_k8s_exec_uses_the_compose_service_word(tmp_path, monkeypatch):
     k8s.create_repro("x1", "8.6.1", offline=True, port=31700, run=_FakeRun())
     seen = {}
 
-    def fake_call(argv):
+    def fake_call(argv, **kwargs):
         seen["argv"] = argv
+        seen["env"] = kwargs.get("env")
         return 0
 
     monkeypatch.setattr(k8s.subprocess, "call", fake_call)
@@ -850,6 +972,8 @@ def test_k8s_exec_uses_the_compose_service_word(tmp_path, monkeypatch):
     assert "deployment/rc-rocketchat" in argv
     assert argv[argv.index("--") + 1:] == ["sh", "-c", "echo hi"]
     assert "--context" in argv          # never the ambient context
+    assert "--kubeconfig" in argv
+    assert seen["env"]["KUBECONFIG"] == argv[argv.index("--kubeconfig") + 1]
 
 
 def test_k8s_prune_refuses_while_repros_remain():
@@ -1219,6 +1343,31 @@ def test_doctor_json_is_an_envelope_and_exits_3_when_not_ready(tmp_path, monkeyp
     assert res.exit_code == 3            # preflight, so an agent stops before `up`
 
 
+def test_doctor_reports_unwritable_k8s_client_state_without_a_traceback(tmp_path, monkeypatch):
+    import json as _j
+    from types import SimpleNamespace
+    from typer.testing import CliRunner
+    from rc_repro import cli
+    from rc_repro.cli import app
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(cli.runner, "docker_available", lambda: False)
+    monkeypatch.setattr(cli.requests, "get", lambda *a, **k: SimpleNamespace(status_code=200))
+    monkeypatch.setattr(k8s, "engine_capacity", lambda: (8.0, 4))
+    monkeypatch.setattr(
+        k8s, "prepare_client_state",
+        lambda: (_ for _ in ()).throw(PermissionError("repositories.lock is read-only")))
+
+    res = CliRunner().invoke(app, ["doctor", "--json"])
+    payload = _j.loads(res.stdout)
+    state_check = next(c for c in payload["data"]["checks"]
+                       if c["check"] == "k8s-client-state")
+    assert state_check["status"] == "fail"
+    assert "repositories.lock is read-only" in state_check["message"]
+    assert payload["data"]["ready"] is False and res.exit_code == 3
+
+
 # --- process/concurrency bugs found by charting --------------------------------
 
 
@@ -1285,11 +1434,36 @@ def test_ensure_cluster_still_raises_on_a_real_creation_failure(tmp_path, monkey
         def run(self, argv, *, check=True):
             import subprocess
             if argv[:3] == ["kind", "create", "cluster"]:
-                return subprocess.CompletedProcess(argv, 1, "", "no space left on device")
+                noise = "creating node\n" * 300
+                return subprocess.CompletedProcess(
+                    argv, 1, noise,
+                    "permission denied while writing the rc-repro kubeconfig")
             return super().run(argv, check=check)
 
-    with pytest.raises(errors.CreateFailedError):
+    with pytest.raises(errors.CreateFailedError) as ei:
         k8s.ensure_cluster(run=RealFail())
+    assert "permission denied while writing the rc-repro kubeconfig" in str(ei.value)
+
+
+def test_ensure_cluster_rejects_an_unusable_exported_kubeconfig(tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    class BadExport(_FakeRun):
+        def __init__(self):
+            super().__init__(clusters="rc-repro-local")
+
+        def run(self, argv, *, check=True):
+            import subprocess
+            if "config" in argv and "current-context" in argv:
+                self.calls.append(argv)
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "could not parse the owned kubeconfig")
+            return super().run(argv, check=check)
+
+    with pytest.raises(errors.CreateFailedError) as ei:
+        k8s.ensure_cluster(run=BadExport())
+    assert "could not parse the owned kubeconfig" in str(ei.value)
 
 
 # --- #21/#22/#23: reclaim, collision, and the last two guards -------------------

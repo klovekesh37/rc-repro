@@ -30,11 +30,13 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 
 import yaml
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from rc_repro import runner, versions
+from rc_repro import config, runner, versions
 from rc_repro.errors import (ConflictError, CreateFailedError, DockerError,
                              NotReadyError, ValidationError)
 from rc_repro.services import events
@@ -66,6 +68,96 @@ _KERNEL_BROKEN_MONGO_MAJOR = 8
 _KERNEL_FIRST_BROKEN = (6, 19)
 
 
+@dataclass(frozen=True)
+class ClientState:
+    """Kubernetes and Helm client state owned by rc-repro.
+
+    kind owns the cluster, so its client configuration must not be redirected by
+    an ambient KUBECONFIG. Helm has three XDG homes plus two repository paths;
+    pinning only repositories.yaml still leaves cache/data writes in the user's
+    home. All of them therefore live below RC_REPRO_HOME.
+    """
+    kubeconfig: Path
+    helm_cache_home: Path
+    helm_config_home: Path
+    helm_data_home: Path
+    helm_repository_config: Path
+    helm_repository_cache: Path
+
+
+def client_state() -> ClientState:
+    root = config.home() / "clients"
+    helm = root / "helm"
+    return ClientState(
+        kubeconfig=root / "kubernetes" / "config",
+        helm_cache_home=helm / "cache",
+        helm_config_home=helm / "config",
+        helm_data_home=helm / "data",
+        helm_repository_config=helm / "config" / "repositories.yaml",
+        helm_repository_cache=helm / "cache" / "repository",
+    )
+
+
+def prepare_client_state() -> ClientState:
+    """Create and prove the rc-repro-owned client directories are writable."""
+    state = client_state()
+    directories = (
+        state.kubeconfig.parent,
+        state.helm_cache_home,
+        state.helm_config_home,
+        state.helm_data_home,
+        state.helm_repository_cache,
+    )
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Directory ownership alone is insufficient: Helm needs to create lock and
+        # index files. A real write probe catches root-owned migrated directories.
+        with tempfile.NamedTemporaryFile(dir=directory):
+            pass
+    for path in (state.kubeconfig, state.helm_repository_config):
+        if path.exists():
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+            os.close(fd)
+    return state
+
+
+def _client_env() -> dict[str, str]:
+    """Return a process environment that cannot fall back to ambient client homes."""
+    state = prepare_client_state()
+    env = os.environ.copy()
+    env.update({
+        "KUBECONFIG": str(state.kubeconfig),
+        "HELM_CACHE_HOME": str(state.helm_cache_home),
+        "HELM_CONFIG_HOME": str(state.helm_config_home),
+        "HELM_DATA_HOME": str(state.helm_data_home),
+        "HELM_REPOSITORY_CONFIG": str(state.helm_repository_config),
+        "HELM_REPOSITORY_CACHE": str(state.helm_repository_cache),
+    })
+    return env
+
+
+def _helm_flags() -> list[str]:
+    state = prepare_client_state()
+    return [
+        "--kubeconfig", str(state.kubeconfig),
+        "--repository-config", str(state.helm_repository_config),
+        "--repository-cache", str(state.helm_repository_cache),
+    ]
+
+
+def _failure_detail(res: subprocess.CompletedProcess, limit: int = 1200) -> str:
+    """Keep the terminal cause when a tool emits more than the display limit."""
+    detail = "\n".join(
+        part.strip() for part in (res.stdout or "", res.stderr or "") if part.strip()
+    )
+    if not detail:
+        return f"command exited {res.returncode} without an error message"
+    if len(detail) <= limit:
+        return detail
+    head = min(300, limit // 3)
+    return f"{detail[:head]}\n... output truncated ...\n{detail[-(limit - head - 28):]}"
+
+
 @dataclass
 class _Runner:
     """Injectable command seam, so the whole module is testable offline."""
@@ -74,13 +166,16 @@ class _Runner:
         return shutil.which(tool)
 
     def run(self, argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
-        return subprocess.run(argv, capture_output=True, text=True, check=check)
+        env = _client_env() if argv and argv[0] in {"kind", "kubectl", "helm"} else None
+        return subprocess.run(argv, capture_output=True, text=True, check=check,
+                              env=env)
 
     def apply(self, ctx: str, ns: str, manifest: str) -> subprocess.CompletedProcess:
         """kubectl apply from stdin. Part of the seam so tests can capture it."""
         return subprocess.run(
-            ["kubectl", "--context", ctx, "-n", ns, "apply", "-f", "-"],
-            input=manifest, capture_output=True, text=True, check=True)
+            _kubectl_argv(ctx, "-n", ns, "apply", "-f", "-"),
+            input=manifest, capture_output=True, text=True, check=True,
+            env=_client_env())
 
     def sleep(self, seconds: float) -> None:
         import time
@@ -92,23 +187,24 @@ class _Runner:
         Part of the seam so tests never spawn a real forward.
         """
         proc = subprocess.Popen(
-            ["kubectl", "--context", ctx, "-n", ns, "port-forward",
-             "svc/rc-rocketchat", f"{host_port}:80"],
+            _kubectl_argv(ctx, "-n", ns, "port-forward", "svc/rc-rocketchat",
+                          f"{host_port}:80"),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True)
+            start_new_session=True, env=_client_env())
         return proc.pid
 
     def install(self, ctx: str, ns: str, values: dict,
                 chart_version: str = "") -> subprocess.CompletedProcess:
         """helm install with values on stdin, so no temp file is left behind."""
         argv = ["helm", "install", "rc", CHART, "--kube-context", ctx,
-                "-n", ns, "--values", "-"]
+                "-n", ns, "--values", "-"] + _helm_flags()
         if chart_version:
             # Pinned: an unpinned install silently changes behaviour the next time
             # the chart is released, which defeats a version-matched repro.
             argv += ["--version", chart_version]
         return subprocess.run(argv, input=yaml.safe_dump(values),
-                              capture_output=True, text=True, check=True)
+                              capture_output=True, text=True, check=False,
+                              env=_client_env())
 
 
 @dataclass
@@ -265,7 +361,7 @@ def _version_key(v: str) -> tuple:
 
 def resolve_chart_version(rc_version: str, run: _Runner | None = None,
                           emit: Emit = null_emit) -> str:
-    """Pick the chart version for a Rocket.Chat version, and never hard-fail.
+    """Pick a pinned chart version for a Rocket.Chat version.
 
     Most Rocket.Chat releases have no chart with a matching appVersion, so an exact
     match cannot be required. The rule is: exact appVersion match if one exists,
@@ -273,23 +369,32 @@ def resolve_chart_version(rc_version: str, run: _Runner | None = None,
     version (a floor, so the chart is never newer than the app it deploys),
     otherwise the newest chart with a warning.
 
-    Returning "" means "let helm choose", which is the unpinned behaviour this
-    function exists to avoid; it is only used when the index cannot be read at all.
+    A missing or unreadable index is terminal. Falling back to an unpinned chart
+    would make the same command deploy different software after a chart release.
     """
     run = run or _Runner()
-    res = run.run(["helm", "search", "repo", CHART, "--versions", "-o", "json"],
+    res = run.run(["helm", "search", "repo", CHART, "--versions", "-o", "json"]
+                  + _helm_flags(),
                   check=False)
+    if res.returncode != 0:
+        raise CreateFailedError(
+            "could not read the Rocket.Chat Helm chart index: " +
+            _failure_detail(res))
     try:
         entries = json.loads(res.stdout or "[]")
-    except ValueError:
-        entries = []
+    except ValueError as exc:
+        raise CreateFailedError(
+            "the Rocket.Chat Helm chart index was not valid JSON: " +
+            _failure_detail(res)) from exc
+    if not isinstance(entries, list):
+        raise CreateFailedError(
+            "the Rocket.Chat Helm chart index had an unexpected JSON shape")
     charts = [(e.get("version", ""), e.get("app_version", "")) for e in entries
               if e.get("version")]
     if not charts:
-        events.warn(emit, "could not read the chart index; helm will choose the "
-                          "chart version, so this run is not fully pinned",
-                    phase="resolve")
-        return ""
+        raise CreateFailedError(
+            "the Rocket.Chat Helm chart index contained no chart versions; "
+            "refusing an unpinned install")
 
     exact = [c for c, app in charts if app == rc_version]
     if exact:
@@ -349,6 +454,26 @@ def cluster_exists(run: _Runner | None = None) -> bool:
     return CLUSTER_NAME in (res.stdout or "").split()
 
 
+def _export_kubeconfig(run: _Runner) -> str:
+    """Refresh the owned kubeconfig for both new and pre-existing clusters."""
+    state = prepare_client_state()
+    res = run.run(["kind", "export", "kubeconfig", "--name", CLUSTER_NAME,
+                   "--kubeconfig", str(state.kubeconfig)], check=False)
+    if res.returncode != 0:
+        raise CreateFailedError(
+            f"could not export kubeconfig for cluster {CLUSTER_NAME}: " +
+            _failure_detail(res))
+    # kind's context is stable today. Read back the owned file when possible so a
+    # future naming change is detected without consulting ambient kubectl state.
+    current = run.run(_kubectl_argv("", "config", "current-context"), check=False)
+    ctx = (current.stdout or "").strip()
+    if current.returncode != 0 or not ctx:
+        raise CreateFailedError(
+            f"the exported kubeconfig for cluster {CLUSTER_NAME} is not usable: " +
+            _failure_detail(current))
+    return ctx
+
+
 def ensure_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> str:
     """Create the rc-repro-owned cluster if it isn't there, and return its context.
 
@@ -370,25 +495,40 @@ def ensure_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> str:
             events.info(emit, f"creating cluster {CLUSTER_NAME}", phase="provision", pct=10)
             # Tolerate a create that lost a race to a process not holding this lock
             # (e.g. a manual `kind create`): "already exist" is success, not failure.
-            res = run.run(["kind", "create", "cluster", "--name", CLUSTER_NAME], check=False)
+            state = prepare_client_state()
+            res = run.run(["kind", "create", "cluster", "--name", CLUSTER_NAME,
+                           "--kubeconfig", str(state.kubeconfig)], check=False)
             if res.returncode != 0 and "already exist" not in (res.stderr or "").lower():
                 raise CreateFailedError(
                     f"could not create the cluster {CLUSTER_NAME}: "
-                    f"{(res.stderr or res.stdout or '').strip()[:300]}")
-    res = run.run(["kind", "get", "kubeconfig", "--name", CLUSTER_NAME], check=False)
-    # kind names the context kind-<cluster>; confirm rather than assume, so a
-    # future naming change surfaces here instead of silently targeting nothing.
-    ctx = f"kind-{CLUSTER_NAME}"
-    if res.stdout and f"name: {ctx}" not in res.stdout and "current-context:" in res.stdout:
-        for line in res.stdout.splitlines():
-            if line.startswith("current-context:"):
-                ctx = line.split(":", 1)[1].strip()
-                break
-    return ctx
+                    f"{_failure_detail(res)}")
+    return _export_kubeconfig(run)
+
+
+def _kubectl_argv(ctx: str, *args: str) -> list[str]:
+    argv = ["kubectl", "--kubeconfig", str(prepare_client_state().kubeconfig)]
+    if ctx:
+        argv += ["--context", ctx]
+    return argv + list(args)
 
 
 def _kubectl(run: _Runner, ctx: str, *args: str, check: bool = True):
-    return run.run(["kubectl", "--context", ctx, *args], check=check)
+    return run.run(_kubectl_argv(ctx, *args), check=check)
+
+
+def setup_helm_repository(run: _Runner) -> None:
+    """Idempotently configure and refresh the official chart repository."""
+    commands = (
+        (["helm", "repo", "add", HELM_REPO_NAME, HELM_REPO_URL,
+          "--force-update"] + _helm_flags(), "configure"),
+        (["helm", "repo", "update", HELM_REPO_NAME] + _helm_flags(), "update"),
+    )
+    for argv, action in commands:
+        res = run.run(argv, check=False)
+        if res.returncode != 0:
+            raise CreateFailedError(
+                f"could not {action} the Rocket.Chat Helm repository: " +
+                _failure_detail(res))
 
 
 def owns_namespace(ns: str, ctx: str, run: _Runner | None = None) -> bool:
@@ -458,6 +598,12 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     """Create a Kubernetes microservices repro. Returns the result payload."""
     run = run or _Runner()
     require_tools(run)
+    try:
+        prepare_client_state()
+    except OSError as exc:
+        raise DockerError(
+            "rc-repro's Kubernetes and Helm client state is not writable under "
+            f"{config.home()}: {exc}") from exc
 
     # A repeat over an existing repro would fail deep inside helm ("cannot re-use a
     # name that is still in use") with a raw error. Refuse early and clearly instead,
@@ -478,8 +624,7 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     # Fail on the impossible combination now rather than after a long wait.
     check_mongo_kernel_support(plan.mongo_tag, run)
 
-    run.run(["helm", "repo", "add", HELM_REPO_NAME, HELM_REPO_URL], check=False)
-    run.run(["helm", "repo", "update", HELM_REPO_NAME], check=False)
+    setup_helm_repository(run)
     plan.chart_version = resolve_chart_version(plan.rc_version, run, emit)
     if plan.chart_version:
         events.info(emit, f"chart {plan.chart_version} for Rocket.Chat "
@@ -499,7 +644,11 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     init_replica_set(run, ctx, plan.namespace, emit)
 
     events.info(emit, "installing the Rocket.Chat chart", phase="boot", pct=55)
-    run.install(ctx, plan.namespace, plan.values, plan.chart_version)
+    installed = run.install(ctx, plan.namespace, plan.values, plan.chart_version)
+    if installed.returncode != 0:
+        raise CreateFailedError(
+            "could not install the Rocket.Chat Helm chart: " +
+            _failure_detail(installed))
 
     events.info(emit, "chart installed", phase="wait", pct=70)
 
@@ -779,13 +928,14 @@ def logs(name: str, *, follow: bool = False, tail: int | None = None,
     run = run or _Runner()
     meta = runner.read_meta(name)
     extra = meta.extra if isinstance(meta.extra, dict) else {}
-    argv = ["kubectl", "--context", extra.get(_CONTEXT, ""), "-n",
-            extra.get(_NAMESPACE, ""), "logs", "deployment/rc-rocketchat"]
+    argv = _kubectl_argv(extra.get(_CONTEXT, ""), "-n",
+                         extra.get(_NAMESPACE, ""), "logs",
+                         "deployment/rc-rocketchat")
     if follow:
         argv.append("--follow")
     if tail is not None:
         argv.append(f"--tail={tail}")
-    return subprocess.call(argv)
+    return subprocess.call(argv, env=_client_env())
 
 
 # --- capacity preflight ---------------------------------------------------------
@@ -992,8 +1142,10 @@ def exec_in(name: str, service: str, args: list[str],
     if not ctx or not ns:
         raise ValidationError(f"{name!r} has no Kubernetes context recorded")
     target = service if service.startswith("rc-") else f"rc-{service}"
-    return subprocess.call(["kubectl", "--context", ctx, "-n", ns, "exec", "-i",
-                            f"deployment/{target}", "--", *args])
+    return subprocess.call(
+        _kubectl_argv(ctx, "-n", ns, "exec", "-i", f"deployment/{target}",
+                      "--", *args),
+        env=_client_env())
 
 
 def owned_namespaces(ctx: str, run: _Runner | None = None) -> list[str]:

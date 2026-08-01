@@ -183,6 +183,8 @@ class _FakeK8sRun:
         out = ""
         if argv[:3] == ["kind", "get", "clusters"]:
             out = "rc-repro-local"
+        elif "config" in argv and "current-context" in argv:
+            out = "kind-rc-repro-local"
         elif argv[:2] == ["docker", "info"]:
             out = f"{8 * 1024**3} 4" if "MemTotal" in argv[-1] else "6.8.0-generic"
         elif "jsonpath={.metadata.labels}" in argv:
@@ -199,7 +201,8 @@ class _FakeK8sRun:
     def apply(self, *a):
         pass
     def install(self, *a, **k):
-        pass
+        import subprocess
+        return subprocess.CompletedProcess(["helm", "install"], 0, "", "")
     def sleep(self, s):
         pass
     def port_forward(self, ctx, ns, host_port):

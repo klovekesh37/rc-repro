@@ -679,7 +679,11 @@ rc-repro down --name <name> --volumes --yes
 
 Needs `kind`, `kubectl` and `helm` on `PATH`. rc-repro owns one local cluster
 (`rc-repro-local`) with a namespace per repro, so several microservices repros
-coexist. MongoDB is always external (a single-node replica set from the official
+coexist. Its kubeconfig and all Helm client state live under
+`RC_REPRO_HOME/clients`; ambient `~/.kube` and Helm XDG directories are never read
+or written. Repository setup, chart lookup and chart installation fail with the
+structured `CREATE_FAILED` error instead of continuing with an unpinned chart.
+MongoDB is always external (a single-node replica set from the official
 image, since the chart's bundled MongoDB is amd64-only and its default tag predates
 what recent Rocket.Chat requires). Reachability is a `kubectl port-forward`, so
 `root_url` behaves exactly as on Docker.
@@ -736,6 +740,7 @@ only for RC < 8 (deprecated in 8.x).
 ```
 ~/.rc-repro/                  # override with RC_REPRO_HOME
 ├── config.yaml               # default_repro, optional reg_token / rc_image
+├── clients/                  # isolated kubeconfig and Helm config/cache/data
 ├── presets/                  # your custom/team presets
 ├── reports/                  # benchmark & loadtest markdown reports
 ├── loadtests/                # saved loadtest baselines (--save / --compare)

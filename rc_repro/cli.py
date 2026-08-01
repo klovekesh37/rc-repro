@@ -1999,6 +1999,15 @@ def doctor(
                      " on PATH (not needed for Docker presets)", "k8s-tools")
     else:
         line("ok", "kind, kubectl and helm present (Kubernetes presets available)", "k8s-tools")
+        k8s_state_ok = True
+        try:
+            state = _k8s.prepare_client_state()
+            line("ok", "rc-repro Kubernetes and Helm client state is writable at "
+                       f"{state.kubeconfig.parent.parent}", "k8s-client-state")
+        except OSError as exc:
+            k8s_state_ok = False
+            line("fail", "rc-repro Kubernetes and Helm client state is not writable: "
+                         f"{exc}", "k8s-client-state")
         mem_gib, cpus = _k8s.engine_capacity()
         if mem_gib or cpus:
             floor_ok = mem_gib >= _k8s.FLOOR_MEMORY_GIB and cpus >= _k8s.FLOOR_CPUS
@@ -2007,9 +2016,9 @@ def doctor(
             # CPU is the binding constraint during start-up, so it is named too: a
             # memory-only report would look fine on a host that then crawls.
             line("ok" if floor_ok else "warn", msg, "k8s-floor")
-        if _k8s.cluster_exists():
+        if k8s_state_ok and _k8s.cluster_exists():
             line("ok", f"rc-repro cluster {_k8s.CLUSTER_NAME} exists (reused, so `up` is faster)")
-        stale = lcsvc.stale_forwards()
+        stale = lcsvc.stale_forwards() if k8s_state_ok else []
         if stale:
             names = ", ".join(r["name"] for r in stale)
             line("warn", f"port-forward down for: {names} "
