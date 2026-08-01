@@ -469,9 +469,16 @@ def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: fl
     have died, so it is revived before waiting rather than timed out against.
     """
     if isinstance(meta.extra, dict) and meta.extra.get("topology") == "kubernetes":
+        # Dispatch fully to the Kubernetes wait, not just revive-then-wait_serving.
+        # wait_serving's is_alive/tick read compose state (runner.rc_state), which is
+        # empty for a Kubernetes repro, and it has no terminal-pod detection, so a
+        # stuck pull would sit out the timeout instead of aborting (exit 7). k8s.
+        # wait_ready owns both. This is what the non-json `ready` and the GUI use, so
+        # they must get the same behaviour as the --json path, not a compose wait.
         from rc_repro.services import k8s
-        ensure_reachable(meta.name, emit)
-        meta = runner.read_meta(meta.name)
+        result = k8s.wait_ready(meta.name, timeout=timeout, emit=emit)
+        return {"booted_s": result.get("booted_s", 0),
+                "running_version": result.get("version", "?")}
     started = time.monotonic()
     served = wait_serving(meta, emit, timeout)
     elapsed = int(time.monotonic() - started)

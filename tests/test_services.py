@@ -1117,19 +1117,25 @@ def test_logs_dispatches_to_kubectl(tmp_path, monkeypatch):
 
 def test_wait_and_finalize_dispatches_for_every_caller(tmp_path, monkeypatch):
     """Regression: dispatch lived in the CLI's `ready --json` branch only, so the
-    non-json CLI path and the web GUI both called the compose-shaped path. Guarding
-    three call sites separately is how one gets missed, so it dispatches in the
-    service function instead."""
+    non-json CLI path and the web GUI both called the compose-shaped path. It now
+    dispatches in the service function, fully to k8s.wait_ready (not just revive-then-
+    compose-wait), so all three callers get terminal-pod detection."""
     from rc_repro import runner
+    from rc_repro.services import k8s
     from rc_repro.services import lifecycle as lc
     _make_k8s_repro("w1", 31930, monkeypatch, tmp_path)
-    revived = []
-    monkeypatch.setattr(lc, "ensure_reachable", lambda n, e=None: revived.append(n))
-    monkeypatch.setattr(lc, "wait_serving", lambda m, e, t: {"version": "8.6.1"})
-    monkeypatch.setattr(lc, "finalize", lambda m, e: None)
-    monkeypatch.setattr(lc.postready, "run_post_ready", lambda m, a, e: None)
-    lc.wait_and_finalize(runner.read_meta("w1"))
-    assert revived == ["w1"]          # the forward was revived, not timed out against
+    seen = {}
+
+    def fake_wait(name, timeout=600.0, emit=None):
+        seen["name"] = name
+        return {"booted_s": 3, "version": "8.6.1"}
+
+    monkeypatch.setattr(k8s, "wait_ready", fake_wait)
+    monkeypatch.setattr(lc, "wait_serving", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("wait_serving must not run for a Kubernetes repro")))
+    out = lc.wait_and_finalize(runner.read_meta("w1"))
+    assert seen["name"] == "w1"        # dispatched to the Kubernetes wait
+    assert out["running_version"] == "8.6.1"
 
 
 def test_web_stats_is_guarded_like_the_cli():
@@ -1353,3 +1359,28 @@ def test_offline_is_refused_on_the_kubernetes_path(tmp_path, monkeypatch):
         lc.create_repro(lc.CreateReq(version="8.6.1", preset="microservices",
                                      name="off", offline=True))
     assert "offline cannot work on the Kubernetes topology" in str(ei.value)
+
+
+def test_wait_and_finalize_dispatches_fully_to_k8s_wait(tmp_path, monkeypatch):
+    """Final-sweep regression: wait_and_finalize revived the forward but then called
+    the compose-shaped wait_serving, whose is_alive reads compose state and which has
+    no terminal-pod detection. The non-json `ready` and the GUI use this, so they must
+    get k8s.wait_ready, not a compose wait."""
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("wf", "8.6.1", offline=True, port=34300, run=_FakeRun())
+    called = {}
+
+    def fake_wait(name, timeout=600.0, emit=None):
+        called["name"] = name
+        return {"booted_s": 9, "version": "8.6.1"}
+
+    monkeypatch.setattr(k8s, "wait_ready", fake_wait)
+    # wait_serving must NOT be used for a k8s repro
+    monkeypatch.setattr(lc, "wait_serving", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("wait_serving called on a Kubernetes repro")))
+    out = lc.wait_and_finalize(runner.read_meta("wf"))
+    assert called["name"] == "wf"
+    assert out == {"booted_s": 9, "running_version": "8.6.1"}
