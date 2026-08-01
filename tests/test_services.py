@@ -1284,3 +1284,72 @@ def test_ensure_cluster_still_raises_on_a_real_creation_failure(tmp_path, monkey
 
     with pytest.raises(errors.CreateFailedError):
         k8s.ensure_cluster(run=RealFail())
+
+
+# --- #21/#22/#23: reclaim, collision, and the last two guards -------------------
+
+
+def test_second_up_on_an_existing_repro_is_refused_clearly(tmp_path, monkeypatch):
+    """#22: a repeat would fail deep inside helm with a raw error; refuse early."""
+    from rc_repro import errors
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("dup", "8.6.1", offline=True, port=34200, run=_FakeRun())
+    with pytest.raises(errors.ConflictError) as ei:
+        k8s.create_repro("dup", "8.6.1", offline=True, port=34201, run=_FakeRun())
+    assert "already exists" in str(ei.value)
+    assert "rc-repro down" in str(ei.value)          # names how to proceed
+
+
+def test_prune_dispatches_kubernetes_teardown_not_compose(tmp_path, monkeypatch):
+    """#21: prune called runner.down (compose) on a k8s repro, leaking the forward
+    and namespace. It now dispatches to k8s.teardown."""
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("pr", "8.6.1", offline=True, port=34202, run=_FakeRun())
+    monkeypatch.setattr(lc, "prunable", lambda: ["pr"])
+    torn = {}
+    monkeypatch.setattr(k8s, "teardown",
+                        lambda name, volumes=False, emit=None: torn.setdefault("name", name)
+                        or {"removed": [f"namespace/rc-repro-{name}"], "residual": []})
+    # runner.down must NOT be called for a k8s repro
+    monkeypatch.setattr(runner, "down", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("runner.down called on a Kubernetes repro")))
+    out = lc.prune(confirm=True)
+    assert torn["name"] == "pr" and out["removed"] == ["pr"]
+
+
+def test_stale_forwards_reports_a_dead_tunnel_not_a_stranger(tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("sf", "8.6.1", offline=True, port=34203, run=_FakeRun())
+    # the fake forward pid is not alive-and-ours, so forward_state is "down"
+    rows = lc.stale_forwards()
+    assert [r["name"] for r in rows] == ["sf"]
+
+
+def test_monitor_command_is_refused_on_kubernetes(tmp_path, monkeypatch):
+    """#23."""
+    from rc_repro import errors
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("mon", "8.6.1", offline=True, port=34204, run=_FakeRun())
+    with pytest.raises(errors.ValidationError):
+        lc.require_compose_topology("mon", "monitor", "compose-only.")
+
+
+def test_offline_is_refused_on_the_kubernetes_path(tmp_path, monkeypatch):
+    """#23: --offline promises no network but the k8s path must pull chart + images."""
+    from rc_repro import errors
+    from rc_repro.services import lifecycle as lc
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=["engine-resize"])
+    with pytest.raises(errors.ValidationError) as ei:
+        lc.create_repro(lc.CreateReq(version="8.6.1", preset="microservices",
+                                     name="off", offline=True))
+    assert "offline cannot work on the Kubernetes topology" in str(ei.value)

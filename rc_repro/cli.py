@@ -491,6 +491,14 @@ def monitor(
     """Attach (or --off to detach) Prometheus + Grafana on a running repro."""
     from rc_repro.services import monitor as monitorsvc
     target = _resolve_name(name)
+    # The monitoring stack is Prometheus + Grafana as compose services; there is no
+    # cluster rendering of it, so on a Kubernetes repro it would act on a compose
+    # project that does not exist. Refuse with the reason rather than no-op.
+    try:
+        lcsvc.require_compose_topology(target, "monitor",
+            "It attaches Prometheus/Grafana as compose services; there is no Kubernetes equivalent yet.")
+    except errors.ReproError as exc:
+        _fail(exc)
     try:
         if off:
             res = monitorsvc.detach(target, emit=_cli_emit)
@@ -2001,6 +2009,11 @@ def doctor(
             line("ok" if floor_ok else "warn", msg, "k8s-floor")
         if _k8s.cluster_exists():
             line("ok", f"rc-repro cluster {_k8s.CLUSTER_NAME} exists (reused, so `up` is faster)")
+        stale = lcsvc.stale_forwards()
+        if stale:
+            names = ", ".join(r["name"] for r in stale)
+            line("warn", f"port-forward down for: {names} "
+                         "(re-established on the next ready/info; not an error)", "k8s-forwards")
 
     if json_out:
         payload = {"checks": checks, "counts": counts,

@@ -35,8 +35,8 @@ import yaml
 from dataclasses import dataclass, field
 
 from rc_repro import runner, versions
-from rc_repro.errors import (CreateFailedError, DockerError, NotReadyError,
-                             ValidationError)
+from rc_repro.errors import (ConflictError, CreateFailedError, DockerError,
+                             NotReadyError, ValidationError)
 from rc_repro.services import events
 from rc_repro.services.events import Emit, info, null_emit
 
@@ -458,6 +458,16 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     """Create a Kubernetes microservices repro. Returns the result payload."""
     run = run or _Runner()
     require_tools(run)
+
+    # A repeat over an existing repro would fail deep inside helm ("cannot re-use a
+    # name that is still in use") with a raw error. Refuse early and clearly instead,
+    # naming how to proceed. The Kubernetes path has no --force (see #15), so recreate
+    # is an explicit down-then-up, not a silent clobber.
+    if runner.exists(name):
+        raise ConflictError(
+            f"a repro named {name!r} already exists. The Kubernetes topology does not "
+            f"recreate in place; run `rc-repro down --name {name} --volumes` first, or "
+            f"choose another --name.")
 
     events.info(emit, "checking engine capacity", phase="preflight", pct=2)
     check_capacity(run, emit)

@@ -268,6 +268,15 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         # with the command to ask a human to run, rather than inventing a baseline.
         onboarding.require_onboarded()
         _reject_compose_only_flags(req)
+        if req.offline:
+            # --offline promises no network, but the Kubernetes path must pull the
+            # chart and the images, so it cannot honour that. Saying so is better
+            # than half-running: version resolution would use the shipped map while
+            # helm and the pulls still hit the network, which is a confusing lie.
+            raise ValidationError(
+                "--offline cannot work on the Kubernetes topology: it must pull the "
+                "Helm chart and the container images. Drop --offline, or use a "
+                "Compose preset for a fully offline repro.")
         name = req.name or derive_name(req.version, req.preset)
         result = k8s.create_repro(name, req.version, offline=req.offline,
                                   rc_image=req.rc_image or "", mongo=req.mongo or "",
@@ -772,6 +781,18 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         raise ValidationError(f"prune deletes {len(targets)} down repro(s) incl. data - pass confirm=true")
     removed = []
     for name in targets:
+        # Dispatch: a Kubernetes repro has no compose project, so runner.down would
+        # no-op and runner.remove would delete the record while leaking the recorded
+        # port-forward and lingering namespace. k8s.teardown kills the forward (with
+        # the identity check, so never a stranger) and deletes the namespace, which
+        # is the orphan-forward reclaim for a pruned repro.
+        if topology_of_repro(name) == "kubernetes":
+            from rc_repro.services import k8s
+            k8s.teardown(name, volumes=True, emit=emit)
+            _clear_default_if(name)
+            removed.append(name)
+            info(emit, f"pruned {name!r}", phase="done")
+            continue
         if runner.down(name, volumes=True) != 0:
             warn(emit, f"could not clean up {name!r} - skipping", phase="done")
             continue
@@ -780,6 +801,26 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         removed.append(name)
         info(emit, f"pruned {name!r}", phase="done")
     return {"targets": targets, "removed": removed}
+
+
+def stale_forwards() -> list[dict]:
+    """Kubernetes repros whose recorded port-forward is no longer alive-and-ours.
+
+    The truly-orphaned case (a forward whose repro record was deleted without killing
+    it) cannot be found from here: once the record is gone the pid is lost, and the
+    #19 identity check means we will not go hunting arbitrary pids to kill. So this
+    reports the recoverable case, a live repro whose tunnel died, which `ready` or
+    any HTTP verb re-establishes on demand. `doctor` surfaces it so a stuck repro has
+    a visible cause rather than a silent one.
+    """
+    out = []
+    for m in runner.list_meta():
+        if not (isinstance(m.extra, dict) and m.extra.get("topology") == "kubernetes"):
+            continue
+        from rc_repro.services import k8s
+        if k8s.forward_state(m) == "down":
+            out.append({"name": m.name, "host_port": m.host_port})
+    return out
 
 
 # --- cross-topology preconditions ----------------------------------------------
