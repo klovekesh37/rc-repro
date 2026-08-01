@@ -1466,6 +1466,50 @@ def test_ensure_cluster_rejects_an_unusable_exported_kubeconfig(tmp_path, monkey
     assert "could not parse the owned kubeconfig" in str(ei.value)
 
 
+def test_ensure_cluster_reconciles_a_nonzero_create_that_becomes_ready(
+        tmp_path, monkeypatch):
+    """kind may create a healthy node, then fail during host-side kubeconfig export."""
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    class ConvergedAfterError(_FakeRun):
+        def run(self, argv, *, check=True):
+            import subprocess
+            if argv[:3] == ["kind", "create", "cluster"]:
+                self.calls.append(argv)
+                self.clusters = "rc-repro-local"
+                return subprocess.CompletedProcess(
+                    argv, 1, "Creating cluster...", "late kubeconfig export failure")
+            return super().run(argv, check=check)
+
+    events_seen = []
+    ctx = k8s.ensure_cluster(emit=events_seen.append, run=ConvergedAfterError())
+    assert ctx == "kind-rc-repro-local"
+    assert any("recovered" in event.message for event in events_seen)
+
+
+def test_ensure_cluster_refuses_to_reuse_an_unready_node(tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    class Unready(_FakeRun):
+        def __init__(self):
+            super().__init__(clusters="rc-repro-local")
+
+        def run(self, argv, *, check=True):
+            import subprocess
+            if "wait" in argv and "condition=Ready" in " ".join(argv):
+                self.calls.append(argv)
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "timed out waiting for node readiness")
+            return super().run(argv, check=check)
+
+    with pytest.raises(errors.CreateFailedError) as ei:
+        k8s.ensure_cluster(run=Unready())
+    assert "existing cluster rc-repro-local is not usable" in str(ei.value)
+    assert "timed out waiting for node readiness" in str(ei.value)
+
+
 # --- #21/#22/#23: reclaim, collision, and the last two guards -------------------
 
 

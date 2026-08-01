@@ -474,6 +474,12 @@ def _export_kubeconfig(run: _Runner) -> str:
     return ctx
 
 
+def _wait_cluster_ready(run: _Runner, ctx: str) -> subprocess.CompletedProcess:
+    """Prove the API and at least one node are usable before reuse."""
+    return _kubectl(run, ctx, "wait", "--for=condition=Ready", "node", "--all",
+                    "--timeout=60s", check=False)
+
+
 def ensure_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> str:
     """Create the rc-repro-owned cluster if it isn't there, and return its context.
 
@@ -482,6 +488,7 @@ def ensure_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> str:
     point for never selecting the ambient kubectl context implicitly.
     """
     run = run or _Runner()
+    create_failure = ""
     # Serialise creation across concurrent `up`s. Without this, two simultaneous
     # creates both see no cluster and both run `kind create cluster`, and the second
     # fails ("node(s) already exist"). The lock makes the check-then-create atomic,
@@ -498,11 +505,41 @@ def ensure_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> str:
             state = prepare_client_state()
             res = run.run(["kind", "create", "cluster", "--name", CLUSTER_NAME,
                            "--kubeconfig", str(state.kubeconfig)], check=False)
-            if res.returncode != 0 and "already exist" not in (res.stderr or "").lower():
-                raise CreateFailedError(
-                    f"could not create the cluster {CLUSTER_NAME}: "
-                    f"{_failure_detail(res)}")
-    return _export_kubeconfig(run)
+            if res.returncode != 0:
+                combined = f"{res.stdout or ''}\n{res.stderr or ''}".lower()
+                if "already exist" not in combined:
+                    create_failure = _failure_detail(res)
+                    # kind can create the node and then fail while exporting its
+                    # host-side kubeconfig. Preserve the cluster and reconcile it
+                    # rather than returning a false terminal failure immediately.
+                    if not cluster_exists(run):
+                        raise CreateFailedError(
+                            f"could not create the cluster {CLUSTER_NAME}: "
+                            f"{create_failure}")
+    try:
+        ctx = _export_kubeconfig(run)
+    except CreateFailedError as exc:
+        if create_failure:
+            raise CreateFailedError(
+                f"kind create failed for {CLUSTER_NAME}: {create_failure}; "
+                f"owned-kubeconfig recovery also failed: {exc}") from exc
+        raise
+
+    ready = _wait_cluster_ready(run, ctx)
+    if ready.returncode != 0:
+        prefix = (f"kind create failed for {CLUSTER_NAME}: {create_failure}; "
+                  if create_failure else
+                  f"existing cluster {CLUSTER_NAME} is not usable; ")
+        raise CreateFailedError(
+            prefix + "API/node readiness reconciliation failed: " +
+            _failure_detail(ready))
+    if create_failure:
+        events.warn(
+            emit,
+            "kind returned an error, but the owned kubeconfig was recovered and "
+            f"cluster {CLUSTER_NAME} reached Ready; continuing",
+            phase="provision")
+    return ctx
 
 
 def _kubectl_argv(ctx: str, *args: str) -> list[str]:
