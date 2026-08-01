@@ -1211,3 +1211,76 @@ def test_doctor_json_is_an_envelope_and_exits_3_when_not_ready(tmp_path, monkeyp
                for c in payload["data"]["checks"])
     assert payload["data"]["ready"] is False
     assert res.exit_code == 3            # preflight, so an agent stops before `up`
+
+
+# --- process/concurrency bugs found by charting --------------------------------
+
+
+def test_forward_pid_identity_guards_against_reuse(tmp_path, monkeypatch):
+    """#19: a recycled pid must not be trusted or killed. os.kill(pid,0) alone
+    would report a stranger as our forward; the cmdline identity check prevents it."""
+    from rc_repro.services import k8s
+    # a live pid whose command line is NOT a kubectl port-forward: not ours
+    monkeypatch.setattr(k8s.os, "kill", lambda pid, sig: None)   # "alive"
+    monkeypatch.setattr(k8s, "_cmdline_is_kubectl_forward", lambda pid: False)
+    assert k8s._pid_alive(4242) is False
+    # a live pid that IS our forward: ours
+    monkeypatch.setattr(k8s, "_cmdline_is_kubectl_forward", lambda pid: True)
+    assert k8s._pid_alive(4242) is True
+    # a dead pid: not ours, and identity is never consulted
+    def boom(pid, sig):
+        raise ProcessLookupError
+    monkeypatch.setattr(k8s.os, "kill", boom)
+    assert k8s._pid_alive(4242) is False
+
+
+def test_cmdline_identity_reads_proc_then_falls_back(tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    # a fake /proc cmdline for a kubectl port-forward
+    argv = "kubectl\x00--context\x00kind-x\x00-n\x00ns\x00port-forward\x00svc/rc\x00"
+    import io
+    monkeypatch.setattr("builtins.open", lambda *a, **k: io.BytesIO(argv.encode()))
+    assert k8s._cmdline_is_kubectl_forward(1) is True
+    # an unrelated process
+    argv2 = "sshd\x00-D\x00"
+    monkeypatch.setattr("builtins.open", lambda *a, **k: io.BytesIO(argv2.encode()))
+    assert k8s._cmdline_is_kubectl_forward(1) is False
+
+
+def test_ensure_cluster_tolerates_a_lost_creation_race(tmp_path, monkeypatch):
+    """#20: two concurrent creates must not crash. The loser sees 'already exist'
+    and that is success, not a raise."""
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    class RaceLoser(_FakeRun):
+        def __init__(self):
+            super().__init__(clusters="")     # we see no cluster...
+        def run(self, argv, *, check=True):
+            import subprocess
+            if argv[:3] == ["kind", "create", "cluster"]:
+                # ...but another process created it first
+                return subprocess.CompletedProcess(argv, 1, "",
+                    'ERROR: node(s) already exist for a cluster with the name "rc-repro-local"')
+            return super().run(argv, check=check)
+
+    ctx = k8s.ensure_cluster(run=RaceLoser())    # must not raise
+    assert ctx == "kind-rc-repro-local"
+
+
+def test_ensure_cluster_still_raises_on_a_real_creation_failure(tmp_path, monkeypatch):
+    from rc_repro import errors
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    class RealFail(_FakeRun):
+        def __init__(self):
+            super().__init__(clusters="")
+        def run(self, argv, *, check=True):
+            import subprocess
+            if argv[:3] == ["kind", "create", "cluster"]:
+                return subprocess.CompletedProcess(argv, 1, "", "no space left on device")
+            return super().run(argv, check=check)
+
+    with pytest.raises(errors.CreateFailedError):
+        k8s.ensure_cluster(run=RealFail())

@@ -26,6 +26,7 @@ cluster.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -311,6 +312,37 @@ def resolve_chart_version(rc_version: str, run: _Runner | None = None,
     return chart
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _cluster_lock():
+    """A cross-process lock so only one `up` creates the shared cluster at a time.
+
+    A file lock under RC_REPRO_HOME via flock. On a platform without flock the lock
+    degrades to a no-op rather than failing: the race window returns, but a hard
+    dependency on flock would be worse, and the create is idempotent-tolerant above
+    regardless. The lock file is never deleted, so there is no unlink race.
+    """
+    from rc_repro import config
+    lock_path = config.home() / ".cluster.lock"
+    try:
+        config.home().mkdir(parents=True, exist_ok=True)
+        fh = open(lock_path, "w", encoding="utf-8")
+    except OSError:
+        yield
+        return
+    try:
+        try:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass          # no flock (e.g. Windows): degrade to no-op
+        yield
+    finally:
+        fh.close()
+
+
 def cluster_exists(run: _Runner | None = None) -> bool:
     run = run or _Runner()
     res = run.run(["kind", "get", "clusters"], check=False)
@@ -325,11 +357,24 @@ def ensure_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> str:
     point for never selecting the ambient kubectl context implicitly.
     """
     run = run or _Runner()
-    if cluster_exists(run):
-        events.info(emit, f"reusing cluster {CLUSTER_NAME}", phase="provision")
-    else:
-        events.info(emit, f"creating cluster {CLUSTER_NAME}", phase="provision", pct=10)
-        run.run(["kind", "create", "cluster", "--name", CLUSTER_NAME])
+    # Serialise creation across concurrent `up`s. Without this, two simultaneous
+    # creates both see no cluster and both run `kind create cluster`, and the second
+    # fails ("node(s) already exist"). The lock makes the check-then-create atomic,
+    # and the re-check inside it means the loser of the race reuses rather than
+    # retries. This is the concurrency the one-cluster-many-namespaces design exists
+    # to support, so it has to actually hold.
+    with _cluster_lock():
+        if cluster_exists(run):
+            events.info(emit, f"reusing cluster {CLUSTER_NAME}", phase="provision")
+        else:
+            events.info(emit, f"creating cluster {CLUSTER_NAME}", phase="provision", pct=10)
+            # Tolerate a create that lost a race to a process not holding this lock
+            # (e.g. a manual `kind create`): "already exist" is success, not failure.
+            res = run.run(["kind", "create", "cluster", "--name", CLUSTER_NAME], check=False)
+            if res.returncode != 0 and "already exist" not in (res.stderr or "").lower():
+                raise CreateFailedError(
+                    f"could not create the cluster {CLUSTER_NAME}: "
+                    f"{(res.stderr or res.stdout or '').strip()[:300]}")
     res = run.run(["kind", "get", "kubeconfig", "--name", CLUSTER_NAME], check=False)
     # kind names the context kind-<cluster>; confirm rather than assume, so a
     # future naming change surfaces here instead of silently targeting nothing.
@@ -553,13 +598,48 @@ _CONTEXT = "k8s_context"
 _TOPOLOGY = "topology"
 
 
-def _pid_alive(pid: int) -> bool:
-    import os
+def _pid_is_our_forward(pid: int) -> bool:
+    """Whether `pid` is alive AND is a kubectl port-forward we could have started.
+
+    os.kill(pid, 0) alone is not enough: pids are recycled, so a pid recorded in
+    repro.json can, after a reboot or enough churn, belong to an unrelated process.
+    Trusting it would report a stranger as our forward; killing it (stop_port_forward)
+    would SIGTERM that stranger, which is a far worse failure than a leaked forward.
+
+    So the liveness check is paired with an identity check: read the process command
+    line and require it to be a `kubectl ... port-forward`. Where the command line
+    cannot be read (no /proc, e.g. macOS), fall back to `ps`, and if neither is
+    available treat the pid as NOT ours, because the safe default when identity is
+    unknowable is to never signal it.
+    """
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)          # liveness; raises if the pid is gone
     except (OSError, ProcessLookupError):
         return False
-    return True
+    return _cmdline_is_kubectl_forward(pid)
+
+
+def _cmdline_is_kubectl_forward(pid: int) -> bool:
+    # Linux: /proc/<pid>/cmdline is NUL-separated argv, the cheapest reliable read.
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = fh.read().decode("utf-8", "replace").split("\x00")
+        return "kubectl" in " ".join(argv) and "port-forward" in argv
+    except OSError:
+        pass
+    # Fallback (macOS/BSD): ask ps for the command of that pid.
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, check=False).stdout
+    except OSError:
+        return False          # no ps either: identity unknowable -> not ours
+    return "kubectl" in out and "port-forward" in out
+
+
+def _pid_alive(pid: int) -> bool:
+    """Back-compat alias: liveness AND identity, so no caller can regress to a bare
+    existence check that would trust or kill a recycled pid."""
+    return _pid_is_our_forward(pid)
 
 
 def start_port_forward(ctx: str, ns: str, host_port: int,
