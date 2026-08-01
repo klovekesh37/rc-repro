@@ -17,9 +17,12 @@ defects lived — the decision was right and nothing had carried it out.
 
 from __future__ import annotations
 
+import io
 import re
 import subprocess
 import sys
+import tarfile
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -62,13 +65,170 @@ def k8s_service_functions() -> set[str]:
     return set(re.findall(r"^def (\w+)\(", read("rc_repro/services/k8s.py"), re.M))
 
 
-def git_branches() -> set[str]:
-    try:
-        out = subprocess.run(["git", "branch", "--list", "stack/*"], cwd=ROOT,
-                             capture_output=True, text=True, check=False).stdout
-    except OSError:
-        return set()
-    return {ln.strip().lstrip("* ").strip() for ln in out.splitlines() if ln.strip()}
+def git_text(*args: str) -> str:
+    """Run a read-only Git query and return stdout, or raise with its real cause."""
+    result = subprocess.run(["git", *args], cwd=ROOT, capture_output=True,
+                            text=True, check=False)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+        raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+    return result.stdout.strip()
+
+
+def stack_base() -> tuple[str, str]:
+    """Find the closest main ref that is an ancestor of the checked-out stack."""
+    refs = git_text("for-each-ref", "--format=%(refname)", "refs/heads/main",
+                    "refs/remotes").splitlines()
+    main_refs = sorted({ref for ref in refs
+                        if ref == "refs/heads/main" or ref.endswith("/main")})
+    candidates: list[tuple[int, str, str]] = []
+    for ref in main_refs:
+        merge_base = git_text("merge-base", "HEAD", ref)
+        count = int(git_text("rev-list", "--count", f"{merge_base}..HEAD"))
+        if count:
+            candidates.append((count, ref, merge_base))
+    if not candidates:
+        raise RuntimeError("no main ref with stack commits is available; fetch main history")
+    _count, ref, merge_base = min(candidates)
+    return ref, merge_base
+
+
+def stack_commits(base: str) -> list[str]:
+    out = git_text("rev-list", "--reverse", "--topo-order", f"{base}..HEAD")
+    return out.splitlines() if out else []
+
+
+def commit_paths(commit: str) -> set[str]:
+    out = git_text("diff-tree", "--no-commit-id", "--name-only", "-r", commit)
+    return set(out.splitlines()) if out else set()
+
+
+def commit_subject(commit: str) -> str:
+    return git_text("show", "-s", "--format=%s", commit)
+
+
+# The revised answer to decision #10 specified nine independently mergeable PR
+# milestones. Each tuple records the milestone's subject and exact changed-file
+# boundary. Tests deliberately travel with the behavior they prove. Commit ids are
+# never listed: the covered commits always come from the checked-out Git ancestry.
+STACK_LAYERS: tuple[tuple[str, str, frozenset[str]], ...] = (
+    ("error taxonomy and exit codes",
+     "feat: give domain errors stable codes and real exit codes", frozenset({
+         "rc_repro/cli.py", "rc_repro/errors.py", "rc_repro/services/lifecycle.py",
+         "rc_repro/ui.py", "tests/test_core.py", "tests/test_services.py",
+     })),
+    ("machine-readable JSON reads",
+     "feat: add the machine-readable output envelope and --json read verbs", frozenset({
+         "rc_repro/cli.py", "rc_repro/jsonout.py", "tests/test_core.py",
+     })),
+    ("NDJSON lifecycle progress",
+     "feat: stream NDJSON progress and add --json to the lifecycle verbs", frozenset({
+         "rc_repro/cli.py", "rc_repro/jsonout.py", "tests/test_core.py",
+     })),
+    ("capability discovery",
+     "feat: add capabilities as the contract's self-description", frozenset({
+         "rc_repro/cli.py", "rc_repro/jsonout.py", "tests/test_core.py",
+     })),
+    ("Kubernetes microservices preset",
+     "feat: give Kubernetes repros info and logs parity", frozenset({
+         "rc_repro/data/presets/microservices.yaml", "rc_repro/jsonout.py",
+         "rc_repro/presets/__init__.py", "rc_repro/runner.py",
+         "rc_repro/services/k8s.py", "rc_repro/services/lifecycle.py",
+         "tests/test_core.py", "tests/test_services.py",
+     })),
+    ("one-time onboarding",
+     "feat: add one-time onboarding and persisted grants", frozenset({
+         "rc_repro/cli.py", "rc_repro/jsonout.py",
+         "rc_repro/services/onboarding.py", "tests/test_core.py",
+     })),
+    ("canonical agent skill",
+     "feat: ship the canonical agent skill and install it per host", frozenset({
+         ".agents/skills/rc-repro/SKILL.md", ".claude/skills/rc-repro/SKILL.md",
+         "pyproject.toml", "rc_repro/cli.py", "rc_repro/data/skill/SKILL.md",
+         "rc_repro/jsonout.py", "rc_repro/services/skill.py", "tests/test_core.py",
+     })),
+    ("backend-neutral evidence",
+     "feat: add secret-safe, backend-neutral evidence", frozenset({
+         "rc_repro/cli.py", "rc_repro/services/evidence.py", "tests/test_services.py",
+     })),
+    ("capacity and readiness",
+     "feat: enforce the measured capacity floor and wire Kubernetes readiness", frozenset({
+         "rc_repro/cli.py", "rc_repro/runner.py", "rc_repro/services/k8s.py",
+         "tests/test_services.py",
+     })),
+)
+
+
+def validate_stack_layers(commits: list[str], paths_for=commit_paths,
+                          subject_for=commit_subject) -> list[str]:
+    """Return precise order or boundary failures for the nine PR milestones."""
+    failures: list[str] = []
+    if len(commits) < len(STACK_LAYERS):
+        return [f"only {len(commits)} commits; expected {len(STACK_LAYERS)} layers"]
+    for index, ((name, expected_subject, expected_paths), commit) in enumerate(
+            zip(STACK_LAYERS, commits, strict=False), start=1):
+        subject = subject_for(commit)
+        if subject != expected_subject:
+            failures.append(
+                f"layer {index} {name}: expected subject={expected_subject!r} "
+                f"actual subject={subject!r}")
+        actual_paths = paths_for(commit)
+        if actual_paths != set(expected_paths):
+            failures.append(
+                f"layer {index} {name}: expected paths={sorted(expected_paths)} "
+                f"actual paths={sorted(actual_paths)}")
+    return failures
+
+
+def validate_linear_history(base: str, commits: list[str]) -> list[str]:
+    failures: list[str] = []
+    expected_parent = base
+    for commit in commits:
+        fields = git_text("rev-list", "--parents", "-n", "1", commit).split()
+        parents = fields[1:]
+        if parents != [expected_parent]:
+            failures.append(
+                f"{commit[:8]} parents={parents} expected only {expected_parent[:8]}")
+        expected_parent = commit
+    return failures
+
+
+def test_stack_tips(commits: list[str]) -> list[str]:
+    """Run every contribution commit's own tests from a disposable source archive."""
+    failures: list[str] = []
+    for index, commit in enumerate(commits):
+        name = (STACK_LAYERS[index][0] if index < len(STACK_LAYERS)
+                else commit_subject(commit))
+        archive = subprocess.run(["git", "archive", "--format=tar", commit], cwd=ROOT,
+                                 capture_output=True, check=False)
+        if archive.returncode:
+            failures.append(f"{commit[:8]} {name}: git archive failed")
+            continue
+        with tempfile.TemporaryDirectory(prefix="rc-repro-stack-audit-") as tmp:
+            with tarfile.open(fileobj=io.BytesIO(archive.stdout), mode="r:") as tar:
+                tar.extractall(tmp, filter="data")
+            result = subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=tmp,
+                                    capture_output=True, text=True, check=False)
+        if result.returncode:
+            output = "\n".join((result.stdout + result.stderr).splitlines()[-12:])
+            failures.append(f"{commit[:8]} {name}: tests failed\n{output}")
+    return failures
+
+
+def audit_stack_history(*, run_tip_tests: bool = True):
+    ref, base = stack_base()
+    commits = stack_commits(base)
+    curated = commits[:len(STACK_LAYERS)]
+    failures = validate_stack_layers(commits)
+    failures.extend(validate_linear_history(base, commits))
+    if run_tip_tests and not failures:
+        failures.extend(test_stack_tips(commits))
+    covered = [f"{commit[:8]}:{name}" for commit, (name, _subject, _paths)
+               in zip(curated, STACK_LAYERS, strict=False)]
+    followups = [commit[:8] for commit in commits[len(STACK_LAYERS):]]
+    detail = (f"base={ref}@{base[:8]} curated={covered} followups={followups} "
+              f"tip_tests={'run' if run_tip_tests else 'skipped'} failures={failures}")
+    return not failures, f"Git-derived stack commits={len(commits)}", detail
 
 
 # --- the decisions -------------------------------------------------------------
@@ -140,7 +300,7 @@ _DISPATCH = re.compile(r"\b_?k8s(?:svc)?\.\w+\(|"
 
 
 def _function_body(rel: str, fn: str) -> str:
-    """The function's source, terminated only at a COLUMN-ZERO def or decorator.
+    r"""The function's source, terminated only at a COLUMN-ZERO def or decorator.
 
     `\n\s*def` would stop at a nested helper: it truncated `doctor` at its inner
     `def line(...)`, cutting off the Kubernetes section and reporting a false failure.
@@ -215,8 +375,7 @@ def d9_evidence():
 
 
 def d10_stack_exists():
-    branches = git_branches()
-    return bool(branches), f"stack branches={len(branches)}", f"{sorted(branches)[:3]}..."
+    return audit_stack_history()
 
 
 #: The terminal conditions the fail-fast decision named. Transcribed from that

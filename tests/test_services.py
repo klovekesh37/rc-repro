@@ -7,6 +7,7 @@ error typing/HTTP mapping, port validation, and the event model.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -1264,7 +1265,7 @@ def test_wait_and_finalize_dispatches_for_every_caller(tmp_path, monkeypatch):
 
 def test_web_stats_is_guarded_like_the_cli():
     # The GUI calls the same service layer, so it inherits the same class of bug.
-    src = open("rc_repro/web/app.py", encoding="utf-8").read()
+    src = Path("rc_repro/web/app.py").read_text(encoding="utf-8")
     i = src.find("ids = runner.container_ids(target)")
     assert i > 0
     assert "require_compose_topology" in src[max(0, i - 500):i]
