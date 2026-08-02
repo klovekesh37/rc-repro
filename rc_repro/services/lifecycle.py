@@ -285,7 +285,7 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         if req.wait:
             # --wait must mean the same thing on both topologies, or a caller that
             # asked to block gets an unready repro and no error.
-            result.update(k8s.wait_ready(name, emit=emit))
+            result.update(wait_and_finalize(runner.read_meta(name), emit))
             result["waited"] = True
         return result
     require_docker()
@@ -451,14 +451,35 @@ def wait_serving(meta: runner.Metadata, emit: Emit, timeout: float) -> dict:
         raise NotReadyError(str(exc) + hint) from exc
 
 
-def finalize(meta: runner.Metadata, emit: Emit):
-    try:
-        auth = login(meta)
-        if rcapi.complete_setup_wizard(meta.root_url, auth, config.ADMIN_PASSWORD):
-            info(emit, "setup wizard skipped - no registration needed.", phase="post_ready")
-        return auth
-    except Exception:  # noqa: BLE001 - finalize is best-effort
-        return None
+def finalize(meta: runner.Metadata, emit: Emit, *, required: bool = False):
+    """Make the advertised first admin usable after HTTP readiness.
+
+    Compose keeps this best-effort because custom-admin presets may deliberately
+    replace the fixed account. Kubernetes always provisions that account through
+    the chart, so readiness is incomplete until login and wizard completion work.
+    The main deployment can answer /api/info before first-user creation finishes;
+    retry that bounded startup race rather than returning a false success.
+    """
+    attempts = 6 if required else 1
+    for attempt in range(attempts):
+        try:
+            auth = login(meta)
+            if rcapi.complete_setup_wizard(
+                    meta.root_url, auth, config.ADMIN_PASSWORD):
+                info(emit, "setup wizard skipped - no registration needed.",
+                     phase="post_ready")
+                return auth
+        except Exception:  # noqa: BLE001 - retried below or best-effort for Compose
+            pass
+        if attempt + 1 < attempts:
+            info(emit, "waiting for the first admin to become usable",
+                 phase="post_ready")
+            time.sleep(2)
+    if required:
+        raise NotReadyError(
+            f"{meta.name!r} is serving, but its first admin and setup-wizard state "
+            f"are not usable yet; retry `rc-repro ready --name {meta.name}`")
+    return None
 
 
 def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: float = 300.0) -> dict:
@@ -469,7 +490,9 @@ def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: fl
     how one of them gets missed. On Kubernetes the URL is a port-forward that may
     have died, so it is revived before waiting rather than timed out against.
     """
-    if isinstance(meta.extra, dict) and meta.extra.get("topology") == "kubernetes":
+    is_kubernetes = (isinstance(meta.extra, dict) and
+                     meta.extra.get("topology") == "kubernetes")
+    if is_kubernetes:
         # Dispatch fully to the Kubernetes wait, not just revive-then-wait_serving.
         # wait_serving's is_alive/tick read compose state (runner.rc_state), which is
         # empty for a Kubernetes repro, and it has no terminal-pod detection, so a
@@ -478,14 +501,15 @@ def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: fl
         # they must get the same behaviour as the --json path, not a compose wait.
         from rc_repro.services import k8s
         result = k8s.wait_ready(meta.name, timeout=timeout, emit=emit)
-        return {"booted_s": result.get("booted_s", 0),
-                "running_version": result.get("version", "?")}
-    started = time.monotonic()
-    served = wait_serving(meta, emit, timeout)
-    elapsed = int(time.monotonic() - started)
-    auth = finalize(meta, emit)
+        elapsed = result.get("booted_s", 0)
+        running = result.get("version", "?")
+    else:
+        started = time.monotonic()
+        served = wait_serving(meta, emit, timeout)
+        elapsed = int(time.monotonic() - started)
+        running = served.get("version", "?")
+    auth = finalize(meta, emit, required=is_kubernetes)
     postready.run_post_ready(meta, auth, emit)
-    running = served.get("version", "?")
     if running != "?" and not meta.rc_version.startswith(running):
         warn(emit, f"running version {running} != requested {meta.rc_version}", phase="wait")
     info(emit, "ready", phase="done", pct=100.0)

@@ -341,6 +341,12 @@ def build_values(rc_version: str, *, offline: bool = False,
     values = {
         "image": {"repository": rc_image or r.rc_image, "tag": rc_version},
         "microservices": {"enabled": True},
+        # Match the Compose lifecycle contract: every repro has the advertised
+        # first admin and opens at the login screen rather than Rocket.Chat's
+        # setup wizard. The chart applies extraEnv to the main Rocket.Chat
+        # deployment, which owns first-user creation in microservices mode.
+        "extraEnv": [{"name": key, "value": value}
+                     for key, value in config.first_admin_env().items()],
         # Never the bundled subchart: Bitnami is amd64-only and the chart's
         # default MongoDB tag is rejected by its own appVersion.
         "mongodb": {"enabled": False},
@@ -1235,7 +1241,9 @@ def wait_ready(name: str, *, timeout: float = 600.0, emit: Emit = null_emit,
         info_doc = rcapi.api_info(meta.root_url)
         if info_doc:
             booted = int(i * _MONGO_READY_INTERVAL)
-            info(emit, "Rocket.Chat is serving", phase="done", pct=100)
+            # HTTP is only the first readiness fact: the shared lifecycle still
+            # has to prove the first admin and complete the setup wizard.
+            info(emit, "Rocket.Chat is serving", phase="post_ready", pct=95)
             return {"name": name, "booted_s": booted,
                     "version": info_doc.get("version", "?"),
                     "port_forward": forward_state(meta)}

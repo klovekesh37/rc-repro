@@ -387,11 +387,7 @@ def ready(
             lcsvc.require_docker()
             target = lcsvc.resolve_name(name)
             m = runner.read_meta(target)
-            if isinstance(m.extra, dict) and m.extra.get("topology") == "kubernetes":
-                from rc_repro.services import k8s as k8ssvc
-                result = k8ssvc.wait_ready(target, timeout=timeout, emit=writer.emit)
-            else:
-                result = lcsvc.wait_and_finalize(m, emit=writer.emit, timeout=timeout)
+            result = lcsvc.wait_and_finalize(m, emit=writer.emit, timeout=timeout)
         except errors.ReproError as exc:
             # NotReadyError here is exit 5: the clock ran out with the outcome
             # still unknown, which is distinct from a known-dead create (7).

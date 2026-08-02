@@ -361,6 +361,26 @@ def test_k8s_values_never_use_the_bundled_mongodb():
     assert "externalMongodbOplogUrl" in k8s.build_values("7.10.13", offline=True).values
 
 
+def test_k8s_create_provisions_the_advertised_first_admin(tmp_path, monkeypatch):
+    from rc_repro import config
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    fake = _FakeRun()
+
+    k8s.create_repro("admin-ready", "8.6.1", offline=True, run=fake)
+
+    env = {item["name"]: item["value"]
+           for item in fake.installed[0]["values"]["extraEnv"]}
+    assert env == {
+        "OVERWRITE_SETTING_Show_Setup_Wizard": "completed",
+        "INITIAL_USER": "yes",
+        "ADMIN_USERNAME": config.ADMIN_USERNAME,
+        "ADMIN_NAME": config.ADMIN_NAME,
+        "ADMIN_EMAIL": config.ADMIN_EMAIL,
+        "ADMIN_PASS": config.ADMIN_PASSWORD,
+    }
+
+
 def test_k8s_create_labels_for_ownership_and_installs_the_chart():
     from rc_repro.services import k8s
     fake = _FakeRun()
@@ -947,8 +967,11 @@ def test_k8s_wait_ready_revives_the_forward_and_persists_the_new_pid(tmp_path, m
     before = runner.read_meta("r1").extra["k8s_forward_pid"]
 
     monkeypatch.setattr(rcapi, "api_info", lambda url, timeout=5.0: {"version": "8.6.1"})
-    out = k8s.wait_ready("r1", run=fake)
+    published = []
+    out = k8s.wait_ready("r1", emit=published.append, run=fake)
     assert out["version"] == "8.6.1" and out["name"] == "r1"
+    assert published[-1].phase == "post_ready"
+    assert published[-1].terminal is False
     # the dead forward was re-established and the new pid recorded, so a later
     # `down` kills the forward that is actually running
     assert runner.read_meta("r1").extra["k8s_forward_pid"] == before
@@ -1335,10 +1358,16 @@ def test_create_passes_port_and_honours_wait(tmp_path, monkeypatch):
         return {"name": name}
 
     monkeypatch.setattr(k8s, "create_repro", fake_create)
-    monkeypatch.setattr(k8s, "wait_ready", lambda n, emit=None: {"booted_s": 5})
+    meta = object()
+    monkeypatch.setattr(lc.runner, "read_meta", lambda n: meta)
+    monkeypatch.setattr(lc, "wait_and_finalize", lambda m, emit=None: (
+        got.update(finalized=m) or {"booted_s": 5}))
+    monkeypatch.setattr(k8s, "wait_ready", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("create must use the shared wait-and-finalize lifecycle")))
     res = lc.create_repro(lc.CreateReq(version="8.6.1", preset="microservices",
                                        name="t15", port=31916, wait=True))
     assert got["port"] == 31916                    # no longer dropped
+    assert got["finalized"] is meta
     assert res["waited"] is True and res["booted_s"] == 5
 
 
@@ -1407,6 +1436,32 @@ def test_logs_dispatches_to_kubectl(tmp_path, monkeypatch):
     assert seen == {"name": "g3", "follow": False, "tail": 50}
 
 
+def test_ready_json_uses_the_shared_finalization_for_kubernetes(
+        tmp_path, monkeypatch):
+    import json
+    from typer.testing import CliRunner
+    from rc_repro import cli
+    from rc_repro.cli import app
+    from rc_repro.services import k8s
+    _make_k8s_repro("ready-json", 31923, monkeypatch, tmp_path)
+    seen = {}
+
+    monkeypatch.setattr(cli.lcsvc, "require_docker", lambda: None)
+    monkeypatch.setattr(cli.lcsvc, "wait_and_finalize", lambda meta, emit, timeout: (
+        seen.update(name=meta.name) or
+        {"booted_s": 4, "running_version": "8.6.1"}))
+    monkeypatch.setattr(k8s, "wait_ready", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("ready --json must use the shared finalization lifecycle")))
+
+    res = CliRunner().invoke(
+        app, ["ready", "--name", "ready-json", "--timeout", "30", "--json"])
+
+    assert res.exit_code == 0
+    assert seen["name"] == "ready-json"
+    result = json.loads(res.stdout.strip().splitlines()[-1])
+    assert result["data"]["running_version"] == "8.6.1"
+
+
 def test_wait_and_finalize_dispatches_for_every_caller(tmp_path, monkeypatch):
     """Regression: dispatch lived in the CLI's `ready --json` branch only, so the
     non-json CLI path and the web GUI both called the compose-shaped path. It now
@@ -1423,6 +1478,7 @@ def test_wait_and_finalize_dispatches_for_every_caller(tmp_path, monkeypatch):
         return {"booted_s": 3, "version": "8.6.1"}
 
     monkeypatch.setattr(k8s, "wait_ready", fake_wait)
+    monkeypatch.setattr(lc, "finalize", lambda meta, emit, required=False: object())
     monkeypatch.setattr(lc, "wait_serving", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("wait_serving must not run for a Kubernetes repro")))
     out = lc.wait_and_finalize(runner.read_meta("w1"))
@@ -1829,15 +1885,82 @@ def test_wait_and_finalize_dispatches_fully_to_k8s_wait(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
     k8s.create_repro("wf", "8.6.1", offline=True, port=34300, run=_FakeRun())
     called = {}
+    auth = object()
 
     def fake_wait(name, timeout=600.0, emit=None):
         called["name"] = name
         return {"booted_s": 9, "version": "8.6.1"}
 
     monkeypatch.setattr(k8s, "wait_ready", fake_wait)
+    monkeypatch.setattr(lc, "finalize", lambda meta, emit, required=False: (
+        called.update(finalized=meta.name, required=required) or auth))
+    monkeypatch.setattr(lc.postready, "run_post_ready", lambda meta, got, emit: (
+        called.update(post_ready=(meta.name, got))))
     # wait_serving must NOT be used for a k8s repro
     monkeypatch.setattr(lc, "wait_serving", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("wait_serving called on a Kubernetes repro")))
     out = lc.wait_and_finalize(runner.read_meta("wf"))
     assert called["name"] == "wf"
+    assert called["finalized"] == "wf"
+    assert called["required"] is True
+    assert called["post_ready"] == ("wf", auth)
     assert out == {"booted_s": 9, "running_version": "8.6.1"}
+
+
+def test_k8s_wait_retries_until_the_first_admin_is_usable(tmp_path, monkeypatch):
+    from rc_repro import rcapi, runner
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("admin-lag", "8.6.1", offline=True, port=34301,
+                     run=_FakeRun())
+    monkeypatch.setattr(k8s, "wait_ready", lambda *a, **k: (
+        {"booted_s": 3, "version": "8.6.1"}))
+    auth = rcapi.Auth("test-token", "test-user")
+    attempts = iter([RuntimeError("admin not created"),
+                     RuntimeError("admin not created"), auth])
+    seen = {"logins": 0, "sleeps": 0, "completed": 0}
+
+    def fake_login(meta):
+        seen["logins"] += 1
+        value = next(attempts)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(lc, "login", fake_login)
+    monkeypatch.setattr(lc.time, "sleep", lambda seconds: (
+        seen.update(sleeps=seen["sleeps"] + 1)))
+    monkeypatch.setattr(rcapi, "complete_setup_wizard", lambda *a, **k: (
+        seen.update(completed=seen["completed"] + 1) or True))
+
+    lc.wait_and_finalize(runner.read_meta("admin-lag"))
+
+    assert seen == {"logins": 3, "sleeps": 2, "completed": 1}
+
+
+def test_k8s_wait_does_not_claim_ready_when_the_first_admin_is_unusable(
+        tmp_path, monkeypatch):
+    from rc_repro import errors, runner
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("admin-missing", "8.6.1", offline=True, port=34302,
+                     run=_FakeRun())
+    monkeypatch.setattr(k8s, "wait_ready", lambda *a, **k: (
+        {"booted_s": 3, "version": "8.6.1"}))
+    seen = {"logins": 0}
+
+    def missing_admin(meta):
+        seen["logins"] += 1
+        raise RuntimeError("admin not created")
+
+    monkeypatch.setattr(lc, "login", missing_admin)
+    monkeypatch.setattr(lc.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(errors.NotReadyError) as exc:
+        lc.wait_and_finalize(runner.read_meta("admin-missing"))
+
+    assert seen["logins"] == 6
+    assert "is serving" in str(exc.value)
+    assert "rc-repro ready --name admin-missing" in str(exc.value)

@@ -29,6 +29,18 @@ ADMIN_PASSWORD = "admin123"
 ADMIN_EMAIL = "admin@example.com"
 ADMIN_NAME = "Admin"
 
+
+def first_admin_env() -> dict[str, str]:
+    """Rocket.Chat's shared first-user and completed-onboarding contract."""
+    return {
+        "OVERWRITE_SETTING_Show_Setup_Wizard": "completed",
+        "INITIAL_USER": "yes",
+        "ADMIN_USERNAME": ADMIN_USERNAME,
+        "ADMIN_NAME": ADMIN_NAME,
+        "ADMIN_EMAIL": ADMIN_EMAIL,
+        "ADMIN_PASS": ADMIN_PASSWORD,
+    }
+
 # Host ports published by preset side services. One registry so presets can't
 # silently collide with each other — a new preset picks a port by looking here.
 # (RC's own port is allocated dynamically per repro; these are fixed for now —
