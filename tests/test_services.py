@@ -369,16 +369,67 @@ def test_k8s_create_provisions_the_advertised_first_admin(tmp_path, monkeypatch)
 
     k8s.create_repro("admin-ready", "8.6.1", offline=True, run=fake)
 
-    env = {item["name"]: item["value"]
+    # Shared contract: ADMIN_* + setup-wizard complete. Never INITIAL_USER=yes.
+    env = {item["name"]: item.get("value")
            for item in fake.installed[0]["values"]["extraEnv"]}
     assert env == {
         "OVERWRITE_SETTING_Show_Setup_Wizard": "completed",
-        "INITIAL_USER": "yes",
         "ADMIN_USERNAME": config.ADMIN_USERNAME,
         "ADMIN_NAME": config.ADMIN_NAME,
         "ADMIN_EMAIL": config.ADMIN_EMAIL,
         "ADMIN_PASS": config.ADMIN_PASSWORD,
     }
+    assert "INITIAL_USER" not in env
+    assert config.first_admin_env() == {
+        "OVERWRITE_SETTING_Show_Setup_Wizard": "completed",
+        "ADMIN_USERNAME": config.ADMIN_USERNAME,
+        "ADMIN_NAME": config.ADMIN_NAME,
+        "ADMIN_EMAIL": config.ADMIN_EMAIL,
+        "ADMIN_PASS": config.ADMIN_PASSWORD,
+    }
+
+
+def test_k8s_reg_token_uses_secret_not_values(tmp_path, monkeypatch):
+    """Token reaches the workload via Secret + valueFrom; never on disk or helm values."""
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    fake = _FakeRun()
+    secret = "SUPER-SECRET-TOKEN-VALUE"
+
+    out = k8s.create_repro("tok", "8.6.1", offline=True, reg_token=secret, run=fake)
+
+    assert out["reg_token_supplied"] is True
+    # Secret applied via stdin (captured in applied manifests), not argv.
+    assert any(
+        "kind: Secret" in m and k8s.REG_TOKEN_SECRET in m and secret in m
+        for m in fake.applied
+    )
+    # Helm values reference the secret; they never contain the token value.
+    values = fake.installed[0]["values"]
+    dumped = __import__("yaml").safe_dump(values)
+    assert secret not in dumped
+    reg = next(e for e in values["extraEnv"] if e["name"] == "REG_TOKEN")
+    assert reg["valueFrom"]["secretKeyRef"]["name"] == k8s.REG_TOKEN_SECRET
+    assert "value" not in reg
+    # Workspace values.yaml and repro.json are secret-safe.
+    artifact = (runner.workspace("tok") / "values.yaml").read_text()
+    meta_text = (runner.workspace("tok") / "repro.json").read_text()
+    assert secret not in artifact and secret not in meta_text
+    meta = runner.read_meta("tok")
+    assert meta.extra.get("reg_token_supplied") is True
+    assert "reg_token" not in meta.extra
+
+
+def test_k8s_without_reg_token_does_not_claim_supplied(tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    fake = _FakeRun()
+    out = k8s.create_repro("plain", "8.6.1", offline=True, run=fake)
+    assert out["reg_token_supplied"] is False
+    assert all(e.get("name") != "REG_TOKEN" for e in fake.installed[0]["values"]["extraEnv"])
+    assert runner.read_meta("plain").extra.get("reg_token_supplied") is not True
 
 
 def test_k8s_create_labels_for_ownership_and_installs_the_chart():

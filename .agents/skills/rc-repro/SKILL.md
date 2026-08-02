@@ -26,7 +26,9 @@ question is about documented behaviour rather than observed behaviour.
 1. **Read `rc-repro capabilities` first.** It is JSON, needs no container engine,
    and is the authority for *this build* on which commands exist, which accept
    `--json`, which stream progress, and what the error and exit codes mean. Do not
-   assume a flag exists because it once did.
+   assume a flag exists because it once did. Also read
+   `onboarding.preferences.retain_runs` and `topology_features` from that
+   document; never parse `config.yaml` and never invent retention policy.
 2. **Branch on exit codes and `error.code`, never on prose.** Messages get
    reworded; codes do not. In particular: exit 6 means a human decision is
    required, so stop and relay `error.gate.approve_with` verbatim rather than
@@ -62,6 +64,30 @@ secret-safe by design: the root URL is reduced to its origin and no tokens appea
 in it. Never paste a registration token or licence into a case; reference that one
 was used instead.
 
+### Retention (teardown by default)
+
+After the work is done:
+
+1. Read `capabilities` and take `onboarding.preferences.retain_runs`.
+   - Missing, false, or any non-boolean value means **teardown**.
+   - Only the boolean `true` means the human persisted a retain preference.
+2. Capture evidence: `rc-repro evidence --name <name> --json`.
+3. Unless the task explicitly requires keeping the repro **or**
+   `retain_runs` is true:
+   - `rc-repro down --name <name> --volumes --yes --json`
+   - Confirm the result's residual list is empty.
+   - On Kubernetes the shared Kind cluster may remain warm after `down`; that is
+     deliberate. Report it only when the task also asked to reclaim it
+     (`rc-repro prune --yes`), and never delete it while owned namespaces remain.
+4. When retaining (persisted preference **or** explicit task):
+   - Do **not** tear down.
+   - Report the exact cleanup command from `evidence.retention.cleanup`.
+   - Evidence records `retention.reason` as only `persisted preference` or
+     `explicit task`.
+
+If the installed skill is stale (`capabilities.skill` not current), reinstall with
+`rc-repro skill install` before relying on these recipes.
+
 ### Clean up
 
 ```
@@ -69,7 +95,8 @@ rc-repro down --name <name> --volumes --yes --json
 ```
 
 Tear down by default. Keeping a repro costs disk and leaves state behind, so retain
-one only when asked, and when you do, report the exact command that removes it.
+one only when the task says so or the human's persisted preference says so, and
+when you do, report the exact command that removes it.
 The Kubernetes preset's shared Kind cluster deliberately stays warm after `down`.
 Use `rc-repro prune --yes` only when the task also calls for reclaiming that empty
 cluster; it refuses while an rc-repro-owned namespace remains.
@@ -78,7 +105,8 @@ cluster; it refuses while an rc-repro-owned namespace remains.
 
 - **A preset may need a cluster.** `capabilities` reports `presets_by_topology`;
   anything outside `compose` needs Kubernetes tooling and far more memory and CPU.
-  Check before offering it.
+  Check before offering it. `topology_features` says which seed/scale modes each
+  topology supports.
 - **Version pairs matter.** rc-repro resolves the right MongoDB for a Rocket.Chat
   version. Do not override it unless you know why.
 - **Not every host can run every version.** Some combinations are refused at

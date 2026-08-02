@@ -103,7 +103,39 @@ def _licensed(meta) -> dict:
             "source": "reg_token" if supplied else None}
 
 
-def record(name: str, *, retained: bool | None = None) -> dict:
+#: Only these reasons may appear on a retained run. Anything else is refused so
+#: agents cannot invent a soft justification for leaving state behind.
+_RETAIN_REASONS = frozenset({"persisted preference", "explicit task"})
+
+
+def resolve_retention(*, retained: bool | None = None,
+                      reason: str | None = None,
+                      preferences: dict | None = None) -> dict:
+    """Decide retain vs teardown from explicit args and persisted preference.
+
+    Missing or malformed ``retain_runs`` falls back to teardown. A retained run
+    must name either a persisted preference or an explicit task.
+    """
+    prefs = preferences if preferences is not None else {}
+    pref_raw = prefs.get("retain_runs") if isinstance(prefs, dict) else None
+    pref_retain = pref_raw is True  # malformed/missing => False
+
+    if retained is True:
+        why = (reason or "").strip() or ("persisted preference" if pref_retain
+                                         else "explicit task")
+        if why not in _RETAIN_REASONS:
+            why = "explicit task"
+        return {"retained": True, "reason": why}
+    if retained is False:
+        return {"retained": False, "reason": None}
+    # Default: preference only when it is exactly True; else teardown.
+    if pref_retain:
+        return {"retained": True, "reason": "persisted preference"}
+    return {"retained": False, "reason": None}
+
+
+def record(name: str, *, retained: bool | None = None,
+           reason: str | None = None) -> dict:
     """Build the evidence record for a repro."""
     target = lifecycle.resolve_name(name)
     meta = runner.read_meta(target)
@@ -128,6 +160,14 @@ def record(name: str, *, retained: bool | None = None) -> dict:
         engine = {"docker_version": runner.docker_server_version(),
                   "compose_version": runner.compose_version()}
 
+    try:
+        from rc_repro.services import onboarding
+        prefs = onboarding.state().get("preferences") or {}
+    except Exception:  # noqa: BLE001 - evidence must not fail on a bad config
+        prefs = {}
+    retention = resolve_retention(retained=retained, reason=reason,
+                                  preferences=prefs)
+
     return {
         # Identical shape on both topologies, so a consumer never branches here.
         "repro": {
@@ -149,7 +189,8 @@ def record(name: str, *, retained: bool | None = None) -> dict:
         "ownership": _ownership(meta, topology),
         "license": _licensed(meta),
         "retention": {
-            "retained": bool(retained) if retained is not None else True,
+            "retained": retention["retained"],
+            "reason": retention["reason"],
             "cleanup": _cleanup_command(meta.name, topology),
             "owner": "rc-repro",
             "created_at": meta.created_at,

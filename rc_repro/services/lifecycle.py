@@ -238,7 +238,8 @@ def warn_if_unlicensed(req: CreateReq, emit: Emit = null_emit) -> bool:
         return False
     warn(emit, f"{req.preset!r} is an enterprise feature and no licence was supplied; "
                "it will run but may not function as licensed "
-               "(pass --reg-token, or see cloud.rocket.chat)",
+               "(pass --reg-token, set RC_REPRO_REG_TOKEN, or store reg_token in "
+               "the owner-only config; see cloud.rocket.chat)",
          phase="preflight", code="LICENSE_ABSENT_EE_PRESET")
     return True
 
@@ -279,14 +280,23 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
                 "Helm chart and the container images. Drop --offline, or use a "
                 "Compose preset for a fully offline repro.")
         name = req.name or derive_name(req.version, req.preset)
+        # Same three token sources as Compose: request, config file, env override
+        # (load_config applies RC_REPRO_REG_TOKEN). Never logged.
+        token = req.reg_token or config.load_config().get("reg_token") or ""
         result = k8s.create_repro(name, req.version, offline=req.offline,
                                   rc_image=req.rc_image or "", mongo=req.mongo or "",
-                                  port=req.port, emit=emit)
-        if req.wait:
+                                  port=req.port, reg_token=token, emit=emit)
+        # Seed requires a ready admin. Force the wait path when seed is set, so
+        # GUI/API create-and-seed match CLI create-and-seed without double work.
+        need_wait = req.wait or req.seed
+        if need_wait:
             # --wait must mean the same thing on both topologies, or a caller that
             # asked to block gets an unready repro and no error.
             result.update(wait_and_finalize(runner.read_meta(name), emit))
             result["waited"] = True
+        if req.seed:
+            result["seed"] = run_seed_inline(
+                runner.read_meta(name), req.seed_profile, req.stats, emit)
         return result
     require_docker()
     cfg = config.load_config()
@@ -341,6 +351,9 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         mongo_flavor=resolved.mongo_flavor, preset=pre.name, root_url=root,
         host_port=host_port, version_source=resolved.source, pinned=req.pin,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    if token:
+        # Boolean only; compose.env holds the value for the container, not the record.
+        meta.extra["reg_token_supplied"] = True
     if pre.post_ready:
         meta.extra["post_ready"] = pre.post_ready
     if pre.notes:
@@ -466,7 +479,9 @@ def finalize(meta: runner.Metadata, emit: Emit, *, required: bool = False):
             auth = login(meta)
             if rcapi.complete_setup_wizard(
                     meta.root_url, auth, config.ADMIN_PASSWORD):
-                info(emit, "setup wizard skipped - no registration needed.",
+                # Local setup only. Do not imply Enterprise registration or
+                # licensing is complete or unnecessary.
+                info(emit, "local setup wizard completed; admin is usable",
                      phase="post_ready")
                 return auth
         except Exception:  # noqa: BLE001 - retried below or best-effort for Compose
@@ -519,7 +534,19 @@ def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: fl
 # --- seed (inline, used by create --seed) -------------------------------------
 
 def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit) -> dict:
+    """Ordinary REST seed shared by create --seed, seed, HTTP API, and GUI.
+
+    Kubernetes reachability is a port-forward that may have died; revive it
+    before login. Compose-only resource statistics are refused before any
+    monitor starts or seed mutation occurs.
+    """
     from rc_repro import perf
+    ensure_reachable(meta.name)
+    if stats and _is_kubernetes(meta):
+        raise ValidationError(
+            "--stats / seed resource statistics are not supported on the "
+            "Kubernetes topology: they require the Compose resource monitor. "
+            "Use the ordinary REST seed without --stats.")
     try:
         auth = login(meta)
     except Exception as exc:  # noqa: BLE001
@@ -544,11 +571,13 @@ def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit
 # --- read / state -------------------------------------------------------------
 
 def _summary(meta: runner.Metadata) -> dict:
+    from rc_repro.services import access
     d = {
         "name": meta.name, "rc_version": meta.rc_version, "mongo_tag": meta.mongo_tag,
         "mongo_flavor": meta.mongo_flavor, "preset": meta.preset, "root_url": meta.root_url,
         "host_port": meta.host_port, "login": {"user": config.ADMIN_USERNAME, "password": config.ADMIN_PASSWORD},
         "pinned": meta.pinned, "notes": list(meta.extra.get("notes", []) if isinstance(meta.extra, dict) else []),
+        "access": access.handoff(meta.host_port, meta.root_url),
     }
     n = meta.extra.get("instances") if isinstance(meta.extra, dict) else None
     if n:
@@ -557,6 +586,8 @@ def _summary(meta: runner.Metadata) -> dict:
     if isinstance(meta.extra, dict) and meta.extra.get("monitoring"):
         d["monitoring"] = True
         d["grafana_url"] = f"http://localhost:{config.MONITOR_PORTS[1]}"
+    if isinstance(meta.extra, dict) and meta.extra.get("reg_token_supplied"):
+        d["reg_token_supplied"] = True
     return d
 
 

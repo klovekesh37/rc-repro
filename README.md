@@ -732,7 +732,31 @@ kernel 6.19 or newer ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121
 on such a host use a 7.x line, and rc-repro refuses the impossible combination up
 front rather than timing out. Microservices are an enterprise feature: an unlicensed
 repro comes up but may not function as licensed, so rc-repro warns and records the
-licence state in evidence (pass `--reg-token` to supply a Cloud registration token).
+licence state in evidence (pass `--reg-token`, `RC_REPRO_REG_TOKEN`, or owner-only
+`config.yaml` `reg_token` to supply a Cloud registration token; the Kubernetes path
+delivers it through a Secret, never through values.yaml).
+
+### Remote access over SSH
+
+Repros bind to **loopback only** by default. That is intentional: admin credentials
+are fixed and weak. A local session opens the URL from `info` directly. From an SSH
+session, open a tunnel on your machine instead of trying to browse the remote host's
+`localhost`:
+
+```bash
+# On the remote host (after create + ready)
+rc-repro up --preset microservices --version 8.6.1 --name first-repro --wait --json
+# The result's data.access field includes tunnel_command and browser_url when SSH_* is set.
+
+# On your laptop (example; use the exact tunnel_command from the result)
+ssh -N -L 3000:127.0.0.1:3000 you@remote-host
+# Then open http://127.0.0.1:3000 in a local browser.
+rc-repro down --name first-repro --volumes --yes
+```
+
+rc-repro never changes the bind address, opens a firewall, or creates public ingress
+for this handoff. Override the suggested host/user with `RC_REPRO_SSH_HOST` and
+`RC_REPRO_SSH_USER` if the defaults are wrong.
 
 ## Agent & JSON interface
 

@@ -159,6 +159,23 @@ def _cli_emit(ev: Event) -> None:
         typer.echo(f"  {ev.message}")
 
 
+def _print_access(result: dict) -> None:
+    """Show remote SSH tunnel instructions only when the session needs them."""
+    access = result.get("access") if isinstance(result, dict) else None
+    if not isinstance(access, dict) or access.get("mode") != "remote_ssh":
+        return
+    tunnel = access.get("tunnel_command")
+    browser = access.get("browser_url")
+    if tunnel:
+        ui.hint("  remote access (repro is loopback-only on the server):")
+        ui.hint(f"    tunnel : {tunnel}")
+    if browser:
+        ui.hint(f"    browser: {browser}")
+    note = access.get("note")
+    if note:
+        ui.hint(f"    note   : {note}")
+
+
 def _render_create_result(result: dict) -> None:
     """Format a create_repro result the way `up` used to (panel + notes + hints)."""
     meta = runner.read_meta(result["name"])
@@ -172,6 +189,7 @@ def _render_create_result(result: dict) -> None:
         _summary_panel(meta)
         ui.hint(f"  ready when serving : rc-repro ready --name {meta.name}")
         ui.hint(f"  follow logs        : rc-repro logs --name {meta.name} -f")
+    _print_access(result)
     _print_notes(meta)
 
 
@@ -245,7 +263,33 @@ def _run_seed(meta: runner.Metadata, profile: str,
     objects, so a stray `typer.echo` here would corrupt the stream. When `emit` is
     given, the caller gets the seed summary back to fold into its envelope rather
     than a printed panel.
+
+    Shared service path for the default profile (no count overrides) so CLI,
+    JSON, HTTP, and GUI cannot diverge. Custom user/channel/message overrides
+    remain a CLI convenience on the same REST seeder.
     """
+    # Revive a dead Kubernetes port-forward before any HTTP call.
+    lcsvc.ensure_reachable(meta.name)
+    if stats:
+        lcsvc.require_compose_topology(
+            meta.name, "seed --stats",
+            why="It reads container stats from the compose project; the "
+                "Kubernetes equivalent needs metrics-server.")
+    # Default profile with no overrides: one shared lifecycle path.
+    if users is None and channels is None and messages is None:
+        try:
+            summary = lcsvc.run_seed_inline(meta, profile, stats, emit or _cli_emit)
+        except errors.ReproError as exc:
+            if emit is not None:
+                raise
+            _fail(exc)
+        if emit is not None:
+            return {"users": summary.get("users"), "channels": summary.get("channels"),
+                    "messages": summary.get("messages"),
+                    "elapsed_s": round(float(summary.get("total_s", 0)), 1)}
+        _print_seed_result(summary, float(summary.get("total_s", 0)),
+                           None, meta)
+        return None
     try:
         auth = _login(meta)
     except Exception as exc:  # noqa: BLE001
@@ -412,13 +456,15 @@ def ready(
 
 
 def _finalize(meta: runner.Metadata):
-    """Skip the setup wizard's cloud-registration step so the repro is usable
-    immediately. Best-effort (custom-admin presets / 2FA may block it); returns
-    the admin auth for post-ready actions, or None."""
+    """Complete the local setup wizard so the advertised admin is usable.
+
+    Best-effort (custom-admin presets / 2FA may block it); returns the admin
+    auth for post-ready actions, or None. This is not Enterprise registration.
+    """
     try:
         auth = _login(meta)
         if rcapi.complete_setup_wizard(meta.root_url, auth, config.ADMIN_PASSWORD):
-            typer.echo("  setup wizard skipped — no registration needed.")
+            typer.echo("  local setup wizard completed; admin is usable")
         return auth
     except Exception:  # noqa: BLE001 - finalize is best-effort
         return None
@@ -747,20 +793,30 @@ def seed_cmd(
     --scale bulk-inserts users/messages straight into MongoDB (orders of
     magnitude faster than the REST seed) to reproduce SCALE/perf behaviour.
     Bulk users are credential-less and messages fire no app hooks; use the
-    default REST seed when you need real, loginable users.
+    default REST seed when you need real, loginable users. --scale and --stats
+    are Compose-only; ordinary REST seed works on Compose and Kubernetes.
     """
-    _require_docker()
     _target = _resolve_name(name)
     # Kubernetes reachability is a port-forward that may have died; revive it before
     # talking HTTP, or this fails for a reason unrelated to what was asked.
     lcsvc.ensure_reachable(_target)
     m = runner.read_meta(_target)
     if clear_scale:
-        _clear_scale(m)
+        try:
+            datasvc.clear_scale(_target, emit=_cli_emit)
+        except errors.ReproError as exc:
+            _fail(exc)
         return
     if scale:
-        _run_scale(m, scale)
+        try:
+            datasvc.run_scale(_target, scale, emit=_cli_emit)
+        except errors.ReproError as exc:
+            _fail(exc)
         return
+    # REST seed needs a container engine only on Compose; Kubernetes talks HTTP
+    # through the port-forward. Require docker only when the topology is compose.
+    if lcsvc.topology_of_repro(_target) == "compose":
+        _require_docker()
     _run_seed(m, profile, users, channels, messages, stats=stats)
 
 

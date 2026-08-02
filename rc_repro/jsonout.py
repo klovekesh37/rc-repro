@@ -297,4 +297,20 @@ def capabilities(app: Any) -> dict:
                       if (getattr(p, "topology", "compose") or "compose") == t)
             for t in topologies
         },
+        # What each topology supports, so an agent or GUI can hide unsupported
+        # choices before submission rather than learning only after failure.
+        "topology_features": {
+            "compose": {
+                "seed": True,
+                "seed_stats": True,
+                "scale": True,
+                "clear_scale": True,
+            },
+            "kubernetes": {
+                "seed": True,
+                "seed_stats": False,
+                "scale": False,
+                "clear_scale": False,
+            },
+        },
     }

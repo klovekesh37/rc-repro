@@ -69,6 +69,12 @@ FLOOR_CPUS = 4
 _KERNEL_BROKEN_MONGO_MAJOR = 8
 _KERNEL_FIRST_BROKEN = (6, 19)
 
+#: Kubernetes Secret that carries REG_TOKEN into the workload. The token never
+#: appears in values.yaml, repro metadata, or helm argv: only this Secret and the
+#: chart's secretKeyRef reference hold the value at rest in the cluster.
+REG_TOKEN_SECRET = "rc-repro-reg-token"
+REG_TOKEN_SECRET_KEY = "token"
+
 
 @dataclass(frozen=True)
 class ClientState:
@@ -328,8 +334,53 @@ def init_replica_set(run: _Runner, ctx: str, ns: str, emit: Emit = null_emit) ->
             "streams cannot work: " + (ok.stdout or ok.stderr or "").strip()[:300])
 
 
+def _extra_env(*, reg_token_supplied: bool = False) -> list[dict]:
+    """Chart extraEnv entries for the shared first-admin contract and optional token.
+
+    When a registration token is supplied, REG_TOKEN is referenced from a
+    Kubernetes Secret via valueFrom rather than inlined. The Secret is applied
+    separately, so the rendered values.yaml and helm stdin never contain the
+    token value.
+    """
+    env: list[dict] = [
+        {"name": key, "value": value}
+        for key, value in config.first_admin_env().items()
+    ]
+    if reg_token_supplied:
+        env.append({
+            "name": "REG_TOKEN",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": REG_TOKEN_SECRET,
+                    "key": REG_TOKEN_SECRET_KEY,
+                },
+            },
+        })
+    return env
+
+
+def _reg_token_secret_manifest(name: str, token: str) -> str:
+    """Opaque Secret applied via stdin so the token never appears in process argv."""
+    owner_k, owner_v = OWNER_LABEL.split("=", 1)
+    body = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": REG_TOKEN_SECRET,
+            "labels": {
+                owner_k: owner_v,
+                REPRO_LABEL: name,
+            },
+        },
+        "type": "Opaque",
+        "stringData": {REG_TOKEN_SECRET_KEY: token},
+    }
+    return yaml.safe_dump(body, sort_keys=False)
+
+
 def build_values(rc_version: str, *, offline: bool = False,
-                 rc_image: str = "", mongo: str = "") -> Plan:
+                 rc_image: str = "", mongo: str = "",
+                 reg_token_supplied: bool = False) -> Plan:
     """Resolve versions and render the Helm values for one repro.
 
     Reuses versions.resolve unchanged: it already returns everything the chart
@@ -345,8 +396,7 @@ def build_values(rc_version: str, *, offline: bool = False,
         # first admin and opens at the login screen rather than Rocket.Chat's
         # setup wizard. The chart applies extraEnv to the main Rocket.Chat
         # deployment, which owns first-user creation in microservices mode.
-        "extraEnv": [{"name": key, "value": value}
-                     for key, value in config.first_admin_env().items()],
+        "extraEnv": _extra_env(reg_token_supplied=reg_token_supplied),
         # Never the bundled subchart: Bitnami is amd64-only and the chart's
         # default MongoDB tag is rejected by its own appVersion.
         "mongodb": {"enabled": False},
@@ -699,8 +749,14 @@ def _mongo_manifest(name: str, tag: str) -> str:
 
 def create_repro(name: str, rc_version: str, *, offline: bool = False,
                  rc_image: str = "", mongo: str = "", port: int = 0,
+                 reg_token: str = "",
                  emit: Emit = null_emit, run: _Runner | None = None) -> dict:
-    """Create a Kubernetes microservices repro. Returns the result payload."""
+    """Create a Kubernetes microservices repro. Returns the result payload.
+
+    ``reg_token`` is delivered through a Kubernetes Secret and a chart
+    ``valueFrom`` reference. It must never land in values.yaml, repro.json, or
+    helm/kubectl argv.
+    """
     run = run or _Runner()
     require_tools(run)
     try:
@@ -720,11 +776,15 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
             f"recreate in place; run `rc-repro down --name {name} --volumes` first, or "
             f"choose another --name.")
 
+    token = (reg_token or "").strip()
+    token_supplied = bool(token)
+
     events.info(emit, "checking engine capacity", phase="preflight", pct=2)
     check_capacity(run, emit)
 
     events.info(emit, "resolving versions and chart", phase="resolve", pct=5)
-    plan = build_values(rc_version, offline=offline, rc_image=rc_image, mongo=mongo)
+    plan = build_values(rc_version, offline=offline, rc_image=rc_image, mongo=mongo,
+                        reg_token_supplied=token_supplied)
     plan.name, plan.namespace = name, namespace_for(name)
     # Fail on the impossible combination now rather than after a long wait.
     check_mongo_kernel_support(plan.mongo_tag, run)
@@ -742,6 +802,13 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     # Ownership is asserted at creation, so teardown can prove what it may delete.
     _kubectl(run, ctx, "label", "namespace", plan.namespace,
              OWNER_LABEL, f"{REPRO_LABEL}={name}", "--overwrite")
+
+    if token_supplied:
+        # Apply via stdin (run.apply), never as argv, so process listings cannot
+        # observe the token. The helm values only reference the Secret by name.
+        events.info(emit, "installing the registration token Secret",
+                    phase="boot", pct=25)
+        run.apply(ctx, plan.namespace, _reg_token_secret_manifest(name, token))
 
     events.info(emit, f"starting MongoDB {plan.mongo_tag}", phase="boot", pct=30)
     run.apply(ctx, plan.namespace, _mongo_manifest(name, plan.mongo_tag))
@@ -763,6 +830,13 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     host_port = port or runner.pick_port()
     pid = start_port_forward(ctx, plan.namespace, host_port, run)
     resolved = versions.resolve(plan.rc_version, offline=offline)
+    extra = {_TOPOLOGY: "kubernetes", _NAMESPACE: plan.namespace,
+             _CONTEXT: ctx, _FORWARD_PID: pid,
+             "chart_version": plan.chart_version}
+    # Boolean only: evidence and info report whether a token was consumed, never
+    # the value. Absent means not supplied, so consumers do not invent True.
+    if token_supplied:
+        extra["reg_token_supplied"] = True
     meta = runner.Metadata(
         name=name, project=plan.namespace, rc_version=plan.rc_version,
         rc_image=plan.rc_image, mongo_tag=plan.mongo_tag,
@@ -770,12 +844,12 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
         root_url=f"http://localhost:{host_port}", host_port=host_port,
         version_source=resolved.source,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        extra={_TOPOLOGY: "kubernetes", _NAMESPACE: plan.namespace,
-               _CONTEXT: ctx, _FORWARD_PID: pid,
-               "chart_version": plan.chart_version},
+        extra=extra,
     )
     # The workspace holds the rendered artifact, values.yaml here instead of
     # docker-compose.yml, so evidence hashes the same kind of thing either way.
+    # plan.values holds only a secretKeyRef when a token was supplied: no token
+    # value is written to disk.
     runner.write(name, yaml.safe_dump(plan.values, sort_keys=False), meta,
                  artifact_name="values.yaml")
     events.info(emit, f"forwarding localhost:{host_port}", phase="wait", pct=80)
@@ -787,12 +861,16 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     # and anything else needing HTTP call ensure_port_forward first and revive it.
     # Claiming "up" here would be the kind of confident-but-wrong status that
     # sends someone debugging their network instead of waiting for a pod.
+    from rc_repro.services import access
+    access_info = access.handoff(host_port, meta.root_url)
     return {"name": name, "namespace": plan.namespace, "context": ctx,
             "topology": "kubernetes", "rc_version": plan.rc_version,
             "mongo_tag": plan.mongo_tag, "chart": CHART,
             "chart_version": plan.chart_version,
             "root_url": meta.root_url, "host_port": host_port,
-            "port_forward": forward_state(meta)}
+            "port_forward": forward_state(meta),
+            "access": access_info,
+            "reg_token_supplied": token_supplied}
 
 
 def teardown(name: str, *, volumes: bool = False, emit: Emit = null_emit,

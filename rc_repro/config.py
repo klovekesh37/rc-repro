@@ -31,10 +31,15 @@ ADMIN_NAME = "Admin"
 
 
 def first_admin_env() -> dict[str, str]:
-    """Rocket.Chat's shared first-user and completed-onboarding contract."""
+    """Rocket.Chat's shared first-user and completed local-setup contract.
+
+    Both Compose and Kubernetes inject this exact map. Do not set
+    ``INITIAL_USER``: Rocket.Chat expects a JSON user object there, and the
+    scalar ``yes`` produces a JSON parse error on boot. The ADMIN_* variables
+    plus the setup-wizard overwrite are the supported first-admin path.
+    """
     return {
         "OVERWRITE_SETTING_Show_Setup_Wizard": "completed",
-        "INITIAL_USER": "yes",
         "ADMIN_USERNAME": ADMIN_USERNAME,
         "ADMIN_NAME": ADMIN_NAME,
         "ADMIN_EMAIL": ADMIN_EMAIL,
