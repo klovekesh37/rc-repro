@@ -72,11 +72,12 @@ def test_installer_checks_existing_tools_and_conflicts_before_package_changes():
     source = INSTALLER.read_text(encoding="utf-8")
     inventory = source.index('for tool in docker pipx kind kubectl helm rc-repro')
     conflicts = source.index('for package in docker.io docker-compose')
-    sudo_authorisation = source.index('sudo -v')
+    noninteractive_sudo = source.index('if ! sudo -n true 2>/dev/null; then')
+    sudo_authorisation = source.index('    sudo -v || fail "sudo authorisation failed"')
     first_apt_change = source.index('sudo apt-get update')
 
-    assert inventory < sudo_authorisation
-    assert conflicts < sudo_authorisation < first_apt_change
+    assert inventory < noninteractive_sudo
+    assert conflicts < noninteractive_sudo < sudo_authorisation < first_apt_change
     assert 'install_user="$(id -un)"' in source
     assert "SUDO_USER" not in source
 

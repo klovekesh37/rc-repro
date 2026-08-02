@@ -106,7 +106,12 @@ if ((${#conflicts[@]})); then
 fi
 
 command -v sudo >/dev/null 2>&1 || fail "sudo is required"
-sudo -v || fail "sudo authorisation failed"
+# Cloud images may grant NOPASSWD for commands while `sudo -v` still follows a
+# passworded group rule. Prove an actual command first, then prompt only when
+# the current policy or credential cache requires it.
+if ! sudo -n true 2>/dev/null; then
+    sudo -v || fail "sudo authorisation failed"
+fi
 
 tmp_dir="$(mktemp -d)"
 cleanup() {
