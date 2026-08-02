@@ -1,0 +1,36 @@
+name: publish installer asset
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stamp and verify installer
+        env:
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir -p dist
+          sed \
+            -e "s|__RC_REPRO_RELEASE_REPOSITORY__|${RELEASE_REPOSITORY}|g" \
+            -e "s|__RC_REPRO_RELEASE_TAG__|${RELEASE_TAG}|g" \
+            rc-repro-install > dist/rc-repro-install
+          chmod 0755 dist/rc-repro-install
+          bash -n dist/rc-repro-install
+          ! grep -q '__RC_REPRO_RELEASE_' dist/rc-repro-install
+          sha256sum dist/rc-repro-install > dist/rc-repro-install.sha256
+      - name: Upload installer and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$RELEASE_TAG" --clobber \
+            dist/rc-repro-install \
+            dist/rc-repro-install.sha256

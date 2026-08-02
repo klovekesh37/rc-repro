@@ -246,7 +246,7 @@ def _onboarding_state() -> dict:
                 "onboard_with": onboarding.ONBOARD_COMMAND}
     except Exception:  # noqa: BLE001 - discovery must not fail on a bad config
         return {"completed": False, "grants": {}, "preferences": {},
-                "onboard_with": "rc-repro onboard --accept-defaults"}
+                "onboard_with": "rc-repro onboard"}
 
 
 def _skill_state() -> dict:

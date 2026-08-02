@@ -249,9 +249,10 @@ class _FakeRun:
     def __init__(self, *, tools=("kind", "kubectl", "helm"), clusters="",
                  kernel="6.8.0-generic", labels='{"app.kubernetes.io/managed-by":"rc-repro"}',
                  mongo_ready="true", rs_ok="1", index=None,
-                 mem_gib=8.0, cpus=4):
+                 mem_gib=8.0, cpus=4, engine="docker", cluster_owned=True):
         self.tools, self.clusters, self.kernel, self.labels = tools, clusters, kernel, labels
         self.mongo_ready, self.rs_ok = mongo_ready, rs_ok
+        self.engine, self.cluster_owned = engine, cluster_owned
         self.mem_bytes, self.cpus = int(mem_gib * 1024 ** 3), cpus
         # A realistic slice of `helm search repo --versions -o json`, including the
         # sparse appVersion coverage the real index has.
@@ -270,6 +271,9 @@ class _FakeRun:
     def which(self, tool):
         return f"/usr/bin/{tool}" if tool in self.tools else None
 
+    def docker_server_platform(self):
+        return "Podman Engine" if self.engine == "podman" else "Docker Engine - Community"
+
     def run(self, argv, *, check=True):
         import subprocess
         self.calls.append(argv)
@@ -284,6 +288,12 @@ class _FakeRun:
             # two different probes share the command; the format tells them apart
             out = (f"{self.mem_bytes} {self.cpus}" if "MemTotal" in argv[-1]
                    else self.kernel)
+        elif argv[:3] == ["podman", "machine", "inspect"]:
+            out = "running" if self.engine == "podman" else ""
+        elif "configmap" in argv and "rc-repro-cluster-owner" in argv:
+            out = ('{"metadata":{"labels":{"app.kubernetes.io/managed-by":"rc-repro"}},'
+                   '"data":{"cluster":"rc-repro-local"}}'
+                   if self.cluster_owned else "")
         elif "jsonpath={.metadata.labels}" in argv:
             out = self.labels
         elif "jsonpath={.status.containerStatuses[0].ready}" in argv:
@@ -298,6 +308,8 @@ class _FakeRun:
         return subprocess.CompletedProcess(argv, 0, out, "")
 
     def apply(self, ctx, ns, manifest):
+        if "rc-repro-cluster-owner" in manifest:
+            self.cluster_owned = True
         self.applied.append(manifest)
 
     def install(self, ctx, ns, values, chart_version=""):
@@ -363,7 +375,8 @@ def test_k8s_create_labels_for_ownership_and_installs_the_chart():
     kubectl_calls = [c for c in fake.calls if c[0] == "kubectl"]
     assert all("--kubeconfig" in c for c in kubectl_calls)
     assert all("--context" in c for c in kubectl_calls if "current-context" not in c)
-    assert fake.applied and "replSet" in fake.applied[0]   # replica set, not standalone
+    assert any("rc-repro-cluster-owner" in manifest for manifest in fake.applied)
+    assert any("replSet" in manifest for manifest in fake.applied)  # replica set, not standalone
     assert fake.installed and fake.installed[0]["values"]["mongodb"]["enabled"] is False
     # the chart is pinned, not left to helm's "latest"
     assert fake.installed[0]["chart_version"] == "7.0.2"
@@ -506,6 +519,53 @@ def test_k8s_reuses_an_existing_cluster():
     fake2 = _FakeRun(clusters="")
     k8s.ensure_cluster(run=fake2)
     assert any(c[:3] == ["kind", "create", "cluster"] for c in fake2.calls)
+
+
+def test_k8s_refuses_a_same_named_cluster_without_ownership_proof(tmp_path, monkeypatch):
+    from rc_repro import errors
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    with pytest.raises(errors.ConflictError) as exc:
+        k8s.ensure_cluster(run=_FakeRun(
+            clusters=k8s.CLUSTER_NAME, cluster_owned=False))
+
+    assert "ownership marker" in str(exc.value)
+
+
+def test_k8s_prune_refuses_a_same_named_cluster_without_ownership_proof(
+        tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    fake = _FakeRun(clusters=k8s.CLUSTER_NAME, cluster_owned=False)
+
+    out = k8s.prune_cluster(run=fake)
+
+    assert out["deleted"] is False
+    assert "ownership marker" in out["reason"]
+    assert not any(c[:3] == ["kind", "delete", "cluster"] for c in fake.calls)
+
+
+def test_k8s_rolls_back_a_new_cluster_if_ownership_cannot_be_marked(
+        tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    class MarkerFails(_FakeRun):
+        def apply(self, ctx, ns, manifest):
+            import subprocess
+            if "rc-repro-cluster-owner" in manifest:
+                return subprocess.CompletedProcess(
+                    ["kubectl", "apply"], 1, "", "marker rejected")
+            return super().apply(ctx, ns, manifest)
+
+    fake = MarkerFails(clusters="")
+    with pytest.raises(errors.CreateFailedError) as exc:
+        k8s.ensure_cluster(run=fake)
+
+    assert "marker rejected" in str(exc.value)
+    assert "rolled back" in str(exc.value)
+    assert any(call[:3] == ["kind", "delete", "cluster"] for call in fake.calls)
 
 
 def test_k8s_create_persists_shared_metadata(tmp_path, monkeypatch):
@@ -793,10 +853,13 @@ def test_k8s_capacity_refuses_a_small_engine_without_a_grant(tmp_path, monkeypat
     from rc_repro.services import k8s
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
     with pytest.raises(errors.ValidationError) as ei:
-        k8s.check_capacity(_FakeRun(mem_gib=2.0, cpus=5))
+        k8s.check_capacity(_FakeRun(
+            mem_gib=2.0, cpus=5, engine="podman",
+            tools=("kind", "kubectl", "helm", "podman")))
     msg = str(ei.value)
     assert "podman machine set --memory 6144" in msg
-    assert "--grant engine-resize" in msg
+    assert "rc-repro onboard" in msg
+    assert "--grant engine-resize" not in msg
     assert "stops unrelated containers" in msg      # the real cost, stated
     assert errors.ValidationError.exit_code == 2
 
@@ -816,7 +879,7 @@ def test_k8s_capacity_resizes_when_granted_and_says_so(tmp_path, monkeypatch):
                 self.mem_bytes = 8 * 1024 ** 3
             return super().run(argv, check=check)
 
-    fake = Resizes(mem_gib=2.0, cpus=4,
+    fake = Resizes(mem_gib=2.0, cpus=4, engine="podman",
                    tools=("kind", "kubectl", "helm", "podman"))
     seen = []
     k8s.check_capacity(fake, emit=seen.append)
@@ -857,6 +920,20 @@ def test_k8s_capacity_will_not_resize_docker_desktop(tmp_path, monkeypatch):
     with pytest.raises(errors.ValidationError) as ei:
         k8s.check_capacity(_FakeRun(mem_gib=2.0, cpus=4))      # no podman on PATH
     assert "Docker Desktop" in str(ei.value)
+
+
+def test_k8s_capacity_will_not_resize_a_separate_podman_install(tmp_path, monkeypatch):
+    from rc_repro.services import k8s, onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=["engine-resize"])
+    fake = _FakeRun(
+        mem_gib=2.0, cpus=4, engine="docker",
+        tools=("kind", "kubectl", "helm", "podman"))
+
+    with pytest.raises(errors.ValidationError):
+        k8s.check_capacity(fake)
+
+    assert not any(call[:2] == ["podman", "machine"] for call in fake.calls)
 
 
 def test_k8s_wait_ready_revives_the_forward_and_persists_the_new_pid(tmp_path, monkeypatch):
@@ -992,8 +1069,14 @@ def test_gate_registry_matches_what_the_code_actually_raises(tmp_path, monkeypat
         onboarding.require_grant("engine-resize")
     except errors.AuthorityGateError as exc:
         raised.add(exc.code)
+    try:
+        onboarding.require_grant("owned-cluster")
+    except errors.AuthorityGateError as exc:
+        raised.add(exc.code)
     assert raised <= set(errors.GATE_CODES), raised - set(errors.GATE_CODES)
-    assert raised == {"GATE_NOT_ONBOARDED", "GATE_ENGINE_RESIZE"}
+    assert raised == {
+        "GATE_NOT_ONBOARDED", "GATE_ENGINE_RESIZE", "GATE_OWNED_CLUSTER"
+    }
 
 
 def test_k8s_exec_uses_the_compose_service_word(tmp_path, monkeypatch):
@@ -1147,8 +1230,9 @@ def test_evidence_bundle_captures_one_log_file_per_pod(tmp_path, monkeypatch):
 
 
 def _make_k8s_repro(name, port, monkeypatch, tmp_path):
-    from rc_repro.services import k8s
+    from rc_repro.services import k8s, onboarding
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=["owned-cluster"])
     k8s.create_repro(name, "8.6.1", offline=True, port=port, run=_FakeRun())
 
 
@@ -1243,7 +1327,7 @@ def test_create_passes_port_and_honours_wait(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
     # The Kubernetes path now gates on onboarding, so satisfy it: this test is about
     # port and wait, not the gate (which has its own test below).
-    onboarding.complete(grants=["engine-resize"])
+    onboarding.complete(grants=["engine-resize", "owned-cluster"])
     got = {}
 
     def fake_create(name, version, **kw):
@@ -1386,7 +1470,7 @@ def test_compose_only_flags_are_refused_on_kubernetes(tmp_path, monkeypatch):
     from rc_repro.services import lifecycle as lc
     from rc_repro.services import onboarding
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
-    onboarding.complete(grants=["engine-resize"])
+    onboarding.complete(grants=["engine-resize", "owned-cluster"])
     for flag in ("fresh", "force", "monitor"):
         req = lc.CreateReq(version="8.6.1", preset="microservices", name="ff", **{flag: True})
         with pytest.raises(errors.ValidationError) as ei:
@@ -1636,9 +1720,10 @@ def test_prune_dispatches_kubernetes_teardown_not_compose(tmp_path, monkeypatch)
     """#21: prune called runner.down (compose) on a k8s repro, leaking the forward
     and namespace. It now dispatches to k8s.teardown."""
     from rc_repro import runner
-    from rc_repro.services import k8s
+    from rc_repro.services import k8s, onboarding
     from rc_repro.services import lifecycle as lc
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=["owned-cluster"])
     k8s.create_repro("pr", "8.6.1", offline=True, port=34202, run=_FakeRun())
     monkeypatch.setattr(lc, "prunable", lambda: ["pr"])
     torn = {}
@@ -1659,9 +1744,11 @@ def test_prune_dispatches_kubernetes_teardown_not_compose(tmp_path, monkeypatch)
     assert out["cluster"]["deleted"] is True
 
 
-def test_prune_reaches_an_empty_cluster_after_all_records_are_gone(monkeypatch):
-    from rc_repro.services import k8s
+def test_prune_reaches_an_empty_cluster_after_all_records_are_gone(tmp_path, monkeypatch):
+    from rc_repro.services import k8s, onboarding
     from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=["owned-cluster"])
 
     state = {"cluster": k8s.CLUSTER_NAME, "exists": True, "prunable": True,
              "namespaces": [], "reason": "empty rc-repro-owned cluster"}
@@ -1724,7 +1811,7 @@ def test_offline_is_refused_on_the_kubernetes_path(tmp_path, monkeypatch):
     from rc_repro.services import lifecycle as lc
     from rc_repro.services import onboarding
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
-    onboarding.complete(grants=["engine-resize"])
+    onboarding.complete(grants=["engine-resize", "owned-cluster"])
     with pytest.raises(errors.ValidationError) as ei:
         lc.create_repro(lc.CreateReq(version="8.6.1", preset="microservices",
                                      name="off", offline=True))

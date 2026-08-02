@@ -267,6 +267,7 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         # exists to have a human grant once. An un-onboarded agent gets exit 6 here
         # with the command to ask a human to run, rather than inventing a baseline.
         onboarding.require_onboarded()
+        onboarding.require_grant("owned-cluster")
         _reject_compose_only_flags(req)
         if req.offline:
             # --offline promises no network, but the Kubernetes path must pull the
@@ -722,6 +723,8 @@ def _topology_of(preset_name: str) -> str:
 def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: Emit = null_emit) -> dict:
     target = resolve_name(name)
     if topology_of_repro(target) == "kubernetes":
+        from rc_repro.services import onboarding
+        onboarding.require_grant("owned-cluster")
         from rc_repro.services import k8s
         if volumes and not confirm:
             raise ValidationError(f"deleting {target!r}'s data and record is irreversible - "
@@ -798,6 +801,9 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         if plan["cluster"].get("exists"):
             detail += " and the owned Kind cluster once it is empty"
         raise ValidationError(f"prune deletes {detail} - pass confirm=true")
+    if cluster_target or any(topology_of_repro(name) == "kubernetes" for name in targets):
+        from rc_repro.services import onboarding
+        onboarding.require_grant("owned-cluster")
     removed = []
     for name in targets:
         # Dispatch: a Kubernetes repro has no compose project, so runner.down would

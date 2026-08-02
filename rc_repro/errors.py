@@ -116,6 +116,7 @@ class AuthorityGateError(ReproError):
 #: is the point: a gate a caller cannot anticipate is one it cannot handle.
 GATE_CODES: dict[str, str] = {
     "GATE_NOT_ONBOARDED": "rc-repro has not been onboarded on this machine",
+    "GATE_OWNED_CLUSTER": "the rc-repro-owned local cluster was not authorised",
     "GATE_ENGINE_RESIZE": "resizing the container engine was not authorised",
     "GATE_UNAPPROVED_CLUSTER": "the target Kubernetes cluster is not an approved one",
     "GATE_DELETE_UNOWNED": "the resource was not created by rc-repro",

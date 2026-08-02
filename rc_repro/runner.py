@@ -506,8 +506,23 @@ def docker_server_version() -> str | None:
     return _first_line(["docker", "version", "--format", "{{.Server.Version}}"])
 
 
+def docker_server_platform() -> str | None:
+    """Product name for the active Docker-compatible server endpoint."""
+    return _first_line(["docker", "version", "--format", "{{.Server.Platform.Name}}"])
+
+
+def docker_cli_version() -> str | None:
+    """Human-readable Docker CLI version without bypassing the runner seam."""
+    return _first_line(["docker", "--version"])
+
+
 def compose_version() -> str | None:
     return _first_line(["docker", "compose", "version", "--short"])
+
+
+def compose_version_line() -> str | None:
+    """Human-readable Compose version without bypassing the runner seam."""
+    return _first_line(["docker", "compose", "version"])
 
 
 def docker_kernel_version() -> str | None:

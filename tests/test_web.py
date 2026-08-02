@@ -178,6 +178,8 @@ class _FakeK8sRun:
         self.forwards = []
     def which(self, tool):
         return f"/usr/bin/{tool}"
+    def docker_server_platform(self):
+        return "Docker Engine - Community"
     def run(self, argv, *, check=True):
         import subprocess, json as _j
         out = ""
@@ -187,6 +189,9 @@ class _FakeK8sRun:
             out = "kind-rc-repro-local"
         elif argv[:2] == ["docker", "info"]:
             out = f"{8 * 1024**3} 4" if "MemTotal" in argv[-1] else "6.8.0-generic"
+        elif "configmap" in argv and "rc-repro-cluster-owner" in argv:
+            out = ('{"metadata":{"labels":{"app.kubernetes.io/managed-by":"rc-repro"}},'
+                   '"data":{"cluster":"rc-repro-local"}}')
         elif "jsonpath={.metadata.labels}" in argv:
             out = '{"app.kubernetes.io/managed-by":"rc-repro"}'
         elif "jsonpath={.status.containerStatuses[0].ready}" in argv:
@@ -214,7 +219,7 @@ def _k8s_client(tmp_path, monkeypatch):
     from rc_repro.services import k8s, onboarding
     _FakeRun = _FakeK8sRun
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
-    onboarding.complete(grants=["engine-resize"])          # the k8s path gates on this
+    onboarding.complete(grants=["engine-resize", "owned-cluster"])
     fake = _FakeRun()
     monkeypatch.setattr(k8s, "_Runner", lambda: fake)
     # wait_ready would poll a real cluster; the GUI's create does not wait, but be safe

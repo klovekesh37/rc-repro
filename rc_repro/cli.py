@@ -1726,48 +1726,128 @@ def onboard(
                                          help="take every default without prompting (for scripts/CI)"),
     grant: list[str] = typer.Option(None, "--grant",
                                     help="authority to hand over, repeatable (see --help)"),
-    retain_runs: bool = typer.Option(False, "--retain-runs",
-                                     help="keep repros after evidence capture instead of tearing down"),
+    retain_runs: Optional[bool] = typer.Option(
+        None, "--retain-runs/--teardown-by-default",
+        help="persist whether agent-driven runs are retained after evidence capture"),
+    reconfigure: bool = typer.Option(
+        False, "--reconfigure",
+        help="ask settled human questions again so their answers can be changed"),
     json_out: bool = typer.Option(False, "--json", help="emit the resulting state as JSON"),
 ) -> None:
     """Answer rc-repro's setup questions once. Later runs never re-ask them.
 
-    Interactive without flags; fully non-interactive with --accept-defaults, so a
-    human can authorise a machine in one command and an agent then runs silently.
+    The normal human path is interactive. Automation uses --accept-defaults and
+    supplies every authority it needs explicitly with --grant.
     """
-    grants = list(grant or [])
+    current = onboardsvc.state()
+    environment = onboardsvc.detect_environment()
+    grants = {name for name in onboardsvc.GRANTS
+              if current["grants"].get(onboardsvc.grant_key(name))}
+    grants.update(grant or [])
+    denied: set[str] = set()
     prefs: dict = {}
-    if not accept_defaults and not json_out:
-        # Interactive: a thin collector calling the same writer the flags call, so
-        # the two front doors cannot drift.
-        typer.echo("rc-repro setup — asked once, then never again.\n")
-        if "engine-resize" not in grants:
-            typer.echo("Some presets need more memory than your container engine has.")
-            ui.warn("  Resizing restarts the engine, which stops unrelated containers.")
+    interactive = not accept_defaults and not json_out
+
+    if json_out and not accept_defaults:
+        exc = errors.ValidationError(
+            "--json is non-interactive; pair it with --accept-defaults and explicit "
+            "--grant values")
+        jsonout.fail(exc)
+
+    if interactive:
+        typer.echo("rc-repro setup — durable choices are asked once.\n")
+        typer.echo("Detected environment")
+        typer.echo(f"  OS: {environment['os']} ({environment['architecture']})")
+        typer.echo(f"  host: {environment['cpus']} CPUs, "
+                   f"{environment['memory_gib']:.1f} GiB memory, "
+                   f"{environment['disk_free_gib']:.1f} GiB disk free")
+        for tool in ("docker", "compose", "kind", "kubectl", "helm"):
+            typer.echo(f"  {tool}: {environment['tools'][tool]}")
+        if environment["docker_ready"]:
+            typer.echo(f"  container capacity: {environment['engine_cpus']} CPUs, "
+                       f"{environment['engine_memory_gib']:.1f} GiB")
+        readiness = "ready" if environment["microservices_ready"] else "not ready"
+        typer.echo(f"  Kubernetes microservices: {readiness}\n")
+
+        asked = False
+        cluster_key = "owned_cluster"
+        cluster_answered = current["answered_grants"].get(cluster_key, False)
+        if "owned-cluster" not in (grant or []) and (reconfigure or not cluster_answered):
+            typer.echo("rc-repro uses one local Kind cluster and one namespace per repro.")
+            ui.note("  It creates or deletes only resources carrying rc-repro ownership labels.")
+            if typer.confirm(
+                    "May rc-repro create and later delete those owned resources?",
+                    default=current["grants"].get(cluster_key, False)):
+                grants.add("owned-cluster")
+            else:
+                grants.discard("owned-cluster")
+                denied.add("owned-cluster")
+            asked = True
+
+        resize_key = "engine_resize"
+        resize_answered = current["answered_grants"].get(resize_key, False)
+        if (environment["engine_resize_relevant"] and
+                "engine-resize" not in (grant or []) and
+                (reconfigure or not resize_answered)):
+            typer.echo("This container engine is below the measured Kubernetes capacity floor.")
+            ui.warn("  Resizing restarts the engine and stops unrelated containers.")
             if typer.confirm("May rc-repro stop, resize, and restart it when needed?",
-                             default=False):
-                grants.append("engine-resize")
-        prefs["retain_runs"] = typer.confirm(
-            "Keep repros after capturing evidence (instead of tearing them down)?",
-            default=False)
+                             default=current["grants"].get(resize_key, False)):
+                grants.add("engine-resize")
+            else:
+                grants.discard("engine-resize")
+                denied.add("engine-resize")
+            asked = True
+
+        retention_answered = current["answered_preferences"].get("retain_runs", False)
+        if retain_runs is not None:
+            prefs["retain_runs"] = retain_runs
+        elif reconfigure or not retention_answered:
+            typer.echo("\nAgent-driven runs capture evidence and tear down by default.")
+            prefs["retain_runs"] = typer.confirm(
+                "Retain repros after evidence capture instead?",
+                default=bool(current["preferences"].get("retain_runs")))
+            asked = True
+
+        if not current["completed"] or reconfigure or asked:
+            typer.echo("\nThe microservices preset is an Enterprise topology.")
+            ui.warn("  Without a Rocket.Chat Enterprise licence it may not behave as licensed.")
+        else:
+            typer.echo("Settled choices are unchanged; use --reconfigure to change them.")
     else:
-        prefs["retain_runs"] = retain_runs
+        # Automation defaults only questions that have never been answered. It does
+        # not revoke an earlier standing grant or retention choice on a safe rerun.
+        for name in onboardsvc.GRANTS:
+            key = onboardsvc.grant_key(name)
+            if not current["answered_grants"].get(key, False) and name not in grants:
+                denied.add(name)
+        if retain_runs is not None:
+            prefs["retain_runs"] = retain_runs
+        elif not current["answered_preferences"].get("retain_runs", False):
+            prefs["retain_runs"] = False
 
     try:
-        result = onboardsvc.complete(grants=grants, preferences=prefs)
+        result = onboardsvc.complete(
+            grants=sorted(grants), denied_grants=sorted(denied), preferences=prefs)
     except errors.ReproError as exc:
         jsonout.fail(exc) if json_out else _fail(exc)
 
+    first_run = (onboardsvc.FIRST_RUN_COMMAND
+                 if (result["grants"]["owned_cluster"] and
+                     environment.get("microservices_ready", False))
+                 else "rc-repro up --version 8.6.1 --name first-repro --wait")
     if json_out:
-        jsonout.emit(jsonout.envelope("onboard", result))
+        jsonout.emit(jsonout.envelope(
+            "onboard", {**result, "first_run_command": first_run}))
         return
     ui.ok("✓ onboarding recorded")
     for name in sorted(onboardsvc.GRANTS):
-        key = name.replace("-", "_")
+        key = onboardsvc.grant_key(name)
         mark = "granted" if result["grants"].get(key) else "not granted"
         typer.echo(f"  {name}: {mark}")
     typer.echo(f"  retain runs: {result['preferences']['retain_runs']}")
-    ui.hint("  change any answer by running `rc-repro onboard` again")
+    ui.hint(f"  first run: {first_run}")
+    ui.hint("  change an answer with `rc-repro onboard --reconfigure`")
 
 
 skill_app = typer.Typer(help="Install the rc-repro agent skill into an agent host.")

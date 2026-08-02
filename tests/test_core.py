@@ -1584,7 +1584,153 @@ def test_missing_grant_is_a_gate_but_onboarding_is_not_reasked(tmp_path, monkeyp
     with pytest.raises(errors.AuthorityGateError) as ei:
         onboarding.require_grant("engine-resize")
     assert ei.value.code == "GATE_ENGINE_RESIZE"
-    assert "--grant engine-resize" in ei.value.as_gate()["approve_with"]
+    assert ei.value.as_gate()["approve_with"] == "rc-repro onboard"
+
+
+def test_settled_grant_denial_points_to_interactive_reconfiguration(tmp_path, monkeypatch):
+    from rc_repro import errors
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(denied_grants=["owned-cluster"])
+
+    with pytest.raises(errors.AuthorityGateError) as ei:
+        onboarding.require_grant("owned-cluster")
+
+    assert ei.value.code == "GATE_OWNED_CLUSTER"
+    assert ei.value.as_gate()["approve_with"] == "rc-repro onboard --reconfigure"
+
+
+def test_onboarding_updates_only_answers_supplied_by_this_run(tmp_path, monkeypatch):
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    first = onboarding.complete(
+        grants=["owned-cluster"], denied_grants=["engine-resize"],
+        preferences={"retain_runs": True})
+    assert first["grants"] == {"owned_cluster": True, "engine_resize": False}
+    assert all(first["answered_grants"].values())
+    second = onboarding.complete(grants=["engine-resize"])
+    assert second["grants"] == {"owned_cluster": True, "engine_resize": True}
+    assert second["preferences"]["retain_runs"] is True
+    assert second["clusters"] == ["rc-repro-local"]
+
+
+def test_interactive_onboarding_shows_facts_persists_authority_and_does_not_reask(
+        tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from rc_repro.cli import app
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding, "detect_environment", lambda: {
+        "os": "Ubuntu 24.04.4 LTS", "os_version": "24.04", "architecture": "x86_64",
+        "cpus": 4, "memory_gib": 15.6, "disk_free_gib": 75.0,
+        "tools": {"docker": "Docker 29.6.1", "compose": "Docker Compose v5.3.1",
+                  "kind": "kind v0.32.0", "kubectl": "Client Version: v1.36.1",
+                  "helm": "v3.21.3"},
+        "docker_ready": True, "engine_memory_gib": 15.6, "engine_cpus": 4,
+        "missing_kubernetes_tools": [], "microservices_ready": True,
+        "engine_resize_relevant": False,
+    })
+
+    first = CliRunner().invoke(app, ["onboard"], input="y\nn\n")
+    assert first.exit_code == 0, first.output
+    assert "Detected environment" in first.output
+    assert "create and later delete those owned resources" in first.output
+    assert "Enterprise topology" in first.output
+    assert onboarding.FIRST_RUN_COMMAND in first.output
+    saved = onboarding.state()
+    assert saved["grants"]["owned_cluster"] is True
+    assert saved["preferences"]["retain_runs"] is False
+    assert saved["answered_grants"]["engine_resize"] is False
+
+    second = CliRunner().invoke(app, ["onboard"], input="")
+    assert second.exit_code == 0, second.output
+    assert "Settled choices are unchanged" in second.output
+    assert "May rc-repro" not in second.output
+    assert onboarding.state()["grants"] == saved["grants"]
+
+
+def test_interactive_onboarding_prints_a_first_command_the_detected_machine_can_run(
+        tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from rc_repro.cli import app
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding, "detect_environment", lambda: {
+        "os": "Ubuntu 24.04.4 LTS", "os_version": "24.04", "architecture": "x86_64",
+        "cpus": 2, "memory_gib": 3.8, "disk_free_gib": 75.0,
+        "tools": {"docker": "Docker 29.6.1", "compose": "Docker Compose v5.3.1",
+                  "kind": "missing", "kubectl": "missing", "helm": "missing"},
+        "docker_ready": True, "engine_memory_gib": 3.8, "engine_cpus": 2,
+        "missing_kubernetes_tools": ["kind", "kubectl", "helm"],
+        "microservices_ready": False, "engine_resize_relevant": False,
+    })
+
+    result = CliRunner().invoke(app, ["onboard"], input="y\nn\n")
+
+    assert result.exit_code == 0, result.output
+    assert onboarding.FIRST_RUN_COMMAND not in result.output
+    assert "rc-repro up --version 8.6.1 --name first-repro --wait" in result.output
+
+
+def test_environment_detection_routes_docker_commands_through_runner(tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s, onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(onboarding, "_version_line", lambda tool, *args: f"{tool} ok")
+    monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.6.1")
+    monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version v5.3.1")
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(k8s, "engine_capacity", lambda: (15.6, 4))
+    monkeypatch.setattr(k8s, "engine_resize_supported", lambda: False)
+
+    detected = onboarding.detect_environment()
+
+    assert detected["tools"]["docker"] == "Docker version 29.6.1"
+    assert detected["tools"]["compose"] == "Docker Compose version v5.3.1"
+
+
+@pytest.mark.parametrize(
+    ("capacity", "resize_supported", "expected"),
+    [((8.0, 2), True, False), ((2.0, 4), False, False), ((2.0, 4), True, True)],
+)
+def test_environment_only_offers_resize_for_a_supported_memory_shortfall(
+        tmp_path, monkeypatch, capacity, resize_supported, expected):
+    from rc_repro import runner
+    from rc_repro.services import k8s, onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(onboarding, "_version_line", lambda tool, *args: f"{tool} ok")
+    monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.6.1")
+    monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version v5.3.1")
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(k8s, "engine_capacity", lambda: capacity)
+    monkeypatch.setattr(k8s, "engine_resize_supported", lambda: resize_supported)
+
+    assert onboarding.detect_environment()["engine_resize_relevant"] is expected
+
+
+def test_noninteractive_onboarding_needs_accept_defaults_and_explicit_cluster_grant(
+        tmp_path, monkeypatch):
+    import json as _json
+    from typer.testing import CliRunner
+    from rc_repro.cli import app
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding, "detect_environment", lambda: {})
+
+    refused = CliRunner().invoke(app, ["onboard", "--json"])
+    assert refused.exit_code == 2
+    assert "--accept-defaults" in refused.output
+
+    baseline = CliRunner().invoke(app, ["onboard", "--accept-defaults", "--json"])
+    assert baseline.exit_code == 0, baseline.output
+    assert _json.loads(baseline.stdout)["data"]["grants"]["owned_cluster"] is False
+
+    granted = CliRunner().invoke(
+        app, ["onboard", "--accept-defaults", "--grant", "owned-cluster", "--json"])
+    assert granted.exit_code == 0, granted.output
+    assert _json.loads(granted.stdout)["data"]["grants"]["owned_cluster"] is True
 
 
 def test_onboarding_is_additive_and_keeps_existing_keys(tmp_path, monkeypatch):
@@ -1633,6 +1779,14 @@ def test_capabilities_reports_onboarding_state(tmp_path, monkeypatch):
     assert cap["onboarding"]["onboard_with"] == onboarding.ONBOARD_COMMAND
     onboarding.complete(grants=["engine-resize"])
     assert jsonout.capabilities(app)["onboarding"]["completed"] is True
+
+
+def test_capabilities_bad_config_still_routes_a_human_to_interactive_onboarding(monkeypatch):
+    from rc_repro import jsonout
+    from rc_repro.services import onboarding
+    monkeypatch.setattr(onboarding, "state", lambda: (_ for _ in ()).throw(ValueError("bad")))
+
+    assert jsonout._onboarding_state()["onboard_with"] == "rc-repro onboard"
 
 
 # --- the agent skill bundle ----------------------------------------------------

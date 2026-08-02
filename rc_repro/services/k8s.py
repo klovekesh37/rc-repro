@@ -57,6 +57,7 @@ CLUSTER_NAME = "rc-repro-local"
 #: namespace that merely looks like rc-repro's is left alone.
 OWNER_LABEL = "app.kubernetes.io/managed-by=rc-repro"
 REPRO_LABEL = "rc-repro.io/repro"
+CLUSTER_OWNER_CONFIGMAP = "rc-repro-cluster-owner"
 
 #: Measured floor for the microservices topology (see the #12 findings): peak
 #: working set 3.49 GiB and ~3.5 of 4 cores during convergence. CPU is the binding
@@ -165,6 +166,9 @@ class _Runner:
 
     def which(self, tool: str) -> str | None:
         return shutil.which(tool)
+
+    def docker_server_platform(self) -> str | None:
+        return runner.docker_server_platform()
 
     def run(self, argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
         env = _client_env() if argv and argv[0] in {"kind", "kubectl", "helm"} else None
@@ -481,6 +485,46 @@ def _wait_cluster_ready(run: _Runner, ctx: str) -> subprocess.CompletedProcess:
                     "--timeout=60s", check=False)
 
 
+def _cluster_owner_manifest() -> str:
+    owner_key, owner_value = OWNER_LABEL.split("=", 1)
+    return yaml.safe_dump({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": CLUSTER_OWNER_CONFIGMAP,
+            "namespace": "kube-system",
+            "labels": {owner_key: owner_value},
+        },
+        "data": {"cluster": CLUSTER_NAME},
+    })
+
+
+def _mark_cluster_owned(ctx: str, run: _Runner) -> None:
+    """Create the in-cluster proof that permits later reuse and deletion."""
+    try:
+        result = run.apply(ctx, "kube-system", _cluster_owner_manifest())
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CreateFailedError(
+            f"cluster {CLUSTER_NAME} was created but its ownership marker could "
+            f"not be recorded: {exc}") from exc
+    if result is not None and result.returncode != 0:
+        raise CreateFailedError(
+            f"cluster {CLUSTER_NAME} was created but its ownership marker could "
+            f"not be recorded: {_failure_detail(result)}")
+
+
+def _rollback_unmarked_cluster(run: _Runner) -> str:
+    """Remove a just-created cluster that failed before ownership was provable."""
+    try:
+        result = run.run(
+            ["kind", "delete", "cluster", "--name", CLUSTER_NAME], check=False)
+    except OSError as exc:
+        return f"; rollback also failed: {exc}"
+    if result.returncode != 0:
+        return f"; rollback also failed: {_failure_detail(result)}"
+    return "; the unmarked cluster was rolled back"
+
+
 def ensure_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> str:
     """Create the rc-repro-owned cluster if it isn't there, and return its context.
 
@@ -490,6 +534,7 @@ def ensure_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> str:
     """
     run = run or _Runner()
     create_failure = ""
+    created_here = False
     # Serialise creation across concurrent `up`s. Without this, two simultaneous
     # creates both see no cluster and both run `kind create cluster`, and the second
     # fails ("node(s) already exist"). The lock makes the check-then-create atomic,
@@ -506,7 +551,9 @@ def ensure_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> str:
             state = prepare_client_state()
             res = run.run(["kind", "create", "cluster", "--name", CLUSTER_NAME,
                            "--kubeconfig", str(state.kubeconfig)], check=False)
-            if res.returncode != 0:
+            if res.returncode == 0:
+                created_here = True
+            else:
                 combined = f"{res.stdout or ''}\n{res.stderr or ''}".lower()
                 if "already exist" not in combined:
                     create_failure = _failure_detail(res)
@@ -517,14 +564,28 @@ def ensure_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> str:
                         raise CreateFailedError(
                             f"could not create the cluster {CLUSTER_NAME}: "
                             f"{create_failure}")
+                    created_here = True
     try:
         ctx = _export_kubeconfig(run)
     except CreateFailedError as exc:
+        rollback = _rollback_unmarked_cluster(run) if created_here else ""
         if create_failure:
             raise CreateFailedError(
                 f"kind create failed for {CLUSTER_NAME}: {create_failure}; "
-                f"owned-kubeconfig recovery also failed: {exc}") from exc
-        raise
+                f"owned-kubeconfig recovery also failed: {exc}{rollback}") from exc
+        raise CreateFailedError(f"{exc}{rollback}") from exc
+
+    if created_here:
+        try:
+            _mark_cluster_owned(ctx, run)
+        except CreateFailedError as exc:
+            raise CreateFailedError(
+                f"{exc}{_rollback_unmarked_cluster(run)}") from exc
+    elif not cluster_is_ours(ctx, run):
+        raise ConflictError(
+            f"a Kind cluster named {CLUSTER_NAME!r} exists without rc-repro's "
+            "ownership marker; refusing to reuse or delete it. Rename or remove "
+            "that cluster yourself, then retry.")
 
     ready = _wait_cluster_ready(run, ctx)
     if ready.returncode != 0:
@@ -1003,6 +1064,27 @@ def _resize_command(mib: int) -> str:
             f"&& podman machine start")
 
 
+def engine_resize_supported(run: _Runner | None = None) -> bool:
+    """Whether the active Docker-compatible endpoint is a running Podman machine.
+
+    Finding a separate ``podman`` binary is not enough: resizing that machine while
+    rc-repro is connected to Docker Engine would stop the wrong container runtime.
+    """
+    run = run or _Runner()
+    if not run.which("podman"):
+        return False
+    try:
+        if "podman" not in (run.docker_server_platform() or "").lower():
+            return False
+        machine_result = run.run(
+            ["podman", "machine", "inspect", "--format", "{{.State}}"],
+            check=False)
+    except OSError:
+        return False
+    return (machine_result.returncode == 0 and
+            (machine_result.stdout or "").strip().lower() == "running")
+
+
 def check_capacity(run: _Runner | None = None, emit: Emit = null_emit,
                    cfg: dict | None = None) -> None:
     """Refuse, or silently fix, an engine too small for the microservices topology.
@@ -1033,9 +1115,6 @@ def check_capacity(run: _Runner | None = None, emit: Emit = null_emit,
         shortfall.append(f"{cpus} CPUs (need {FLOOR_CPUS})")
     detail = " and ".join(shortfall)
 
-    from rc_repro.services import onboarding
-    granted = onboarding.state(cfg)["grants"].get("engine_resize")
-
     if cpus < FLOOR_CPUS:
         # CPU cannot be raised by the memory resize, and guessing a CPU count for
         # someone's machine is not rc-repro's call.
@@ -1044,22 +1123,29 @@ def check_capacity(run: _Runner | None = None, emit: Emit = null_emit,
             f"{FLOOR_MEMORY_GIB:g} GiB; this engine has {detail}. Raise the engine's "
             f"CPU allocation, or use a Compose preset instead.")
 
+    if not engine_resize_supported(run):
+        raise ValidationError(
+            f"the microservices preset needs {FLOOR_MEMORY_GIB:g} GiB; this engine "
+            f"has {detail}, but the active endpoint is not a running Podman machine "
+            "that rc-repro can resize. Raise Docker Desktop's memory, increase the "
+            "Docker host's memory, or use a Compose preset instead.")
+
+    from rc_repro.services import onboarding
+    granted = onboarding.state(cfg)["grants"].get("engine_resize")
+
     if not granted:
+        grant_command = onboarding.grant_command("engine-resize", cfg)
         raise ValidationError(
             f"the microservices preset needs {FLOOR_MEMORY_GIB:g} GiB; this engine "
             f"has {detail}. Either raise it yourself with "
             f"`{_resize_command(int(FLOOR_MEMORY_GIB * 1024))}`, or grant rc-repro "
-            f"permission to do it with `rc-repro onboard --grant engine-resize` "
+            f"permission to do it with `{grant_command}` "
             f"(note that restarting the engine stops unrelated containers).")
 
     # Granted: act, but report it as an event rather than doing it silently. The
     # grant covers the action, not hiding it.
     events.warn(emit, f"engine has {detail}; resizing it now, which restarts the "
                       f"engine and stops unrelated containers", phase="preflight")
-    if not run.which("podman"):
-        raise ValidationError(
-            "rc-repro may resize the engine, but only a Podman machine can be "
-            "resized from the CLI. Raise Docker Desktop's memory in its settings.")
     target = str(int(FLOOR_MEMORY_GIB * 1024))
     run.run(["podman", "machine", "stop"], check=False)
     run.run(["podman", "machine", "set", "--memory", target], check=False)
@@ -1203,11 +1289,24 @@ def owned_namespaces(ctx: str, run: _Runner | None = None) -> list[str]:
 def cluster_is_ours(ctx: str, run: _Runner | None = None) -> bool:
     """Whether rc-repro created this cluster, so it may be deleted.
 
-    kind names its own clusters, and an existing cluster a user opted into must never
-    be deleted, so this checks the cluster is in kind's list under rc-repro's name
-    rather than trusting the context string.
+    A fixed Kind name is not ownership: another operator can create the same name.
+    rc-repro therefore writes a marker only after it creates the cluster and requires
+    that marker before either reuse or deletion.
     """
-    return cluster_exists(run)
+    run = run or _Runner()
+    result = _kubectl(
+        run, ctx, "-n", "kube-system", "get", "configmap",
+        CLUSTER_OWNER_CONFIGMAP, "-o", "json", check=False)
+    if result.returncode != 0:
+        return False
+    try:
+        payload = json.loads(result.stdout or "")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    labels = payload.get("metadata", {}).get("labels", {})
+    owner_key, owner_value = OWNER_LABEL.split("=", 1)
+    return (labels.get(owner_key) == owner_value and
+            payload.get("data", {}).get("cluster") == CLUSTER_NAME)
 
 
 def cluster_prune_status(run: _Runner | None = None) -> dict:
@@ -1236,7 +1335,13 @@ def cluster_prune_status(run: _Runner | None = None) -> dict:
     base["exists"] = True
     if not run.which("kubectl"):
         return {**base, "reason": "kubectl is unavailable; refusing to delete the cluster"}
-    ctx = f"kind-{CLUSTER_NAME}"
+    try:
+        ctx = _export_kubeconfig(run)
+    except (CreateFailedError, OSError) as exc:
+        return {**base, "reason": f"could not inspect cluster ownership: {exc}"}
+    if not cluster_is_ours(ctx, run):
+        return {**base, "reason": "rc-repro ownership marker is absent or unreadable; "
+                                   "refusing to delete the cluster"}
     try:
         remaining = owned_namespaces(ctx, run)
     except (DockerError, OSError) as exc:

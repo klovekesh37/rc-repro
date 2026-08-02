@@ -54,7 +54,36 @@ Prefer a UI? `rc-repro serve` opens a local web dashboard for everything below
 
 ## Install
 
-**Recommended — with [pipx](https://pipx.pypa.io)** (isolated, adds `rc-repro` to your PATH):
+**Guided Ubuntu 24.04 amd64 setup** — on a clean host, these two auditable
+commands install Docker Engine and Compose, pipx, kind, kubectl, Helm, and the
+core rc-repro CLI from official signed or checksum-verified sources:
+
+```bash
+curl -fsSLO https://github.com/klovekesh37/rc-repro/releases/latest/download/rc-repro-install
+bash rc-repro-install
+```
+
+The installer inventories the host before changing packages, refuses conflicting
+Docker packages instead of removing them, runs `rc-repro doctor`, and creates no
+cluster or repro. If Linux needs a new login for Docker-group or PATH membership,
+the installer says so explicitly. In that new session, complete the interactive
+human setup:
+
+```bash
+rc-repro onboard
+```
+
+The guided bootstrap is deliberately limited to native Ubuntu 24.04 amd64. It
+stops without package changes on macOS, native Windows shells, WSL, other Linux
+releases, and other architectures. On macOS, prepare Docker Desktop and the
+Kubernetes tools separately. On Windows, prefer a Docker Desktop-backed WSL2
+environment and manage its Linux tools separately; the Ubuntu installer refuses
+WSL so it cannot install a second Docker Engine inside the distribution. These
+platforms do not yet have the same newcomer acceptance proof.
+
+**Core CLI only — with [pipx](https://pipx.pypa.io)** (isolated, adds `rc-repro`
+to your PATH). Use this when the required container and Kubernetes tools are
+already managed:
 
 ```bash
 pipx install git+https://github.com/klovekesh37/rc-repro
@@ -69,8 +98,9 @@ python -m pip install --upgrade pip     # editable installs need pip >= 21.3
 pip install -e .
 ```
 
-Then confirm your machine is ready — `doctor` checks Docker, Compose, disk,
-connectivity and ports. Fix any ✗ before continuing:
+For a core-only or virtualenv installation, confirm your separately managed
+prerequisites are ready. `doctor` checks Docker, Compose, disk, connectivity and
+ports; fix any ✗ before continuing:
 
 ```bash
 rc-repro doctor
@@ -655,7 +685,7 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `prune` | delete all `down` repros, then the empty rc-repro-owned Kind cluster (confirms first, `--yes` to skip) |
 | `evidence` | a secret-safe, backend-neutral record of what was deployed and how it is behaving; `--bundle <dir>` also writes logs and the rendered artifact |
 | `capabilities` | what this build can do (contract version, commands, phases, error/exit codes, presets, topologies); the discovery call an agent reads first |
-| `onboard` | answer setup once (engine-resize consent, retention default); needed before the Kubernetes preset, `--accept-defaults` for scripts |
+| `onboard` | inspect the machine and answer owned-cluster, conditional engine-resize, and retention questions once; `--accept-defaults` is for non-interactive automation |
 | `skill install` / `skill status` | install the versioned rc-repro agent skill into an agent host (`claude`, `codex`; Cursor and Copilot read those) |
 
 Run `rc-repro <command> --help` for flags.
@@ -671,10 +701,12 @@ chart on a local `kind` cluster, with the same create, readiness, inspect, evide
 and teardown lifecycle as every other repro:
 
 ```bash
-rc-repro onboard --accept-defaults          # once per machine
-rc-repro up --preset microservices --version 8.6.1
-rc-repro info --name <name>                 # URL, pods, port-forward state
-rc-repro down --name <name> --volumes --yes
+rc-repro onboard                            # interactive, once per machine
+rc-repro up --preset microservices --version 8.6.1 --name first-repro --wait
+rc-repro info --name first-repro            # URL, pods, port-forward state
+rc-repro evidence --name first-repro --json
+# Open the URL reported by `info`, then reproduce the behaviour.
+rc-repro down --name first-repro --volumes --yes
 rc-repro prune --yes                        # optional: reclaim the empty shared cluster
 ```
 
@@ -718,10 +750,12 @@ without scraping human output or importing internals.
   `2` usage, `3` preflight, `4` not found, `5` not ready (may poll), `6` a human
   authority gate (stop and ask), `7` create failed (known dead, stop), `8` conflict.
   Each error also carries a stable `code`.
-- **Authority.** One-time `onboard` persists consent (for example, resizing the
-  container engine for the Kubernetes preset). An un-onboarded agent hitting the
-  Kubernetes path gets exit `6` with the exact command to ask a human to run, rather
-  than inventing a baseline.
+- **Authority.** One-time interactive `onboard` persists permission to create and
+  later delete the owned local cluster and, only when relevant, to resize the
+  container engine. An un-onboarded agent hitting the Kubernetes path gets exit `6`
+  with the exact command to ask a human to run, rather than inventing a baseline.
+  Automation may use `--accept-defaults`, but must supply every authority it needs
+  explicitly with repeatable `--grant` flags.
 - **The skill.** `rc-repro skill install` drops the versioned agent skill into an
   agent host, so the skill always matches the rc-repro you are running.
 
