@@ -756,7 +756,10 @@ rc-repro down --name first-repro --volumes --yes
 
 rc-repro never changes the bind address, opens a firewall, or creates public ingress
 for this handoff. Override the suggested host/user with `RC_REPRO_SSH_HOST` and
-`RC_REPRO_SSH_USER` if the defaults are wrong.
+`RC_REPRO_SSH_USER` if the defaults are wrong. If the suggested port is already in
+use on your laptop, set `RC_REPRO_SSH_LOCAL_PORT` on the remote command before
+running `up` or `info` again; the returned command and browser URL will use that
+client-side port while preserving the repro's remote port.
 
 ## Agent & JSON interface
 

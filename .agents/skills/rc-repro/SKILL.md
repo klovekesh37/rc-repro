@@ -71,7 +71,10 @@ After the work is done:
 1. Read `capabilities` and take `onboarding.preferences.retain_runs`.
    - Missing, false, or any non-boolean value means **teardown**.
    - Only the boolean `true` means the human persisted a retain preference.
-2. Capture evidence: `rc-repro evidence --name <name> --json`.
+2. Capture evidence:
+   - Normal or persisted-preference run: `rc-repro evidence --name <name> --json`.
+   - Explicit task retention: add `--retain-for-task` so the evidence records
+     the task's retention decision truthfully.
 3. Unless the task explicitly requires keeping the repro **or**
    `retain_runs` is true:
    - `rc-repro down --name <name> --volumes --yes --json`

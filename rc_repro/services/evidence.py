@@ -25,6 +25,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from rc_repro import runner
+from rc_repro.errors import ValidationError
 from rc_repro.services import lifecycle
 
 #: The rendered deployment artifact, whichever topology produced it. Evidence
@@ -121,12 +122,12 @@ def resolve_retention(*, retained: bool | None = None,
     pref_retain = pref_raw is True  # malformed/missing => False
 
     if retained is True:
-        # Unknown freeform reasons collapse to explicit task so the closed set
-        # of reasons cannot grow through caller prose.
         why = (reason or "").strip() or ("persisted preference" if pref_retain
                                          else "explicit task")
         if why not in _RETAIN_REASONS:
-            why = "explicit task"
+            raise ValidationError(
+                "retained evidence reason must be 'persisted preference' or "
+                "'explicit task'")
         return {"retained": True, "reason": why}
     if retained is False:
         return {"retained": False, "reason": None}

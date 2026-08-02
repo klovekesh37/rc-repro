@@ -608,6 +608,7 @@ async function submitCreate() {
     preset: f.preset.value,
     port: f.port.value ? parseInt(f.port.value, 10) : 0,
     monitor: f.monitor.checked, seed: f.seed.checked, wait: f.wait.checked,
+    seed_profile: f.seed_profile.value,
     params: {},
   };
   if (!req.version) { toast("version is required"); return; }

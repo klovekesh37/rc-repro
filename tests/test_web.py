@@ -24,6 +24,16 @@ def client(host="http://localhost"):
     return TestClient(create_app(token=TOKEN), base_url=host)
 
 
+def wait_job(c, job_id: str):
+    import time
+    for _ in range(100):
+        state = c.get(f"/api/jobs/{job_id}", headers=H).json()
+        if state["status"] != "running":
+            return state
+        time.sleep(0.02)
+    raise AssertionError(f"job {job_id} did not finish: {state}")
+
+
 def test_health_needs_no_token():
     r = client().get("/api/health")
     assert r.status_code == 200 and "docker" in r.json()
@@ -244,6 +254,52 @@ def test_gui_creates_a_kubernetes_repro_through_the_job(tmp_path, monkeypatch):
     assert st["result"]["namespace"] == "rc-repro-gui1"
 
 
+def test_gui_k8s_create_consumes_env_registration_token_without_exposure(
+        tmp_path, monkeypatch):
+    c, _ = _k8s_client(tmp_path, monkeypatch)
+    secret = "GUI-SECRET-MUST-NOT-PRINT"
+    monkeypatch.setenv("RC_REPRO_REG_TOKEN", secret)
+
+    response = c.post("/api/repros", headers=H, json={
+        "version": "8.6.1", "preset": "microservices",
+        "name": "gui-token", "port": 33010,
+    })
+    state = wait_job(c, response.json()["job_id"])
+
+    assert state["status"] == "done", state.get("error")
+    assert state["result"]["reg_token_supplied"] is True
+    assert secret not in str(state)
+
+
+def test_gui_k8s_create_and_seed_preserves_profile_once(tmp_path, monkeypatch):
+    c, _ = _k8s_client(tmp_path, monkeypatch)
+    seen = []
+    monkeypatch.setattr(lc, "wait_and_finalize",
+                        lambda meta, emit=None: {"booted_s": 1, "running_version": "8.6.1"})
+    monkeypatch.setattr(lc, "run_seed_inline",
+                        lambda meta, profile, stats, emit: seen.append(
+                            (profile, stats)) or {"users": 3})
+
+    response = c.post("/api/repros", headers=H, json={
+        "version": "8.6.1", "preset": "microservices", "name": "gui-seed",
+        "port": 33011, "seed": True, "seed_profile": "large",
+    })
+    state = wait_job(c, response.json()["job_id"])
+
+    assert state["status"] == "done", state.get("error")
+    assert seen == [("large", False)]
+    assert state["result"]["seed"] == {"users": 3}
+
+
+def test_browser_create_form_sends_the_selected_seed_profile():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "rc_repro" / "data" / "webui"
+    html = (root / "index.html").read_text(encoding="utf-8")
+    script = (root / "app.js").read_text(encoding="utf-8")
+    assert 'select name="seed_profile"' in html
+    assert "seed_profile: f.seed_profile.value" in script
+
+
 def test_gui_detail_reads_kubernetes_state(tmp_path, monkeypatch):
     from rc_repro.services import k8s
     c, _ = _k8s_client(tmp_path, monkeypatch)
@@ -278,3 +334,26 @@ def test_gui_stats_refuses_kubernetes_rather_than_reporting_zeros(tmp_path, monk
     k8s.create_repro("gui4", "8.6.1", offline=True, port=33004, run=k8s._Runner())
     r = c.get("/api/repros/gui4/stats", headers=H)
     assert r.status_code == 400          # ValidationError -> 400 via the error handler
+
+
+def test_gui_seed_jobs_refuse_every_compose_only_k8s_mode(tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    c, _ = _k8s_client(tmp_path, monkeypatch)
+    k8s.create_repro("gui-guards", "8.6.1", offline=True, port=33012,
+                     run=k8s._Runner())
+    def unexpected_reconcile(name):
+        raise AssertionError(f"validation must precede port-forward repair: {name}")
+
+    monkeypatch.setattr(lc, "ensure_reachable", unexpected_reconcile)
+
+    requests = [
+        c.post("/api/repros/gui-guards/seed", headers=H, json={"stats": True}),
+        c.post("/api/repros/gui-guards/scale", headers=H,
+               json={"scale": "users=5"}),
+        c.delete("/api/repros/gui-guards/scale", headers=H),
+    ]
+    states = [wait_job(c, response.json()["job_id"]) for response in requests]
+
+    assert all(state["status"] == "error" for state in states)
+    assert all(state["error_kind"] == "ValidationError" for state in states)
+    assert all("kubernetes" in (state["error"] or "").lower() for state in states)

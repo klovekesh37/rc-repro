@@ -205,6 +205,8 @@ _COMPOSE_ONLY_FLAGS: dict[str, str] = {
              "different failure. Pick another --name, or `down` the existing repro.",
     "monitor": "attaches the Prometheus/Grafana compose sidecars on fixed host ports; "
                "nothing renders them into a cluster yet.",
+    "stats": "reads container resources through the compose project; the Kubernetes "
+             "equivalent needs metrics-server.",
 }
 
 
@@ -549,12 +551,12 @@ def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit
     monitor starts or seed mutation occurs.
     """
     from rc_repro import perf
-    ensure_reachable(meta.name)
     if stats and _is_kubernetes(meta):
         raise ValidationError(
             "--stats / seed resource statistics are not supported on the "
             "Kubernetes topology: they require the Compose resource monitor. "
             "Use the ordinary REST seed without --stats.")
+    ensure_reachable(meta.name)
     try:
         auth = login(meta)
     except Exception as exc:  # noqa: BLE001

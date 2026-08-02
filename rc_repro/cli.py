@@ -227,7 +227,7 @@ def up(
         bind=bind, rc_image=rc_image, mongo=mongo, reg_token=reg_token,
         params=_parse_set_params(set_), seed=False, pin=pin,
         wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
-        force=force, monitor=monitor,
+        force=force, monitor=monitor, stats=stats if seed else False,
     )
     if json_out:
         writer = jsonout.EventWriter()
@@ -239,7 +239,7 @@ def up(
             # Seed through the same writer so its progress is part of one stream,
             # rather than a second burst after the envelope.
             summary = _run_seed(runner.read_meta(result["name"]), seed_profile,
-                                stats=False, emit=writer.emit)
+                                stats=stats, emit=writer.emit)
             if summary:
                 result = {**result, "seed": summary}
         jsonout.emit(jsonout.envelope("up", result))
@@ -268,13 +268,19 @@ def _run_seed(meta: runner.Metadata, profile: str,
     JSON, HTTP, and GUI cannot diverge. Custom user/channel/message overrides
     remain a CLI convenience on the same REST seeder.
     """
-    # Revive a dead Kubernetes port-forward before any HTTP call.
-    lcsvc.ensure_reachable(meta.name)
     if stats:
-        lcsvc.require_compose_topology(
-            meta.name, "seed --stats",
-            why="It reads container stats from the compose project; the "
-                "Kubernetes equivalent needs metrics-server.")
+        try:
+            lcsvc.require_compose_topology(
+                meta.name, "seed --stats",
+                why="It reads container stats from the compose project; the "
+                    "Kubernetes equivalent needs metrics-server.")
+        except errors.ReproError as exc:
+            if emit is not None:
+                raise
+            _fail(exc)
+    # Revive a dead Kubernetes port-forward only after validating modes that
+    # must refuse without changing runtime state.
+    lcsvc.ensure_reachable(meta.name)
     # Default profile with no overrides: one shared lifecycle path.
     if users is None and channels is None and messages is None:
         try:
@@ -678,6 +684,7 @@ def info(
     target = _resolve_name(name)
     m = runner.read_meta(target)
     _summary_panel(m)
+    _print_access(lcsvc.describe(target))
     ui.hint(f"  api  : rc-repro api --name {m.name} GET /api/v1/me")
     ui.hint(f"  curl : {m.root_url}/api/info")
     _print_notes(m)
@@ -797,8 +804,19 @@ def seed_cmd(
     are Compose-only; ordinary REST seed works on Compose and Kubernetes.
     """
     _target = _resolve_name(name)
-    # Kubernetes reachability is a port-forward that may have died; revive it before
-    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    # Refuse Compose-only modes before reviving a Kubernetes port-forward. The
+    # service layer repeats these guards for HTTP/GUI and direct callers.
+    try:
+        if clear_scale:
+            lcsvc.require_compose_topology(_target, "clear-scale")
+        elif scale:
+            lcsvc.require_compose_topology(_target, "scale")
+        elif stats:
+            lcsvc.require_compose_topology(_target, "seed --stats")
+    except errors.ReproError as exc:
+        _fail(exc)
+    # Kubernetes reachability is a port-forward that may have died; revive it
+    # only for an operation supported by this topology.
     lcsvc.ensure_reachable(_target)
     m = runner.read_meta(_target)
     if clear_scale:
@@ -1960,6 +1978,9 @@ def skill_status(
 def evidence(
     name: str = typer.Option("", "--name", "-n"),
     bundle: str = typer.Option("", "--bundle", help="also write logs and the rendered artifact to this directory"),
+    retain_for_task: bool = typer.Option(
+        False, "--retain-for-task",
+        help="record that the current task explicitly requires retaining this repro"),
     json_out: bool = typer.Option(True, "--json/--no-json", help="the record is JSON; --no-json prints a summary"),
 ) -> None:
     """Emit a secret-safe record of what was deployed and how it is behaving.
@@ -1968,7 +1989,11 @@ def evidence(
     token, licence, or password appears anywhere.
     """
     try:
-        payload = evidencesvc.record(name)
+        payload = evidencesvc.record(
+            name,
+            retained=True if retain_for_task else None,
+            reason="explicit task" if retain_for_task else None,
+        )
         if bundle:
             payload["bundle"] = evidencesvc.write_bundle(payload["repro"]["name"],
                                                          bundle, payload)
@@ -1981,6 +2006,9 @@ def evidence(
     typer.echo(f"{r['name']}  {r['rc_version']}  {r['topology']}  {payload['runtime']['state']}")
     typer.echo(f"  artifact  {payload['artifact']['name']} sha256:{payload['artifact']['sha256'][:12]}")
     typer.echo(f"  licensed  required={payload['license']['required']} supplied={payload['license']['supplied']}")
+    typer.echo(f"  retained  {payload['retention']['retained']}"
+               + (f" ({payload['retention']['reason']})"
+                  if payload['retention']['reason'] else ""))
     typer.echo(f"  cleanup   {payload['retention']['cleanup']}")
 
 
