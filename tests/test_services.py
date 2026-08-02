@@ -1427,6 +1427,29 @@ def test_doctor_json_is_an_envelope_and_exits_3_when_not_ready(tmp_path, monkeyp
     assert res.exit_code == 3            # preflight, so an agent stops before `up`
 
 
+@pytest.mark.parametrize(("version", "status", "message"), [
+    ("2.40.3", "ok", "docker compose v2 (2.40.3)"),
+    ("v5.3.0", "ok", "docker compose v5 (v5.3.0)"),
+    ("1.29.2", "warn", "rc-repro expects Compose v2 or v5"),
+])
+def test_doctor_accepts_supported_compose_cli_majors(
+        tmp_path, monkeypatch, version, status, message):
+    import json as _j
+    from typer.testing import CliRunner
+    from rc_repro import cli
+    from rc_repro.cli import app
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli.runner, "docker_available", lambda: False)
+    monkeypatch.setattr(cli.runner, "compose_version", lambda: version)
+
+    res = CliRunner().invoke(app, ["doctor", "--json"])
+    payload = _j.loads(res.stdout)
+    compose_check = next(c for c in payload["data"]["checks"]
+                         if c["check"] == "compose-version")
+    assert compose_check["status"] == status
+    assert message in compose_check["message"]
+
+
 def test_doctor_reports_unwritable_k8s_client_state_without_a_traceback(tmp_path, monkeypatch):
     import json as _j
     from types import SimpleNamespace

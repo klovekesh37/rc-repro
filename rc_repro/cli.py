@@ -1929,14 +1929,20 @@ def doctor(
     else:
         line("fail", "Docker daemon not running — start Docker Desktop / dockerd", "docker-daemon")
 
-    # docker compose v2
+    # Compose v2 and v5 are the supported CLIs. v5 deliberately keeps the v2
+    # command surface and Compose Specification; its new major identifies the
+    # official Go SDK rather than a breaking CLI/file-format generation.
     cv = runner.compose_version()
-    if cv and cv.lstrip("v")[:1] == "2":
-        line("ok", f"docker compose v2 ({cv})")
+    compose_match = re.match(r"v?(\d+)(?:\.|$)", (cv or "").strip())
+    compose_major = int(compose_match.group(1)) if compose_match else None
+    if compose_major in {2, 5}:
+        line("ok", f"docker compose v{compose_major} ({cv})", "compose-version")
     elif cv:
-        line("warn", f"docker compose {cv} — rc-repro expects Compose v2")
+        line("warn", f"docker compose {cv} — rc-repro expects Compose v2 or v5",
+             "compose-version")
     else:
-        line("warn", "couldn't detect `docker compose` — install Compose v2")
+        line("warn", "couldn't detect `docker compose` — install Compose v2 or v5",
+             "compose-version")
 
     # Engine/VM kernel vs Mongo 8 (SERVER-121912): mongod 8.0 hard-exits on
     # kernel >= 6.19, which recent RC versions require. Common on fresh Podman /

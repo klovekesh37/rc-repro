@@ -32,7 +32,7 @@ Prefer a UI? `rc-repro serve` opens a local web dashboard for everything below
 
 ## Prerequisites
 
-- **Docker Desktop** (or Docker Engine) with `docker compose` v2 — **must be running**.
+- **Docker Desktop** (or Docker Engine) with `docker compose` v2 or v5 — **must be running**.
 - **Python 3.11+**.
 - Internet access (to pull images and look up version compatibility).
 
