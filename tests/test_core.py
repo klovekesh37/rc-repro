@@ -8,6 +8,8 @@ building — the parts that don't touch Docker or the network.
 from __future__ import annotations
 
 import json
+import os
+import stat
 
 import pytest
 
@@ -570,6 +572,53 @@ def test_env_values_never_persisted_to_config_file(tmp_path, monkeypatch):
     assert "SECRET" not in config.config_file().read_text()
     # ...while readers still see the env value
     assert config.load_config()["reg_token"] == "SECRET"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_config_file_is_owner_only(tmp_path, monkeypatch):
+    # config.yaml can hold reg_token (a Cloud registration token applying an EE
+    # license), so the default umask's 0644 would expose it to every local user.
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    config.save_config({"reg_token": "SECRET"})
+    assert stat.S_IMODE(config.config_file().stat().st_mode) == 0o600
+    assert stat.S_IMODE(config.home().stat().st_mode) == 0o700
+    # no temp file left behind
+    assert not config.config_file().with_name("config.yaml.tmp").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_config_file_permissions_tightened_on_rewrite(tmp_path, monkeypatch):
+    # A file written by an older rc-repro is already 0644; saving must fix it
+    # rather than preserve the loose mode. Unknown keys must survive too.
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    config.home().mkdir(parents=True)
+    config.config_file().write_text(
+        "default_repro: old\ncustom_team_key: keep-me\n",
+        encoding="utf-8",
+    )
+    os.chmod(config.config_file(), 0o644)
+    raw = config.load_config(with_env=False)
+    raw["default_repro"] = "new"
+    config.save_config(raw)
+    assert stat.S_IMODE(config.config_file().stat().st_mode) == 0o600
+    reloaded = config.load_config(with_env=False)
+    assert reloaded["default_repro"] == "new"
+    assert reloaded["custom_team_key"] == "keep-me"
+
+
+def test_config_save_survives_chmod_failure(tmp_path, monkeypatch):
+    # Explicit boundary for Windows / filesystems without POSIX mode bits:
+    # chmod may fail, but the write is still the user's intent.
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    def boom(_path, _mode):
+        raise OSError("permission bits unsupported")
+
+    monkeypatch.setattr(config.os, "chmod", boom)
+    config.save_config({"default_repro": "ok"})
+    assert config.config_file().read_text(encoding="utf-8")
+    assert config.load_config(with_env=False)["default_repro"] == "ok"
+    assert not config.config_file().with_name("config.yaml.tmp").exists()
 
 
 def test_version_single_source():
