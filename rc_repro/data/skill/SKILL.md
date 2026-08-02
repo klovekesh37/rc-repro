@@ -70,6 +70,9 @@ rc-repro down --name <name> --volumes --yes --json
 
 Tear down by default. Keeping a repro costs disk and leaves state behind, so retain
 one only when asked, and when you do, report the exact command that removes it.
+The Kubernetes preset's shared Kind cluster deliberately stays warm after `down`.
+Use `rc-repro prune --yes` only when the task also calls for reclaiming that empty
+cluster; it refuses while an rc-repro-owned namespace remains.
 
 ## Things that will bite you
 

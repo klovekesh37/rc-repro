@@ -652,7 +652,7 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `presets` | list available presets |
 | `versions <X.Y.Z>` | show the resolved MongoDB pairing (without launching) |
 | `doctor` | preflight checks (Docker, Compose, engine kernel, Hub auth, disk, ports, connectivity; `--json` for the machine-readable record) |
-| `prune` | delete all `down` repros (confirms first, `--yes` to skip) |
+| `prune` | delete all `down` repros, then the empty rc-repro-owned Kind cluster (confirms first, `--yes` to skip) |
 | `evidence` | a secret-safe, backend-neutral record of what was deployed and how it is behaving; `--bundle <dir>` also writes logs and the rendered artifact |
 | `capabilities` | what this build can do (contract version, commands, phases, error/exit codes, presets, topologies); the discovery call an agent reads first |
 | `onboard` | answer setup once (engine-resize consent, retention default); needed before the Kubernetes preset, `--accept-defaults` for scripts |
@@ -675,6 +675,7 @@ rc-repro onboard --accept-defaults          # once per machine
 rc-repro up --preset microservices --version 8.6.1
 rc-repro info --name <name>                 # URL, pods, port-forward state
 rc-repro down --name <name> --volumes --yes
+rc-repro prune --yes                        # optional: reclaim the empty shared cluster
 ```
 
 Needs `kind`, `kubectl` and `helm` on `PATH`. rc-repro owns one local cluster
@@ -687,6 +688,10 @@ MongoDB is always external (a single-node replica set from the official
 image, since the chart's bundled MongoDB is amd64-only and its default tag predates
 what recent Rocket.Chat requires). Reachability is a `kubectl port-forward`, so
 `root_url` behaves exactly as on Docker.
+
+Per-repro `down` deliberately keeps the shared cluster warm for later runs. `prune`
+deletes it only after proving that no rc-repro-owned namespace remains; an
+unreachable cluster or failed ownership query is retained rather than guessed safe.
 
 Measured floor: **6 GiB memory and 4 CPUs** (8 recommended); CPU is the binding
 constraint during start-up. `rc-repro doctor` reports whether the toolchain and the

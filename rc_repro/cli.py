@@ -518,18 +518,25 @@ def monitor(
 def prune(
     yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt (for scripts/CI)"),
 ) -> None:
-    """Delete every `down` repro — INCLUDING its data volume and record. Skips pinned and running ones."""
+    """Delete every `down` repro and an empty rc-repro-owned Kind cluster."""
     try:
-        targets = lcsvc.prunable()
+        plan = lcsvc.prune_plan()
     except errors.ReproError as exc:
         _fail(exc)
-    if not targets:
+    targets = plan["targets"]
+    cluster = plan["cluster"]
+    if not targets and not cluster.get("prunable"):
         typer.echo("Nothing to prune.")
         return
     if not yes:
-        typer.echo("These down repros will be deleted — containers, data volumes, and records:")
-        for t in targets:
-            typer.echo(f"  - {t}")
+        if targets:
+            typer.echo("These down repros will be deleted — containers, data volumes, and records:")
+            for t in targets:
+                typer.echo(f"  - {t}")
+        if cluster.get("prunable"):
+            typer.echo(f"The empty rc-repro-owned Kind cluster {cluster['cluster']!r} will also be deleted.")
+        elif cluster.get("exists") and targets:
+            typer.echo(f"The rc-repro-owned Kind cluster {cluster['cluster']!r} will also be deleted if these are its last namespaces.")
         typer.confirm("Continue?", abort=True)
     try:
         res = lcsvc.prune(confirm=True, emit=_cli_emit)
@@ -537,7 +544,9 @@ def prune(
         _fail(exc)
     if res["removed"]:
         ui.ok(f"✓ pruned {len(res['removed'])}: {', '.join(res['removed'])}")
-    else:
+    if res["cluster"].get("deleted"):
+        ui.ok(f"✓ deleted empty Kind cluster {res['cluster']['cluster']!r}")
+    elif not res["removed"]:
         typer.echo("Nothing to prune.")
 
 

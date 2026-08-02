@@ -1193,6 +1193,10 @@ def owned_namespaces(ctx: str, run: _Runner | None = None) -> list[str]:
     run = run or _Runner()
     res = _kubectl(run, ctx, "get", "namespaces", "-l", OWNER_LABEL,
                    "-o", "jsonpath={range .items[*]}{.metadata.name} ", check=False)
+    if res.returncode != 0:
+        raise DockerError(
+            f"could not verify whether cluster {CLUSTER_NAME} still has rc-repro "
+            f"namespaces; refusing to delete it: {_failure_detail(res)}")
     return sorted((res.stdout or "").split())
 
 
@@ -1206,6 +1210,42 @@ def cluster_is_ours(ctx: str, run: _Runner | None = None) -> bool:
     return cluster_exists(run)
 
 
+def cluster_prune_status(run: _Runner | None = None) -> dict:
+    """Describe whether the shared owned cluster can be deleted safely.
+
+    Absence and ambiguity are different. A missing cluster is simply not a prune
+    target; an existing cluster whose namespaces cannot be enumerated must be retained.
+    That distinction prevents an API or kubeconfig failure from becoming permission to
+    destroy a cluster.
+    """
+    run = run or _Runner()
+    base = {"cluster": CLUSTER_NAME, "exists": False, "prunable": False,
+            "namespaces": []}
+    if not run.which("kind"):
+        return {**base, "reason": "kind is unavailable; cluster state was not inspected"}
+    try:
+        clusters = run.run(["kind", "get", "clusters"], check=False)
+    except OSError as exc:
+        return {**base, "reason": f"could not inspect kind clusters: {exc}"}
+    if clusters.returncode != 0:
+        return {**base, "reason": "could not inspect kind clusters: " +
+                _failure_detail(clusters)}
+    if CLUSTER_NAME not in (clusters.stdout or "").split():
+        return {**base, "reason": "no rc-repro-owned cluster"}
+
+    base["exists"] = True
+    if not run.which("kubectl"):
+        return {**base, "reason": "kubectl is unavailable; refusing to delete the cluster"}
+    ctx = f"kind-{CLUSTER_NAME}"
+    try:
+        remaining = owned_namespaces(ctx, run)
+    except (DockerError, OSError) as exc:
+        return {**base, "reason": str(exc)}
+    if remaining:
+        return {**base, "namespaces": remaining, "reason": "repros still present"}
+    return {**base, "prunable": True, "reason": "empty rc-repro-owned cluster"}
+
+
 def prune_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> dict:
     """Delete the rc-repro-owned cluster once no owned namespaces remain.
 
@@ -1214,17 +1254,26 @@ def prune_cluster(emit: Emit = null_emit, run: _Runner | None = None) -> dict:
     running repros with it.
     """
     run = run or _Runner()
-    ctx = f"kind-{CLUSTER_NAME}"
-    if not cluster_is_ours(ctx, run):
-        return {"deleted": False, "reason": "no rc-repro-owned cluster"}
-    remaining = owned_namespaces(ctx, run)
-    if remaining:
-        return {"deleted": False, "reason": "repros still present",
-                "namespaces": remaining}
+    status = cluster_prune_status(run)
+    if not status["prunable"]:
+        return {**status, "deleted": False}
     events.info(emit, f"deleting the empty cluster {CLUSTER_NAME}", phase="teardown")
-    # kind's delete is idempotent by design, so no pre-existence check is needed.
-    run.run(["kind", "delete", "cluster", "--name", CLUSTER_NAME], check=False)
-    return {"deleted": True, "cluster": CLUSTER_NAME}
+    res = run.run(["kind", "delete", "cluster", "--name", CLUSTER_NAME], check=False)
+    if res.returncode != 0:
+        raise DockerError("could not delete the empty rc-repro cluster: " +
+                          _failure_detail(res))
+    try:
+        verify = run.run(["kind", "get", "clusters"], check=False)
+    except OSError as exc:
+        raise DockerError(f"could not verify cluster deletion: {exc}") from exc
+    if verify.returncode != 0:
+        raise DockerError("could not verify cluster deletion: " +
+                          _failure_detail(verify))
+    if CLUSTER_NAME in (verify.stdout or "").split():
+        raise DockerError("kind reported successful deletion but the rc-repro cluster "
+                          "is still present")
+    return {**status, "exists": False, "prunable": False, "deleted": True,
+            "reason": "deleted"}
 
 
 def collect_logs(name: str, run: _Runner | None = None,

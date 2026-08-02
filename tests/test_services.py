@@ -276,6 +276,8 @@ class _FakeRun:
         out = ""
         if argv[:3] == ["kind", "get", "clusters"]:
             out = self.clusters
+        elif argv[:3] == ["kind", "delete", "cluster"]:
+            self.clusters = ""
         elif "config" in argv and "current-context" in argv:
             out = "kind-rc-repro-local"
         elif argv[:2] == ["docker", "info"]:
@@ -1050,6 +1052,47 @@ def test_k8s_prune_does_nothing_without_an_owned_cluster():
     assert out["deleted"] is False and "no rc-repro-owned cluster" in out["reason"]
 
 
+def test_k8s_prune_refuses_when_namespace_state_is_ambiguous():
+    from rc_repro.services import k8s
+
+    class NamespaceQueryFails(_FakeRun):
+        def __init__(self):
+            super().__init__(clusters=k8s.CLUSTER_NAME)
+
+        def run(self, argv, *, check=True):
+            import subprocess
+            if "namespaces" in argv and "-l" in argv:
+                self.calls.append(argv)
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "the owned kubeconfig is unreadable")
+            return super().run(argv, check=check)
+
+    fake = NamespaceQueryFails()
+    out = k8s.prune_cluster(run=fake)
+    assert out["deleted"] is False and out["exists"] is True
+    assert "refusing to delete" in out["reason"]
+    assert not any(c[:3] == ["kind", "delete", "cluster"] for c in fake.calls)
+
+
+def test_k8s_prune_does_not_claim_a_failed_delete_succeeded():
+    from rc_repro.services import k8s
+
+    class DeleteFails(_FakeRun):
+        def __init__(self):
+            super().__init__(clusters=k8s.CLUSTER_NAME)
+
+        def run(self, argv, *, check=True):
+            import subprocess
+            if argv[:3] == ["kind", "delete", "cluster"]:
+                self.calls.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", "docker refused removal")
+            return super().run(argv, check=check)
+
+    with pytest.raises(errors.DockerError) as exc:
+        k8s.prune_cluster(run=DeleteFails())
+    assert "docker refused removal" in str(exc.value)
+
+
 def test_evidence_bundle_captures_one_log_file_per_pod(tmp_path, monkeypatch):
     # One file per pod, not one concatenated log: nine interleaved components are
     # unreadable, and the failing one is what a reader wants.
@@ -1579,11 +1622,56 @@ def test_prune_dispatches_kubernetes_teardown_not_compose(tmp_path, monkeypatch)
     monkeypatch.setattr(k8s, "teardown",
                         lambda name, volumes=False, emit=None: torn.setdefault("name", name)
                         or {"removed": [f"namespace/rc-repro-{name}"], "residual": []})
+    monkeypatch.setattr(k8s, "cluster_prune_status", lambda: {
+        "cluster": k8s.CLUSTER_NAME, "exists": True, "prunable": False,
+        "namespaces": ["rc-repro-pr"], "reason": "repros still present"})
+    monkeypatch.setattr(k8s, "prune_cluster", lambda emit=None: {
+        "cluster": k8s.CLUSTER_NAME, "exists": False, "prunable": False,
+        "namespaces": [], "reason": "deleted", "deleted": True})
     # runner.down must NOT be called for a k8s repro
     monkeypatch.setattr(runner, "down", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("runner.down called on a Kubernetes repro")))
     out = lc.prune(confirm=True)
     assert torn["name"] == "pr" and out["removed"] == ["pr"]
+    assert out["cluster"]["deleted"] is True
+
+
+def test_prune_reaches_an_empty_cluster_after_all_records_are_gone(monkeypatch):
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+
+    state = {"cluster": k8s.CLUSTER_NAME, "exists": True, "prunable": True,
+             "namespaces": [], "reason": "empty rc-repro-owned cluster"}
+    monkeypatch.setattr(lc, "prunable", lambda: [])
+    monkeypatch.setattr(k8s, "cluster_prune_status", lambda: state)
+    deleted = {**state, "exists": False, "prunable": False,
+               "reason": "deleted", "deleted": True}
+    monkeypatch.setattr(k8s, "prune_cluster", lambda emit=None: deleted)
+
+    with pytest.raises(errors.ValidationError):
+        lc.prune(confirm=False)
+    out = lc.prune(confirm=True)
+    assert out["targets"] == [] and out["removed"] == []
+    assert out["cluster"]["deleted"] is True
+
+
+def test_prune_cli_reports_empty_cluster_cleanup(monkeypatch):
+    from typer.testing import CliRunner
+    from rc_repro import cli
+    from rc_repro.services import k8s
+
+    state = {"cluster": k8s.CLUSTER_NAME, "exists": True, "prunable": True,
+             "namespaces": [], "reason": "empty rc-repro-owned cluster"}
+    monkeypatch.setattr(cli.lcsvc, "prune_plan", lambda: {
+        "targets": [], "cluster": state})
+    monkeypatch.setattr(cli.lcsvc, "prune", lambda confirm=False, emit=None: {
+        "targets": [], "removed": [], "cluster": {
+            **state, "exists": False, "prunable": False,
+            "reason": "deleted", "deleted": True}})
+
+    res = CliRunner().invoke(cli.app, ["prune", "--yes"])
+    assert res.exit_code == 0
+    assert "deleted empty Kind cluster 'rc-repro-local'" in res.stdout
 
 
 def test_stale_forwards_reports_a_dead_tunnel_not_a_stranger(tmp_path, monkeypatch):

@@ -452,8 +452,13 @@ async function showLogs(name) {
   catch (e) { $("#job-log").textContent = "error: " + e.message; }
 }
 async function doPrune() {
-  if (!confirm("Delete every 'down' repro, including data volumes and records?")) return;
-  try { const r = await api("/api/prune", { method: "POST", body: JSON.stringify({ confirm: true }) }); toast(`pruned ${r.removed.length}`); loadRepros(); }
+  if (!confirm("Delete every 'down' repro, including data volumes and records, plus the empty rc-repro-owned Kind cluster?")) return;
+  try {
+    const r = await api("/api/prune", { method: "POST", body: JSON.stringify({ confirm: true }) });
+    const cluster = r.cluster?.deleted ? ", deleted empty Kind cluster" : "";
+    toast(`pruned ${r.removed.length}${cluster}`);
+    loadRepros();
+  }
   catch (e) { toast(e.message); }
 }
 

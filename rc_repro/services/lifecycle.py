@@ -780,12 +780,24 @@ def prunable() -> list[str]:
     return out
 
 
+def prune_plan() -> dict:
+    """Return the records and shared cluster that an explicit prune may remove."""
+    from rc_repro.services import k8s
+    return {"targets": prunable(), "cluster": k8s.cluster_prune_status()}
+
+
 def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
-    targets = prunable()
-    if not targets:
-        return {"targets": [], "removed": []}
+    from rc_repro.services import k8s
+    plan = prune_plan()
+    targets = plan["targets"]
+    cluster_target = bool(plan["cluster"].get("prunable"))
+    if not targets and not cluster_target:
+        return {"targets": [], "removed": [], "cluster": plan["cluster"]}
     if not confirm:
-        raise ValidationError(f"prune deletes {len(targets)} down repro(s) incl. data - pass confirm=true")
+        detail = f"{len(targets)} down repro(s) incl. data"
+        if plan["cluster"].get("exists"):
+            detail += " and the owned Kind cluster once it is empty"
+        raise ValidationError(f"prune deletes {detail} - pass confirm=true")
     removed = []
     for name in targets:
         # Dispatch: a Kubernetes repro has no compose project, so runner.down would
@@ -807,7 +819,12 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         _clear_default_if(name)
         removed.append(name)
         info(emit, f"pruned {name!r}", phase="done")
-    return {"targets": targets, "removed": removed}
+    # This must run even when there were no down records. `down --volumes` removes
+    # the final record before a later `prune`, which is exactly when the shared empty
+    # cluster is the only remaining target. The helper rechecks labels and refuses on
+    # ambiguity, so a race cannot turn this into deletion of a live repro.
+    cluster = k8s.prune_cluster(emit=emit)
+    return {"targets": targets, "removed": removed, "cluster": cluster}
 
 
 def stale_forwards() -> list[dict]:
