@@ -1445,6 +1445,9 @@ def test_json_mode_writes_only_objects_to_stdout(tmp_path, monkeypatch):
     from typer.testing import CliRunner
     from rc_repro.cli import app
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    # This is an error-wire-format test, not an integration test. Make the
+    # intended preflight failure deterministic on CI hosts that have Docker.
+    monkeypatch.setattr("rc_repro.runner.docker_available", lambda: False)
     res = CliRunner().invoke(app, ["up", "--version", "8.6.1", "--json"])
     lines = res.stdout.strip().splitlines()
     assert lines, "expected at least one object"
