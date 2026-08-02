@@ -99,6 +99,48 @@ def test_human_info_prints_remote_access_handoff(tmp_path, monkeypatch):
     assert "browser: http://127.0.0.1:3123" in result.output
 
 
+def test_k8s_info_json_exposes_remote_access_and_token_boolean(
+        tmp_path, monkeypatch):
+    from rc_repro.cli import app
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("SSH_CONNECTION", "10.0.0.2 55100 203.0.113.8 22")
+    monkeypatch.setenv("USER", "operator")
+    meta = runner.Metadata(
+        name="remote-k8s-info", project="rc-repro-remote-k8s-info",
+        rc_version="8.6.1", rc_image="i", mongo_tag="8.0",
+        mongo_flavor="official", preset="microservices",
+        root_url="http://localhost:3124", host_port=3124,
+        version_source="map", extra={
+            "topology": "kubernetes",
+            "k8s_namespace": "rc-repro-remote-k8s-info",
+            "k8s_context": "kind-rc-repro-local",
+            "reg_token_supplied": True,
+        },
+    )
+    runner.write("remote-k8s-info", "microservices: {enabled: true}\n", meta,
+                 artifact_name="values.yaml")
+    monkeypatch.setattr(k8s, "pods", lambda name, run=None: [])
+    monkeypatch.setattr(k8s, "forward_state", lambda metadata: "up")
+
+    result = CliRunner().invoke(
+        app, ["info", "--name", "remote-k8s-info", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["data"]["reg_token_supplied"] is True
+    assert payload["data"]["access"] == {
+        "mode": "remote_ssh",
+        "bind": "loopback",
+        "host_port": 3124,
+        "local_port": 3124,
+        "browser_url": "http://127.0.0.1:3124",
+        "tunnel_command": (
+            "ssh -N -L 3124:127.0.0.1:3124 operator@203.0.113.8"),
+        "note": payload["data"]["access"]["note"],
+    }
+
+
 def test_retention_defaults_to_teardown():
     r = evidence.resolve_retention(preferences={})
     assert r == {"retained": False, "reason": None}

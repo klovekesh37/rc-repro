@@ -29,8 +29,10 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -992,8 +994,33 @@ def start_port_forward(ctx: str, ns: str, host_port: int,
     return (run or _Runner()).port_forward(ctx, ns, host_port)
 
 
+def _port_accepting(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_forward(pid: int, port: int, timeout: float = 5.0) -> None:
+    """Wait until a replacement forward is actually accepting connections."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            raise NotReadyError(
+                f"the replacement Kubernetes port-forward for localhost:{port} "
+                "exited before it became ready")
+        if _port_accepting(port):
+            return
+        time.sleep(0.1)
+    raise NotReadyError(
+        f"the replacement Kubernetes port-forward for localhost:{port} did not "
+        f"become ready within {timeout:g}s")
+
+
 def ensure_port_forward(meta, emit: Emit = null_emit,
-                        run: _Runner | None = None) -> int | None:
+                        run: _Runner | None = None, *,
+                        wait_for_listener: bool = True) -> int | None:
     """Make sure the forward is alive, restarting it if not. Returns its pid.
 
     Idempotent and cheap, so callers can invoke it unconditionally instead of
@@ -1007,7 +1034,10 @@ def ensure_port_forward(meta, emit: Emit = null_emit,
     if isinstance(pid, int) and _pid_alive(pid):
         return pid
     events.info(emit, "re-establishing the port-forward", phase="wait")
-    return start_port_forward(ctx, ns, meta.host_port, run)
+    pid = start_port_forward(ctx, ns, meta.host_port, run)
+    if wait_for_listener:
+        _wait_for_forward(pid, meta.host_port)
+    return pid
 
 
 def stop_port_forward(meta) -> bool:
@@ -1090,7 +1120,8 @@ def detail(name: str, run: _Runner | None = None) -> dict:
     meta = runner.read_meta(name)
     extra = meta.extra if isinstance(meta.extra, dict) else {}
     pod_list = pods(name, run)
-    return {
+    from rc_repro.services import access
+    result = {
         "name": meta.name,
         "preset": meta.preset,
         "rc_version": meta.rc_version,
@@ -1104,7 +1135,11 @@ def detail(name: str, run: _Runner | None = None) -> dict:
         "containers": pod_list,
         "port_forward": forward_state(meta),
         "links": [{"label": "Rocket.Chat", "url": meta.root_url}],
+        "access": access.handoff(meta.host_port, meta.root_url),
     }
+    if extra.get("reg_token_supplied"):
+        result["reg_token_supplied"] = True
+    return result
 
 
 def logs(name: str, *, follow: bool = False, tail: int | None = None,
@@ -1312,7 +1347,10 @@ def wait_ready(name: str, *, timeout: float = 600.0, emit: Emit = null_emit,
         # A forward started before the Service has an endpoint can exit immediately.
         # Reconcile on every tick, not just once before the loop: otherwise that
         # early second death leaves every remaining HTTP probe aimed at a dead port.
-        pid = ensure_port_forward(meta, emit, run)
+        # This loop already owns retries while the Service is converging, so an
+        # early forward death is non-terminal here. HTTP consumers outside this
+        # readiness loop use the default listener wait and never race login.
+        pid = ensure_port_forward(meta, emit, run, wait_for_listener=False)
         if pid and pid != (meta.extra or {}).get(_FORWARD_PID):
             meta.extra = {**(meta.extra or {}), _FORWARD_PID: pid}
             runner.write_meta(name, meta)

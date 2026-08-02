@@ -690,8 +690,26 @@ def test_k8s_ensure_port_forward_revives_a_dead_one(tmp_path, monkeypatch):
     k8s.create_repro("t4", "8.6.1", offline=True, port=31236, run=fake)
     m = runner.read_meta("t4")
     fake.forwards.clear()
+    waited = []
+    monkeypatch.setattr(
+        k8s, "_wait_for_forward", lambda pid, port: waited.append((pid, port)))
     assert k8s.ensure_port_forward(m, run=fake) == 424242
     assert fake.forwards == [("rc-repro-t4", 31236)]   # re-established
+    assert waited == [(424242, 31236)]
+
+
+def test_k8s_replacement_forward_must_accept_connections(monkeypatch):
+    from rc_repro import errors
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(k8s, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(k8s, "_port_accepting", lambda port: True)
+    k8s._wait_for_forward(424242, 31236)
+
+    monkeypatch.setattr(k8s, "_pid_alive", lambda pid: False)
+    with pytest.raises(errors.NotReadyError) as ei:
+        k8s._wait_for_forward(424242, 31236)
+    assert "exited before it became ready" in str(ei.value)
 
 
 def test_k8s_teardown_with_volumes_forgets_the_record(tmp_path, monkeypatch):
