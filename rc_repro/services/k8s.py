@@ -31,10 +31,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 import yaml
-from dataclasses import dataclass, field
-from pathlib import Path
 
 from rc_repro import config, runner, versions
 from rc_repro.errors import (ConflictError, CreateFailedError, DockerError,
@@ -701,8 +702,10 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
         mongo_flavor=resolved.mongo_flavor, preset="microservices",
         root_url=f"http://localhost:{host_port}", host_port=host_port,
         version_source=resolved.source,
+        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         extra={_TOPOLOGY: "kubernetes", _NAMESPACE: plan.namespace,
-               _CONTEXT: ctx, _FORWARD_PID: pid},
+               _CONTEXT: ctx, _FORWARD_PID: pid,
+               "chart_version": plan.chart_version},
     )
     # The workspace holds the rendered artifact, values.yaml here instead of
     # docker-compose.yml, so evidence hashes the same kind of thing either way.
@@ -1134,15 +1137,15 @@ def wait_ready(name: str, *, timeout: float = 600.0, emit: Emit = null_emit,
     from rc_repro import rcapi
     run = run or _Runner()
     meta = runner.read_meta(name)
-    # The forward is reconcilable state: probe and revive before waiting, rather
-    # than timing out against a tunnel that closed.
-    pid = ensure_port_forward(meta, emit, run)
-    if pid and pid != (meta.extra or {}).get(_FORWARD_PID):
-        meta.extra = {**(meta.extra or {}), _FORWARD_PID: pid}
-        runner.write_meta(name, meta)
-
     deadline_ticks = max(1, int(timeout / _MONGO_READY_INTERVAL))
     for i in range(deadline_ticks):
+        # A forward started before the Service has an endpoint can exit immediately.
+        # Reconcile on every tick, not just once before the loop: otherwise that
+        # early second death leaves every remaining HTTP probe aimed at a dead port.
+        pid = ensure_port_forward(meta, emit, run)
+        if pid and pid != (meta.extra or {}).get(_FORWARD_PID):
+            meta.extra = {**(meta.extra or {}), _FORWARD_PID: pid}
+            runner.write_meta(name, meta)
         info_doc = rcapi.api_info(meta.root_url)
         if info_doc:
             booted = int(i * _MONGO_READY_INTERVAL)

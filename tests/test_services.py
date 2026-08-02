@@ -521,6 +521,10 @@ def test_k8s_create_persists_shared_metadata(tmp_path, monkeypatch):
     assert m.root_url == "http://localhost:31234"
     assert m.extra["topology"] == "kubernetes"
     assert m.extra["k8s_namespace"] == "rc-repro-t2"
+    assert m.extra["chart_version"] == "7.0.2"
+    from datetime import datetime
+    created = datetime.fromisoformat(m.created_at)
+    assert created.tzinfo is not None
     # the workspace holds values.yaml, not docker-compose.yml
     ws = runner.workspace("t2")
     assert (ws / "values.yaml").exists()
@@ -718,6 +722,9 @@ def test_evidence_is_backend_neutral(tmp_path, monkeypatch):
                                  "created_at"}
     assert rec["repro"]["topology"] == "kubernetes"
     assert rec["repro"]["root_url"] == "http://localhost:31400"
+    assert rec["repro"]["created_at"]
+    assert rec["retention"]["created_at"] == rec["repro"]["created_at"]
+    assert rec["runtime"]["engine"]["chart_version"] == "7.0.2"
     # the rendered artifact is hashed, whichever one the topology produced
     assert rec["artifact"]["name"] == "values.yaml"
     assert len(rec["artifact"]["sha256"]) == 64
@@ -867,6 +874,39 @@ def test_k8s_wait_ready_revives_the_forward_and_persists_the_new_pid(tmp_path, m
     # `down` kills the forward that is actually running
     assert runner.read_meta("r1").extra["k8s_forward_pid"] == before
     assert fake.forwards[-1] == ("rc-repro-r1", 31600)
+
+
+def test_k8s_wait_ready_reconciles_a_forward_that_dies_inside_the_loop(
+        tmp_path, monkeypatch):
+    """Regression from fresh-VPS acceptance: both the create-time forward and the
+    first ready-time replacement can exit before the Service has an endpoint. The
+    wait loop must keep reconciling instead of polling the dead port until timeout.
+    """
+    from rc_repro import rcapi, runner
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    class EarlyDeaths(_FakeRun):
+        def port_forward(self, ctx, ns, host_port):
+            self.forwards.append((ns, host_port))
+            return 41000 + len(self.forwards)
+
+    fake = EarlyDeaths()
+    k8s.create_repro("r1-loop", "8.6.1", offline=True, port=31609, run=fake)
+    # Create starts 41001 and the first ready tick starts 41002; both die early.
+    # The second ready tick starts 41003 after the Service gains an endpoint.
+    monkeypatch.setattr(k8s, "_pid_alive", lambda pid: pid == 41003)
+
+    def api_info(url, timeout=5.0):
+        pid = runner.read_meta("r1-loop").extra["k8s_forward_pid"]
+        return {"version": "8.6.1"} if pid == 41003 else None
+
+    monkeypatch.setattr(rcapi, "api_info", api_info)
+    out = k8s.wait_ready("r1-loop", timeout=15, run=fake)
+
+    assert out["version"] == "8.6.1"
+    assert len(fake.forwards) == 3
+    assert runner.read_meta("r1-loop").extra["k8s_forward_pid"] == 41003
 
 
 def test_k8s_wait_ready_aborts_on_a_terminal_pod_failure(tmp_path, monkeypatch):
