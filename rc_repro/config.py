@@ -11,9 +11,14 @@ State lives under ~/.rc-repro (override with RC_REPRO_HOME):
 from __future__ import annotations
 
 import os
+import threading
+import uuid
 from pathlib import Path
 
 import yaml
+
+# Serialises read-modify-write of config.yaml (see update_config).
+_CONFIG_LOCK = threading.Lock()
 
 # Container-internal Rocket.Chat port. The published host port is chosen per repro.
 RC_CONTAINER_PORT = 3000
@@ -118,5 +123,31 @@ def load_config(with_env: bool = True) -> dict:
 
 
 def save_config(cfg: dict) -> None:
+    """Persist config.yaml atomically (temp file + rename).
+
+    A plain write_text could be read half-written — the web GUI runs service calls
+    on worker threads, so concurrent readers are real.
+    """
     home().mkdir(parents=True, exist_ok=True)
-    config_file().write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    path = config_file()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)   # no-op after a successful replace
+
+
+def update_config(mutate) -> dict:
+    """Read-modify-write config.yaml under a lock; `mutate(cfg)` edits in place.
+
+    Serialised because the GUI's worker threads can otherwise interleave two
+    read-modify-write cycles and lose one of the updates. Reads with
+    with_env=False on purpose: this writes the file back, and an ephemeral
+    RC_REPRO_REG_TOKEN must never be persisted into it.
+    """
+    with _CONFIG_LOCK:
+        cfg = load_config(with_env=False)
+        mutate(cfg)
+        save_config(cfg)
+        return cfg

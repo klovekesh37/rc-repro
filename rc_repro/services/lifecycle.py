@@ -17,9 +17,17 @@ from rc_repro import seed as seeder
 from rc_repro.errors import (ConflictError, DockerError, NotFoundError,
                              NotReadyError, ValidationError)
 from rc_repro.services import diagnose, postready
-from rc_repro.services.events import Emit, Event, info, null_emit, warn
+from rc_repro.services.events import Emit, info, null_emit, warn
 
 _NAME_RE = re.compile(r"[^a-z0-9-]+")
+# What sanitize() can produce, and therefore the only shape a real repro has.
+_VALID_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def _require_valid_name(name: str) -> None:
+    if not _VALID_NAME_RE.match(name):
+        raise ValidationError(
+            f"invalid repro name {name!r} (lowercase letters, digits and '-' only)")
 
 
 # --- naming (pure) ------------------------------------------------------------
@@ -44,14 +52,21 @@ def require_docker() -> None:
 
 
 def resolve_name(name: str | None) -> str:
-    """Explicit name (must exist) else the configured default (must exist)."""
+    """Explicit name (must exist) else the configured default (must exist).
+
+    The name is shape-checked first: `sanitize()` runs only at creation, so every
+    real repro matches, while the value here goes on to become a filesystem path
+    (runner.workspace) and a compose project name. Validating beats trusting it.
+    """
     if name:
+        _require_valid_name(name)
         if not runner.exists(name):
             raise NotFoundError(f"no repro named {name!r} (run `rc-repro list`)")
         return name
     default = config.load_config().get("default_repro")
     if not default:
         raise ValidationError("no name given and no default repro set (use `rc-repro use <name>`)")
+    _require_valid_name(default)
     if not runner.exists(default):
         raise NotFoundError(f"default repro {default!r} no longer exists; set another with `rc-repro use`")
     return default
@@ -227,7 +242,8 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         raise ValidationError(f"--port {req.port} is out of range (want 1024-65535)")
 
     if runner.exists(repro_name) and not req.force and not req.fresh:
-        return _reuse(repro_name, wait, req, emit, stream_output=stream_output)
+        return _reuse(repro_name, wait, req, emit, stream_output=stream_output,
+                      resolved=resolved, preset_name=pre.name)
 
     _guard_project_collision(repro_name)
     check_sidecar_ports(pre, exclude=repro_name)
@@ -242,7 +258,11 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         resolved, project_name=runner.project_name(repro_name), root_url=root,
         host_port=host_port, reg_token=token or None, preset=pre,
         bind_host=bind_host, monitoring=req.monitor)
-    doc = compose.build(spec)
+    try:
+        doc = compose.build(spec)
+    except ValueError as exc:
+        # e.g. a preset naming an entry_service it doesn't define.
+        raise ValidationError(str(exc)) from exc
 
     meta = runner.Metadata(
         name=repro_name, project=spec.project_name, rc_version=resolved.rc_version,
@@ -271,14 +291,25 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         meta.extra["notes"] = list(meta.extra["notes"]) + monitoring.notes()
 
     if runner.exists(repro_name):
+        # Volumes the OLD compose file declared but the new one doesn't (switching
+        # preset with --force, dropping --monitor) would be orphaned: `down -v`
+        # only removes what the file declares, so once it's rewritten nothing can
+        # ever reach them again.
+        stale: set[str] = set()
+        if not req.fresh:
+            try:
+                stale = set(runner.read_compose(repro_name).get("volumes") or {}) - set(doc["volumes"])
+            except Exception:  # noqa: BLE001 - unreadable old file: nothing to reconcile
+                stale = set()
         if runner.down(repro_name, volumes=req.fresh) != 0:
             raise DockerError(f"could not tear down the existing {repro_name!r}; not overwriting it")
+        for bad in runner.remove_volumes(repro_name, sorted(stale)):
+            warn(emit, f"could not remove {bad}, left over from the previous preset",
+                 phase="create")
 
     runner.write(repro_name, compose.to_yaml(doc), meta, files=files)
     if req.pin:
-        raw = config.load_config(with_env=False)
-        raw["default_repro"] = repro_name
-        config.save_config(raw)
+        config.update_config(lambda cfg: cfg.__setitem__("default_repro", repro_name))
 
     info(emit, f"creating {repro_name!r} - RC {resolved.rc_version}, "
                f"Mongo {resolved.mongo_tag} ({resolved.mongo_flavor}), preset {pre.name}",
@@ -302,7 +333,27 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
     return result
 
 
-def _reuse(name: str, wait: bool, req: CreateReq, emit: Emit, *, stream_output: bool) -> dict:
+def _reuse(name: str, wait: bool, req: CreateReq, emit: Emit, *, stream_output: bool,
+           resolved=None, preset_name: str = "") -> dict:
+    meta = runner.read_meta(name)
+    # An existing repro is reused EXACTLY as recorded. Say so when the request
+    # asked for something else: `up --version 9.9.9 --name existing` silently
+    # booted the old version, which is fatal for a tool whose whole premise is
+    # version matching. (The version check in wait_and_finalize compares RC's
+    # reported version against the STORED one, so it stays quiet here.)
+    mismatch: list[str] = []
+    if resolved is not None and resolved.rc_version != meta.rc_version:
+        mismatch.append(f"version {resolved.rc_version} (existing: {meta.rc_version})")
+    if preset_name and preset_name != meta.preset:
+        mismatch.append(f"preset {preset_name!r} (existing: {meta.preset!r})")
+    if req.monitor and not (isinstance(meta.extra, dict) and meta.extra.get("monitoring")):
+        mismatch.append("monitoring (existing: not attached)")
+    if mismatch:
+        warn(emit, f"{name!r} already exists and is reused as-is, ignoring requested "
+                   + "; ".join(mismatch)
+                   + ". Use --force to rebuild it, or --fresh to also wipe its data.",
+             phase="create")
+
     state = runner.rc_state(name)
     if state == "running":
         info(emit, f"{name!r} is already running.", phase="create")
@@ -310,7 +361,6 @@ def _reuse(name: str, wait: bool, req: CreateReq, emit: Emit, *, stream_output: 
         info(emit, f"{name!r} already exists - bringing it back up.", phase="create")
         if _up(name, pull=False, emit=emit, stream_output=stream_output) != 0:
             raise DockerError("`docker compose up` failed")
-    meta = runner.read_meta(name)
     result = _summary(meta)
     result["reused"] = True
     result["waited"] = wait
@@ -457,14 +507,41 @@ def repro_links(m: runner.Metadata) -> list[dict]:
     return links
 
 
-def _pretty_state(status: str) -> str:
-    if not status:
-        return "down"
-    if "running(" in status:
-        return "running"
-    if "exited(" in status:
+def repro_state(rc_status: str, has_containers: bool) -> str:
+    """The state to report for a repro, from its Rocket.Chat container's docker
+    `Status` string ("Up 2 hours (healthy)", "Restarting (1) 5 seconds ago", ...).
+
+    BOTH the list and the detail panel must derive state from this, because they
+    used to disagree. The list read compose's PROJECT-level aggregate, where the
+    always-running Mongo put "running(" in the string and made a crash-looping RC
+    report "running"; the panel checked only whether RC was literally "running"
+    and flattened everything else to "stopped". So one repro showed two different
+    states at the same moment, and neither of them said "restarting" -- during a
+    crash loop, which is exactly when the answer matters.
+
+    `has_containers` separates "the stack is gone" (down) from "containers exist
+    but Rocket.Chat has none" (stopped).
+    """
+    s = (rc_status or "").strip()
+    if not s:
+        return "stopped" if has_containers else "down"
+    low = s.lower()
+    if low.startswith("up"):
+        # docker reports a paused container as "Up 3 days (Paused)".
+        return "paused" if "(paused)" in low else "running"
+    if low.startswith("exited"):
         return "stopped"
-    return status.split("(")[0]
+    # "Restarting (1) 5 seconds ago" -> restarting; "Created"/"Dead" -> as-is.
+    return low.split(" (")[0].split(" ")[0] or "down"
+
+
+# States beyond running/stopped/down that repro_state() can now hand to the UI:
+# mid-transition or wedged, rather than plainly up/stopped/gone. This is the
+# backend->UI contract for them -- tests/test_core.py asserts the web UI styles
+# each one and offers it as a status filter, so adding a state here fails loudly
+# until the dashboard handles it (a state it does not know renders unstyled and,
+# before this existed, with no lifecycle buttons at all).
+TRANSIENT_STATES = ("restarting", "created", "paused", "dead")
 
 
 def _uptime_health(status: str) -> tuple[str, str]:
@@ -486,8 +563,11 @@ def list_repros() -> list[dict]:
     status_map = runner.rc_status_by_project() if docker_up else {}
     out = []
     for m in metas:
-        state = "?" if not docker_up else _pretty_state(states.get(m.project, ""))
-        uptime, health = _uptime_health(status_map.get(m.project, ""))
+        rc_status = status_map.get(m.project, "")
+        # `states` is only consulted for "does this project have ANY container",
+        # never for the state itself -- see repro_state().
+        state = "?" if not docker_up else repro_state(rc_status, bool(states.get(m.project)))
+        uptime, health = _uptime_health(rc_status)
         monitored = bool(isinstance(m.extra, dict) and m.extra.get("monitoring"))
         out.append({"name": m.name, "rc_version": m.rc_version, "mongo_tag": m.mongo_tag,
                     "host_port": m.host_port, "root_url": m.root_url, "state": state,
@@ -503,32 +583,74 @@ def describe(name: str) -> dict:
     return _summary(runner.read_meta(resolve_name(name)))
 
 
+# Substrings that mark an env value as a credential. The env tab is a debugging
+# aid served to any client holding the session token, and it carried real secrets
+# verbatim: REG_TOKEN (an EE license), the LDAP bind password, MinIO's secret key.
+# The workspace's docker-compose.yml on disk stays the source of truth for anyone
+# who genuinely needs a value.
+_SECRET_KEY_HINTS = ("password", "pass", "secret", "token", "_key", "apikey",
+                     "credential")
+REDACTED = "********"
+
+
+def redact_env(key: str, value: str) -> str:
+    """Mask an env value whose KEY names a credential; pass anything else through."""
+    low = key.lower()
+    return REDACTED if value and any(h in low for h in _SECRET_KEY_HINTS) else value
+
+
+def _env_rows(doc: dict) -> list[dict]:
+    """The RC service's env as [{key, value}], credentials masked."""
+    svcs = doc.get("services", {})
+    rc_svc = svcs.get("rocketchat") or svcs.get("rocketchat-1") or {}
+    env = rc_svc.get("environment", {})
+    if isinstance(env, dict):
+        return [{"key": k, "value": redact_env(k, str(v))} for k, v in sorted(env.items())]
+    if isinstance(env, list):  # compose list form "K=V"
+        pairs = [(e.split("=", 1) + [""])[:2] for e in env]
+        return [{"key": k, "value": redact_env(k, v)} for k, v in pairs]
+    return []
+
+
 def detail(name: str) -> dict:
     """Rich detail for the GUI panel: summary + state/uptime/health + links +
     containers + the RC service's env vars."""
     target = resolve_name(name)
     m = runner.read_meta(target)
     d = _summary(m)
+    # The env tab masks credentials and tells the reader that the workspace's
+    # docker-compose.yml is the source of truth for a real value (see redact_env)
+    # -- but nothing in the GUI said where that workspace is.
+    d["workspace"] = str(runner.workspace(target))
+    # The list payload has carried `default` all along; the panel needs it too, so
+    # it can offer "Make default" only where that would change something.
+    d["is_default"] = target == config.load_config().get("default_repro")
+    # `container_details` returns [] both for "no containers" AND for "docker could
+    # not be asked", so deriving state from it alone asserted `down` whenever the
+    # daemon was unreachable — while list_repros() reported "?" for the same repro.
+    # The two views must agree, and neither may claim to know what it cannot.
+    if not runner.docker_available():
+        d["state"], d["uptime"], d["health"] = "?", "", ""
+        d["containers"] = []
+        d["links"] = repro_links(m)
+        d["env"] = _env_rows(runner.read_compose(target))
+        return d
     containers = runner.container_details(target)
     rc = [c for c in containers if c["service"] == "rocketchat" or c["service"].startswith("rocketchat-")]
-    running = any(c["state"] == "running" for c in rc)
-    d["state"] = "running" if running else ("stopped" if containers else "down")
-    up, health = _uptime_health(next((c["status"] for c in rc), ""))
+    rc_status = next((c["status"] for c in rc), "")
+    d["state"] = repro_state(rc_status, bool(containers))
+    up, health = _uptime_health(rc_status)
     d["uptime"] = up
-    d["health"] = health or (d["state"] if running else ("exited" if containers else ""))
+    d["health"] = health or (d["state"] if d["state"] != "down" else "")
+    # A climbing restart count is the difference between "slow to boot" and
+    # "crash-looping"; wait_serving already warns on it during a create, but after
+    # that nothing surfaced it. Only asked when containers exist -- it costs two
+    # docker calls, and a `down` repro has nothing to inspect.
+    if containers:
+        d["restarts"] = runner.rc_restart_count(target)
     d["links"] = repro_links(m)
     d["containers"] = containers
-    doc = runner.read_compose(target)
-    svcs = doc.get("services", {})
-    rc_svc = svcs.get("rocketchat") or svcs.get("rocketchat-1") or {}
-    env = rc_svc.get("environment", {})
-    if isinstance(env, dict):
-        d["env"] = [{"key": k, "value": str(v)} for k, v in sorted(env.items())]
-    elif isinstance(env, list):  # compose list form "K=V"
-        d["env"] = [{"key": (e.split("=", 1) + [""])[0], "value": (e.split("=", 1) + [""])[1]}
-                    for e in env]
-    else:
-        d["env"] = []
+    d["env"] = _env_rows(runner.read_compose(target))
     return d
 
 
@@ -538,14 +660,23 @@ def set_state(name: str, action: str) -> None:
     if fn is None:
         raise ValidationError(f"unknown action {action!r} (want start|stop|restart)")
     if fn(target) != 0:
-        raise DockerError(f"`docker compose {action}` failed for {target!r}")
+        # A `down`ed repro has no containers, so `compose start` can never revive
+        # it. Say what actually works instead of just reporting the exit code.
+        hint = ""
+        if action in ("start", "restart") and runner.rc_state(target) == "absent":
+            hint = (f" - {target!r} was `down`ed, so it has no containers to "
+                    "start; recreate them from its stored metadata instead")
+        raise DockerError(f"`docker compose {action}` failed for {target!r}{hint}")
 
 
 def _clear_default_if(name: str) -> None:
-    cfg = config.load_config(with_env=False)
-    if cfg.get("default_repro") == name:
-        cfg.pop("default_repro", None)
-        config.save_config(cfg)
+    def mutate(cfg: dict) -> None:
+        if cfg.get("default_repro") == name:
+            cfg.pop("default_repro", None)
+
+    # Locked read-modify-write: prune() calls this in a loop and the GUI runs it on
+    # worker threads, so a plain read/write pair can lose an update.
+    config.update_config(mutate)
 
 
 def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: Emit = null_emit) -> dict:

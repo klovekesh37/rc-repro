@@ -495,10 +495,22 @@ def test_parse_scale_messages_without_room_raises():
             raise AssertionError(f"expected ValueError for {bad!r}")
 
 
-def test_parse_scale_room_id_embedded_safely():
-    # room ref is repr()'d into the JS, so a quote can't break out of the string
-    js_room = repr("evil'; db.dropDatabase(); //")
-    assert js_room.startswith(("'", '"')) and "dropDatabase" in js_room
+def test_parse_scale_room_ref_cannot_reach_the_js_unquoted(monkeypatch):
+    # This used to assert on the stdlib's repr() and never touch scaleseed at all,
+    # so the guard it was named for had no coverage. Exercise both layers: the
+    # _SPEC_RE whitelist (the real guard) and the quoted interpolation.
+    from rc_repro import scaleseed
+    captured = {}
+    monkeypatch.setattr(scaleseed, "_eval",
+                        lambda name, js: captured.setdefault("js", js) or (0, '{"inserted": 1}'))
+    scaleseed.bulk_messages("x", 1, "team-chat")
+    assert "'team-chat'" in captured["js"]          # only ever inside a JS literal
+    for bad in ("ev'il", 'ev"il', "ev\\il", "ev\nil", "a b", "a;b", "$where"):
+        try:
+            scaleseed.parse_scale(f"messages=1@{bad}")
+        except ValueError:
+            continue
+        raise AssertionError(f"_SPEC_RE should reject room {bad!r}")
 
 
 def test_yaml_preset_notes_parsed(tmp_path, monkeypatch):
@@ -1021,6 +1033,94 @@ def test_constrain_human():
                             "mongo": {"cpus": 0.5, "mem": None}}) == "rc=2cpu/2g, mongo=0.5cpu"
 
 
+def _fake_run(calls, returncode=0, stdout=""):
+    """subprocess.run stub that records the argv it was handed."""
+    import types
+
+    def run(cmd, **_kw):
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+    return run
+
+
+def test_constrain_restore_only_touches_capped_dimensions(monkeypatch):
+    # A CPU-only --constrain must not make restore() impose a memory limit on a
+    # container that had none (which, with --memory-swap == --memory, would also
+    # disable swap) — restore only puts back what apply() actually changed.
+    from rc_repro.perf import constrain
+    calls = []
+    monkeypatch.setattr(constrain.subprocess, "run", _fake_run(calls))
+    monkeypatch.setattr(constrain.runner, "docker_capacity", lambda: (8.0, 8_000_000_000))
+    a = constrain.Applied("cid1", "rocketchat", 0, 0, 0, set_cpus=True, set_mem=False)
+    assert constrain.restore([a]) == []
+    assert calls == [["docker", "update", "--cpus", "8", "cid1"]]
+
+
+def test_constrain_restore_reports_partial_failure(monkeypatch):
+    # docker info unavailable, a real prior CPU limit but no prior memory limit:
+    # the memory dimension can't be resolved. That must be REPORTED — it used to
+    # be silent whenever the built command was non-empty, so the test's memory
+    # cap stayed applied and the caller printed no warning.
+    from rc_repro.perf import constrain
+    calls = []
+    monkeypatch.setattr(constrain.subprocess, "run", _fake_run(calls))
+    monkeypatch.setattr(constrain.runner, "docker_capacity", lambda: None)
+    a = constrain.Applied("cid1", "rocketchat", 4_000_000_000, 0, 0,
+                          set_cpus=True, set_mem=True)
+    problems = constrain.restore([a])
+    assert len(problems) == 1 and "memory" in problems[0]
+    assert calls == [["docker", "update", "--cpus", "4", "cid1"]]   # CPU still restored
+
+
+def test_constrain_restore_reproduces_implicit_swap_default(monkeypatch):
+    # MemorySwap == 0 next to a real Memory limit is docker's "twice memory"
+    # default, not "unknown". Restoring swap == memory would hand back a
+    # STRICTER config (no swap) than the container started with.
+    from rc_repro.perf import constrain
+    calls = []
+    monkeypatch.setattr(constrain.subprocess, "run", _fake_run(calls))
+    monkeypatch.setattr(constrain.runner, "docker_capacity", lambda: (8.0, 8_000_000_000))
+    a = constrain.Applied("cid1", "mongodb", 0, 2_147_483_648, 0, set_cpus=False, set_mem=True)
+    assert constrain.restore([a]) == []
+    assert calls == [["docker", "update", "--memory", "2147483648",
+                      "--memory-swap", "4294967296", "cid1"]]
+    # an explicit prior swap limit round-trips verbatim; -1 stays unlimited
+    for prior_swap, expected in ((3_000_000_000, "3000000000"), (-1, "-1")):
+        calls.clear()
+        constrain.restore([constrain.Applied("c", "mongodb", 0, 2_147_483_648, prior_swap,
+                                             set_cpus=False, set_mem=True)])
+        assert calls[0][-2] == expected
+
+
+def test_constrain_restore_never_raises(monkeypatch):
+    # restore() runs inside the callers' finally; an OSError escaping it would
+    # skip their remaining cleanup (deleting the seeded-user token file) and mask
+    # whatever error triggered the finally. Report it, don't raise.
+    from rc_repro.perf import constrain
+
+    def boom(*_a, **_k):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(constrain.subprocess, "run", boom)
+    monkeypatch.setattr(constrain.runner, "docker_capacity", lambda: (8.0, 8_000_000_000))
+    problems = constrain.restore(
+        [constrain.Applied("cid1", "rocketchat", 0, 0, 0, set_cpus=True)])
+    assert len(problems) == 1 and "rocketchat" in problems[0]
+
+
+def test_constrain_inspect_limits_bad_output_is_runtime_error(monkeypatch):
+    # Every call site catches RuntimeError; a ValueError from int() would escape
+    # as a raw traceback (CLI) or an InternalError job (GUI).
+    from rc_repro.perf import constrain
+    monkeypatch.setattr(constrain.subprocess, "run", _fake_run([], stdout="<no value>\n"))
+    try:
+        constrain._inspect_limits("cid1")
+    except RuntimeError as exc:
+        assert "cid1" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError for unparseable docker inspect output")
+
+
 def test_rcmetrics_prom_parser():
     from rc_repro.perf import rcmetrics
     text = (
@@ -1129,6 +1229,63 @@ def test_mem_slopes_requires_span():
     assert "rcrepro-x-mongodb-1" not in slopes
 
 
+def test_verdict_refuses_to_judge_an_unmeasured_run():
+    from rc_repro.perf import verdict
+    # A run that issued no requests emits no latency keys at all (handleSummary
+    # drops undefined values). It used to render as a measured 0ms and end in
+    # "the workspace has headroom at this load" -- a health claim from no data.
+    zero = {"rps": 0, "count": 0, "error_rate": 0, "checks_rate": None,
+            "status": {"2xx": 0, "429": 0, "4xx": 0, "5xx": 0, "other": 0}}
+    for summary in (zero, {}):
+        v = verdict.analyze(summary)
+        assert len(v) == 1
+        assert "No requests were recorded" in v[0]
+        assert "headroom" not in v[0]
+
+
+def test_loadtest_markdown_marks_unmeasured_metrics():
+    from rc_repro.perf import report
+    zero = {"rps": 0, "count": 0, "error_rate": 0, "checks_rate": None}
+    ctx = {"name": "r", "version": "8.5.1", "scenario": "messages", "vus": 10,
+           "duration": "30s", "ramp": "", "target": "http://rocketchat:3000", "users": 0}
+    md = report.loadtest_markdown(ctx, zero, [], None, {})
+    assert "| latency p95 | - |" in md          # not "**0ms**"
+    assert "| checks passed | - |" in md        # not "100.0%"
+    # a measured run is formatted exactly as before
+    real = {"rps": 50.0, "count": 100, "p50": 10.0, "p90": 20.0, "p95": 66.0,
+            "p99": 88.0, "avg": 12.0, "min": 3.0, "max": 99.0,
+            "error_rate": 0.0123, "checks_rate": 1.0}
+    md2 = report.loadtest_markdown(ctx, real, [], None, {})
+    assert "| latency p95 | **66ms** |" in md2
+    assert "| throughput | **50.0 req/s** |" in md2
+    assert "| error rate | 1.23% |" in md2 and "| checks passed | 100.0% |" in md2
+
+
+def test_loadtest_markdown_labels_a_spike_run_as_a_spike():
+    from rc_repro.perf import report
+    # ctx["vus"] is the value the CLI told the user it was IGNORING under --spike,
+    # so reporting it described a load shape that never ran.
+    ctx = {"name": "r", "version": "8.5.1", "scenario": "messages", "vus": 10,
+           "duration": "60s", "ramp": "", "spike": "10:100",
+           "target": "http://rocketchat:3000", "users": 0}
+    md = report.loadtest_markdown(ctx, {"p95": 1.0}, [], None, {})
+    assert "spike 10:100 VUs for 60s" in md and "10 VUs for 60s" not in md
+
+
+def test_loadtest_script_budgets_spike_ramps_and_parses_compound_durations():
+    # No JS runtime here, so assert on the shipped script -- as the other
+    # loadtest-script tests do. The invariants: the two 1s transition ramps are
+    # budgeted out of --duration (3*third+2 overshot it, which also skewed
+    # timeline.spike_recovery's exact-thirds windows), seconds() understands k6's
+    # compound durations (1m30s), and an unrun check set reports null.
+    from importlib import resources
+    js = resources.files("rc_repro").joinpath("data", "loadtest", "common.js").read_text(
+        encoding="utf-8")
+    assert "ms|s|m|h" in js
+    assert "const body = total - 2;" in js
+    assert "rate: null" in js
+
+
 def test_verdict_spike_and_soak_rules():
     from rc_repro.perf import verdict
     base = {"p95": 120.0, "rps": 50.0, "error_rate": 0.0}
@@ -1210,3 +1367,382 @@ def test_seed_usernames_avoid_userN_collision():
 def test_seed_channel_names_unique():
     names = [seed.channel_name(i) for i in range(30)]
     assert len(set(names)) == len(names)
+
+
+def test_seed_restores_only_the_2fa_value_it_changed(monkeypatch):
+    # "Unreadable" is not "was on". Restoring ON for both turned email-2FA on for
+    # the ldap/saml/oidc/livechat presets, which switch it OFF on purpose.
+    prior = [None]
+    calls = []
+
+    def fake_get(_url, _auth, _pw, sid, **_kw):
+        return {"Accounts_TwoFactorAuthentication_By_Email_Enabled": prior[0],
+                "API_Enable_Rate_Limiter": False}.get(sid)
+
+    def fake_set(_url, _auth, _pw, sid, value, **_kw):
+        calls.append((sid, value))
+        return True
+
+    monkeypatch.setattr(seed.rcapi, "get_setting", fake_get)
+    monkeypatch.setattr(seed.rcapi, "set_setting", fake_set)
+    monkeypatch.setattr(seed, "_seed_body", lambda *_a, **_k: {"ok": True})
+    twofa = "Accounts_TwoFactorAuthentication_By_Email_Enabled"
+    auth = seed.rcapi.Auth(token="t", user_id="u")
+
+    cases = [
+        (None, []),                                 # unreadable -> don't touch it
+        (False, []),                                # already off -> leave it
+        (True, [(twofa, False), (twofa, True)]),     # on -> disable, then restore
+    ]
+    for prior_value, expected in cases:
+        prior[0] = prior_value
+        calls.clear()
+        seed.seed("http://x", auth, seed.PROFILES["small"])
+        assert [c for c in calls if c[0] == twofa] == expected, prior_value
+
+
+def test_seed_does_not_count_failed_dms():
+    class _Resp:
+        def __init__(self, ok):
+            self.ok, self.status_code = ok, 200 if ok else 400
+
+        def json(self):
+            return {"message": {"_id": "m1"}}
+
+    # every im.create is rejected (revoked create-d permission, DM max users)
+    def post(path, _headers, _payload):
+        return _Resp(not path.endswith("im.create"))
+
+    plan = seed.Plan(users=3, channels=1, messages=1, dms=3, rich=False)
+    out = seed._seed_body("http://x", {"h": "1"}, plan, post, lambda _m: None)
+    # was 3: post() returns None only on a TRANSPORT error, so a 400 still counted
+    # and the number reached the benchmark report as workload never created.
+    assert out["dms"] == 0
+
+
+def test_scaleseed_does_not_rerun_a_partially_applied_script(monkeypatch):
+    from rc_repro import scaleseed
+    shells = []
+
+    def killed_midway(_name, _service, args, **_kw):
+        shells.append(args[0])
+        return 137, '{"inserted": 400000}'      # OOM-killed after committing batches
+
+    monkeypatch.setattr(scaleseed.runner, "compose_exec_capture", killed_midway)
+    rc, _out = scaleseed._eval("x", "print(1)")
+    # Falling through to `mongo` would re-run a non-idempotent insertMany and
+    # duplicate every batch already written.
+    assert rc == 137 and shells == ["mongosh"]
+
+    shells.clear()
+
+    def binary_missing(_name, _service, args, **_kw):
+        shells.append(args[0])
+        return 127, ""                          # never started, no output
+
+    monkeypatch.setattr(scaleseed.runner, "compose_exec_capture", binary_missing)
+    scaleseed._eval("x", "print(1)")
+    assert shells == ["mongosh", "mongo"]       # the legacy fallback still applies
+
+
+def test_parse_scale_rejects_ambiguous_and_oversized_specs():
+    from rc_repro import scaleseed
+    for bad in ("users=10@team-chat",             # a room means nothing for users
+                "messages=10@a,messages=20@b",    # silently last-wins before
+                "users=1,users=2",
+                f"users={scaleseed._MAX_DOCS + 1}"):
+        try:
+            scaleseed.parse_scale(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad!r}")
+    assert scaleseed.parse_scale("users=10,messages=20@general") == {
+        "users": 10, "messages": (20, "general")}
+
+
+def test_configimport_redaction_requires_a_single_mask_alphabet():
+    from rc_repro import configimport
+    for masked in ("XXXXXXXX", "xxxx", "****", "######", "●●●●●●", "····"):
+        assert configimport._is_redacted(masked), masked
+    # A character class matched any MIXTURE, and "." inside [...] is a literal
+    # dot -- so real dotted/mixed values were dropped from the import while being
+    # reported to the operator as "the dump masked this secret".
+    for real in ("....", "*.*.*.*", "x.x.x.x", "#.#.#", "Xx.#*", "1.2.3.4",
+                 "a.b.c.d", "XXX"):
+        assert not configimport._is_redacted(real), real
+
+
+def test_login_refuses_an_unfiltered_otp_poll(monkeypatch):
+    from rc_repro import rcapi
+
+    class _R:
+        status_code, ok = 401, False
+        text = '{"error":"totp-required"}'
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(rcapi.requests, "post", lambda *_a, **_k: _R())
+    # Mailpit is a catch-all inbox; with no resolvable recipient the old code
+    # polled unfiltered and could hand back a DIFFERENT user's code.
+    try:
+        rcapi.login("http://x", "alice", "alice", mailpit_url="http://mailpit")
+    except RuntimeError as exc:
+        assert "another user's code" in str(exc)
+    else:
+        raise AssertionError("expected a refusal rather than an unfiltered poll")
+
+
+def test_login_rejects_a_non_200_success_status(monkeypatch):
+    from rc_repro import rcapi
+
+    class _R:
+        status_code, ok = 302, True             # proxy redirect to HTTPS
+        text = "<html>Found</html>"
+
+        def json(self):
+            return {}
+
+        def raise_for_status(self):
+            return None                          # no-op for 3xx, as requests does
+
+    monkeypatch.setattr(rcapi.requests, "post", lambda *_a, **_k: _R())
+    try:
+        rcapi.login("http://x")
+    except RuntimeError as exc:
+        assert "302" in str(exc) and "2FA" in str(exc)
+    else:
+        raise AssertionError("expected a clear error, not the misleading 2FA path")
+
+
+def _spec_for(pre):
+    """A Spec around a hand-built Preset (the shared _spec() takes a preset NAME)."""
+    r = versions.resolve("8.4.1", offline=True)
+    return compose.Spec.from_resolved(
+        r, project_name="rcrepro-t", root_url="http://localhost:3000",
+        host_port=3000, reg_token=None, preset=pre)
+
+
+def test_compose_entry_service_must_exist():
+    from rc_repro.presets import Preset
+    # Silently skipping a bad entry_service meant NOTHING published the host port:
+    # the repro booted unreachable at its own advertised root_url.
+    pre = Preset(name="broken", entry_service="nope", services={"real": {"image": "x"}})
+    try:
+        compose.build(_spec_for(pre))
+    except ValueError as exc:
+        assert "entry_service" in str(exc) and "nope" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for an undefined entry_service")
+
+
+def test_compose_entry_service_takes_the_host_port_from_rc():
+    from rc_repro.presets import Preset
+    # A single-instance preset with an entry_service: RC must give up the published
+    # host port, or it is bound twice and `up` fails "port is already allocated".
+    pre = Preset(name="lb", entry_service="proxy", services={"proxy": {"image": "x"}})
+    doc = compose.build(_spec_for(pre))
+    assert doc["services"]["proxy"]["ports"] == ["127.0.0.1:3000:80"]
+    assert "ports" not in doc["services"]["rocketchat"]
+
+    # multi-instance keeps its direct per-instance ports (host_port + i)
+    multi = Preset(name="lb2", entry_service="proxy", instances=2,
+                   services={"proxy": {"image": "x"}})
+    doc2 = compose.build(_spec_for(multi))
+    assert doc2["services"]["proxy"]["ports"] == ["127.0.0.1:3000:80"]
+    assert doc2["services"]["rocketchat-1"]["ports"] == ["127.0.0.1:3001:3000"]
+    assert doc2["services"]["rocketchat-2"]["ports"] == ["127.0.0.1:3002:3000"]
+
+
+def test_bind_ports_handles_a_bare_container_port():
+    doc = {"services": {
+        "a": {"ports": ["8025:8025"]},           # host:container
+        "b": {"ports": ["127.0.0.1:9000:9000"]},  # already IP-qualified
+        "c": {"ports": ["8025"]},                 # BARE container port
+        "d": {"ports": ["1.2.3.4:5:6"]},
+    }}
+    compose._bind_ports(doc, "127.0.0.1")
+    assert doc["services"]["a"]["ports"] == ["127.0.0.1:8025:8025"]
+    assert doc["services"]["b"]["ports"] == ["127.0.0.1:9000:9000"]   # untouched
+    # "127.0.0.1:8025" would be read as host:container with an invalid host port;
+    # IP::CONTAINER keeps the loopback guarantee with an ephemeral host port.
+    assert doc["services"]["c"]["ports"] == ["127.0.0.1::8025"]
+    assert doc["services"]["d"]["ports"] == ["1.2.3.4:5:6"]
+
+
+def test_read_meta_tolerates_a_field_from_a_newer_version(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    ws = tmp_path / "repros" / "r"
+    ws.mkdir(parents=True)
+    (ws / "docker-compose.yml").write_text("name: rcrepro-r\n", encoding="utf-8")
+    blob = {
+        "name": "r", "project": "rcrepro-r", "rc_version": "8.5.1", "rc_image": "i",
+        "mongo_tag": "8.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3000", "host_port": 3000,
+        "version_source": "map (fallback)",
+        "a_field_from_the_future": {"nested": True},   # written by a newer rc-repro
+    }
+    (ws / "repro.json").write_text(json.dumps(blob), encoding="utf-8")
+    # Metadata(**blob) used to TypeError, and list_meta swallows that -- silently
+    # dropping the repro from `rc-repro list`.
+    m = runner.read_meta("r")
+    assert m.name == "r" and m.host_port == 3000
+    assert [x.name for x in runner.list_meta()] == ["r"]
+
+
+def test_update_config_is_a_locked_read_modify_write(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setenv("RC_REPRO_REG_TOKEN", "ephemeral-secret")
+    config.update_config(lambda cfg: cfg.__setitem__("default_repro", "a"))
+    config.update_config(lambda cfg: cfg.__setitem__("other", 1))
+    raw = config.config_file().read_text(encoding="utf-8")
+    # both updates survive (a read/write pair could lose one), and the env-only
+    # token is never persisted into the file
+    assert config.load_config(with_env=False) == {"default_repro": "a", "other": 1}
+    assert "ephemeral-secret" not in raw
+
+
+def test_resolve_name_rejects_a_name_that_is_not_a_repro(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from rc_repro import errors
+    from rc_repro.services import lifecycle as lcsvc
+    # The name becomes a filesystem path and a compose project name; sanitize()
+    # only runs at creation, so every other entry point validates the shape.
+    for bad in ("../../etc", "..", "Has-Caps", "with space", "semi;colon"):
+        try:
+            lcsvc.resolve_name(bad)
+        except errors.ValidationError:
+            continue
+        raise AssertionError(f"expected ValidationError for {bad!r}")
+
+
+def test_detail_redacts_secret_env_values():
+    from rc_repro.services import lifecycle as lcsvc
+    # The env tab is served to any client holding the session token and used to
+    # carry these verbatim.
+    for key in ("REG_TOKEN", "ADMIN_PASS",
+                "OVERWRITE_SETTING_LDAP_Authentication_Password",
+                "OVERWRITE_SETTING_FileUpload_S3_AWSSecretAccessKey",
+                "MINIO_ROOT_PASSWORD"):
+        assert lcsvc.redact_env(key, "s3cret") == lcsvc.REDACTED, key
+    # non-secrets stay visible -- debugging them is the point of the tab
+    for key, val in (("ROOT_URL", "http://localhost:3000"),
+                     ("MONGO_URL", "mongodb://mongodb:27017/rocketchat"),
+                     ("DEPLOY_METHOD", "docker")):
+        assert lcsvc.redact_env(key, val) == val, key
+    assert lcsvc.redact_env("REG_TOKEN", "") == ""      # empty stays empty
+
+
+def test_k6_keeps_secrets_out_of_the_argv(tmp_path, monkeypatch):
+    import types
+    from rc_repro.perf import k6
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    ws = tmp_path / "repros" / "r"
+    ws.mkdir(parents=True)
+    captured = {}
+
+    def fake_run(cmd, **_kw):
+        captured["cmd"] = cmd
+        (ws / "loadtest" / "summary.json").write_text(json.dumps({"rps": 1}), encoding="utf-8")
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(k6.subprocess, "run", fake_run)
+    k6.run("r", "messages", vus=1, duration="1s", ramp=None,
+           token="PAT-SECRET-VALUE", uid="u1", target="http://rocketchat:3000")
+    argv = " ".join(captured["cmd"])
+    # `ps` / /proc/<pid>/cmdline expose the argv to every local user for the whole
+    # run, and `docker inspect` afterwards.
+    assert "PAT-SECRET-VALUE" not in argv
+    assert config.ADMIN_PASSWORD not in argv
+    assert "--env-file" in captured["cmd"]
+    # non-secret env still rides the argv, and the secret file does not outlive the run
+    assert "RC_URL=http://rocketchat:3000" in captured["cmd"]
+    assert not (ws / "loadtest" / "k6.env").exists()
+
+
+# --- web UI static assets -----------------------------------------------------
+
+def test_webui_hidden_toggles_actually_hide():
+    """`el.hidden = true` must really hide, and must target an id that exists.
+
+    The UA stylesheet's `[hidden] { display: none }` loses to any author rule
+    setting `display` on the same element, and `form label`/`.checks label` both
+    do. Without an explicit `!important` override every hidden-toggle on a label
+    is a silent no-op -- the seed dialog shipped showing "Profile" and "Scale
+    spec" simultaneously in both modes because of exactly this.
+    """
+    import re
+    from importlib import resources
+    webui = resources.files("rc_repro").joinpath("data", "webui")
+    css = webui.joinpath("app.css").read_text(encoding="utf-8")
+    js = webui.joinpath("app.js").read_text(encoding="utf-8")
+    html = webui.joinpath("index.html").read_text(encoding="utf-8")
+
+    assert re.search(r"\[hidden\][^{]*\{[^}]*display:\s*none\s*!important", css), \
+        "app.css must force `[hidden] { display: none !important }`"
+
+    toggled = set(re.findall(r'\$\("#([^"]+)"\)\.hidden\s*=', js))
+    assert toggled, "expected app.js to toggle .hidden on at least one element"
+    missing = sorted(toggled - set(re.findall(r'id="([^"]+)"', html)))
+    assert not missing, f"app.js toggles .hidden on id(s) not in index.html: {missing}"
+
+
+def test_webui_busy_state_is_styled_and_labelled():
+    """Every action that shows a spinner must have a verb, and the classes app.js
+    emits for it must exist in app.css.
+
+    The busy state is assembled from three places -- the label passed to
+    runAction, the BUSY_VERB lookup, and the .spin/.working CSS -- so a rename in
+    any one of them silently degrades to a frozen, unstyled button.
+    """
+    import re
+    from importlib import resources
+    webui = resources.files("rc_repro").joinpath("data", "webui")
+    css = webui.joinpath("app.css").read_text(encoding="utf-8")
+    js = webui.joinpath("app.js").read_text(encoding="utf-8")
+
+    # Keys may be bare (Stop:) or quoted ("Make default":) -- a label with a space
+    # has to be quoted, and reading only bare keys made such an entry invisible
+    # here, so the check passed while the button still said "Make default…".
+    verbs = {bare or quoted for quoted, bare in
+             re.findall(r"(?:\"([^\"]+)\"|(\w+))\s*:\s*\"\w+ing\b",
+                        js[js.index("const BUSY_VERB"):].split("}")[0])}
+    assert verbs, "expected a BUSY_VERB map in app.js"
+
+    # Labels handed to runAction must resolve to a verb, else the button shows the
+    # bare label ("Stop…") instead of "Stopping…".
+    literal = set(re.findall(r'runAction\([^,]+,\s*"([^"]+)"', js))
+    state = set(re.findall(r'\b\w+:\s*"(\w+)"', js[js.index("const STATE_LABEL"):]
+                           .split("}")[0]))
+    missing = sorted((literal | state) - verbs)
+    assert not missing, f"action label(s) with no BUSY_VERB entry: {missing}"
+
+    for cls, sel in [("spin", r"\.spin\s*\{"), ("btn working", r"\.btn\.working"),
+                     ("pill working", r"\.pill\.working")]:
+        assert re.search(sel, css), f"app.js emits class {cls!r} with no rule in app.css"
+    assert re.search(r"@keyframes\s+rc-spin", css), "the .spin animation is undefined"
+    # A spinner that cannot animate must still say what is happening.
+    assert "prefers-reduced-motion" in css
+
+
+def test_webui_handles_every_state_the_backend_can_report():
+    """Each state repro_state() can return must be styled and filterable.
+
+    repro_state() stopped flattening docker's transitional states, so they now
+    reach the dashboard for real. A state the UI does not know about renders with
+    no colour and lands in renderDetail's fallback branch -- which did not exist
+    until these became reachable.
+    """
+    import re
+    from importlib import resources
+    from rc_repro.services import lifecycle as lc
+    webui = resources.files("rc_repro").joinpath("data", "webui")
+    css = webui.joinpath("app.css").read_text(encoding="utf-8")
+    html = webui.joinpath("index.html").read_text(encoding="utf-8")
+
+    for state in ("running", "stopped", "down", "unknown") + lc.TRANSIENT_STATES:
+        assert re.search(rf"\.card\.st-{state}\b", css), f"no card accent for state {state!r}"
+        assert re.search(rf"\.pill\.{state}\b", css), f"no pill colour for state {state!r}"
+    # …and each real one is reachable from the status filter.
+    for state in lc.TRANSIENT_STATES:
+        assert f'value="{state}"' in html, f"status filter cannot select {state!r}"

@@ -31,10 +31,50 @@ def test_sanitize_and_derive():
     assert lc.sanitize("...") == ""      # no usable chars -> empty (caller rejects)
 
 
-def test_pretty_state():
-    assert lc._pretty_state("") == "down"
-    assert lc._pretty_state("running(3), exited(1)") == "running"
-    assert lc._pretty_state("exited(2)") == "stopped"
+def test_repro_state_from_rc_container_status():
+    # "no rocketchat container" splits on whether anything else survives.
+    assert lc.repro_state("", False) == "down"
+    assert lc.repro_state("", True) == "stopped"
+    assert lc.repro_state("Up 2 hours (healthy)", True) == "running"
+    assert lc.repro_state("Up 5 seconds (health: starting)", True) == "running"
+    assert lc.repro_state("Exited (0) 2 minutes ago", True) == "stopped"
+    assert lc.repro_state("Created", True) == "created"
+    assert lc.repro_state("Dead", True) == "dead"
+    # docker reports a paused container as "Up …(Paused)" -- it must not read as running.
+    assert lc.repro_state("Up 3 days (Paused)", True) == "paused"
+    # The regression: a crash-looping RC. The list used to read compose's project
+    # aggregate, where the healthy Mongo's "running(1)" made this "running", while
+    # detail() called it "stopped". Both had to become "restarting".
+    assert lc.repro_state("Restarting (1) 5 seconds ago", True) == "restarting"
+
+
+def test_list_and_detail_agree_on_a_crash_looping_repro(monkeypatch, tmp_path):
+    """The same repro, through both code paths, must report the same state."""
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    meta = lc.runner.Metadata(name="r", project="rcrepro-r", rc_version="8.5.1",
+                           rc_image="img", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="http://localhost:3000",
+                           host_port=3000, version_source="test")
+    crash = "Restarting (1) 5 seconds ago"
+    monkeypatch.setattr(lc.runner, "docker_available", lambda: True)
+    monkeypatch.setattr(lc.runner, "exists", lambda _n: True)
+    monkeypatch.setattr(lc.runner, "list_meta", lambda: [meta])
+    monkeypatch.setattr(lc.runner, "read_meta", lambda _n: meta)
+    monkeypatch.setattr(lc.runner, "read_compose", lambda _n: {})
+    monkeypatch.setattr(lc.runner, "rc_restart_count", lambda _n: 7)
+    # What each path actually asks docker: the project aggregate names Mongo as
+    # running, which is precisely what used to mislead the list.
+    monkeypatch.setattr(lc.runner, "project_states",
+                        lambda: {"rcrepro-r": "restarting(1), running(1)"})
+    monkeypatch.setattr(lc.runner, "rc_status_by_project", lambda: {"rcrepro-r": crash})
+    monkeypatch.setattr(lc.runner, "container_details", lambda _n: [
+        {"service": "rocketchat", "state": "restarting", "status": crash, "health": ""},
+        {"service": "mongo", "state": "running", "status": "Up 2 hours", "health": ""}])
+
+    listed = lc.list_repros()[0]
+    detailed = lc.detail("r")
+    assert listed["state"] == detailed["state"] == "restarting"
+    assert detailed["restarts"] == 7      # the crash loop is now visible
 
 
 def test_createreq_defaults():
@@ -188,13 +228,47 @@ def test_rc_restart_count(monkeypatch):
     assert runner.rc_restart_count("x") == 0   # no container -> 0, no crash
 
 
+def test_docker_queries_behind_the_gui_poll_cannot_hang_or_raise(monkeypatch):
+    """A wedged daemon must degrade, not park a threadpool worker forever.
+
+    docker_available() (timeout=10) can pass and the NEXT call still hang: these
+    three run on the dashboard's 4s poll, so an unbounded one is a worker leak
+    that ends with the server answering nothing. Each already has a documented
+    "couldn't ask docker" value -- they just have to reach it.
+    """
+    import subprocess
+
+    from rc_repro import runner
+
+    for exc in (subprocess.TimeoutExpired(cmd="docker", timeout=30),
+                FileNotFoundError("docker"),
+                OSError("no fork")):
+        def boom(*a, **k):
+            raise exc
+
+        monkeypatch.setattr(runner.subprocess, "run", boom)
+        assert runner._compose_ls() is None                  # None = "couldn't ask"
+        assert runner.project_states() is None               # prune refuses on None
+        assert runner.rc_status_by_project() == {}
+        monkeypatch.setattr(runner, "service_container_ids", lambda n, s: ["abc"])
+        assert runner.rc_restart_count("x") == 0
+
+    # And every one of them passes a timeout, so the hang cannot happen at all.
+    calls = []
+    monkeypatch.setattr(runner.subprocess, "run",
+                        lambda *a, **k: calls.append(k.get("timeout")) or
+                        __import__("types").SimpleNamespace(stdout="", returncode=1))
+    runner._compose_ls(); runner.rc_status_by_project(); runner.rc_restart_count("x")
+    assert calls and all(t is not None for t in calls), f"unbounded docker call: {calls}"
+
+
 def test_kernel_major_minor_parsing():
-    from rc_repro import cli
-    assert cli._kernel_major_minor("6.19.7-200.fc43.aarch64") == (6, 19)
-    assert cli._kernel_major_minor("5.15.0-generic") == (5, 15)
-    assert cli._kernel_major_minor("6.19") == (6, 19)
-    assert cli._kernel_major_minor(None) is None
-    assert cli._kernel_major_minor("not-a-kernel") is None
+    from rc_repro.services import doctor as doctorsvc
+    assert doctorsvc._kernel_major_minor("6.19.7-200.fc43.aarch64") == (6, 19)
+    assert doctorsvc._kernel_major_minor("5.15.0-generic") == (5, 15)
+    assert doctorsvc._kernel_major_minor("6.19") == (6, 19)
+    assert doctorsvc._kernel_major_minor(None) is None
+    assert doctorsvc._kernel_major_minor("not-a-kernel") is None
 
 
 def test_hub_logged_in(monkeypatch, tmp_path):
@@ -231,3 +305,158 @@ def test_event_model_and_emit():
     assert seen[1].level == "warn"
     d = seen[0].as_dict()
     assert d["message"] == "hello" and d["terminal"] is False
+
+
+# --- job manager (web/jobs.py; no fastapi needed) ----------------------------
+
+def _await_finish(job, tries: int = 400) -> None:
+    import time
+    for _ in range(tries):
+        if job.status != "running":
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"job {job.id} never finished")
+
+
+def test_job_events_are_capped_with_absolute_indices():
+    from rc_repro.web import jobs as J
+    job = J.Job(id="job_x", kind="t")
+    for i in range(J.MAX_EVENTS_PER_JOB + 50):
+        job.emit(events.Event(f"e{i}"))
+    # `serve` is long-lived and every streamed docker line is an Event, so the
+    # per-job buffer is bounded -- but the index the SSE stream hands out stays
+    # absolute, so a reader cannot desync by counting.
+    assert len(job.events) == J.MAX_EVENTS_PER_JOB
+    assert job.n_events == J.MAX_EVENTS_PER_JOB + 50
+    evs, done, nxt = job.snapshot(0)
+    assert len(evs) == J.MAX_EVENTS_PER_JOB and nxt == job.n_events
+    assert job.snapshot(nxt) == ([], done, nxt)      # nothing new after catching up
+
+
+def test_job_registry_evicts_finished_jobs_only():
+    from rc_repro.web import jobs as J
+    mgr = J.JobManager()
+    for i in range(J.MAX_JOBS + 20):
+        mgr._jobs[f"job_{i}"] = J.Job(id=f"job_{i}", kind="t", status="done")
+    mgr._jobs["job_live"] = J.Job(id="job_live", kind="t", status="running")
+    mgr._evict_locked()
+    assert len(mgr._jobs) <= J.MAX_JOBS
+    assert mgr.get("job_live") is not None    # a running job is never evicted
+    assert mgr.get("job_0") is None           # the oldest finished ones go first
+
+
+def test_job_status_is_set_before_the_terminal_event(monkeypatch):
+    from rc_repro.web import jobs as J
+    captured = []
+    original = J.Job.emit
+
+    def spy(self, ev):
+        captured.append((ev.terminal, self.status, self.result))
+        original(self, ev)
+
+    monkeypatch.setattr(J.Job, "emit", spy)
+    job = J.JobManager().submit("t", lambda emit: "R")
+    _await_finish(job)
+    terminal = [c for c in captured if c[0]]
+    # A client that polls /api/jobs/<id> on seeing `terminal` used to read
+    # status="running" with result=None, because the event came first.
+    assert terminal and terminal[-1] == (True, "done", "R")
+
+
+def test_job_internal_error_does_not_leak_a_traceback():
+    from rc_repro.web import jobs as J
+    job = J.JobManager().submit("t", lambda emit: 1 / 0)
+    _await_finish(job)
+    assert job.status == "error" and job.error_kind == "InternalError"
+    evs, _done, _n = job.snapshot(0)
+    # The traceback goes to the server's stderr; it must not ride the SSE payload
+    # into a browser, which renders whatever it is handed.
+    assert evs and all("trace" not in (e.get("data") or {}) for e in evs)
+
+
+def test_job_reproerror_keeps_its_kind_on_the_wire():
+    from rc_repro.web import jobs as J
+
+    def boom(emit):
+        raise errors.NotFoundError("no such repro")
+
+    job = J.JobManager().submit("t", boom)
+    _await_finish(job)
+    assert job.status == "error" and job.error_kind == "NotFoundError"
+    evs, _done, _n = job.snapshot(0)
+    assert evs[-1]["data"]["kind"] == "NotFoundError"
+
+
+def test_set_state_explains_a_downed_repro(monkeypatch):
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(lc.runner, "start", lambda n: 1)
+    monkeypatch.setattr(lc.runner, "rc_state", lambda n: "absent")
+    with pytest.raises(errors.DockerError) as exc:
+        lc.set_state("x", "start")
+    # `compose start` cannot revive a repro with no containers -- say what does.
+    assert "no containers to start" in str(exc.value)
+
+
+def test_summary_carries_preset_notes():
+    # These are what the GUI renders from the create job's result and the CLI
+    # prints in a box after `up` -- the Keycloak realm, the /etc/hosts line, etc.
+    m = lc.runner.Metadata(
+        name="x", project="rcrepro-x", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="oidc",
+        root_url="http://localhost:3000", host_port=3000, version_source="map",
+        extra={"notes": ["Add this to /etc/hosts:", "    127.0.0.1  keycloak"]})
+    assert lc._summary(m)["notes"] == ["Add this to /etc/hosts:",
+                                      "    127.0.0.1  keycloak"]
+
+
+def test_compose_major_version_parsing():
+    from rc_repro.services import doctor as doctorsvc
+    # A first-CHARACTER compare reported every Compose newer than v2 as
+    # unsupported (v5 is current) and would misread v10 as v1.
+    assert doctorsvc._major_version("2.29.1") == 2
+    assert doctorsvc._major_version("v2.29.1") == 2
+    assert doctorsvc._major_version("5.3.1") == 5
+    assert doctorsvc._major_version("10.0.0") == 10
+    assert doctorsvc._major_version("1.29.2") == 1        # genuinely too old
+    assert doctorsvc._major_version(None) is None
+    assert doctorsvc._major_version("") is None
+    assert doctorsvc._major_version("unknown") is None
+
+
+def test_detail_reports_unknown_state_when_docker_is_unreachable(monkeypatch):
+    from rc_repro import runner
+    monkeypatch.setattr(runner, "docker_available", lambda: False)
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(runner, "read_meta", lambda n: lc.runner.Metadata(
+        name=n, project=f"rcrepro-{n}", rc_version="8.5.1", rc_image="i", mongo_tag="8.0",
+        mongo_flavor="official", preset="default", root_url="http://localhost:3000",
+        host_port=3000, version_source="map"))
+    monkeypatch.setattr(runner, "read_compose", lambda n: {"services": {"rocketchat": {}}})
+    d = lc.detail("x")
+    # container_details() returns [] both for "none" and for "could not ask docker",
+    # so detail() used to assert "down" while list_repros() said "?" for the same
+    # repro -- and the panel then offered a Bring up button that could only fail.
+    assert d["state"] == "?" and d["health"] == "" and d["uptime"] == ""
+    assert d["containers"] == []
+
+
+def test_detail_says_whether_this_repro_is_the_default(monkeypatch, tmp_path):
+    """The panel offers "Make default" only when it would change something.
+
+    list_repros() has always carried `default`; detail() did not, so the panel
+    had to either hide the action or show it on the repro that already is one.
+    """
+    from rc_repro import config, runner
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(runner, "docker_available", lambda: False)
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(runner, "read_meta", lambda n: lc.runner.Metadata(
+        name=n, project=f"rcrepro-{n}", rc_version="8.5.1", rc_image="i", mongo_tag="8.0",
+        mongo_flavor="official", preset="default", root_url="http://localhost:3000",
+        host_port=3000, version_source="map"))
+    monkeypatch.setattr(runner, "read_compose", lambda n: {"services": {"rocketchat": {}}})
+
+    assert lc.detail("a")["is_default"] is False       # nothing pinned yet
+    config.update_config(lambda cfg: cfg.__setitem__("default_repro", "a"))
+    assert lc.detail("a")["is_default"] is True
+    assert lc.detail("b")["is_default"] is False

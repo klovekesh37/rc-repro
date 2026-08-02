@@ -38,10 +38,15 @@ export default function () {
   const login = step("login", http.post(`${URL}/api/v1/login`,
     JSON.stringify(creds), { headers: JSON_HDR }));
   if (login.status !== 200) return;   // no session — count the failure, skip the rest
-  const body = login.json();
+  // status 200 does not guarantee a JSON body: a front proxy can answer 200 with
+  // an HTML error page, and an unchecked body.data deref throws, killing the
+  // iteration via dropped_iterations with nothing in the summary to explain it.
+  let data = null;
+  try { data = login.json("data"); } catch (e) { data = null; }
+  if (!data || !data.authToken) return;
   const auth = { headers: {
-    "X-Auth-Token": body.data.authToken,
-    "X-User-Id": body.data.userId,
+    "X-Auth-Token": data.authToken,
+    "X-User-Id": data.userId,
     "Content-Type": "application/json",
   } };
 

@@ -165,6 +165,8 @@ _SCENARIO_DESC = {
     "read": "GET `channels.history` — the read path.",
     "mixed": "60% reads, 30% posts, 10% logins — a realistic blend.",
     "journey": "a full user session per iteration — login → rooms → open → post → sync, each step timed.",
+    "webhook": "POST through a real incoming-webhook integration — an alert-storm write path.",
+    "badbot": "a badly-written client: tight unpaginated polling of history/users.list/channels.list.",
     "custom": "a caller-supplied endpoint.",
 }
 
@@ -177,6 +179,19 @@ def _status_breakdown(summary: dict) -> str:
     return " · ".join(parts)
 
 
+def _cell(summary: dict, key: str, fmt: str = "{:.0f}ms", bold: bool = False) -> str:
+    """One metric cell, or '-' when the metric is absent.
+
+    A run that issued no requests emits no latency/checks keys at all, so
+    `.get(key, 0)` would render "not measured" as a confident 0ms / 0%.
+    """
+    v = summary.get(key)
+    if v is None:
+        return "-"
+    s = fmt.format(v)
+    return f"**{s}**" if bold else s
+
+
 def loadtest_markdown(ctx: dict, summary: dict, slo_results: list[dict],
                       resources: dict | None, host: dict,
                       snapshot: dict | None = None, compare: dict | None = None,
@@ -186,8 +201,11 @@ def loadtest_markdown(ctx: dict, summary: dict, slo_results: list[dict],
     the workspace context; `compare` an optional baseline diff
     ({label, saved_at, rows})."""
     when = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    load = (f"ramp {ctx['ramp']} VUs" if ctx.get("ramp") else f"{ctx['vus']} VUs") + \
-        f" for {ctx['duration']}"
+    # A spike run's `vus` is the value the CLI told the user it was ignoring, so
+    # reporting it labelled the run as a load shape that never happened.
+    load = (f"spike {ctx['spike']} VUs" if ctx.get("spike")
+            else f"ramp {ctx['ramp']} VUs" if ctx.get("ramp")
+            else f"{ctx['vus']} VUs") + f" for {ctx['duration']}"
     identity = (f"{ctx['users']} seeded users (round-robin per VU)"
                 if ctx.get("users") else "the admin token")
     lines = [
@@ -222,16 +240,16 @@ def loadtest_markdown(ctx: dict, summary: dict, slo_results: list[dict],
     lines += [
         "## Results", "",
         "| metric | value |", "|---|---|",
-        f"| requests | {summary.get('count', 0):.0f} |",
-        f"| throughput | **{summary.get('rps', 0):.1f} req/s** |",
-        f"| latency p50 | {summary.get('p50', 0):.0f}ms |",
-        f"| latency p90 | {summary.get('p90', 0):.0f}ms |",
-        f"| latency p95 | **{summary.get('p95', 0):.0f}ms** |",
-        f"| latency p99 | {summary.get('p99', 0):.0f}ms |",
-        f"| latency avg / min / max | {summary.get('avg', 0):.0f} / "
-        f"{summary.get('min', 0):.0f} / {summary.get('max', 0):.0f} ms |",
-        f"| error rate | {summary.get('error_rate', 0) * 100:.2f}% |",
-        f"| checks passed | {summary.get('checks_rate', 0) * 100:.1f}% |",
+        f"| requests | {_cell(summary, 'count', '{:.0f}')} |",
+        f"| throughput | {_cell(summary, 'rps', '{:.1f} req/s', bold=True)} |",
+        f"| latency p50 | {_cell(summary, 'p50')} |",
+        f"| latency p90 | {_cell(summary, 'p90')} |",
+        f"| latency p95 | {_cell(summary, 'p95', bold=True)} |",
+        f"| latency p99 | {_cell(summary, 'p99')} |",
+        f"| latency avg / min / max | {_cell(summary, 'avg', '{:.0f}')} / "
+        f"{_cell(summary, 'min', '{:.0f}')} / {_cell(summary, 'max', '{:.0f}')} ms |",
+        f"| error rate | {_cell(summary, 'error_rate', '{:.2%}')} |",
+        f"| checks passed | {_cell(summary, 'checks_rate', '{:.1%}')} |",
     ]
     responses = _status_breakdown(summary)
     if responses:

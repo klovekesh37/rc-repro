@@ -115,12 +115,25 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
     # honoured when we could actually read the setting; unknown -> restore on.)
     email_2fa = "Accounts_TwoFactorAuthentication_By_Email_Enabled"
     rate_limiter = "API_Enable_Rate_Limiter"
-    # Prior values (None = couldn't read). Restore is keyed on the KNOWN-off
-    # state only: an unreadable setting must never leave 2FA disabled, so unknown
-    # (None) restores ON — matching the limiter's "unknown -> restore on" rule.
+    # Prior values (None = the read failed). "Unreadable" is NOT "was on": the
+    # old rule restored ON for both, so a single transient 500 — likely, since
+    # seeding starts the moment RC answers — turned email-2FA on for the ldap /
+    # saml / oidc / livechat presets, which deliberately switch it OFF because
+    # their users have no mailbox here. Only touch a value we actually observed,
+    # and only put back what we actually changed.
     email_2fa_prev = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, email_2fa)
     limiter_was_off = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, rate_limiter) is False
-    _set(email_2fa, False)
+    email_2fa_changed = False
+    _authorship_warning = (
+        "seeded users may not be loginable, so messages will be authored by admin")
+    if email_2fa_prev is None:
+        log(f"  ⚠ could not read the email-2FA setting — leaving it alone; {_authorship_warning}")
+    elif email_2fa_prev:
+        email_2fa_changed = _set(email_2fa, False)
+        if not email_2fa_changed:
+            # Previously silent: the bool was discarded, so a failed disable
+            # surfaced only as "0 usable as authors" further down.
+            log(f"  ⚠ could not disable email-2FA — {_authorship_warning}")
     if not limiter_was_off and not _set(rate_limiter, False):
         log("  ⚠ could not disable the API rate limiter — seed rates may be throttled")
 
@@ -129,8 +142,21 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
     finally:
         if not limiter_was_off:
             _set(rate_limiter, True)
-        if email_2fa_prev is not False:   # was on, or unknown -> restore on
+        if email_2fa_changed:
             _set(email_2fa, True)
+
+
+def _message_id(resp) -> str | None:
+    """The posted message's `_id`, or None.
+
+    `.ok` is true for any 2xx, and a front proxy (Traefik fronts the
+    multi-instance preset) can answer 200 with an HTML error page — a raw
+    JSONDecodeError there would abort the entire seed mid-way.
+    """
+    try:
+        return (resp.json().get("message") or {}).get("_id")
+    except (ValueError, AttributeError):
+        return None
 
 
 def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
@@ -180,7 +206,7 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
             msg.add(dt * 1000)
             n += 1
             if plan.rich and random.random() < 0.2:
-                mid = (r.json().get("message") or {}).get("_id")
+                mid = _message_id(r)
                 if mid:
                     # The thread reply is a real extra message — count it so the
                     # reported total isn't understated (the reaction is not).
@@ -205,7 +231,14 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
     if plan.rich and names:
         for gn in _GROUP_NAMES:
             members = random.sample(names, k=min(len(names), 4))
-            timed("channels", "/api/v1/groups.create", admin_hdr, {"name": gn, "members": members})
+            gr = timed("channels", "/api/v1/groups.create", admin_hdr,
+                       {"name": gn, "members": members})
+            # On a re-seed the group already exists, groups.create fails, and this
+            # run's freshly sampled members are not in it — their posts then 400
+            # (RC can't auto-join a private group). Only author into a group this
+            # run actually created.
+            if gr is None or not gr.ok:
+                continue
             total_msgs += post_messages(f"#{gn}", members, max(3, plan.messages // 3))
 
     # 4. Messages into the default GENERAL channel (everyone is a member).
@@ -218,7 +251,13 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
             break
         u1, u2 = random.sample(names, 2)
         hdr = {**tokens[u1].headers(), "Content-Type": "application/json"} if u1 in tokens else admin_hdr
-        if timed("dms", "/api/v1/im.create", hdr, {"username": u2}) is not None:
+        r = timed("dms", "/api/v1/im.create", hdr, {"username": u2})
+        # post() returns None only on a TRANSPORT error, so a 400/403 (revoked
+        # create-d permission, Accounts_Direct_Message_Max_Users) still counted as
+        # a DM and still fired a doomed postMessage. The reported count then
+        # landed in the benchmark report as workload that was never created.
+        # post_messages() already checks .ok — match it.
+        if r is not None and r.ok:
             timed("dms", "/api/v1/chat.postMessage", hdr, {"channel": f"@{u2}", "text": random.choice(_MESSAGES)})
             dms += 1
     log(f"messages: ~{total_msgs}  DMs: {dms}")

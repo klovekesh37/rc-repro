@@ -12,7 +12,8 @@ import shutil
 import socket
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, field
+import uuid
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from rc_repro import config
@@ -20,10 +21,18 @@ from rc_repro import config
 
 def _atomic_write(path: Path, content: str) -> None:
     """Write via a temp file in the same dir + os.replace, so readers never see a
-    partially written file (rename is atomic on the same filesystem)."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, path)
+    partially written file (rename is atomic on the same filesystem).
+
+    The temp name is unique per call: a fixed `<name>.tmp` meant two concurrent
+    writers (two web jobs touching the same repro) shared one temp path and
+    clobbered each other, defeating the atomicity this exists to provide.
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)   # no-op after a successful replace
 
 
 @dataclass
@@ -74,9 +83,20 @@ def write(name: str, compose_yaml: str, meta: Metadata,
         fp.write_text(content.replace("{{ROOT_URL}}", meta.root_url), encoding="utf-8")
 
 
+_META_FIELDS = frozenset(f.name for f in fields(Metadata))
+
+
 def read_meta(name: str) -> Metadata:
+    """Load a repro's metadata.
+
+    Unknown keys are dropped rather than raising: a repro.json written by a NEWER
+    rc-repro carrying an added field would otherwise TypeError, and `list_meta`
+    swallows that — silently making the repro vanish from `rc-repro list`.
+    """
     blob = json.loads((workspace(name) / "repro.json").read_text(encoding="utf-8"))
-    return Metadata(**blob)
+    if not isinstance(blob, dict):
+        raise TypeError("repro.json is not a JSON object")
+    return Metadata(**{k: v for k, v in blob.items() if k in _META_FIELDS})
 
 
 def read_compose(name: str) -> dict:
@@ -190,14 +210,21 @@ def remove(name: str) -> None:
 # --- docker compose -----------------------------------------------------------
 
 
-def _compose(name: str, *args: str, capture: bool = False) -> subprocess.CompletedProcess:
-    """Run `docker compose <args>` in a repro workspace."""
+def _compose(name: str, *args: str, capture: bool = False,
+             timeout: float | None = None) -> subprocess.CompletedProcess:
+    """Run `docker compose <args>` in a repro workspace.
+
+    `timeout` is opt-in and left unset by default: `up`/`pull`/`logs -f` are
+    legitimately long-running. Bounded callers (samplers, one-shot queries) pass
+    one so a wedged daemon can't block a worker thread forever.
+    """
     cmd = ["docker", "compose", *args]
     return subprocess.run(
         cmd,
         cwd=workspace(name),
         text=True,
         capture_output=capture,
+        timeout=timeout,
     )
 
 
@@ -268,15 +295,47 @@ def compose_exec(name: str, service: str, args: list[str]) -> int:
     return _compose(name, "exec", "-T", service, *args).returncode
 
 
-def compose_exec_capture(name: str, service: str, args: list[str]) -> tuple[int, str]:
-    """Like compose_exec, but captures stdout: (returncode, stdout)."""
-    r = _compose(name, "exec", "-T", service, *args, capture=True)
+def compose_exec_capture(name: str, service: str, args: list[str],
+                         timeout: float | None = None) -> tuple[int, str]:
+    """Like compose_exec, but captures stdout: (returncode, stdout).
+
+    Returns (1, "") instead of raising when the exec can't run or `timeout`
+    expires, so best-effort samplers degrade to "no sample" rather than
+    stranding their thread."""
+    try:
+        r = _compose(name, "exec", "-T", service, *args, capture=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
     return r.returncode, r.stdout or ""
 
 
 def rm_services(name: str, services: list[str]) -> int:
     """Stop and remove specific services (docker compose rm -s -f <services>)."""
     return _compose(name, "rm", "-s", "-f", *services).returncode
+
+
+def remove_volumes(name: str, volumes: list[str]) -> list[str]:
+    """Delete named volumes belonging to a repro's compose project.
+
+    `docker compose down -v` only removes volumes DECLARED in the compose file, so
+    a volume whose declaration is dropped (detaching monitoring, switching preset
+    with --force) becomes unreachable and survives forever. Containers must be
+    gone first. Returns the volume names that could not be removed.
+    """
+    proj = project_name(name)
+    failed: list[str] = []
+    for vol in volumes:
+        full = f"{proj}_{vol}"
+        try:
+            r = subprocess.run(["docker", "volume", "rm", full],
+                               capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            failed.append(full)
+            continue
+        # Already gone is success, not a failure.
+        if r.returncode != 0 and "no such volume" not in (r.stderr or "").lower():
+            failed.append(full)
+    return failed
 
 
 def service_container_ids(name: str, service: str) -> list[str]:
@@ -288,9 +347,15 @@ def service_container_ids(name: str, service: str) -> list[str]:
 
 
 def docker_capacity() -> tuple[float, int] | None:
-    """(cpus, memory_bytes) available to the docker engine/VM, or None."""
-    r = subprocess.run(["docker", "info", "--format", "{{.NCPU}} {{.MemTotal}}"],
-                       capture_output=True, text=True)
+    """(cpus, memory_bytes) available to the docker engine/VM, or None.
+
+    Never raises: callers use this during best-effort restore paths, where an
+    OSError (docker gone, fork failure) must not escape."""
+    try:
+        r = subprocess.run(["docker", "info", "--format", "{{.NCPU}} {{.MemTotal}}"],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
     if r.returncode != 0:
         return None
     try:
@@ -308,14 +373,21 @@ def container_ids(name: str) -> list[str]:
 
 def docker_stats(container_ids: list[str]) -> str:
     """One `docker stats --no-stream` sample for the given containers, as
-    tab-separated `name<TAB>cpu%<TAB>mem-usage` lines ('' on error/none)."""
+    tab-separated `name<TAB>cpu%<TAB>mem-usage` lines ('' on error/none).
+
+    Timed out: this is polled on a sampler thread once a second, so a wedged
+    daemon would otherwise block that thread (and its child) forever — the
+    thread is a daemon and its `join` gives up, so it would leak silently."""
     if not container_ids:
         return ""
-    proc = subprocess.run(
-        ["docker", "stats", "--no-stream", "--format",
-         "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}", *container_ids],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["docker", "stats", "--no-stream", "--format",
+             "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}", *container_ids],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
     return proc.stdout if proc.returncode == 0 else ""
 
 
@@ -347,11 +419,19 @@ def _compose_ls() -> list[dict] | None:
 
     Newer compose emits a JSON array; older versions emit NDJSON (one object per
     line). Both are handled so callers work across compose versions.
+
+    Bounded: the GUI polls this every 4s on a threadpool worker. A daemon that
+    answers `docker info` (so docker_available() says yes) but then wedges on
+    `compose ls` would otherwise park a worker per poll until the server stops
+    answering at all. Failing to None is already the "couldn't ask docker" path.
     """
-    proc = subprocess.run(
-        ["docker", "compose", "ls", "--all", "--format", "json"],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["docker", "compose", "ls", "--all", "--format", "json"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
     if proc.returncode != 0:
         return None
     raw = (proc.stdout or "").strip()
@@ -407,8 +487,13 @@ def rc_restart_count(name: str) -> int:
     ids = service_container_ids(name, "rocketchat") or service_container_ids(name, "rocketchat-1")
     if not ids:
         return 0
-    r = subprocess.run(["docker", "inspect", "--format", "{{.RestartCount}}", ids[0]],
-                       capture_output=True, text=True)
+    # Bounded for the same reason as _compose_ls: the detail panel refreshes this
+    # on a timer, and "unknown" (0) is already the documented fallback.
+    try:
+        r = subprocess.run(["docker", "inspect", "--format", "{{.RestartCount}}", ids[0]],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return 0
     try:
         return int((r.stdout or "0").strip())
     except ValueError:
@@ -419,11 +504,14 @@ def rc_status_by_project() -> dict[str, str]:
     """Map compose project -> its rocketchat container `Status` string
     ("Up 2 hours (healthy)"), in ONE `docker ps` call (cheap enough for the whole
     dashboard). Used to show uptime/health per repro without an N-call fan-out."""
-    proc = subprocess.run(
-        ["docker", "ps", "--all", "--format",
-         '{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}\t{{.Status}}'],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["docker", "ps", "--all", "--format",
+             '{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}\t{{.Status}}'],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}          # same 4s-poll bound as _compose_ls; {} = "couldn't ask"
     if proc.returncode != 0:
         return {}
     out: dict[str, str] = {}

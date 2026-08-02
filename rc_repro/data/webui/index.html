@@ -9,10 +9,12 @@
 <body>
   <header class="topbar">
     <div class="brand"><span class="dollar">$</span> rc-repro</div>
-    <span id="docker-badge" class="chip">docker: ?</span>
+    <!-- A button, not a span: when this says "down" the diagnosis is what you want next. -->
+    <button id="docker-badge" class="chip" title="Run the environment check">docker: ?</button>
     <div class="topbar-actions">
       <button id="btn-new" class="btn primary">+ New repro</button>
       <button id="btn-bench" class="btn">Benchmark</button>
+      <button id="btn-jobs" class="btn">Activity</button>
       <button id="btn-refresh" class="btn">Refresh</button>
       <button id="btn-prune" class="btn danger">Prune down</button>
     </div>
@@ -27,14 +29,20 @@
         </div>
       </div>
       <div class="toolbar-controls">
-        <input id="filter" class="input" placeholder="Filter repros...">
-        <select id="status-filter" class="input">
+        <input id="filter" class="input" placeholder="Filter repros..." aria-label="Filter repros by name">
+        <select id="status-filter" class="input" aria-label="Filter by status">
           <option value="">All statuses</option>
           <option value="running">Running</option>
           <option value="stopped">Stopped</option>
           <option value="down">Down</option>
+          <!-- docker reports these verbatim; repro_state() passes them through -->
+          <option value="restarting">Restarting</option>
+          <option value="paused">Paused</option>
+          <option value="created">Created</option>
+          <option value="dead">Dead</option>
+          <option value="?">Unknown (docker down)</option>
         </select>
-        <select id="sort-by" class="input">
+        <select id="sort-by" class="input" aria-label="Sort repros">
           <option value="name">Sort: name</option>
           <option value="state">Sort: state</option>
           <option value="port">Sort: port</option>
@@ -56,18 +64,36 @@
     <form id="create-form" method="dialog">
       <h2>New repro</h2>
       <label>Rocket.Chat version <input name="version" placeholder="8.5.1" required></label>
+      <p id="version-hint" class="hint"></p>
       <label>Preset <select name="preset" id="preset-select"></select></label>
       <p id="preset-desc" class="hint"></p>
       <div id="preset-params"></div>
       <label>Host port (blank = auto) <input name="port" type="number" min="1024" max="65535" placeholder="auto"></label>
       <div class="checks">
         <label><input type="checkbox" name="monitor"> Monitoring (Prometheus + Grafana)</label>
-        <label><input type="checkbox" name="seed"> Seed sample data</label>
+        <label><input type="checkbox" name="seed"> Seed sample data (users, channels, messages)</label>
+        <label id="create-seed-profile-row" hidden>Seed profile
+          <select name="seed_profile">
+            <option value="small">small — 5 users, 3 channels, 5 msgs/channel</option>
+            <option value="standard">standard — 20 users, 8 channels, 20 msgs/channel</option>
+            <option value="large">large — 100 users, 20 channels, 100 msgs/channel</option>
+          </select>
+        </label>
         <label><input type="checkbox" name="wait" checked> Wait until ready</label>
       </div>
       <details class="adv">
         <summary>Advanced options</summary>
         <label>Name (blank = derived) <input name="name" placeholder="e.g. rc8-5-1-ldap"></label>
+        <label>If that name already exists
+          <select name="existing">
+            <option value="reuse">Reuse it — just start the existing containers as they are</option>
+            <option value="force">Rebuild it from the settings above — keep its data</option>
+            <option value="fresh">Rebuild it and DELETE its data — users, channels, messages, uploads</option>
+          </select>
+        </label>
+        <p class="hint">Only applies when the name is already taken. “Reuse” is the default, and it is why
+          creating over an existing name keeps the old version, preset and port — those are read back from
+          the existing workspace, not rebuilt. Seeding and “Wait until ready” still run against it.</p>
         <label>Registration token — EE license (--reg-token) <input name="reg_token" placeholder="cloud reg token"></label>
         <label>MongoDB tag override (--mongo) <input name="mongo" placeholder="e.g. 8.0"></label>
         <label>RC image override (--rc-image) <input name="rc_image" placeholder="registry/…/rocket.chat"></label>
@@ -106,7 +132,7 @@
       <menu>
         <button type="button" id="seed-cancel" class="btn">Cancel</button>
         <button type="button" id="seed-clear" class="btn danger">Clear scale data</button>
-        <button type="button" class="btn primary" id="seed-submit">Seed</button>
+        <button class="btn primary" id="seed-submit">Seed</button>
       </menu>
     </form>
   </dialog>
@@ -124,7 +150,7 @@
       <div id="import-plan" class="plan" hidden></div>
       <menu>
         <button type="button" id="import-cancel" class="btn">Cancel</button>
-        <button type="button" id="import-preview" class="btn">Preview plan</button>
+        <button id="import-preview" class="btn">Preview plan</button>
         <button type="button" class="btn primary" id="import-apply" disabled>Apply</button>
       </menu>
     </form>
@@ -175,7 +201,7 @@
       <label>SLO <input name="slo" value="p95=500ms,error=2%"></label>
       <div class="row2">
         <label>Start VUs <input name="start" type="number" min="1" value="10"></label>
-        <label>Max VUs <input name="max_vus" type="number" min="1" value="320"></label>
+        <label>Max VUs <input name="max_vus" type="number" min="1" value="640"></label>
       </div>
       <div class="row2">
         <label>Step duration <input name="step_duration" value="20s"></label>
@@ -200,15 +226,83 @@
       </label>
       <menu>
         <button type="button" id="bench-cancel" class="btn">Cancel</button>
-        <button type="button" class="btn primary" id="bench-submit">Run benchmark</button>
+        <button class="btn primary" id="bench-submit">Run benchmark</button>
       </menu>
     </form>
+  </dialog>
+
+  <!-- API token. Its own dialog rather than reusing the job log, which a
+       detached background job may still be writing into. -->
+  <dialog id="pat-dialog">
+    <h2 id="pat-title">API token</h2>
+    <p class="hint">Personal Access Token with “Ignore Two Factor Authentication”. Pass both
+      headers on every API call.</p>
+    <pre id="pat-body" class="log"></pre>
+    <menu>
+      <button type="button" id="pat-copy" class="btn">Copy headers</button>
+      <button type="button" id="pat-close" class="btn primary">Close</button>
+    </menu>
+  </dialog>
+
+  <!-- API call console: the GUI's `rc-repro api`. The response renders in place,
+       so app.js cancels the submit to keep the dialog open. method="dialog" is
+       still the right fallback: if that handler never ran, this closes the dialog
+       rather than attempting a navigation the CSP's `form-action 'none'` blocks. -->
+  <dialog id="call-dialog">
+    <form id="call-form" method="dialog">
+      <h2 id="call-title">API call</h2>
+      <p class="hint">An authenticated REST call against this workspace, as its admin —
+        the same request <code>rc-repro api</code> makes.</p>
+      <div class="row2">
+        <label class="narrow">Method
+          <select name="method">
+            <option>GET</option><option>POST</option><option>PUT</option>
+            <option>DELETE</option><option>PATCH</option>
+          </select>
+        </label>
+        <label>Path <input name="path" value="/api/v1/me" placeholder="/api/v1/users.list"></label>
+      </div>
+      <label>JSON body (POST / PUT / PATCH)
+        <textarea name="data" rows="3" spellcheck="false"
+                  placeholder='{"userId": "…", "data": {"name": "New Name"}}'></textarea></label>
+      <div class="checks">
+        <label><input type="checkbox" name="pat"> Auth with a PAT, like a customer script</label>
+        <label><input type="checkbox" name="two_fa"> Add the 2FA password header</label>
+      </div>
+      <pre id="call-out" class="log" hidden></pre>
+      <menu>
+        <button type="button" id="call-copy" class="btn">Copy response</button>
+        <button type="button" id="call-close" class="btn">Close</button>
+        <button type="submit" id="call-send" class="btn primary">Send</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Doctor: the preflight report, same checks as `rc-repro doctor` -->
+  <dialog id="doctor-dialog">
+    <h2>Environment check</h2>
+    <p class="hint">The same preflight as <code>rc-repro doctor</code>: Docker, Compose, engine
+      kernel, registry auth, disk, connectivity and ports.</p>
+    <div id="doctor-body" class="plan"></div>
+    <menu>
+      <button type="button" id="doctor-recheck" class="btn">Re-check</button>
+      <button type="button" id="doctor-close" class="btn primary">Close</button>
+    </menu>
+  </dialog>
+
+  <!-- Activity: running + recent jobs, reopenable -->
+  <dialog id="jobs-dialog">
+    <h2>Activity</h2>
+    <p class="hint">Jobs keep running on the server after their dialog is closed — including
+      across a page refresh. Click one to reopen its output.</p>
+    <div id="jobs-list" class="plan"></div>
+    <menu><button type="button" id="jobs-close" class="btn">Close</button></menu>
   </dialog>
 
   <!-- Job/progress + logs dialog -->
   <dialog id="job-dialog">
     <h2 id="job-title">Working…</h2>
-    <pre id="job-log" class="log"></pre>
+    <pre id="job-log" class="log" aria-live="polite"></pre>
     <menu><button id="job-close" class="btn">Close</button></menu>
   </dialog>
 

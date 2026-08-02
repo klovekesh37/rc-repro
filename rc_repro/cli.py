@@ -18,7 +18,7 @@ from typing import Optional
 import requests
 import typer
 
-from rc_repro import compose, config, errors, presets, perf, rcapi, runner, ui, versions
+from rc_repro import config, errors, presets, perf, rcapi, runner, ui, versions
 from rc_repro import seed as seeder
 from rc_repro.perf import report as perf_report
 from rc_repro.perf.timings import fmt_ms
@@ -39,17 +39,14 @@ _err = ui.die  # error-exit (red on stderr + exit 1), kept under the local name
 
 
 def _resolve_name(name: str | None) -> str:
-    """Return the target repro name: explicit, else the configured default."""
-    if name:
-        if not runner.exists(name):
-            _err(f"no repro named {name!r} (run `rc-repro list`)")
-        return name
-    default = config.load_config().get("default_repro")
-    if not default:
-        _err("no --name given and no default repro set (use `rc-repro use <name>`)")
-    if not runner.exists(default):
-        _err(f"default repro {default!r} no longer exists; set another with `rc-repro use`")
-    return default
+    """Return the target repro name: explicit, else the configured default.
+
+    Delegates to the service layer so both front-ends share one implementation
+    (and one set of name-validation rules) rather than drifting apart."""
+    try:
+        return lcsvc.resolve_name(name)
+    except errors.ReproError as exc:
+        _err(str(exc))
 
 
 def _require_docker() -> None:
@@ -61,22 +58,6 @@ def _login(meta: runner.Metadata) -> rcapi.Auth:
     """Admin login for a repro. Passes the repro's Mailpit URL (email preset)
     so rcapi can satisfy an email-2FA challenge automatically."""
     return rcapi.login(meta.root_url, mailpit_url=meta.extra.get(config.EXTRA_MAILPIT_URL))
-
-
-def _pretty_state(status: str) -> str:
-    """Friendly label from a `docker compose ls` status.
-
-    Status aggregates all services, e.g. 'exited(1), running(3)' — the official
-    mongo flavor always has an exited one-shot mongo-init, so check for ANY
-    running container first rather than the leading token.
-    """
-    if not status:
-        return "down"           # no containers -> a plain `down`
-    if "running(" in status:
-        return "running"
-    if "exited(" in status:
-        return "stopped"        # `stop`-paused (all containers exited)
-    return status.split("(")[0]
 
 
 def _parse_set_params(set_: list[str] | None) -> dict[str, str]:
@@ -340,26 +321,6 @@ def ready(
     _print_notes(m)
 
 
-def _finalize(meta: runner.Metadata):
-    """Skip the setup wizard's cloud-registration step so the repro is usable
-    immediately. Best-effort (custom-admin presets / 2FA may block it); returns
-    the admin auth for post-ready actions, or None."""
-    try:
-        auth = _login(meta)
-        if rcapi.complete_setup_wizard(meta.root_url, auth, config.ADMIN_PASSWORD):
-            typer.echo("  setup wizard skipped — no registration needed.")
-        return auth
-    except Exception:  # noqa: BLE001 - finalize is best-effort
-        return None
-
-
-def _clear_default_if(name: str) -> None:
-    cfg = config.load_config(with_env=False)   # read-modify-WRITE: file only
-    if cfg.get("default_repro") == name:
-        cfg.pop("default_repro", None)
-        config.save_config(cfg)
-
-
 @app.command()
 def down(
     name: str = typer.Option("", "--name", "-n"),
@@ -479,9 +440,7 @@ def use(name: str = typer.Argument(..., help="repro to make the default")) -> No
     """Set the default repro for name-less commands."""
     if not runner.exists(name):
         _err(f"no repro named {name!r}")
-    cfg = config.load_config(with_env=False)   # read-modify-WRITE: file only
-    cfg["default_repro"] = name
-    config.save_config(cfg)
+    config.update_config(lambda cfg: cfg.__setitem__("default_repro", name))
     ui.ok(f"✓ default repro is now {name!r}.")
 
 
@@ -934,22 +893,43 @@ def _print_diag(rcm: dict, mongo_slow: dict | None, tl: dict | None,
                 typer.secho("  " + cont, fg=typer.colors.CYAN)
 
 
+def _load_shape(ctx: dict) -> str:
+    """The offered-load shape recorded in a run context ('spike 10:100' / 'ramp
+    10:200' / '50 VUs'), for panels and baseline-mismatch warnings."""
+    if ctx.get("spike"):
+        return f"spike {ctx['spike']}"
+    if ctx.get("ramp"):
+        return f"ramp {ctx['ramp']}"
+    return f"{ctx.get('vus', '?')} VUs"
+
+
+def _metric(summary: dict, key: str, fmt: str = "{:.0f}ms") -> str:
+    """A summary metric for display, or '-' when it was not measured.
+
+    A zero-request run emits no latency/checks keys at all, so `.get(key, 0)`
+    would present an absent measurement as a confident 0ms."""
+    v = summary.get(key)
+    return "-" if v is None else fmt.format(v)
+
+
 def _print_loadtest(ctx: dict, summary: dict, slo_results: list[dict]) -> None:
     from rc_repro.perf import slo as slo_mod
     rows = [
-        ("throughput", f"{summary.get('rps', 0):.1f} req/s   ({summary.get('count', 0):.0f} requests)"),
-        ("latency", f"p50 {summary.get('p50', 0):.0f}ms  p90 {summary.get('p90', 0):.0f}ms  "
-                    f"p95 {summary.get('p95', 0):.0f}ms  p99 {summary.get('p99', 0):.0f}ms"),
-        ("", f"avg {summary.get('avg', 0):.0f}ms  min {summary.get('min', 0):.0f}ms  "
-             f"max {summary.get('max', 0):.0f}ms"),
-        ("errors", f"{summary.get('error_rate', 0) * 100:.2f}%   checks {summary.get('checks_rate', 0) * 100:.0f}% ok"),
+        ("throughput", f"{_metric(summary, 'rps', '{:.1f}')} req/s   "
+                       f"({_metric(summary, 'count', '{:.0f}')} requests)"),
+        ("latency", f"p50 {_metric(summary, 'p50')}  p90 {_metric(summary, 'p90')}  "
+                    f"p95 {_metric(summary, 'p95')}  p99 {_metric(summary, 'p99')}"),
+        ("", f"avg {_metric(summary, 'avg')}  min {_metric(summary, 'min')}  "
+             f"max {_metric(summary, 'max')}"),
+        ("errors", f"{_metric(summary, 'error_rate', '{:.2%}')}   "
+                   f"checks {_metric(summary, 'checks_rate', '{:.0%}')} ok"),
     ]
     breakdown = _status_breakdown(summary)
     if breakdown:
         rows.append(("responses", breakdown))
     if ctx.get("constrained"):
         rows.append(("constrained", ctx["constrained"]))
-    load = (f"ramp {ctx['ramp']}" if ctx.get("ramp") else f"{ctx['vus']} VUs") + f" / {ctx['duration']}"
+    load = _load_shape(ctx) + f" / {ctx['duration']}"
     if ctx.get("users"):
         load += f", {ctx['users']} users"
     ui.panel(f"loadtest {ctx.get('label', ctx['scenario'])} ({load})", rows)
@@ -1198,6 +1178,9 @@ def loadtest(
     except RuntimeError as exc:
         _err(str(exc))   # raises typer.Exit; finally still runs (mon stopped, limiter restored)
     finally:
+        # users.json holds live seeded-user auth tokens — delete it FIRST, so no
+        # later restore step failing can leave credentials on disk.
+        (runner.workspace(m.name) / "loadtest" / "users.json").unlink(missing_ok=True)
         if sampler:
             rcm_report = sampler.stop()
         if mon:
@@ -1215,11 +1198,14 @@ def loadtest(
             except Exception:  # noqa: BLE001
                 _warn("  ⚠ could not restore the Prometheus metrics setting")
         if mongo_prior:
-            mongoprof.stop(m.name, mongo_prior)
+            # Wrapped like its neighbours: an exception here would skip the
+            # resource-cap restore below and leave the containers capped.
+            try:
+                mongoprof.stop(m.name, mongo_prior)
+            except Exception:  # noqa: BLE001
+                _warn("  ⚠ could not restore the Mongo profiler level")
         for problem in constrain_mod.restore(applied_constraints):
             _warn(f"  ⚠ could not restore resource limits — {problem}")
-        # users.json holds seeded-user tokens — don't leave them on disk.
-        (runner.workspace(m.name) / "loadtest" / "users.json").unlink(missing_ok=True)
 
     # Collect the diagnosis artifacts (profile entries survive the level reset).
     mongo_slow = mongoprof.collect(m.name, since_ms) if (diag and mongo_prior) else None
@@ -1230,13 +1216,20 @@ def loadtest(
         points.unlink(missing_ok=True)   # can be tens of MB — don't leave it around
 
     ctx = {"name": m.name, "version": m.rc_version, "scenario": scenario, "vus": vus,
-           "duration": duration, "ramp": ramp, "target": target, "label": label,
-           "users": len(users), "constrained": snapshot.get("constraints", "")}
+           "duration": duration, "ramp": ramp, "spike": spike, "target": target,
+           "label": label, "users": len(users),
+           "constrained": snapshot.get("constraints", "")}
     slo_results = slo_mod.evaluate(rules, summary) if rules else []
     compare_rows = baseline.compare({"summary": summary}, base) if base else []
     if base and (base.get("ctx") or {}).get("scenario") not in (None, scenario):
         _warn(f"  ⚠ baseline {compare!r} was a {(base['ctx']or{}).get('scenario')!r} run — "
               f"comparing across scenarios")
+    # Load shape too, not just scenario: a spike baseline diffed against a steady
+    # run compares different offered loads, which the deltas can't account for.
+    if base and _load_shape(base.get("ctx") or {}) != _load_shape(ctx):
+        _warn(f"  ⚠ baseline {compare!r} ran a different load shape "
+              f"({_load_shape(base.get('ctx') or {})} vs {_load_shape(ctx)}) — "
+              "deltas reflect the offered load, not just the workspace")
     if base and (base.get("snapshot") or {}).get("constraints") != snapshot.get("constraints"):
         _warn(f"  ⚠ baseline {compare!r} ran under different resource constraints "
               f"({(base.get('snapshot') or {}).get('constraints') or 'none'} vs "
@@ -1567,108 +1560,27 @@ def versions_cmd(
         typer.echo(f"  note         : {r.note}")
 
 
-def _kernel_major_minor(kv: str | None) -> tuple[int, int] | None:
-    """(major, minor) from a kernel string like '6.19.7-200.fc43.aarch64', or None."""
-    m = re.match(r"(\d+)\.(\d+)", kv or "")
-    return (int(m.group(1)), int(m.group(2))) if m else None
-
-
 @app.command()
 def doctor() -> None:
     """Preflight: check Docker, Compose, disk, connectivity and ports."""
-    import shutil
-
-    counts = {"ok": 0, "warn": 0, "fail": 0}
+    from rc_repro.services import doctor as doctorsvc
+    report = doctorsvc.run_checks()
     marks = {
-        "ok": ("✓", typer.colors.GREEN),
-        "warn": ("⚠", typer.colors.YELLOW),
-        "fail": ("✗", typer.colors.RED),
+        "ok": ("\u2713", typer.colors.GREEN),
+        "warn": ("\u26a0", typer.colors.YELLOW),
+        "fail": ("\u2717", typer.colors.RED),
     }
-
-    def line(status: str, msg: str) -> None:
-        counts[status] += 1
-        sym, color = marks[status]
-        typer.secho(f"{sym} {msg}", fg=color)
-
-    # Docker daemon (everything else that needs Docker degrades gracefully).
-    docker_up = runner.docker_available()
-    if docker_up:
-        line("ok", f"Docker daemon running ({runner.docker_server_version() or '?'})")
-    else:
-        line("fail", "Docker daemon not running — start Docker Desktop / dockerd")
-
-    # docker compose v2
-    cv = runner.compose_version()
-    if cv and cv.lstrip("v")[:1] == "2":
-        line("ok", f"docker compose v2 ({cv})")
-    elif cv:
-        line("warn", f"docker compose {cv} — rc-repro expects Compose v2")
-    else:
-        line("warn", "couldn't detect `docker compose` — install Compose v2")
-
-    # Engine/VM kernel vs Mongo 8 (SERVER-121912): mongod 8.0 hard-exits on
-    # kernel >= 6.19, which recent RC versions require. Common on fresh Podman /
-    # FCOS machines and easy to misread as a volume/permission failure.
-    if docker_up:
-        kv = runner.docker_kernel_version()
-        mm = _kernel_major_minor(kv) if kv else None
-        if mm and mm >= (6, 19):
-            line("warn", f"engine kernel {kv} — MongoDB 8.0 will not start (SERVER-121912); "
-                         "use an engine on kernel < 6.19 for RC versions that require Mongo 8")
-        elif kv:
-            line("ok", f"engine kernel {kv}")
-
-    # Docker Hub auth: anonymous pulls hit Hub's rate limit (registry.rocket.chat
-    # counts against Hub too), which shows up as a silent, container-less `down`.
-    hub = runner.hub_logged_in()
-    if hub is True:
-        line("ok", "logged in to Docker Hub (avoids anonymous pull-rate limits)")
-    elif hub is False:
-        line("warn", "not logged in to Docker Hub — anonymous pulls can hit the rate "
-                     "limit; run `docker login`. registry.rocket.chat counts against Hub too")
-
-    # Disk headroom (RC images are ~1.5 GB each).
-    try:
-        free_gb = shutil.disk_usage(config.home().parent).free / 1e9
-        if free_gb >= 10:
-            line("ok", f"Disk: {free_gb:.0f} GB free")
-        else:
-            line("warn", f"Disk: only {free_gb:.0f} GB free — images are ~1.5 GB each")
-    except OSError:
-        line("warn", "couldn't check disk space")
-
-    # Live version lookup reachability.
-    try:
-        r = requests.get("https://releases.rocket.chat/8.5.1/info", timeout=5)
-        if r.status_code == 200:
-            line("ok", "releases.rocket.chat reachable (live version lookup available)")
-        else:
-            line("warn", "releases.rocket.chat returned non-200 — use `--offline` if needed")
-    except requests.RequestException:
-        line("warn", "releases.rocket.chat unreachable — use `--offline` (falls back to shipped map)")
-
-    # Ports.
-    try:
-        free = runner.pick_port()
-        if runner.port_free(3000):
-            line("ok", f"Port 3000 free (repros auto-pick from 3000; next free: {free})")
-        else:
-            line("warn", f"Port 3000 in use — `up` will auto-pick the next free port ({free})")
-    except RuntimeError as exc:   # bounded scan found nothing bindable
-        line("fail", str(exc))
-
-    # Repro summary.
-    metas = runner.list_meta()
-    if docker_up and metas:
-        states = runner.project_states() or {}
-        running = sum(1 for m in metas if _pretty_state(states.get(m.project, "")) == "running")
-        typer.echo(f"  repros: {len(metas)} total, {running} running")
-
+    for row in report["checks"]:
+        sym, color = marks[row["status"]]
+        typer.secho(f'{sym} {row["message"]}', fg=color)
+    if report["repros"]:
+        typer.echo(f'  repros: {report["repros"]["total"]} total, '
+                   f'{report["repros"]["running"]} running')
     typer.echo("")
-    if counts["fail"]:
+    if report["verdict"] == "fail":
         typer.secho("Not ready — fix the ✗ item(s) above.", fg=typer.colors.RED)
         raise typer.Exit(1)
-    if counts["warn"]:
+    if report["verdict"] == "warn":
         typer.secho("Usable, with warnings above.", fg=typer.colors.YELLOW)
     else:
         typer.secho("All good — rc-repro is ready.", fg=typer.colors.GREEN)

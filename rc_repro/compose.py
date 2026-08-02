@@ -289,8 +289,29 @@ def build(spec: Spec) -> dict:
     # balancer) instead of rocketchat — the port isn't known until `up`, so it's
     # injected here rather than in the preset.
     entry = spec.preset.entry_service
-    if entry and entry in doc["services"]:
+    if entry:
+        if entry not in doc["services"]:
+            # Silently skipping meant NOTHING published the host port: the repro
+            # booted and was unreachable at its own advertised root_url.
+            raise ValueError(
+                f"preset {spec.preset.name!r} sets entry_service {entry!r}, which is not "
+                f"one of its services ({', '.join(sorted(doc['services']))})")
         doc["services"][entry]["ports"] = [f"{spec.host_port}:80"]
+        # The front-end owns the published port now. Leaving the same host port on
+        # the RC service too binds it twice and `up` fails with "port is already
+        # allocated" — which a single-instance preset setting entry_service (a
+        # custom one; the built-in multi-instance forces instances >= 2) would hit
+        # every time. Drop only the colliding mapping, so multi-instance keeps its
+        # direct per-instance ports on host_port+i.
+        for svc_name, svc in rc_services.items():
+            if svc_name == entry:
+                continue
+            kept = [p for p in svc.get("ports", [])
+                    if str(p).split(":")[0] != str(spec.host_port)]
+            if kept:
+                svc["ports"] = kept
+            else:
+                svc.pop("ports", None)
 
     # --- optional monitoring add-on (Prometheus + Grafana) ---
     if spec.monitoring:
@@ -316,14 +337,24 @@ def _bind_ports(doc: dict, bind: str) -> None:
         ports = svc.get("ports")
         if not ports:
             continue
-        # Prefix only a bare "port" or "host:container" mapping whose first field
-        # is numeric. A mapping already carrying an IP ("127.0.0.1:8025:8025",
-        # two colons) is left alone — otherwise it'd become a double-IP mapping.
-        svc["ports"] = [
-            f"{bind}:{p}" if str(p).count(":") < 2 and str(p).split(":", 1)[0].isdigit()
-            else str(p)
-            for p in ports
-        ]
+        out: list[str] = []
+        for p in ports:
+            s = str(p)
+            if s.count(":") >= 2:
+                # Already IP-qualified ("127.0.0.1:8025:8025") — prefixing again
+                # would produce a double-IP mapping.
+                out.append(s)
+            elif s.count(":") == 1 and s.split(":", 1)[0].isdigit():
+                out.append(f"{bind}:{s}")                 # "8025:8025"
+            elif s.isdigit():
+                # A BARE container port. "127.0.0.1:8025" would be parsed as
+                # host:container with an invalid host port, so use compose's
+                # IP::CONTAINER form: an ephemeral host port, still bound to
+                # `bind` rather than every interface.
+                out.append(f"{bind}::{s}")
+            else:
+                out.append(s)
+        svc["ports"] = out
 
 
 def to_yaml(doc: dict) -> str:

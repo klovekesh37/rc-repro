@@ -7,17 +7,26 @@ Short guide for teammates working on the tool itself. For *using* rc-repro, see
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,gui]"    # gui too: tests/test_web.py needs fastapi
 pytest                 # pure-logic tests — no Docker needed, run in seconds
+ruff check .           # real-error lint (pyflakes); not a style gate
 ```
 
-CI runs `pytest` on every push/PR (see `.github/workflows/ci.yml`).
+Install the **`gui`** extra even if you're not touching the web GUI — without it
+`tests/test_web.py` skips itself as a single "1 skipped" and you lose all of the
+API/auth coverage. CI runs `ruff check` then `pytest` on every push/PR against
+Python 3.11 and 3.12 (see `.github/workflows/ci.yml`).
 
 ## Project layout
 
 | Module | Responsibility |
 |--------|----------------|
-| `rc_repro/cli.py` | Typer commands, orchestration, `up`/`ready` flow, preflight |
+| `rc_repro/cli.py` | Typer commands: option parsing, terminal rendering, CLI-only `loadtest`/`capacity`/`benchmark` |
+| `rc_repro/services/` | the shared "brain" both front-ends run: `lifecycle` (create/ready/teardown/prune), `perf` (GUI loadtest/capacity/benchmark), `data` (scale prefill, config-import), `monitor` (attach/detach), `postready` (preset self-config actions), `diagnose` (opaque `up` failures), `events` (the progress `Event`/`Emit` contract) |
+| `rc_repro/web/` | the `serve` GUI: `app.py` (FastAPI routes, token + Host guard, SSE/WS) and `jobs.py` (background job registry). Imported lazily — the core CLI never depends on it |
+| `rc_repro/errors.py` | `ReproError` hierarchy with `http_status`; the failure contract between services and both front-ends |
+| `rc_repro/configimport.py` | parse a support-dump `*-settings.json` into an apply/skip plan, and apply it |
+| `rc_repro/scaleseed.py` | bulk `--scale` MongoDB prefill (and its tagged undo) |
 | `rc_repro/versions.py` | RC version → MongoDB pairing (live lookup + fallback map) |
 | `rc_repro/presets/` | preset package: `__init__.py` holds the `Preset` dataclass + loader |
 | `rc_repro/presets/_common.py` | shared `--set` param helpers (`truthy_param`/`int_param`/`str_param`) |
@@ -33,7 +42,7 @@ CI runs `pytest` on every push/PR (see `.github/workflows/ci.yml`).
 | `rc_repro/ui.py` | terminal output helpers (`ok`/`warn`/`fail`/`note`/`die`) |
 | `rc_repro/config.py` | paths, constants, `PRESET_PORTS` registry, env-var overrides, persisted config |
 | `rc_repro/__init__.py` | `__version__` (single-sourced from `pyproject.toml` via `importlib.metadata`) |
-| `rc_repro/data/` | shipped version map, static preset YAML, monitoring dashboard JSON, k6 load-test scripts (`data/loadtest/`) |
+| `rc_repro/data/` | shipped version map, static preset YAML, monitoring dashboard JSON, k6 load-test scripts (`data/loadtest/`), GUI assets (`data/webui/`) |
 
 ## Adding a preset
 
@@ -63,7 +72,9 @@ Useful `Preset` fields:
 - `files` — generated files written to the workspace (e.g. an LDIF or realm JSON).
 - `params_help` — one line per `--set` key, shown by `rc-repro presets`.
 - `post_ready` — actions run once RC is serving; add a handler in
-  `cli._POST_READY_ACTIONS` and key it by the action's `"action"` string.
+  `services/postready.py`'s `_POST_READY_ACTIONS` and key it by the action's
+  `"action"` string. Nothing checks that coupling automatically, so a typo'd
+  action string is a silent no-op — add a test alongside the handler.
 - `notes` — tips printed after `up` / by `info`.
 - `ports` — host ports the preset's side services publish (see below).
 - `volumes` — named volumes merged into the compose top-level `volumes:` (any
@@ -86,9 +97,14 @@ supports `env`, `services`, `rocketchat`, `depends_on`, `notes`, `params_help`,
 
 ## Conventions
 
-- Add/adjust a test in `tests/test_core.py` for any new resolution/preset/compose
-  logic (these run without Docker; each test gets an isolated `RC_REPRO_HOME` via
-  `tests/conftest.py`).
+- Add/adjust a test for anything you change. Four files, pick by layer:
+  `tests/test_core.py` (version resolution, presets, compose, perf, seed/import),
+  `tests/test_services.py` (the `services/` layer and `web/jobs.py`),
+  `tests/test_web.py` (the HTTP API — needs the `gui` extra),
+  `tests/test_diagnose.py` (failure-signature matching). All run without Docker;
+  each test gets an isolated `RC_REPRO_HOME` via `tests/conftest.py`.
+- `test_core.py`/`test_diagnose.py` use `try/except/else` for expected errors;
+  `test_services.py`/`test_web.py` use `pytest.raises`. Match the file you're in.
 - Keep Docker interaction in `runner.py` and REST interaction in `rcapi.py`.
 - Use `ui.ok/warn/fail`/`_err` for status output rather than raw `typer.secho`.
 - Check `docker compose` return codes — lifecycle commands must fail loudly, not

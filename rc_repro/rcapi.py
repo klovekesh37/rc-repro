@@ -73,7 +73,13 @@ def wait_ready(
 
 
 def _auth_from(resp) -> Auth:
-    data = resp.json().get("data", {})
+    try:
+        data = resp.json().get("data", {})
+    except ValueError:
+        # A 200 with a non-JSON body (proxy error page) must fall through to the
+        # RuntimeError below, which carries the body text an operator needs — not
+        # escape as a bare JSONDecodeError.
+        data = {}
     token = data.get("authToken")
     user_id = data.get("userId")
     if not token or not user_id:
@@ -105,6 +111,13 @@ def login(
         return _auth_from(resp)
     if "totp-required" not in resp.text:
         resp.raise_for_status()
+        # raise_for_status() is a no-op for 2xx/3xx, so a 204 — or a reverse
+        # proxy's 302 to HTTPS, the case --allow-host exists for — used to fall
+        # through into the 2FA branch below and report a missing Mailpit URL for
+        # what is really a redirect.
+        raise RuntimeError(
+            f"login returned HTTP {resp.status_code}, which is neither a success "
+            f"nor a 2FA challenge: {resp.text[:200]}")
 
     # 2FA challenge. Try the password-fallback method first (no email needed).
     resp2 = requests.post(
@@ -124,17 +137,31 @@ def login(
     # recipient so a code for another user (Mailpit is a catch-all inbox for
     # every address) is never picked up by mistake, and snapshot the inbox first
     # so a leftover code from a previous login isn't mistaken for the fresh one.
-    to_email = user if "@" in user else (
-        config.ADMIN_EMAIL if user == config.ADMIN_USERNAME else None
-    )
+    if "@" in user:
+        to_email = user
+    elif user == config.ADMIN_USERNAME:
+        to_email = config.ADMIN_EMAIL
+    else:
+        # Falling back to None disabled the recipient filter entirely, so this
+        # could hand back a DIFFERENT user's code — the exact thing the filter
+        # exists to prevent. Refuse instead of guessing.
+        raise RuntimeError(
+            f"cannot fetch an email-2FA code for {user!r}: its address is unknown, "
+            "and polling the shared Mailpit inbox unfiltered could return another "
+            "user's code")
     baseline = newest_mail_stamp(mailpit_url, to_email=to_email)
-    requests.post(
+    sent = requests.post(
         f"{base}/users.2fa.sendEmailCode",
         json={"emailOrUsername": user}, timeout=timeout,
     )
     code = fetch_email_otp(mailpit_url, to_email=to_email, after=baseline)
     if not code:
-        raise RuntimeError("email-2FA code did not arrive in Mailpit within the timeout")
+        # Surface a failed send instead of blaming the timeout for it.
+        detail = "" if sent.ok else (
+            f" (users.2fa.sendEmailCode returned HTTP {sent.status_code}: "
+            f"{sent.text[:120]})")
+        raise RuntimeError(
+            "email-2FA code did not arrive in Mailpit within the timeout" + detail)
     resp3 = requests.post(
         f"{base}/login", json=creds, timeout=timeout,
         headers={"x-2fa-code": code, "x-2fa-method": "email"},
@@ -242,12 +269,16 @@ def generate_pat(
     """
     base = f"{root_url.rstrip('/')}/api/v1"
     hdr = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
-    r = requests.post(
-        f"{base}/users.generatePersonalAccessToken",
-        headers=hdr,
-        json={"tokenName": token_name, "bypassTwoFactor": bypass_2fa},
-        timeout=timeout,
-    )
+
+    def _post(path: str, body: dict):
+        # The documented contract is "a token, or RuntimeError". A bare
+        # ConnectionError/ReadTimeout escaping would break it for any caller that
+        # narrows its except clause.
+        try:
+            return requests.post(f"{base}/{path}", headers=hdr, json=body, timeout=timeout)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"could not reach {path}: {exc}") from exc
+
     def _json(resp) -> dict:
         # A 5xx/HTML/empty body must fall through to the RuntimeError below, not
         # escape as a raw JSONDecodeError.
@@ -256,16 +287,13 @@ def generate_pat(
         except ValueError:
             return {}
 
+    r = _post("users.generatePersonalAccessToken",
+              {"tokenName": token_name, "bypassTwoFactor": bypass_2fa})
     j = _json(r)
     if j.get("success") and j.get("token"):
         return j["token"]
     # Already exists → regenerate it (also 2FA-guarded).
-    r2 = requests.post(
-        f"{base}/users.regeneratePersonalAccessToken",
-        headers=hdr,
-        json={"tokenName": token_name},
-        timeout=timeout,
-    )
+    r2 = _post("users.regeneratePersonalAccessToken", {"tokenName": token_name})
     j2 = _json(r2)
     if j2.get("success") and j2.get("token"):
         return j2["token"]

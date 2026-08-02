@@ -11,8 +11,12 @@ export { handleSummary };
 
 export default function () {
   const auth = vuAuth();
+  // Check all three: checks_rate described only 1/3 of the traffic, and the two
+  // unchecked calls are the unpaginated ones this scenario exists to stress.
   const hist = record(http.get(`${URL}/api/v1/channels.history?roomName=general&count=100`, auth));
-  record(http.get(`${URL}/api/v1/users.list`, auth));
-  record(http.get(`${URL}/api/v1/channels.list`, auth));
+  const users = record(http.get(`${URL}/api/v1/users.list`, auth));
+  const chans = record(http.get(`${URL}/api/v1/channels.list`, auth));
   check(hist, { "poll 200": (r) => r.status === 200 });
+  check(users, { "users.list 200": (r) => r.status === 200 });
+  check(chans, { "channels.list 200": (r) => r.status === 200 });
 }

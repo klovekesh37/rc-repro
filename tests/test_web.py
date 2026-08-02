@@ -29,14 +29,34 @@ def test_health_needs_no_token():
     assert r.status_code == 200 and "docker" in r.json()
 
 
-def test_api_requires_token():
+def test_api_requires_token(monkeypatch):
     assert client().get("/api/repros").status_code == 401
-    assert client().get("/api/repros", headers=H).status_code == 200 or True  # token accepted (may 500 w/o mock)
+    # Mock the service so the authorized half is a real assertion — it used to be
+    # `== 200 or True`, which passes unconditionally.
+    monkeypatch.setattr(lc, "list_repros", lambda: [])
+    assert client().get("/api/repros", headers=H).status_code == 200
 
 
 def test_non_localhost_host_rejected():
     r = client(host="http://evil.example").get("/api/health")
     assert r.status_code == 403
+
+
+def test_host_guard_is_case_insensitive():
+    """Hostnames are case-insensitive; comparing them raw is a fail-CLOSED bug.
+
+    `curl http://LOCALHOST:7070/` and a proxy forwarding `Host: Lab.Example.Com`
+    both got "host not allowed", which reads like the guard is broken rather
+    than like a spelling difference.
+    """
+    app = create_app(token="", allow_hosts=["Lab.Example.Com"])
+    c = TestClient(app, base_url="http://localhost")
+    for hdr in ("LOCALHOST", "LocalHost", "localhost",
+                "lab.example.com", "LAB.EXAMPLE.COM", "Lab.Example.Com:443"):
+        assert c.get("/api/health", headers={"host": hdr}).status_code == 200, hdr
+    # Case folding must not widen the allow-list to unrelated hosts.
+    for hdr in ("evil.example", "lab.example.com.evil", "notlocalhost"):
+        assert c.get("/api/health", headers={"host": hdr}).status_code == 403, hdr
 
 
 def test_allow_host_permits_proxy_domain():
@@ -47,6 +67,26 @@ def test_allow_host_permits_proxy_domain():
                       base_url=proxy).get("/api/health").status_code == 200
     assert TestClient(create_app(token="", allow_hosts=["*"]),
                       base_url=proxy).get("/api/health").status_code == 200
+
+
+def test_missing_host_header_rejected():
+    # "" used to be a member of the allow-list, so a Host-less request walked
+    # straight past the DNS-rebind guard.
+    assert client().get("/api/health", headers={"host": ""}).status_code == 403
+
+
+def test_ipv6_loopback_host_allowed():
+    # '[::1]:7070'.split(':')[0] is '[', so a naive port strip 403s the IPv6
+    # loopback even though '::1' is in the allow-list. Set the header directly:
+    # TestClient's transport can't parse a bracketed IPv6 base_url.
+    for hdr in ("[::1]:7070", "[::1]"):
+        assert client().get("/api/health", headers={"host": hdr}).status_code == 200
+
+
+def test_openapi_schema_not_exposed():
+    # The schema path does not start with /api/, so the token guard never covered
+    # it — it must not be served at all.
+    assert client().get("/openapi.json", headers=H).status_code == 404
 
 
 def test_list_repros(monkeypatch):
@@ -102,7 +142,34 @@ def test_config_import_plan_upload(monkeypatch, tmp_path):
     r = c.post("/api/repros/x/config-import/plan", headers=H,
                files={"file": ("s.json", b"[]", "application/json")}, data={"only": ""})
     assert r.status_code == 200 and r.json()["counts"]["apply"] == 2
-    assert (tmp_path / "import" / "settings.json").exists()   # stashed for apply
+    # One file per upload rather than a shared settings.json: two tabs previewing
+    # different dumps used to race, and the second silently won the first's apply.
+    upload_id = r.json()["upload_id"]
+    assert (tmp_path / "import" / f"{upload_id}.json").exists()
+
+
+def test_config_import_uploads_do_not_collide(monkeypatch, tmp_path):
+    from rc_repro.services import data
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(lc.runner, "workspace", lambda n: tmp_path)
+    seen = []
+    monkeypatch.setattr(data, "import_plan", lambda name, path, only=None: seen.append(path) or {
+        "counts": {"apply": 0, "redacted": 0, "denied": 0},
+        "apply": [], "redacted": [], "denied": [], "oauth_services": []})
+    c = client()
+    ids = [c.post("/api/repros/x/config-import/plan", headers=H,
+                  files={"file": ("s.json", b"[]", "application/json")},
+                  data={"only": ""}).json()["upload_id"] for _ in range(2)]
+    assert ids[0] != ids[1] and len(set(seen)) == 2
+
+
+def test_config_import_apply_rejects_a_forged_upload_id(monkeypatch, tmp_path):
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(lc.runner, "workspace", lambda n: tmp_path)
+    # The id becomes a filename, so it is pattern-checked before use.
+    for bad in ("../../etc/passwd", "u../../x", "nope", "", "u0123456789ab/../x"):
+        r = client().post("/api/repros/x/config-import", headers=H, json={"upload_id": bad})
+        assert r.status_code == 400, bad
 
 
 def test_config_import_apply_requires_prior_upload(monkeypatch, tmp_path):
@@ -159,3 +226,318 @@ def test_create_only_accepts_known_fields(monkeypatch):
     r = client().post("/api/repros", headers=H,
                       json={"version": "8.5.1", "bogus_field": "drop me"})
     assert r.status_code == 200 and seen["v"] == "8.5.1"   # unknown key ignored, no crash
+
+
+def test_security_headers_are_set():
+    csp = client().get("/api/health").headers["content-security-policy"]
+    directives = dict((d.strip().split(" ", 1) + [""])[:2]
+                      for d in csp.split(";") if d.strip())
+    # script-src 'self' with no 'unsafe-inline' means an injected inline handler
+    # (`<img onerror=...>`) cannot run even if a renderer forgets to escape.
+    assert directives["script-src"].strip() == "'self'"
+    # style ATTRIBUTES are used throughout the UI, so styles do need it
+    assert "'unsafe-inline'" in directives["style-src"]
+    assert directives["object-src"].strip() == "'none'"
+    r = client().get("/api/health")
+    assert r.headers["x-content-type-options"] == "nosniff"
+    # the session token rides in ?t=, so no Referer may carry it off-origin
+    assert r.headers["referrer-policy"] == "no-referrer"
+
+
+def test_up_endpoint_recreates_a_downed_repro_from_stored_metadata(monkeypatch):
+    import time as _t
+    import types
+    # `down` (keep data) removes the containers, so `docker compose start` can
+    # never revive it -- /state is useless and the GUI card had no way back up.
+    seen = {}
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(lc.runner, "read_meta",
+                        lambda n: types.SimpleNamespace(rc_version="8.5.1", preset="ldap"))
+
+    def fake_create(req, emit, stream_output=False):
+        seen.update(version=req.version, preset=req.preset, name=req.name,
+                    wait=req.wait, offline=req.offline)
+        return {"name": req.name}
+
+    monkeypatch.setattr(lc, "create_repro", fake_create)
+    r = client().post("/api/repros/x/up", headers=H)
+    assert r.status_code == 200 and r.json()["job_id"].startswith("job_")
+    for _ in range(400):                     # poll rather than a fixed sleep
+        if seen:
+            break
+        _t.sleep(0.01)
+    # nothing is re-entered by the user: version and preset come from repro.json
+    assert seen == {"version": "8.5.1", "preset": "ldap", "name": "x",
+                    "wait": True, "offline": True}
+
+
+def test_config_import_apply_uses_the_previewed_filter(monkeypatch, tmp_path):
+    from rc_repro.services import data
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(lc.runner, "workspace", lambda n: tmp_path)
+    seen = {}
+    monkeypatch.setattr(data, "import_plan", lambda name, path, only=None: {
+        "counts": {"apply": 0, "redacted": 0, "denied": 0},
+        "apply": [], "redacted": [], "denied": [], "oauth_services": []})
+    monkeypatch.setattr(data, "import_apply",
+                        lambda name, path, only=None, emit=None: seen.setdefault("only", only) or {"applied": 0})
+    c = client()
+    r = c.post("/api/repros/x/config-import/plan", headers=H,
+               files={"file": ("s.json", b"[]", "application/json")},
+               data={"only": "Livechat,LDAP"})
+    upload_id = r.json()["upload_id"]
+    # The client asks for a DIFFERENT filter at apply time. It must be ignored: the
+    # whole point of the preview step is that what was reviewed is what runs.
+    c.post("/api/repros/x/config-import", headers=H,
+           json={"upload_id": upload_id, "only": "Accounts"})
+    for _ in range(400):
+        if "only" in seen:
+            break
+        __import__("time").sleep(0.01)
+    assert seen["only"] == {"Livechat", "LDAP"}
+
+
+def test_config_import_prunes_stale_uploads(monkeypatch, tmp_path):
+    from rc_repro.services import data
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(lc.runner, "workspace", lambda n: tmp_path)
+    monkeypatch.setattr(data, "import_plan", lambda name, path, only=None: {
+        "counts": {"apply": 0, "redacted": 0, "denied": 0},
+        "apply": [], "redacted": [], "denied": [], "oauth_services": []})
+    c = client()
+    for _ in range(8):
+        c.post("/api/repros/x/config-import/plan", headers=H,
+               files={"file": ("s.json", b"[]", "application/json")}, data={"only": ""})
+    # A previewed-but-never-applied dump has nothing to delete it, and these are
+    # customers' config files -- they must not accumulate without bound.
+    assert len(list((tmp_path / "import").glob("u*.json"))) == 5
+
+
+def test_version_preview_endpoint(monkeypatch):
+    monkeypatch.setattr(lc.runner, "docker_kernel_version", lambda: "6.1.167")
+    r = client().get("/api/versions/8.5.1?offline=true", headers=H)
+    assert r.status_code == 200
+    b = r.json()
+    # Lets the create dialog show the pairing before committing to a multi-GB pull.
+    assert b["mongo_tag"] == "8.0" and b["mongo_flavor"] == "official"
+    assert "warning" not in b                      # kernel 6.1 runs Mongo 8 fine
+    assert client().get("/api/versions/nonsense", headers=H).status_code == 400
+
+
+def test_version_preview_warns_about_the_mongo8_kernel_trap(monkeypatch):
+    # SERVER-121912: mongod 8.0 hard-exits on kernel >= 6.19, and the failure reads
+    # like a volume/permission problem. Surface it before the pull, not minutes in.
+    monkeypatch.setattr(lc.runner, "docker_kernel_version", lambda: "6.19.7-200.fc43")
+    b = client().get("/api/versions/8.5.1?offline=true", headers=H).json()
+    assert "SERVER-121912" in b["warning"]
+    # an older RC pairs with an older Mongo, so no warning
+    older = client().get("/api/versions/7.10.13?offline=true", headers=H).json()
+    assert "warning" not in older and older["mongo_tag"] == "7.0"
+
+
+def test_monitor_endpoint_toggles(monkeypatch):
+    from rc_repro.services import monitor as monitorsvc
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    seen = []
+    monkeypatch.setattr(monitorsvc, "attach", lambda n, emit=None: seen.append(("attach", n)) or {})
+    monkeypatch.setattr(monitorsvc, "detach", lambda n, emit=None: seen.append(("detach", n)) or {})
+    c = client()
+    for off, want in ((False, "attach"), (True, "detach")):
+        r = c.post(f"/api/repros/x/monitor?off={'true' if off else 'false'}", headers=H)
+        assert r.status_code == 200 and r.json()["job_id"].startswith("job_")
+    for _ in range(400):
+        if len(seen) == 2:
+            break
+        __import__("time").sleep(0.01)
+    assert sorted(k for k, _ in seen) == ["attach", "detach"]
+
+
+def test_jobs_list_carries_label_and_survives_the_dialog(monkeypatch):
+    """The activity list is the only way back to a job whose dialog was closed."""
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    from rc_repro.services import data
+    monkeypatch.setattr(data, "run_scale", lambda name, spec, emit=None: {"users": 5})
+    c = client()
+    job_id = c.post("/api/repros/rc8-5-1/scale", headers=H,
+                    json={"scale": "users=5"}).json()["job_id"]
+
+    r = c.get("/api/jobs", headers=H)
+    assert r.status_code == 200
+    rows = r.json()["jobs"]
+    row = next(j for j in rows if j["id"] == job_id)
+    # `kind` alone cannot tell two concurrent seeds apart -- the label names the target.
+    assert row["kind"] == "scale" and row["label"] == "rc8-5-1"
+    assert row["started_at"] > 0
+    # The list must stay compact: a benchmark's `result` is a large nested document.
+    assert "result" not in row and "events" not in row
+
+
+def test_jobs_list_needs_a_token():
+    assert client().get("/api/jobs").status_code == 401
+
+
+def test_doctor_endpoint_returns_the_same_report_the_cli_renders(monkeypatch):
+    from rc_repro.services import doctor as doctorsvc
+    monkeypatch.setattr(doctorsvc, "run_checks", lambda: {
+        "checks": [{"status": "fail", "message": "Docker daemon not running"}],
+        "counts": {"ok": 0, "warn": 0, "fail": 1}, "verdict": "fail", "repros": None})
+    r = client().get("/api/doctor", headers=H)
+    assert r.status_code == 200
+    body = r.json()
+    # The dashboard needs the verdict to colour its banner, not just the rows.
+    assert body["verdict"] == "fail"
+    assert body["checks"][0]["status"] == "fail"
+
+
+def test_doctor_endpoint_needs_a_token():
+    assert client().get("/api/doctor").status_code == 401
+
+
+def test_set_default_endpoint(monkeypatch, tmp_path):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    r = client().post("/api/repros/rc8-5-1/default", headers=H)
+    assert r.status_code == 200 and r.json()["default"] == "rc8-5-1"
+    from rc_repro import config
+    assert config.load_config()["default_repro"] == "rc8-5-1"
+
+
+def test_pat_endpoint_maps_a_failure_to_not_ready(monkeypatch):
+    from rc_repro import rcapi, runner as runner_mod
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(runner_mod, "read_meta",
+                        lambda n: type("M", (), {"name": n, "root_url": "http://x", "extra": {}})())
+    monkeypatch.setattr(lc, "login", lambda m: type("A", (), {"user_id": "u1"})())
+    monkeypatch.setattr(rcapi, "generate_pat", lambda *a, **k: "tok_abc")
+    r = client().post("/api/repros/x/pat", headers=H, json={})
+    assert r.status_code == 200
+    assert r.json()["token"] == "tok_abc" and r.json()["user_id"] == "u1"
+
+    # A workspace that is up but not finalized cannot mint one -> 409, not 500.
+    monkeypatch.setattr(rcapi, "generate_pat", lambda *a, **k: None)
+    assert client().post("/api/repros/x/pat", headers=H, json={}).status_code == 409
+
+
+def _stub_call_target(monkeypatch):
+    """Wire up /call's dependencies except rcapi.call, which each test sets."""
+    from rc_repro import runner as runner_mod
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(runner_mod, "read_meta",
+                        lambda n: type("M", (), {"name": n, "root_url": "http://x:3000",
+                                                 "extra": {}})())
+    monkeypatch.setattr(lc, "login", lambda m: type("A", (), {"user_id": "u1", "token": "t1"})())
+
+
+def test_api_call_endpoint_relays_the_response(monkeypatch):
+    from rc_repro import rcapi
+    _stub_call_target(monkeypatch)
+    seen = {}
+
+    def fake_call(root_url, method, path, auth=None, data=None, extra_headers=None, **kw):
+        seen.update(root_url=root_url, method=method, path=path, data=data,
+                    extra=extra_headers, token=auth.token)
+        return 200, '{"success":true}'
+
+    monkeypatch.setattr(rcapi, "call", fake_call)
+    r = client().post("/api/repros/x/call", headers=H,
+                      json={"method": "post", "path": "/api/v1/users.update",
+                            "data": '{"userId": "abc"}'})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == 200 and body["text"] == '{"success":true}'
+    assert body["tag"] == "admin" and body["url"] == "http://x:3000/api/v1/users.update"
+    assert isinstance(body["elapsed_ms"], (int, float))
+    # The method is upper-cased and the JSON body arrives parsed, not as a string.
+    assert seen["method"] == "POST" and seen["data"] == {"userId": "abc"}
+    assert seen["extra"] is None and seen["token"] == "t1"
+
+
+def test_api_call_reports_a_rocketchat_error_as_a_result_not_a_failure(monkeypatch):
+    """A 403 from Rocket.Chat is the answer the user asked for.
+
+    Mapping it onto the endpoint's own status would have surfaced it as a red
+    toast with no body -- exactly the detail needed to see WHY it was refused.
+    """
+    from rc_repro import rcapi
+    _stub_call_target(monkeypatch)
+    monkeypatch.setattr(rcapi, "call",
+                        lambda *a, **k: (403, '{"error":"unauthorized"}'))
+    r = client().post("/api/repros/x/call", headers=H, json={"method": "GET", "path": "/api/v1/me"})
+    assert r.status_code == 200
+    assert r.json()["status"] == 403 and "unauthorized" in r.json()["text"]
+
+
+def test_api_call_uses_a_pat_and_the_2fa_header_when_asked(monkeypatch):
+    from rc_repro import rcapi
+    _stub_call_target(monkeypatch)
+    monkeypatch.setattr(rcapi, "generate_pat", lambda *a, **k: "pat_xyz")
+    seen = {}
+
+    def fake_call(root_url, method, path, auth=None, data=None, extra_headers=None, **kw):
+        seen.update(token=auth.token, user_id=auth.user_id, extra=extra_headers)
+        return 200, "{}"
+
+    monkeypatch.setattr(rcapi, "call", fake_call)
+    r = client().post("/api/repros/x/call", headers=H,
+                      json={"method": "GET", "path": "/api/v1/me", "pat": True, "two_fa": True})
+    assert r.status_code == 200 and r.json()["tag"] == "PAT+2fa"
+    # The PAT replaces the login token; the user id stays.
+    assert seen["token"] == "pat_xyz" and seen["user_id"] == "u1"
+    assert seen["extra"]["x-2fa-method"] == "password"
+
+
+def test_api_call_rejects_bad_input_before_touching_the_workspace(monkeypatch):
+    from rc_repro import rcapi
+    _stub_call_target(monkeypatch)
+    monkeypatch.setattr(rcapi, "call", lambda *a, **k: pytest.fail("should not have been called"))
+    post = lambda body: client().post("/api/repros/x/call", headers=H, json=body)  # noqa: E731
+    assert post({"method": "GET", "path": ""}).status_code == 400            # no path
+    assert post({"method": "TRACE", "path": "/api/v1/me"}).status_code == 400  # not whitelisted
+    bad_json = post({"method": "POST", "path": "/api/v1/me", "data": "{nope}"})
+    assert bad_json.status_code == 400 and "valid JSON" in bad_json.json()["error"]
+
+
+def test_api_call_cannot_be_pointed_at_another_host(monkeypatch):
+    """`path` must stay a path on this repro, never a new destination.
+
+    This endpoint takes a caller-supplied URL fragment and has the server fetch
+    it, which is the shape of an SSRF. It is safe only because rcapi.call()
+    joins `root_url + "/" + path.lstrip("/")` -- pin that, because a "cleaner"
+    urljoin() here would silently start honouring an absolute URL.
+    """
+    from urllib.parse import urlparse
+
+    from rc_repro import rcapi
+    _stub_call_target(monkeypatch)
+    seen = []
+    monkeypatch.setattr(rcapi, "call",
+                        lambda root, m, p, **k: (seen.append(root), (200, "{}"))[1])
+    for hostile in ("http://evil.example/x", "//evil.example/x", "/../../evil"):
+        r = client().post("/api/repros/x/call", headers=H,
+                          json={"method": "GET", "path": hostile})
+        assert r.status_code == 200
+        # The host is what matters, not the spelling: "http://evil.example/x"
+        # survives as a path *segment* ("http://x:3000/http://evil.example/x"),
+        # which is fine. It reaching evil.example is not.
+        assert urlparse(r.json()["url"]).netloc == "x:3000", hostile
+    assert seen == ["http://x:3000"] * 3
+
+
+def test_api_call_maps_a_dead_workspace_to_not_ready(monkeypatch):
+    import requests
+
+    from rc_repro import rcapi
+    _stub_call_target(monkeypatch)
+
+    def boom(*a, **k):
+        raise requests.ConnectionError("connection refused")
+
+    monkeypatch.setattr(rcapi, "call", boom)
+    r = client().post("/api/repros/x/call", headers=H, json={"method": "GET", "path": "/api/v1/me"})
+    assert r.status_code == 409 and "connection refused" in r.json()["error"]
+
+
+def test_api_call_needs_a_token():
+    assert client().post("/api/repros/x/call", json={"method": "GET", "path": "/"}).status_code == 401
