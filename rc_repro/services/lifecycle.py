@@ -233,8 +233,11 @@ def warn_if_unlicensed(req: CreateReq, emit: Emit = null_emit) -> bool:
         return False
     if not getattr(pre, "requires_license", False):
         return False
-    supplied = bool(req.reg_token or config.load_config().get("reg_token"))
-    if supplied:
+    # Strip: whitespace-only must not count as a licence (same rule as k8s create).
+    token = (req.reg_token or config.load_config().get("reg_token") or "")
+    if isinstance(token, str):
+        token = token.strip()
+    if token:
         return False
     warn(emit, f"{req.preset!r} is an enterprise feature and no licence was supplied; "
                "it will run but may not function as licensed "
@@ -281,8 +284,11 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
                 "Compose preset for a fully offline repro.")
         name = req.name or derive_name(req.version, req.preset)
         # Same three token sources as Compose: request, config file, env override
-        # (load_config applies RC_REPRO_REG_TOKEN). Never logged.
-        token = req.reg_token or config.load_config().get("reg_token") or ""
+        # (load_config applies RC_REPRO_REG_TOKEN). Never logged. Strip so a blank
+        # value matches warn_if_unlicensed and does not create an empty Secret.
+        token = (req.reg_token or config.load_config().get("reg_token") or "")
+        if isinstance(token, str):
+            token = token.strip()
         result = k8s.create_repro(name, req.version, offline=req.offline,
                                   rc_image=req.rc_image or "", mongo=req.mongo or "",
                                   port=req.port, reg_token=token, emit=emit)
@@ -336,7 +342,9 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         check_monitor_ports(exclude=repro_name)
     host_port = pick_host_port(req.port, pre, exclude=repro_name)
     root = req.root_url or f"http://localhost:{host_port}"
-    token = req.reg_token or cfg.get("reg_token") or ""
+    token = (req.reg_token or cfg.get("reg_token") or "")
+    if isinstance(token, str):
+        token = token.strip()
     bind_host = req.bind or cfg.get("bind_host") or config.DEFAULT_BIND_HOST
 
     spec = compose.Spec.from_resolved(

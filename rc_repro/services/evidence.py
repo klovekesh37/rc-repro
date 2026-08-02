@@ -121,6 +121,8 @@ def resolve_retention(*, retained: bool | None = None,
     pref_retain = pref_raw is True  # malformed/missing => False
 
     if retained is True:
+        # Unknown freeform reasons collapse to explicit task so the closed set
+        # of reasons cannot grow through caller prose.
         why = (reason or "").strip() or ("persisted preference" if pref_retain
                                          else "explicit task")
         if why not in _RETAIN_REASONS:
