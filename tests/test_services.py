@@ -955,7 +955,8 @@ def test_evidence_redacts_the_root_url():
     assert evidence.safe_origin("http://admin:pw@localhost:3000/channel/x?t=1") == \
         "http://localhost:3000"
     assert evidence.safe_origin("https://[::1]:8443/p") == "https://[::1]:8443"
-    for bad in ("ftp://x", "", "not a url", "file:///etc/passwd"):
+    for bad in ("ftp://x", "", "not a url", "file:///etc/passwd",
+                "http://localhost:not-a-port", "http://localhost:99999"):
         assert evidence.safe_origin(bad) == "REDACTED"
 
 

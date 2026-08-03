@@ -42,14 +42,15 @@ def safe_origin(url: str) -> str:
     try:
         parsed = urlsplit(url)
         host = parsed.hostname
+        port = parsed.port
     except (UnicodeError, ValueError):
         return "REDACTED"
     if parsed.scheme not in ("http", "https") or not host:
         return "REDACTED"
     if ":" in host:                      # IPv6 literal
         host = f"[{host}]"
-    port = parsed.port
-    return f"{parsed.scheme}://{host}:{port}" if port else f"{parsed.scheme}://{host}"
+    return (f"{parsed.scheme}://{host}:{port}"
+            if port is not None else f"{parsed.scheme}://{host}")
 
 
 def _artifact(name: str) -> tuple[str, str]:

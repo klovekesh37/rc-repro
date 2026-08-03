@@ -50,7 +50,7 @@ def run_scale(name: str, spec_str: str, emit: Emit = null_emit) -> dict:
     target = lifecycle.resolve_name(name)
     lifecycle.require_compose_topology(
         target, "scale",
-        why=" bulk Mongo prefill talks to MongoDB through docker compose exec; "
+        why="bulk Mongo prefill talks to MongoDB through docker compose exec; "
             "the Kubernetes topology has no equivalent path yet")
     try:
         spec = scaleseed.parse_scale(spec_str)
@@ -82,7 +82,7 @@ def clear_scale(name: str, emit: Emit = null_emit) -> dict:
     target = lifecycle.resolve_name(name)
     lifecycle.require_compose_topology(
         target, "clear-scale",
-        why=" clear-scale removes bulk Mongo rows written through docker compose "
+        why="clear-scale removes bulk Mongo rows written through docker compose "
             "exec; the Kubernetes topology has no equivalent path yet")
     res = _scale_ok(*scaleseed.clear(target), "clear")
     out = {"users": res.get("users", 0), "messages": res.get("messages", 0),

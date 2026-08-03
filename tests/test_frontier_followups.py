@@ -389,11 +389,12 @@ def test_scale_refused_on_kubernetes_before_side_effects(tmp_path, monkeypatch):
     )
     runner.write("kscale", "microservices: {enabled: true}\n", meta,
                  artifact_name="values.yaml")
-    with pytest.raises(ValidationError) as ei:
+    with pytest.raises(ValidationError) as scale_error:
         datasvc.run_scale("kscale", "users=10")
-    assert "not supported" in str(ei.value).lower() or "kubernetes" in str(ei.value).lower()
-    with pytest.raises(ValidationError):
+    assert "yet. bulk Mongo prefill" in str(scale_error.value)
+    with pytest.raises(ValidationError) as clear_error:
         datasvc.clear_scale("kscale")
+    assert "yet. clear-scale removes" in str(clear_error.value)
 
 
 def test_seed_stats_refused_on_kubernetes(tmp_path, monkeypatch):
