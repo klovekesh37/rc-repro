@@ -371,6 +371,19 @@ def test_browser_create_form_sends_the_selected_seed_profile():
     assert "seed_profile: f.seed_profile.value" in script
 
 
+def test_browser_prune_reports_partial_cleanup_and_kind_cluster():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "rc_repro" / "data" / "webui"
+    script = (root / "app.js").read_text(encoding="utf-8")
+    report = script.split("function reportPrune(r) {", 1)[1].split("\n}", 1)[0]
+    action = script.split("async function doPrune() {", 1)[1].split("\n}", 1)[0]
+
+    assert "r.targets" in report and "r.removed" in report
+    assert "could not be cleaned up" in report
+    assert "r.cluster?.deleted" in report and "deleted empty Kind cluster" in report
+    assert "reportPrune(r);" in action
+
+
 def test_gui_detail_reads_kubernetes_state(tmp_path, monkeypatch):
     from rc_repro.services import k8s
     c, _ = _k8s_client(tmp_path, monkeypatch)

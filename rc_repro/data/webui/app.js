@@ -813,11 +813,17 @@ async function showLogs(name) {
 }
 function reportPrune(r) {
   const targets = (r.targets || []).length, removed = (r.removed || []).length;
-  if (!targets) { toast("nothing to prune", "info"); return; }
-  if (removed === targets) { toast(`pruned ${removed}`, "ok"); return; }
+  const clusterDeleted = !!r.cluster?.deleted;
+  const cluster = clusterDeleted ? "; deleted empty Kind cluster" : "";
+  if (!targets) {
+    toast(clusterDeleted ? "deleted empty Kind cluster" : "nothing to prune",
+          clusterDeleted ? "ok" : "info");
+    return;
+  }
+  if (removed === targets) { toast(`pruned ${removed}${cluster}`, "ok"); return; }
   // lifecycle.prune() warns per-repro through emit, and the endpoint is synchronous
   // so those warnings are discarded -- the shortfall is the only signal we get.
-  toast(`pruned ${removed} of ${targets}; ${targets - removed} could not be cleaned up`);
+  toast(`pruned ${removed} of ${targets}; ${targets - removed} could not be cleaned up${cluster}`);
 }
 
 // Prune is the same story as Stop -- a synchronous call that removes containers
@@ -840,8 +846,7 @@ async function doPrune() {
   await withBusy($("#btn-prune"), "Pruning…", async () => {
     try {
       const r = await api("/api/prune", { method: "POST", body: JSON.stringify({ confirm: true }) });
-      const cluster = r.cluster?.deleted ? ", deleted empty Kind cluster" : "";
-      toast(`pruned ${r.removed.length}${cluster}`);
+      reportPrune(r);
       await loadRepros();
     } catch (e) { toast(e.message); }
   });
