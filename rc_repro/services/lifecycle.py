@@ -221,7 +221,8 @@ def _reject_compose_only_flags(req: CreateReq) -> None:
         f"topology: {reasons}")
 
 
-def warn_if_unlicensed(req: CreateReq, emit: Emit = null_emit) -> bool:
+def warn_if_unlicensed(req: CreateReq, emit: Emit = null_emit,
+                       pre: presets.Preset | None = None) -> bool:
     """Warn when an enterprise preset is created without a licence.
 
     Returns whether the warning fired, so a caller (and a test) can tell. The code
@@ -229,10 +230,11 @@ def warn_if_unlicensed(req: CreateReq, emit: Emit = null_emit) -> bool:
     arrive on the request or from the RC_REPRO_REG_TOKEN env override, so both count
     as a licence being supplied.
     """
-    try:
-        pre = presets.load(req.preset)
-    except Exception:  # noqa: BLE001 - a bad preset is reported later, not here
-        return False
+    if pre is None:
+        try:
+            pre = presets.resolve(req.preset, params=req.params)
+        except Exception:  # noqa: BLE001 - a bad preset is reported later, not here
+            return False
     if not getattr(pre, "requires_license", False):
         return False
     # Strip: whitespace-only must not count as a licence (same rule as k8s create).
@@ -249,22 +251,39 @@ def warn_if_unlicensed(req: CreateReq, emit: Emit = null_emit) -> bool:
     return True
 
 
-def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool = False) -> dict:
+def create_repro(req: CreateReq, emit: Emit = null_emit, *,
+                 stream_output: bool = False,
+                 deployment_type: str | None = None) -> dict:
     """Create-or-reuse a repro. Returns a result dict (meta + boot/seed info).
 
     `stream_output=True` streams docker's line output through `emit` (for the web
     job log); False leaves docker's own progress on the terminal (CLI default).
     """
+    try:
+        # Resolve the complete built-in scenario before selecting a deployment
+        # lifecycle. Kubernetes used to dispatch first and therefore never saw
+        # LDAP's parameters, services, or generated assets.
+        if deployment_type is None:
+            # Preserve the old resolver call shape for existing callers and
+            # monkey-patched integrations; the optional target is an internal
+            # seam until the public selector is decided in a later ticket.
+            pre = presets.resolve(req.preset, params=req.params)
+        else:
+            pre = presets.resolve(req.preset, deployment_type=deployment_type,
+                                  params=req.params)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+
     # Licence signal, before dispatch so it fires for every topology and every EE
     # preset. The chart does not validate a licence, so an unlicensed microservices
     # run comes up present but not necessarily functioning as licensed; a warn event
     # with a stable code lets an agent branch on it without reading prose, and it is
     # a warning rather than a refusal because the chart itself installs without one.
-    warn_if_unlicensed(req, emit)
+    warn_if_unlicensed(req, emit, pre)
 
     # Topology dispatch. One line, delegating wholesale, so the Compose body below
     # stays exactly as it was and the web GUI gets the same routing as the CLI.
-    if _topology_of(req.preset) == "kubernetes":
+    if pre.topology == "kubernetes":
         from rc_repro.services import k8s, onboarding
         # The gate lives on the Kubernetes path, not on every command: the Docker
         # default has always worked with zero config and must keep doing so (the map
@@ -293,7 +312,7 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
             token = token.strip()
         result = k8s.create_repro(name, req.version, offline=req.offline,
                                   rc_image=req.rc_image or "", mongo=req.mongo or "",
-                                  port=req.port, reg_token=token, emit=emit)
+                                  port=req.port, reg_token=token, preset=pre, emit=emit)
         # Seed requires a ready admin. Force the wait path when seed is set, so
         # GUI/API create-and-seed match CLI create-and-seed without double work.
         need_wait = req.wait or req.seed
@@ -318,10 +337,6 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
     if req.mongo:
         versions.apply_mongo_override(resolved, req.mongo)
 
-    try:
-        pre = presets.load(req.preset, req.params)
-    except ValueError as exc:
-        raise ValidationError(str(exc)) from exc
     unknown = _unknown_params(req.params, pre)
     if unknown:
         valid = ", ".join(sorted(pre.params_help)) or "(this preset takes no --set params)"

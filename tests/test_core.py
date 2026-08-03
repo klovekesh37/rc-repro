@@ -64,6 +64,55 @@ def test_ldap_preset_generates_users():
     assert p.env["OVERWRITE_SETTING_LDAP_Server_Type"] == ""  # generic, not AD
 
 
+def test_ldap_scenario_resolves_one_intent_for_both_deployments():
+    compose = presets.resolve("ldap", "compose", {"users": "3", "domain": "example.org"})
+    kubernetes = presets.resolve("ldap", "kubernetes", {"users": "3", "domain": "example.org"})
+
+    assert compose.scenario == kubernetes.scenario == "ldap"
+    assert compose.scenario_params == kubernetes.scenario_params == {
+        "users": 3,
+        "domain": "example.org",
+        "base_dn": "dc=example,dc=org",
+    }
+    assert compose.topology == "compose"
+    assert kubernetes.topology == "kubernetes"
+    assert compose.env["OVERWRITE_SETTING_LDAP_Host"] == "openldap"
+    env = kubernetes.env
+    assert env["OVERWRITE_SETTING_LDAP_Host"] == "openldap"
+    assert any("kind: Service" in manifest and "name: openldap" in manifest
+               for manifest in kubernetes.kubernetes_manifests)
+
+
+def test_ldap_scenario_reuses_the_legacy_compose_builder():
+    legacy = presets.load("ldap", {"users": "3", "domain": "example.org"})
+    resolved = presets.resolve("ldap", "compose", {"users": "3", "domain": "example.org"})
+
+    assert resolved.scenario == "ldap"
+    assert resolved.services == legacy.services
+    assert resolved.files == legacy.files
+    assert resolved.env == legacy.env
+    assert resolved.params_help == legacy.params_help
+
+
+def test_scenario_refuses_an_unsupported_deployment_type():
+    with pytest.raises(ValueError, match="does not support deployment type 'nomad'"):
+        presets.resolve("ldap", "nomad")
+
+
+def test_user_yaml_still_shadows_a_built_in_scenario():
+    config.preset_dir().mkdir(parents=True)
+    (config.preset_dir() / "ldap.yaml").write_text(
+        "name: ldap\ndescription: local override\nenv: {CUSTOM: value}\n",
+        encoding="utf-8",
+    )
+
+    resolved = presets.resolve("ldap", params={"users": "3"})
+
+    assert resolved.description == "local override"
+    assert resolved.env == {"CUSTOM": "value"}
+    assert resolved.scenario == ""
+
+
 def test_saml_preset_realm_scales_with_users():
     p = presets.load("saml", {"users": "4"})
     realm = json.loads(dict(p.files)["saml/keycloak-realm.json"])

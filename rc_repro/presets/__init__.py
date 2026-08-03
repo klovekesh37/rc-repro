@@ -13,6 +13,7 @@ from importlib import resources
 import yaml
 
 from rc_repro import config
+from rc_repro.presets.scenario import Scenario
 
 
 @dataclass
@@ -60,6 +61,15 @@ class Preset:
     # for them. A non-compose value routes create/ready/teardown to that
     # topology's service module instead of the Compose path.
     topology: str = "compose"
+    # Internal scenario provenance. These fields are deliberately additive and
+    # are not written to saved records; the resolved Preset remains the lifecycle
+    # aggregate while the scenario definition stays built-in-only.
+    scenario: str = ""
+    scenario_params: dict = field(default_factory=dict)
+    # Native Kubernetes resources emitted by a built-in scenario adapter. The
+    # adapter reuses ``env`` for Rocket.Chat settings; this field carries only
+    # concrete backing resources, not an arbitrary Helm-values overlay.
+    kubernetes_manifests: list[str] = field(default_factory=list)
 
 
 def _parse(text: str, source: str) -> Preset:
@@ -109,6 +119,29 @@ def _dynamic_builders() -> dict:
     }
 
 
+def _scenario_definitions() -> dict[str, Scenario]:
+    """Built-in scenario registry; intentionally not a public plugin registry."""
+    from rc_repro.presets import ldap
+
+    return {"ldap": ldap.scenario()}
+
+
+def _user_path(name: str):
+    return config.preset_dir() / f"{name}.yaml"
+
+
+def _load_non_scenario(name: str, params: dict) -> Preset:
+    """Load a legacy dynamic or static preset without scenario dispatch."""
+    builders = _dynamic_builders()
+    if name in builders:
+        return builders[name](params)
+
+    builtin = resources.files("rc_repro").joinpath("data", "presets", f"{name}.yaml")
+    if not builtin.is_file():
+        raise ValueError(f"unknown preset {name!r} (run `rc-repro presets` to list)")
+    return _parse(builtin.read_text(encoding="utf-8"), source="built-in")
+
+
 def load(name: str, params: dict | None = None) -> Preset:
     """Return a preset by name.
 
@@ -118,18 +151,40 @@ def load(name: str, params: dict | None = None) -> Preset:
     """
     params = params or {}
 
-    user_path = config.preset_dir() / f"{name}.yaml"
+    user_path = _user_path(name)
     if user_path.exists():
         return _parse(user_path.read_text(encoding="utf-8"), source=str(user_path))
 
-    builders = _dynamic_builders()
-    if name in builders:
-        return builders[name](params)
+    scenario = _scenario_definitions().get(name)
+    if scenario:
+        return scenario.resolve(params, "compose")
+    return _load_non_scenario(name, params)
 
-    builtin = resources.files("rc_repro").joinpath("data", "presets", f"{name}.yaml")
-    if not builtin.is_file():
-        raise ValueError(f"unknown preset {name!r} (run `rc-repro presets` to list)")
-    return _parse(builtin.read_text(encoding="utf-8"), source="built-in")
+
+def resolve(name: str, deployment_type: str | None = None,
+            params: dict | None = None) -> Preset:
+    """Resolve one preset through its built-in scenario adapter when present.
+
+    ``deployment_type`` is an internal seam. Leaving it unset preserves the
+    current catalog behaviour and uses the preset's own declared topology. A
+    user YAML override always wins and is never interpreted as a scenario.
+    """
+    params = params or {}
+    user_path = _user_path(name)
+    if user_path.exists():
+        preset = _parse(user_path.read_text(encoding="utf-8"), source=str(user_path))
+    else:
+        scenario = _scenario_definitions().get(name)
+        if scenario:
+            target = deployment_type or "compose"
+            return scenario.resolve(params, target)
+        preset = _load_non_scenario(name, params)
+
+    if deployment_type and preset.topology != deployment_type:
+        raise ValueError(
+            f"preset {name!r} declares deployment type {preset.topology!r}, "
+            f"not {deployment_type!r}")
+    return preset
 
 
 def list_presets() -> list[Preset]:

@@ -230,6 +230,7 @@ class Plan:
     mongo_tag: str
     chart_version: str = ""
     values: dict = field(default_factory=dict)
+    scenario_manifests: list[str] = field(default_factory=list)
 
 
 def namespace_for(name: str) -> str:
@@ -382,7 +383,7 @@ def _reg_token_secret_manifest(name: str, token: str) -> str:
 
 def build_values(rc_version: str, *, offline: bool = False,
                  rc_image: str = "", mongo: str = "",
-                 reg_token_supplied: bool = False) -> Plan:
+                 reg_token_supplied: bool = False, preset=None) -> Plan:
     """Resolve versions and render the Helm values for one repro.
 
     Reuses versions.resolve unchanged: it already returns everything the chart
@@ -409,8 +410,17 @@ def build_values(rc_version: str, *, offline: bool = False,
         # Rocket.Chat below 8.x still wants the oplog URL; 8.x deprecates it.
         values["externalMongodbOplogUrl"] = \
             "mongodb://mongo-0.mongo:27017/local?replicaSet=rs0"
+    scenario_manifests: list[str] = []
+    if preset is not None and preset.scenario:
+        # A built-in scenario's RC settings use the existing Preset.env field;
+        # only its concrete native resources travel through this Kubernetes path.
+        values["extraEnv"].extend(
+            {"name": key, "value": str(value)}
+            for key, value in preset.env.items())
+        scenario_manifests = list(preset.kubernetes_manifests or [])
     return Plan(name="", namespace="", rc_version=rc_version,
-                rc_image=rc_image or r.rc_image, mongo_tag=tag, values=values)
+                rc_image=rc_image or r.rc_image, mongo_tag=tag, values=values,
+                scenario_manifests=scenario_manifests)
 
 
 def _version_key(v: str) -> tuple:
@@ -749,17 +759,26 @@ def _mongo_manifest(name: str, tag: str) -> str:
         owner=f"{owner_k}: {owner_v}", repro=REPRO_LABEL, name=name, tag=tag)
 
 
+def _render_scenario_manifest(manifest: str, name: str) -> str:
+    """Bind a built-in scenario resource to this namespace-local repro."""
+    return manifest.replace("__RC_REPRO_NAME__", name)
+
+
 def create_repro(name: str, rc_version: str, *, offline: bool = False,
                  rc_image: str = "", mongo: str = "", port: int = 0,
-                 reg_token: str = "",
+                 reg_token: str = "", preset=None,
                  emit: Emit = null_emit, run: _Runner | None = None) -> dict:
     """Create a Kubernetes microservices repro. Returns the result payload.
 
     ``reg_token`` is delivered through a Kubernetes Secret and a chart
     ``valueFrom`` reference. It must never land in values.yaml, repro.json, or
-    helm/kubectl argv.
+    helm/kubectl argv. ``preset`` is the resolved internal aggregate; omitting it
+    retains the legacy ``microservices`` behaviour.
     """
     run = run or _Runner()
+    if preset is not None and preset.topology != "kubernetes":
+        raise ValidationError(
+            f"preset {preset.name!r} cannot run on the Kubernetes topology")
     require_tools(run)
     try:
         prepare_client_state()
@@ -786,7 +805,7 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
 
     events.info(emit, "resolving versions and chart", phase="resolve", pct=5)
     plan = build_values(rc_version, offline=offline, rc_image=rc_image, mongo=mongo,
-                        reg_token_supplied=token_supplied)
+                        reg_token_supplied=token_supplied, preset=preset)
     plan.name, plan.namespace = name, namespace_for(name)
     # Fail on the impossible combination now rather than after a long wait.
     check_mongo_kernel_support(plan.mongo_tag, run)
@@ -804,6 +823,10 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     # Ownership is asserted at creation, so teardown can prove what it may delete.
     _kubectl(run, ctx, "label", "namespace", plan.namespace,
              OWNER_LABEL, f"{REPRO_LABEL}={name}", "--overwrite")
+
+    for manifest in plan.scenario_manifests:
+        events.info(emit, "applying scenario services", phase="provision")
+        run.apply(ctx, plan.namespace, _render_scenario_manifest(manifest, name))
 
     if token_supplied:
         # Apply via stdin (run.apply), never as argv, so process listings cannot

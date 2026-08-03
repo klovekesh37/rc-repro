@@ -361,6 +361,19 @@ def test_k8s_values_never_use_the_bundled_mongodb():
     assert "externalMongodbOplogUrl" in k8s.build_values("7.10.13", offline=True).values
 
 
+def test_k8s_values_include_resolved_scenario_adapter():
+    from rc_repro import presets
+    from rc_repro.services import k8s
+
+    ldap = presets.resolve("ldap", "kubernetes", {"users": "3"})
+    values = k8s.build_values("8.6.1", offline=True, preset=ldap).values
+    env = {entry["name"]: entry["value"] for entry in values["extraEnv"]}
+
+    assert env["OVERWRITE_SETTING_LDAP_Enable"] == "true"
+    assert env["OVERWRITE_SETTING_LDAP_BaseDN"] == "dc=example,dc=com"
+    assert values["microservices"]["enabled"] is True
+
+
 def test_k8s_create_provisions_the_advertised_first_admin(tmp_path, monkeypatch):
     from rc_repro import config
     from rc_repro.services import k8s
@@ -451,6 +464,21 @@ def test_k8s_create_labels_for_ownership_and_installs_the_chart():
     assert fake.installed and fake.installed[0]["values"]["mongodb"]["enabled"] is False
     # the chart is pinned, not left to helm's "latest"
     assert fake.installed[0]["chart_version"] == "7.0.2"
+
+
+def test_k8s_create_applies_resolved_scenario_and_preserves_record_compatibility(
+        tmp_path, monkeypatch):
+    from rc_repro import presets, runner
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    fake = _FakeRun()
+    ldap = presets.resolve("ldap", "kubernetes", {"users": "2"})
+    k8s.create_repro("ldap-k8s", "8.6.1", offline=True, preset=ldap, run=fake)
+
+    assert any("kind: Service" in manifest and "name: openldap" in manifest
+               for manifest in fake.applied)
+    assert runner.read_meta("ldap-k8s").preset == "microservices"
 
 
 def test_k8s_client_state_is_owned_and_ambient_paths_are_ignored(tmp_path, monkeypatch):
@@ -1438,6 +1466,54 @@ def test_create_passes_port_and_honours_wait(tmp_path, monkeypatch):
     assert got["port"] == 31916                    # no longer dropped
     assert got["finalized"] is meta
     assert res["waited"] is True and res["booted_s"] == 5
+
+
+def test_lifecycle_resolves_preset_before_kubernetes_dispatch(tmp_path, monkeypatch):
+    from rc_repro import presets
+    from rc_repro.services import k8s, onboarding
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=["engine-resize", "owned-cluster"])
+    resolved = presets.resolve("microservices")
+    seen = {}
+
+    def fake_resolve(name, deployment_type=None, params=None):
+        seen["resolve"] = (name, deployment_type, params)
+        return resolved
+
+    monkeypatch.setattr(lc.presets, "resolve", fake_resolve)
+    monkeypatch.setattr(k8s, "create_repro",
+                        lambda name, version, **kwargs: seen.update(kwargs) or {"name": name})
+
+    lc.create_repro(lc.CreateReq(version="8.6.1", preset="microservices",
+                                 name="resolved-before-dispatch", params={"x": "y"}))
+
+    assert seen["resolve"] == ("microservices", None, {"x": "y"})
+    assert seen["preset"] is resolved
+
+
+def test_lifecycle_can_select_a_scenario_deployment_adapter(tmp_path, monkeypatch):
+    from rc_repro.services import k8s, onboarding
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=["engine-resize", "owned-cluster"])
+    seen = {}
+
+    monkeypatch.setattr(
+        k8s, "create_repro",
+        lambda name, version, **kwargs: seen.update(kwargs) or {"name": name})
+
+    lc.create_repro(
+        lc.CreateReq(version="8.6.1", preset="ldap", name="ldap-k8s",
+                     params={"users": "3"}),
+        deployment_type="kubernetes",
+    )
+
+    assert seen["preset"].scenario == "ldap"
+    assert seen["preset"].topology == "kubernetes"
+    assert seen["preset"].scenario_params["users"] == 3
 
 
 def test_require_compose_topology_refuses_rather_than_no_ops(tmp_path, monkeypatch):
