@@ -23,6 +23,7 @@ from rc_repro import seed as seeder
 from rc_repro.perf import report as perf_report
 from rc_repro.perf.timings import fmt_ms
 from rc_repro.services import data as datasvc
+from rc_repro.services import envvars as envsvc
 from rc_repro.services import lifecycle as lcsvc
 from rc_repro.services.events import Event, null_emit
 
@@ -184,6 +185,8 @@ def up(
     acme_email: str = typer.Option("", "--acme-email", help="[usually not needed] Let's Encrypt contact email; remembered via `rc-repro config set acme.email`", hidden=True),
     acme_challenge: str = typer.Option("", "--acme-challenge", help="[usually not needed] force tlsalpn | dns. Inferred: dns when ~/.rc-repro/acme/dns.env exists, else tlsalpn", hidden=True),
     acme_dns_provider: str = typer.Option("", "--acme-dns-provider", help="[usually not needed] lego DNS provider name; inferred from the variables in dns.env", hidden=True),
+    env: list[str] = typer.Option(None, "--env", "-e", help="extra raw env var KEY=VALUE (repeatable). Persisted, so `up --force` keeps it; change it later with `rc-repro env`"),
+    setting: list[str] = typer.Option(None, "--setting", help="Rocket.Chat SETTING Id=VALUE (repeatable) — adds the OVERWRITE_SETTING_ prefix a setting needs"),
     tls_san: str = typer.Option("", "--tls-san", help="[usually not needed] with --https: extra names/IPs in the local certificate, e.g. your LAN IP", hidden=True),
 ) -> None:
     """Create and start a version-matched Rocket.Chat repro."""
@@ -201,6 +204,7 @@ def up(
         acme_email=acme_email, acme_staging=acme_staging,
         # "" means "not given", so the service layer may infer it. tlsalpn is both
         # the default and a valid explicit choice, hence the separate flag.
+        env={**envsvc.parse_set(env or []), **envsvc.as_setting(setting or [])},
         acme_challenge=(acme_challenge or "tlsalpn"),
         acme_challenge_given=bool(acme_challenge),
         acme_dns_provider=acme_dns_provider,
@@ -542,6 +546,51 @@ def config_cmd(
         ui.ok(f"✓ {key} = {value}")
         return
     _err(f"unknown action {action!r} (want: list | get | set | unset)")
+
+
+@app.command(name="env")
+def env_cmd(
+    name: str = typer.Option("", "--name", "-n"),
+    set_: list[str] = typer.Option(None, "--set", help="raw env var KEY=VALUE (repeatable)"),
+    setting: list[str] = typer.Option(None, "--setting", help="Rocket.Chat SETTING Id=VALUE (repeatable) — adds the OVERWRITE_SETTING_ prefix for you, which a setting needs to take effect"),
+    unset: list[str] = typer.Option(None, "--unset", help="KEY to remove entirely, including a preset default (repeatable)"),
+    no_restart: bool = typer.Option(False, "--no-restart", help="write the change but don't recreate the container yet"),
+) -> None:
+    """Show or change a repro's Rocket.Chat environment variables.
+
+    With no --set/--unset, lists the effective environment (credentials masked) and
+    marks which keys you have overridden.
+
+    An env var cannot be changed inside a running container, so applying a change
+    recreates the Rocket.Chat container. MongoDB keeps running and its volume is
+    untouched, so no data is lost and it takes seconds.
+    """
+    if not set_ and not setting and not unset:
+        cur = envsvc.current(name)
+        rows = [(e["key"], e["value"] + ("   <- yours" if e["override"] else ""))
+                for e in cur["env"]]
+        ui.panel(f"env: {cur['name']}", rows)
+        if cur["overrides"]:
+            ui.hint("  your overrides: " + ", ".join(cur["overrides"]))
+        else:
+            ui.hint("  no overrides — this is the preset/base environment.")
+        ui.hint("  a Rocket.Chat setting: rc-repro env --setting Some_Setting_Id=value" +
+                (f" --name {cur['name']}" if name else ""))
+        ui.hint("  a raw env var:        rc-repro env --set KEY=VALUE" +
+                (f" --name {cur['name']}" if name else ""))
+        return
+    try:
+        sets = {**envsvc.parse_set(set_ or []), **envsvc.as_setting(setting or [])}
+        result = envsvc.set_env(name, sets, list(unset or []),
+                                restart=not no_restart, emit=_cli_emit)
+    except errors.ReproError as exc:
+        _err(str(exc))
+    verb = "applied" if result["restarted"] else "written (not yet applied)"
+    ui.ok(f"✓ env {verb} on {result['name']!r}.")
+    for o in result["overrides"]:
+        typer.echo(f"    {o['key']} = " + ("(removed)" if o["removed"] else o["value"]))
+    if result["restarted"]:
+        ui.hint(f"  verify: rc-repro env --name {result['name']}")
 
 
 @app.command(name="tls-status")

@@ -192,7 +192,7 @@ const PENDING = new Map();
 const BUSY_VERB = {
   Stop: "Stopping", Start: "Starting", Restart: "Restarting", Down: "Removing",
   "Make default": "Setting default", "API token": "Minting",
-  "Check TLS": "Checking",
+  "Check TLS": "Checking", Env: "Applying",
 };
 const pendingOn = (name) => PENDING.get(name) || "";
 
@@ -417,11 +417,81 @@ function renderTab() {
         d.state === "?" ? "Docker is unavailable." : "No containers — this repro is down."));
     }
   } else if (dstate.tab === "env") {
-    const t = el("table", { class: "dtable" }, el("tr", {}, el("th", {}, "key"), el("th", {}, "value")));
-    for (const e of (d.env || [])) t.append(el("tr", {}, el("td", {}, e.key), el("td", { class: "v" }, e.value)));
+    const t = el("table", { class: "dtable" },
+      el("tr", {}, el("th", {}, "name"), el("th", {}, "value"), el("th", {}, "")));
+    for (const e of (d.env || [])) {
+      // Two kinds live in this list and they are not interchangeable: a Rocket.Chat
+      // SETTING only works with the OVERWRITE_SETTING_ prefix, a plain env var only
+      // works without it. Show the setting id itself and tag it, rather than a wall
+      // of OVERWRITE_SETTING_* that hides which is which.
+      const isSetting = e.key.startsWith(ENV_SETTING_PREFIX);
+      const shown = isSetting ? e.key.slice(ENV_SETTING_PREFIX.length) : e.key;
+      const name = el("td", {}, shown);
+      if (isSetting) name.append(el("span", { class: "pill small" }, "setting"));
+      if (e.override) name.append(el("span", { class: "yours" }, "*"));
+      t.append(el("tr", {}, name, el("td", { class: "v" }, e.value),
+        el("td", {}, el("button", {
+          class: "btn small danger",
+          title: e.override ? "Remove this override" : "Remove this variable from the workspace",
+          // The FULL key, not the displayed one — that is what compose holds.
+          onclick: () => doEnvChange(d.name, {}, {}, [e.key]),
+        }, "remove"))));
+    }
     body.append(t);
     if (!(d.env || []).length) body.append(el("p", { class: "empty" }, "No environment variables."));
+    body.append(el("p", { class: "hint" },
+      "* = set by you. Changing anything here recreates the Rocket.Chat container — "
+      + "MongoDB keeps running, so no data is lost."));
+
+    const kind = el("select", { class: "input", "aria-label": "kind" },
+      el("option", { value: "setting" }, "Rocket.Chat setting"),
+      el("option", { value: "env" }, "Plain env var"));
+    const key = el("input", { class: "input", placeholder: "Message_AllowEditing", "aria-label": "name" });
+    const val = el("input", { class: "input", placeholder: "false", "aria-label": "value" });
+    const why = el("p", { class: "hint" }, "");
+    const explain = () => {
+      const setting = kind.value === "setting";
+      key.placeholder = setting ? "Message_AllowEditing" : "MY_FLAG";
+      val.placeholder = setting ? "false" : "true";
+      why.textContent = setting
+        ? "Anything you would change in Admin → Settings. The OVERWRITE_SETTING_ prefix"
+          + " it needs is added for you — without it Rocket.Chat ignores the variable"
+          + " silently. Re-applied on every boot, but the admin UI can still change it"
+          + " while the container runs."
+        : "A real environment variable (MONGO_URL, NODE_ENV, a feature flag). Passed"
+          + " through exactly as typed.";
+    };
+    kind.addEventListener("change", explain);
+    explain();
+    const add = el("button", { class: "btn primary", onclick: () => {
+      const k = key.value.trim();
+      if (!k) { toast("enter a name"); return; }
+      const payload = { [k]: val.value };
+      doEnvChange(d.name, kind.value === "env" ? payload : {},
+                  kind.value === "setting" ? payload : {}, []);
+    } }, "Set + restart");
+    body.append(el("div", { class: "row2" }, kind, key, val, add), why);
   }
+}
+
+// ---- env vars ---------------------------------------------------------------
+// An env var cannot change inside a running container, so this recreates the
+// Rocket.Chat service. It goes through streamJob because that recreate takes
+// seconds to tens of seconds -- long enough that a silent button looks broken.
+const ENV_SETTING_PREFIX = "OVERWRITE_SETTING_";
+
+// `setting` is kept separate from `set` all the way to the server, which adds the
+// OVERWRITE_SETTING_ prefix. The browser deliberately does not prepend it, so the
+// rule lives in exactly one place.
+function doEnvChange(name, set, setting, unset) {
+  const changed = Object.keys(set).concat(Object.keys(setting)).concat(unset).join(", ");
+  if (unset.length && !confirm(`Remove ${unset.join(", ")} from ${name}?\n\n`
+      + "This recreates the Rocket.Chat container. Data is kept.")) return;
+  return runAction(name, "Env", async () => {
+    const { job_id } = await api(`/api/repros/${name}/env`,
+      { method: "POST", body: JSON.stringify({ set, setting, unset }) });
+    streamJob(job_id, `Env change on ${name}: ${changed}`);
+  });
 }
 
 // ---- logs viewer ------------------------------------------------------------

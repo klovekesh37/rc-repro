@@ -191,6 +191,14 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 .banner.bad { border-color: rgba(248,81,73,.45); background: rgba(248,81,73,.08); }
 .urlbox .copy { margin-left: auto; background: none; border: 1px solid var(--line2); color: var(--muted); border-radius: 7px; padding: .3rem .5rem; cursor: pointer; }
 .urlbox .copy:hover { color: #fff; border-color: var(--blue); }
+/* Env-vars tab: a Rocket.Chat SETTING and a plain env var are not interchangeable,
+   so the row says which. `.pill` carries a ● bullet, which reads as a status here —
+   suppress it for this inline label. */
+.pill.small { font-size: .64rem; padding: .05rem .4rem; margin-left: .45rem;
+  color: var(--blue); border-color: rgba(88,166,255,.35); background: rgba(88,166,255,.1); }
+.pill.small::before { content: none; }
+.yours { color: var(--amber); margin-left: .35rem; }
+
 .dtable { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: .8rem; }
 .dtable th { text-align: left; color: var(--muted); font-weight: 500; padding: .4rem .5rem; border-bottom: 1px solid var(--line); }
 .dtable td { padding: .4rem .5rem; border-bottom: 1px solid var(--line); word-break: break-all; }

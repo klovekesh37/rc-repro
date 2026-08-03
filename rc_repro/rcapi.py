@@ -345,6 +345,30 @@ def get_setting(root_url: str, auth: Auth, password: str, setting_id: str, timeo
     return None
 
 
+def setting_ids(root_url: str, auth: Auth, password: str,
+                timeout: float = 20.0) -> set[str] | None:
+    """Every setting id this workspace knows, or None if it could not be asked.
+
+    Used to catch a silent mistake: a Rocket.Chat SETTING only takes effect from the
+    environment as `OVERWRITE_SETTING_<id>`. A bare setting id is accepted by docker,
+    changes nothing, and reports no error — so it is worth asking the workspace
+    itself which names are settings rather than guessing from their shape.
+    """
+    headers = {**auth.headers(), **password_2fa_headers(password)}
+    try:
+        # count=0 means "all" to Rocket.Chat's REST pagination.
+        resp = requests.get(f"{root_url.rstrip('/')}/api/v1/settings?count=0",
+                            headers=headers, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        body = resp.json()
+        if body.get("success") is not True:
+            return None
+        return {s["_id"] for s in body.get("settings", []) if s.get("_id")}
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        return None
+
+
 def set_setting(root_url: str, auth: Auth, password: str, setting_id: str, value, timeout: float = 15.0) -> bool:
     """PATCH a Rocket.Chat setting (2FA-guarded; satisfied via password method)."""
     headers = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}

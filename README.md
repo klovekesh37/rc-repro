@@ -12,15 +12,16 @@ rc-repro down --name TICKET-1234 --volumes              # bin it when done
 ```
 
 Prefer a UI? `rc-repro serve` opens a local web dashboard for everything below
-(create, seed, config-import, load-test, monitoring). See [Web GUI](#web-gui-rc-repro-serve).
+(create, seed, config-import, load-test, monitoring). See [Web GUI](#web-gui).
 
 ## Contents
 
 - [Getting started](#getting-started) — prerequisites, install, your first repro
 - [Everyday use](#everyday-use) — commands & lifecycle
-- [Web GUI](#web-gui-rc-repro-serve) — `rc-repro serve`, a local dashboard
-- [HTTPS](#https) — local CA, Let's Encrypt, or your own certificate
+- [Web GUI](#web-gui) — `rc-repro serve`, a local dashboard
 - [Scenarios](#scenarios) — presets (LDAP, SAML, email, …) & monitoring
+- [HTTPS](#https) — local CA, Let's Encrypt, or your own certificate
+- [Environment variables](#environment-variables) — `rc-repro env`, change settings on a running repro
 - [Data & performance](#data--performance) — sample data, data-scale prefill, config import, benchmarking, load testing
 - [API testing](#api-testing)
 - [Reference](#reference) — command list, version resolution, state, development
@@ -164,9 +165,9 @@ Once a repro is pinned (or set with `rc-repro use <name>`), commands with no
 
 ---
 
-# Web GUI (`rc-repro serve`)
+# Web GUI
 
-A local, browser-based dashboard over the same engine as the CLI — useful when
+`rc-repro serve` — a local, browser-based dashboard over the same engine as the CLI — useful when
 you'd rather click than type. Needs the `gui` extra (see [Install](#install)).
 
 ```bash
@@ -200,101 +201,6 @@ What you can do from it:
 
 Long operations stream live progress in the browser. Everything the GUI does is
 also a CLI command — same code underneath.
-
----
-
-# HTTPS
-
-Serve a repro over TLS. Terminated by a Traefik sidecar; Rocket.Chat's `ROOT_URL`
-becomes the https URL, which is what makes OAuth/SAML redirects, `Secure` cookies,
-mixed-content cases and the mobile app behave like a customer's workspace.
-
-It is a **flag, not a preset** — `--preset` takes one value, so a `tls` preset
-could never be combined with `oidc`, `saml`, `livechat` or `multi-instance`, which
-are exactly the ones that need HTTPS.
-
-Three ways to get the certificate. The domain itself is yours to manage at your DNS
-provider — rc-repro's job is only to obtain and serve the certificate.
-
-| | Command | Trusted by browsers / mobile |
-|---|---|---|
-| **Local CA** | `--https` | after `rc-repro trust-ca` (browsers only) |
-| **Let's Encrypt** | `--domain rc1.example.com` | **yes, automatically** |
-| **Your own** | `--domain … --tls-cert … --tls-key …` | if your issuer is |
-
-```bash
-# Local: offline, no domain, no rate limits.
-rc-repro up -v 8.6.1 --https
-rc-repro trust-ca                       # once per machine, to silence warnings
-  -> https://rc8-6-1.rcrepro.localhost:8443
-
-# Let's Encrypt. Remember the contact email once:
-rc-repro config set acme.email you@example.com
-# ...then a domain is the only flag you need. Do the staging run FIRST.
-rc-repro up -v 8.6.1 --domain rc1.example.com --acme-staging --wait
-rc-repro tls-status -n rc8-6-1           # what is ACTUALLY being served
-
-# A certificate you already have:
-rc-repro up -v 8.6.1 --domain rc1.example.com \
-    --tls-cert ./fullchain.pem --tls-key ./privkey.pem
-```
-
-`--domain` implies HTTPS — a hostname has no other meaning here. `up --wait` only
-proves Rocket.Chat booted (it polls the plain http port); Traefik obtains its
-certificate afterwards and falls back to a placeholder if that fails, so use
-**`rc-repro tls-status`** (or **Check TLS** in the GUI) to see the real issuer.
-
-## What is worked out for you
-
-You do not choose a challenge or name a DNS provider — both are derived, and the
-job log says which and why:
-
-| Derived | How |
-|---|---|
-| **Challenge** | `dns-01` when `~/.rc-repro/acme/dns.env` exists, otherwise `tlsalpn` (needs inbound TCP/443). Those two are the only ones — `http-01` needed port 80 *as well as* 443 and did nothing `tlsalpn` does not |
-| **DNS provider** | from the variable names in `dns.env` — `CF_DNS_API_TOKEN` → cloudflare, `AWS_*` → route53, `DO_AUTH_TOKEN` → digitalocean, … |
-| **Bind interface** | an inbound challenge needs `0.0.0.0` (and warns about the exposure); `dns-01` stays on loopback |
-| **http → https redirect** | a domain-backed repro also publishes `:80` and redirects permanently, as the official compose files do. Best-effort: if something else holds 80 it is skipped with a warning rather than refusing |
-
-So to use DNS-01 — required **behind Cloudflare's orange cloud**, since Cloudflare
-terminates TLS and an inbound challenge can never reach you — just drop the token in
-place:
-
-```bash
-mkdir -p ~/.rc-repro/acme && chmod 700 ~/.rc-repro/acme
-printf 'CF_DNS_API_TOKEN=%s\n' "$TOKEN" > ~/.rc-repro/acme/dns.env
-chmod 600 ~/.rc-repro/acme/dns.env
-# nothing else changes:
-rc-repro up -v 8.6.1 --domain rc1.example.com --acme-staging --wait
-```
-
-Credentials are read from that file, never from the command line. Each
-[lego provider](https://go-acme.github.io/lego/dns/) reads its own variables. A
-Cloudflare token needs **both** `Zone:Zone:Read` and `Zone:DNS:Edit`.
-
-Override any of it with `--acme-challenge`, `--acme-dns-provider` or `--acme-email`
-(hidden from `--help`; see `rc-repro config list` for what is remembered).
-
-## Things worth knowing
-
-- **A valid certificate is not the same as a reachable workspace.** `dns-01` issues
-  with no DNS record and no public route at all, so `up` warns when the name has no
-  record or the workspace is bound to loopback. Locally:
-  `curl --resolve rc1.example.com:443:127.0.0.1 https://rc1.example.com/api/info`
-- **Staging is untrusted on purpose.** A browser warning on `--acme-staging` is the
-  success signal. Staging and production use separate storage, so switching really
-  re-issues.
-- **Rate limits.** 5 certificates per identical hostname per 7 days, and 5 failed
-  validations per hostname per hour — hence staging first. ACME state lives in
-  `~/.rc-repro/acme/` **outside** the workspace, so `down --volumes` cannot force a
-  re-issue.
-- **Internal calls still use http.** `rc-repro api`, seeding and the load tests talk
-  to the repro's plain port, so they need no CA. `rc-repro info` shows both URLs.
-- **⚠ Repros run fixed weak credentials (`admin`/`admin123`).** Do not leave a
-  publicly reachable `--domain` repro running: the hostname appears in public
-  certificate-transparency logs within minutes of issuance.
-- Not yet supported: `--https` together with the `multi-instance` preset (it runs
-  its own Traefik) — it refuses with a clear error rather than half-working.
 
 ---
 
@@ -466,6 +372,174 @@ rc-repro monitor --name test --off      # detach them
 
 Config mirrors the official [`RocketChat/rocketchat-compose`](https://github.com/RocketChat/rocketchat-compose)
 monitoring stack (file-SD Prometheus + provisioned Grafana).
+
+---
+
+# HTTPS
+
+`up --https` / `up --domain` — serve a repro over TLS. Terminated by a Traefik sidecar; Rocket.Chat's `ROOT_URL`
+becomes the https URL, which is what makes OAuth/SAML redirects, `Secure` cookies,
+mixed-content cases and the mobile app behave like a customer's workspace.
+
+It is a **flag, not a preset** — `--preset` takes one value, so a `tls` preset
+could never be combined with `oidc`, `saml`, `livechat` or `multi-instance`, which
+are exactly the ones that need HTTPS.
+
+Three ways to get the certificate. The domain itself is yours to manage at your DNS
+provider — rc-repro's job is only to obtain and serve the certificate.
+
+| | Command | Trusted by browsers / mobile |
+|---|---|---|
+| **Local CA** | `--https` | after `rc-repro trust-ca` (browsers only) |
+| **Let's Encrypt** | `--domain rc1.example.com` | **yes, automatically** |
+| **Your own** | `--domain … --tls-cert … --tls-key …` | if your issuer is |
+
+```bash
+# Local: offline, no domain, no rate limits.
+rc-repro up -v 8.6.1 --https
+rc-repro trust-ca                       # once per machine, to silence warnings
+  -> https://rc8-6-1.rcrepro.localhost:8443
+
+# Let's Encrypt. Remember the contact email once:
+rc-repro config set acme.email you@example.com
+# ...then a domain is the only flag you need. Do the staging run FIRST.
+rc-repro up -v 8.6.1 --domain rc1.example.com --acme-staging --wait
+rc-repro tls-status -n rc8-6-1           # what is ACTUALLY being served
+
+# A certificate you already have:
+rc-repro up -v 8.6.1 --domain rc1.example.com \
+    --tls-cert ./fullchain.pem --tls-key ./privkey.pem
+```
+
+`--domain` implies HTTPS — a hostname has no other meaning here. `up --wait` only
+proves Rocket.Chat booted (it polls the plain http port); Traefik obtains its
+certificate afterwards and falls back to a placeholder if that fails, so use
+**`rc-repro tls-status`** (or **Check TLS** in the GUI) to see the real issuer.
+
+## What is worked out for you
+
+You do not choose a challenge or name a DNS provider — both are derived, and the
+job log says which and why:
+
+| Derived | How |
+|---|---|
+| **Challenge** | `dns-01` when `~/.rc-repro/acme/dns.env` exists, otherwise `tlsalpn` (needs inbound TCP/443). Those two are the only ones — `http-01` needed port 80 *as well as* 443 and did nothing `tlsalpn` does not |
+| **DNS provider** | from the variable names in `dns.env` — `CF_DNS_API_TOKEN` → cloudflare, `AWS_*` → route53, `DO_AUTH_TOKEN` → digitalocean, … |
+| **Bind interface** | an inbound challenge needs `0.0.0.0` (and warns about the exposure); `dns-01` stays on loopback |
+| **http → https redirect** | a domain-backed repro also publishes `:80` and redirects permanently, as the official compose files do. Best-effort: if something else holds 80 it is skipped with a warning rather than refusing |
+
+So to use DNS-01 — required **behind Cloudflare's orange cloud**, since Cloudflare
+terminates TLS and an inbound challenge can never reach you — just drop the token in
+place:
+
+```bash
+mkdir -p ~/.rc-repro/acme && chmod 700 ~/.rc-repro/acme
+printf 'CF_DNS_API_TOKEN=%s\n' "$TOKEN" > ~/.rc-repro/acme/dns.env
+chmod 600 ~/.rc-repro/acme/dns.env
+# nothing else changes:
+rc-repro up -v 8.6.1 --domain rc1.example.com --acme-staging --wait
+```
+
+Credentials are read from that file, never from the command line. Each
+[lego provider](https://go-acme.github.io/lego/dns/) reads its own variables. A
+Cloudflare token needs **both** `Zone:Zone:Read` and `Zone:DNS:Edit`.
+
+Override any of it with `--acme-challenge`, `--acme-dns-provider` or `--acme-email`
+(hidden from `--help`; see `rc-repro config list` for what is remembered).
+
+## Gotchas
+
+- **A valid certificate is not the same as a reachable workspace.** `dns-01` issues
+  with no DNS record and no public route at all, so `up` warns when the name has no
+  record or the workspace is bound to loopback. Locally:
+  `curl --resolve rc1.example.com:443:127.0.0.1 https://rc1.example.com/api/info`
+- **Staging is untrusted on purpose.** A browser warning on `--acme-staging` is the
+  success signal. Staging and production use separate storage, so switching really
+  re-issues.
+- **Rate limits.** 5 certificates per identical hostname per 7 days, and 5 failed
+  validations per hostname per hour — hence staging first. ACME state lives in
+  `~/.rc-repro/acme/` **outside** the workspace, so `down --volumes` cannot force a
+  re-issue.
+- **Internal calls still use http.** `rc-repro api`, seeding and the load tests talk
+  to the repro's plain port, so they need no CA. `rc-repro info` shows both URLs.
+- **⚠ Repros run fixed weak credentials (`admin`/`admin123`).** Do not leave a
+  publicly reachable `--domain` repro running: the hostname appears in public
+  certificate-transparency logs within minutes of issuance.
+- Not yet supported: `--https` together with the `multi-instance` preset (it runs
+  its own Traefik) — it refuses with a clear error rather than half-working.
+
+---
+
+# Environment variables
+
+`rc-repro env` — Rocket.Chat is configured largely through environment variables, and a repro often
+needs one the preset does not set — an `OVERWRITE_SETTING_*`, a feature flag, or
+something a customer has in their own deployment.
+
+```bash
+rc-repro env                                        # list the effective env (secrets masked)
+rc-repro env --setting Message_AllowEditing=false   # a Rocket.Chat SETTING
+rc-repro env --set MY_FLAG=true                     # a raw env var
+rc-repro env --unset ALLOW_UNSAFE_QUERY_AND_FIELDS_API_PARAMS
+rc-repro up -v 8.6.1 --setting Log_Level=2 --env MY_FLAG=true   # or at creation
+```
+
+## Settings vs. env vars — `--setting` and the `OVERWRITE_SETTING_` prefix
+
+Most Rocket.Chat configuration is a **setting** (what you would change in the admin
+UI), not a plain env var. A setting only takes effect from the environment when it
+carries the `OVERWRITE_SETTING_` prefix:
+
+| Env var | Effect on the `Accounts_ShowFormLogin` setting |
+|---|---|
+| `Accounts_ShowFormLogin=false` | **none** — accepted by docker, silently ignored |
+| `OVERWRITE_SETTING_Accounts_ShowFormLogin=false` | applied |
+
+The bare form failing quietly is the trap, so:
+
+- **`--setting Id=value` adds the prefix for you.** Prefer it for anything you would
+  otherwise change in Admin → Settings.
+- **`--set` is for real env vars** (`MONGO_URL`, `NODE_ENV`, a feature flag).
+- If you use `--set` with a name that *is* a setting on this workspace, rc-repro
+  says so and tells you the prefixed form. It asks the workspace which names are
+  settings, so it is right for whatever version is running.
+
+`OVERWRITE_SETTING_*` is **asserted at every boot, not locked**: the REST API and the
+admin UI can still change the value while the container runs, and the next restart
+puts the env value back.
+
+The GUI's **Env-vars** tab does the same, and keeps the two kinds apart: the add row
+has a **Rocket.Chat setting / Plain env var** selector, settings are listed by their
+bare id with a `setting` tag (rather than a wall of `OVERWRITE_SETTING_*`), rows you
+set are marked `*`, and each has a **remove**. The prefix is added server-side, so the
+browser and the CLI cannot disagree about it.
+
+## How it works, and what it costs
+
+**An env var cannot be changed inside a running container** — the environment is
+fixed when the container is created. So applying a change rewrites the compose file
+and recreates the **Rocket.Chat** container only:
+
+- **MongoDB keeps running and its volume is untouched** — no data is lost.
+- No image pull, so it takes seconds.
+- Rocket.Chat restarts, so open sessions reconnect.
+
+Use `--no-restart` to write the change and apply it at the next `up`.
+
+## Gotchas
+
+- **Overrides persist.** They are stored in the repro's metadata, not just the
+  generated compose file, so `up --force` keeps them. (Editing the compose file by
+  hand does *not* survive a rebuild.)
+- **`--unset` removes a key entirely**, including a preset or base default. Blanking
+  one to `""` is not the same thing — Rocket.Chat treats an empty value as set.
+- **Precedence:** base defaults → preset env → your overrides. Yours win.
+- **All instances.** With `multi-instance`, the change is applied to every
+  `rocketchat-N`.
+- **Load-bearing keys** (`MONGO_URL`, `PORT`, `ROOT_URL`, `TRANSPORTER`) are allowed —
+  reproducing a broken configuration is the point — but each prints a warning saying
+  what it will break.
+- Values are masked by key name when listed, the same as the Env-vars tab.
 
 ---
 
@@ -739,6 +813,7 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `down` | remove containers (`--volumes` also deletes data + record; confirms first, `--yes` to skip) |
 | `use <name>` | set the default repro for name-less commands |
 | `config` | read/write remembered settings (`config set acme.email …`) |
+| `env` | show or change a repro's Rocket.Chat env vars, recreating RC to apply (`--set`, `--unset`, `--no-restart`) |
 | `list` | all repros: version, port, state, URL |
 | `info` | URL, admin creds, snippets, preset notes |
 | `token` / `api` / `pat` | REST auth + calls |
@@ -751,7 +826,7 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `monitor` | attach/detach Prometheus + Grafana on a running repro |
 | `trust-ca` | install rc-repro's local CA so `--https` repros are trusted (`--uninstall`, `--show`) |
 | `tls-status` | report the certificate a `--https` repro is actually serving — see [HTTPS](#https) |
-| `serve` | launch the local [web GUI](#web-gui-rc-repro-serve) (needs `pip install 'rc-repro[gui]'`) |
+| `serve` | launch the local [web GUI](#web-gui) (needs `pip install 'rc-repro[gui]'`) |
 | `logs` | tail a repro's logs |
 | `presets` | list available presets |
 | `versions <X.Y.Z>` | show the resolved MongoDB pairing (without launching) |

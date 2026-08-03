@@ -2331,3 +2331,145 @@ def test_domain_is_normalized_the_way_the_official_docs_require():
     assert spec.root_url == "https://rc1.example.com"
     y = dict(tls.files(spec, ["rocketchat"]))["tls/dynamic.yml"]
     assert '- main: "rc1.example.com"' in y
+
+
+# --- env var overrides (up --env / rc-repro env) -------------------------------
+
+
+def test_env_overrides_beat_the_preset_and_can_remove_a_base_key():
+    """User overrides are applied last, and None removes a key entirely.
+
+    Blanking a base default to "" is not the same as removing it — Rocket.Chat
+    treats an empty value as set — so unset has to delete the key.
+    """
+    pre = presets.load("default")
+    res = versions.resolve("8.6.1", offline=True)
+    spec = compose.Spec.from_resolved(
+        res, project_name="p", root_url="http://x", host_port=3000, reg_token=None,
+        preset=pre, env_overrides={"MY_VAR": "v", "ADMIN_USERNAME": "someone",
+                                   "MONGO_URL": None})
+    env = compose.build(spec)["services"]["rocketchat"]["environment"]
+    assert env["MY_VAR"] == "v"
+    assert env["ADMIN_USERNAME"] == "someone", "an override must beat the base default"
+    assert "MONGO_URL" not in env, "None must delete the key, not blank it"
+    # Untouched keys survive.
+    assert env["ROOT_URL"] == "http://x" and env["PORT"] == "3000"
+
+    # No overrides -> byte-identical to before the feature existed.
+    plain = compose.Spec.from_resolved(
+        res, project_name="p", root_url="http://x", host_port=3000, reg_token=None,
+        preset=pre)
+    assert "MY_VAR" not in compose.build(plain)["services"]["rocketchat"]["environment"]
+
+
+def test_env_overrides_apply_to_every_rocketchat_instance():
+    """multi-instance clones rocketchat into rocketchat-1..N; all must get them."""
+    pre = presets.load("multi-instance", {"instances": "3"})
+    res = versions.resolve("8.6.1", offline=True)
+    spec = compose.Spec.from_resolved(
+        res, project_name="p", root_url="http://x", host_port=3000, reg_token=None,
+        preset=pre, env_overrides={"MY_VAR": "v"})
+    doc = compose.build(spec)
+    rc = [s for s in doc["services"] if s.startswith("rocketchat")]
+    assert len(rc) == 3
+    for svc in rc:
+        assert doc["services"][svc]["environment"]["MY_VAR"] == "v", svc
+
+
+def test_env_var_names_are_validated_before_reaching_compose():
+    """An invalid name produces a compose file docker rejects, so refuse it here."""
+    import pytest
+    from rc_repro.errors import ValidationError
+    from rc_repro.services import envvars
+
+    assert envvars.parse_set(["A=1", "B_2=x=y"]) == {"A": "1", "B_2": "x=y"}
+    assert envvars.parse_set([]) == {}
+    with pytest.raises(ValidationError, match="not KEY=VALUE"):
+        envvars.parse_set(["JUST_A_KEY"])
+    for bad in ("2LEADING=1", "has-hyphen=1", "has space=1", "=1"):
+        with pytest.raises(ValidationError, match="valid environment variable name"):
+            envvars.parse_set([bad])
+    with pytest.raises(ValidationError, match="valid environment variable name"):
+        envvars.check_names(["has-hyphen"])
+
+
+def test_env_rows_mark_which_keys_the_user_set():
+    """The panel offers "remove" on every row, and it means different things.
+
+    Removing an override restores the preset default; removing an inherited key
+    deletes it from the workspace. The panel can only say which if detail() marks
+    them.
+    """
+    from rc_repro.services import lifecycle as lc
+    doc = {"services": {"rocketchat": {"environment": {
+        "MY_VAR": "v", "ADMIN_PASS": "secret", "PORT": "3000"}}}}
+    rows = {r["key"]: r for r in lc._env_rows(doc, {"MY_VAR": "v"})}
+    assert rows["MY_VAR"]["override"] is True
+    assert rows["PORT"]["override"] is False
+    assert rows["ADMIN_PASS"]["value"] == "********", "credentials still masked"
+    # No overrides argument -> nothing marked, and the shape is unchanged.
+    assert all(r["override"] is False for r in lc._env_rows(doc))
+    # compose's list form is handled too.
+    listform = {"services": {"rocketchat": {"environment": ["A=1", "B=2"]}}}
+    assert [r["key"] for r in lc._env_rows(listform, {"A": "1"})] == ["A", "B"]
+    assert lc._env_rows(listform, {"A": "1"})[0]["override"] is True
+
+
+def test_setting_expansion_and_the_bare_setting_id_trap():
+    """A Rocket.Chat SETTING only applies from the environment WITH the prefix.
+
+    Verified against a live 8.6.1 workspace: `Accounts_ShowFormLogin=false` left the
+    setting `True`, while `OVERWRITE_SETTING_Accounts_ShowFormLogin=false` made it
+    `False`. The bare form is accepted by docker and silently does nothing, which is
+    why --setting exists and why a bare setting id is warned about.
+    """
+    from rc_repro.services import envvars
+    assert envvars.SETTING_PREFIX == "OVERWRITE_SETTING_"
+    assert envvars.as_setting(["Message_AllowEditing=false"]) == {
+        "OVERWRITE_SETTING_Message_AllowEditing": "false"}
+    # A value containing '=' survives; only the first separator splits.
+    assert envvars.as_setting(["A_B=x=y"]) == {"OVERWRITE_SETTING_A_B": "x=y"}
+    assert envvars.as_setting([]) == {}
+    # It reuses the same name validation as --set.
+    import pytest
+    from rc_repro.errors import ValidationError
+    with pytest.raises(ValidationError, match="not KEY=VALUE"):
+        envvars.as_setting(["Message_AllowEditing"])
+
+
+def test_bare_setting_warning_asks_the_workspace_and_stays_quiet_when_it_cannot(monkeypatch):
+    """Which names are settings is version-specific, so ask the workspace, not a list.
+
+    And it is only a warning path: an unreachable workspace must not block an env
+    change, since setting env on a repro that is not serving is legitimate.
+    """
+    from rc_repro import rcapi
+    from rc_repro.services import envvars
+    meta = type("M", (), {"name": "e", "root_url": "http://x", "extra": {}})()
+
+    monkeypatch.setattr(envvars.lifecycle, "login", lambda m: object())
+    monkeypatch.setattr(rcapi, "setting_ids",
+                        lambda *a, **k: {"Message_AllowEditing", "Accounts_ShowFormLogin"})
+    seen: list = []
+    envvars.warn_bare_settings(meta, ["Message_AllowEditing", "MY_OWN_VAR"], seen.append)
+    msgs = " ".join(str(getattr(e, "message", e)) for e in seen)
+    assert "Message_AllowEditing is a Rocket.Chat SETTING" in msgs
+    assert "OVERWRITE_SETTING_Message_AllowEditing" in msgs, "must give the fix"
+    assert "MY_OWN_VAR" not in msgs, "a real env var must not be flagged"
+
+    # Already prefixed -> nothing to say, and no API call needed.
+    seen.clear()
+    envvars.warn_bare_settings(meta, ["OVERWRITE_SETTING_Message_AllowEditing"], seen.append)
+    assert seen == []
+
+    # Workspace unreachable -> silent, never fatal.
+    seen.clear()
+    monkeypatch.setattr(envvars.lifecycle, "login",
+                        lambda m: (_ for _ in ()).throw(RuntimeError("not serving")))
+    envvars.warn_bare_settings(meta, ["Message_AllowEditing"], seen.append)
+    assert seen == []
+    seen.clear()
+    monkeypatch.setattr(envvars.lifecycle, "login", lambda m: object())
+    monkeypatch.setattr(rcapi, "setting_ids", lambda *a, **k: None)
+    envvars.warn_bare_settings(meta, ["Message_AllowEditing"], seen.append)
+    assert seen == []

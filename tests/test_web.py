@@ -598,3 +598,102 @@ def test_tls_endpoint_refuses_a_repro_without_https(monkeypatch):
 
 def test_tls_endpoint_needs_a_token():
     assert client().get("/api/repros/t/tls").status_code == 401
+
+
+def test_env_endpoints(monkeypatch):
+    """GET reports the effective env; POST is a job because the recreate is slow."""
+    from rc_repro.services import envvars as envsvc
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(envsvc, "current", lambda n: {
+        "name": n, "overrides": ["MY"],
+        "env": [{"key": "MY", "value": "v", "override": True},
+                {"key": "ADMIN_PASS", "value": "********", "override": False}]})
+    r = client().get("/api/repros/e/env", headers=H)
+    assert r.status_code == 200
+    assert r.json()["overrides"] == ["MY"]
+    assert [e["key"] for e in r.json()["env"]] == ["MY", "ADMIN_PASS"]
+
+    seen = {}
+    monkeypatch.setattr(envsvc, "set_env",
+                        lambda name, sets, unset, restart=True, emit=None:
+                        seen.update(name=name, sets=sets, unset=unset, restart=restart)
+                        or {"name": name, "restarted": restart, "overrides": []})
+    r = client().post("/api/repros/e/env", headers=H,
+                      json={"set": {"A": "1"}, "unset": ["B"]})
+    assert r.status_code == 200 and r.json()["job_id"].startswith("job_")
+    assert seen["sets"] == {"A": "1"} and seen["unset"] == ["B"] and seen["restart"] is True
+
+
+def test_env_post_rejects_the_wrong_shapes(monkeypatch):
+    """`set` must be an object and `unset` a list — a string for either would reach
+    the service layer and produce something incoherent."""
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    for body, msg in [({"set": ["A=1"]}, "must be an object"),
+                      ({"unset": "B"}, "must be a list")]:
+        r = client().post("/api/repros/e/env", headers=H, json=body)
+        assert r.status_code == 400 and msg in r.json()["error"], body
+
+
+def test_env_endpoints_need_a_token():
+    assert client().get("/api/repros/e/env").status_code == 401
+    assert client().post("/api/repros/e/env", json={"set": {}}).status_code == 401
+
+
+def test_env_post_keeps_settings_and_plain_vars_apart(monkeypatch):
+    """`setting` is prefixed by the SERVER, not the caller.
+
+    The two kinds are not interchangeable — a Rocket.Chat setting only works with
+    OVERWRITE_SETTING_, a plain env var only works without it — so the rule lives in
+    one place and every front-end gets it.
+    """
+    from rc_repro.services import envvars as envsvc
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    seen = {}
+    monkeypatch.setattr(envsvc, "set_env",
+                        lambda name, sets, unset, restart=True, emit=None:
+                        seen.update(sets=sets, unset=unset)
+                        or {"name": name, "restarted": True, "overrides": []})
+
+    r = client().post("/api/repros/e/env", headers=H, json={
+        "set": {"MY_PLAIN": "raw"},
+        "setting": {"Message_AllowStarring": "false"},
+        "unset": ["OLD"]})
+    assert r.status_code == 200
+    assert seen["sets"] == {"MY_PLAIN": "raw",
+                            "OVERWRITE_SETTING_Message_AllowStarring": "false"}
+    assert seen["unset"] == ["OLD"]
+
+    # An already-prefixed setting id is not double-prefixed.
+    client().post("/api/repros/e/env", headers=H,
+                  json={"setting": {"OVERWRITE_SETTING_Foo_Bar": "1"}})
+    assert seen["sets"] == {"OVERWRITE_SETTING_Foo_Bar": "1"}
+
+    # And the shape is validated.
+    r = client().post("/api/repros/e/env", headers=H, json={"setting": ["A=1"]})
+    assert r.status_code == 400 and "must be an object" in r.json()["error"]
+
+
+def test_static_assets_must_revalidate_so_an_upgrade_is_not_masked():
+    """StaticFiles sends ETag/Last-Modified but no Cache-Control.
+
+    With no freshness directive a browser may reuse a cached copy WITHOUT
+    revalidating (heuristic freshness, RFC 9111 4.2.2), so after upgrading rc-repro
+    the old app.js keeps running and new UI simply is not there — which looks
+    exactly like a missing feature. `no-cache` means "revalidate first", not
+    "don't store", so the ETag still answers 304.
+    """
+    c = client()
+    for path in ("/", "/app.js", "/app.css"):
+        r = c.get(path)
+        assert r.status_code == 200, path
+        assert r.headers.get("cache-control") == "no-cache", path
+        assert r.headers.get("etag"), f"{path} must still carry an ETag for the 304"
+
+    # A matching ETag stays cheap.
+    etag = c.get("/app.js").headers["etag"]
+    r = c.get("/app.js", headers={"If-None-Match": etag})
+    assert r.status_code == 304 and not r.content
+
+    # API responses are not given a blanket directive here; the SSE stream sets its
+    # own, and the rest are dynamic anyway.
+    assert c.get("/api/health").headers.get("cache-control") is None

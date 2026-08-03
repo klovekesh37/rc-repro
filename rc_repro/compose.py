@@ -7,7 +7,7 @@ presets can deep-merge extra services / env / RC patches into it.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import yaml
@@ -35,6 +35,9 @@ class Spec:
     monitoring: bool = False   # --monitor: add Prometheus + Grafana
     # --https: terminate TLS in a Traefik sidecar. None = plain http, as before.
     tls: "TlsSpec | None" = None
+    # `up --env K=V` / `rc-repro env --set`. Applied to every rocketchat service,
+    # last, so it beats the preset. A None value removes the key.
+    env_overrides: dict = field(default_factory=dict)
     container_port: int = config.RC_CONTAINER_PORT
     # Host interface published ports bind to (the official rocketchat-compose
     # BIND_IP pattern). Loopback by default: repros run weak fixed credentials,
@@ -47,7 +50,8 @@ class Spec:
                       host_port: int, reg_token: str | None, preset: Preset,
                       bind_host: str = config.DEFAULT_BIND_HOST,
                       monitoring: bool = False,
-                      tls: "TlsSpec | None" = None) -> "Spec":
+                      tls: "TlsSpec | None" = None,
+                      env_overrides: dict | None = None) -> "Spec":
         """Build a Spec from a versions.Resolved plus the launch-time choices."""
         return cls(
             project_name=project_name,
@@ -64,6 +68,7 @@ class Spec:
             bind_host=bind_host,
             monitoring=monitoring,
             tls=tls,
+            env_overrides=dict(env_overrides or {}),
         )
 
 
@@ -108,6 +113,16 @@ def _rc_environment(spec: Spec) -> dict:
         env["REG_TOKEN"] = spec.reg_token
     # Preset env (OVERWRITE_SETTING_* etc.) wins over base defaults.
     env.update({k: str(v) for k, v in spec.preset.env.items()})
+    # Explicit user overrides win over everything, including the base keys: this is
+    # a reproduction tool, so pointing MONGO_URL or ROOT_URL somewhere odd is a
+    # legitimate thing to want. `rc-repro env` warns about the ones that break it.
+    # A None value means "remove this key entirely", which is how you unset a base
+    # or preset default rather than merely blanking it.
+    for k, v in (spec.env_overrides or {}).items():
+        if v is None:
+            env.pop(k, None)
+        else:
+            env[k] = str(v)
     return env
 
 

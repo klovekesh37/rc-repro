@@ -137,6 +137,16 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
         response = await call_next(request)
         response.headers.setdefault("Content-Security-Policy", csp)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        # StaticFiles sends ETag + Last-Modified but no Cache-Control, and with no
+        # freshness directive a browser is free to reuse a cached copy WITHOUT
+        # revalidating (heuristic freshness, RFC 9111 4.2.2). After upgrading
+        # rc-repro that means the old app.js/app.css keep being used and the new UI
+        # simply is not there -- indistinguishable from a missing feature, and only
+        # fixable with a hard refresh nobody should have to know about.
+        # `no-cache` means "revalidate first", not "don't store": the ETag still
+        # answers 304, so this costs a conditional request, not a re-download.
+        if not path.startswith("/api/"):
+            response.headers.setdefault("Cache-Control", "no-cache")
         # The session token rides in ?t= (EventSource/WebSocket cannot set
         # headers), so suppress the Referer that would carry it off-origin.
         response.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -509,6 +519,38 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
             raise NotReadyError("Rocket.Chat did not return a token (is it ready?)")
         return {"token": pat, "user_id": auth.user_id, "label": label,
                 "bypass_2fa": bypass_2fa, "root_url": meta.root_url}
+
+    @app.get("/api/repros/{name}/env")
+    def env_get(name: str):
+        """The RC service's effective environment, with user overrides marked."""
+        from rc_repro.services import envvars as envsvc
+        return envsvc.current(name)
+
+    @app.post("/api/repros/{name}/env")
+    def env_set(name: str, body: dict = Body(...)):
+        """Change env vars and recreate Rocket.Chat so they take effect.
+
+        A job, not synchronous: recreating the container takes seconds to tens of
+        seconds, and the GUI already knows how to stream a job's progress.
+        """
+        from rc_repro.services import envvars as envsvc
+        target = lc.resolve_name(name)
+        sets = body.get("set") or {}
+        if not isinstance(sets, dict):
+            raise ValidationError("`set` must be an object of KEY: VALUE")
+        # Rocket.Chat SETTINGS come in separately and are prefixed here, not by the
+        # caller: a bare setting id silently does nothing, so the rule belongs on
+        # the server where every front-end gets it.
+        settings = body.get("setting") or {}
+        if not isinstance(settings, dict):
+            raise ValidationError("`setting` must be an object of SettingId: VALUE")
+        sets = {**sets, **envsvc.prefix_settings(settings)}
+        unset = body.get("unset") or []
+        if not isinstance(unset, list):
+            raise ValidationError("`unset` must be a list of key names")
+        job = jobs.submit("env", envsvc.set_env, target, sets, [str(u) for u in unset],
+                          restart=bool(body.get("restart", True)), label=target)
+        return {"job_id": job.id}
 
     @app.get("/api/repros/{name}/tls")
     def tls_state(name: str):

@@ -191,6 +191,8 @@ class CreateReq:
     # if it may be inferred.
     acme_challenge_given: bool = False
     acme_dns_provider: str = ""
+    # `up --env KEY=VALUE`. Merged over the preset's env; a None value removes a key.
+    env: dict = field(default_factory=dict)
     # Set by _resolve_tls when an inbound ACME challenge requires a public bind.
     # Derived, not asked for -- an explicit --bind always wins.
     bind_public: bool = False
@@ -443,11 +445,25 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
     # ROOT_URL); `root` stays http so rc-repro's own API calls need no CA.
     public = tlsspec.root_url if tlsspec else ""
 
+    # Overrides already on this repro are carried forward: `up --force` rebuilds the
+    # compose file from the spec, so without this a rebuild would silently drop env
+    # the user had set. Anything named on THIS run wins.
+    env_overrides: dict = {}
+    if runner.exists(repro_name):
+        try:
+            prev = runner.read_meta(repro_name).extra.get("env")
+            if isinstance(prev, dict):
+                env_overrides.update(prev)
+        except Exception:  # noqa: BLE001 - half-written record; nothing to carry
+            pass
+    env_overrides.update(req.env or {})
+
     spec = compose.Spec.from_resolved(
         resolved, project_name=runner.project_name(repro_name),
         root_url=(req.root_url or public or root),
         host_port=host_port, reg_token=token or None, preset=pre,
-        bind_host=bind_host, monitoring=req.monitor, tls=tlsspec)
+        bind_host=bind_host, monitoring=req.monitor, tls=tlsspec,
+        env_overrides=env_overrides)
     try:
         doc = compose.build(spec)
     except ValueError as exc:
@@ -471,6 +487,8 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         meta.extra.update(pre.extra)
     if pre.ports:
         meta.extra["sidecar_ports"] = pre.ports
+    if env_overrides:
+        meta.extra["env"] = env_overrides
     files = list(pre.files)
     if tlsspec:
         from rc_repro import tls as tlsmod
@@ -848,17 +866,25 @@ def redact_env(key: str, value: str) -> str:
     return REDACTED if value and any(h in low for h in _SECRET_KEY_HINTS) else value
 
 
-def _env_rows(doc: dict) -> list[dict]:
-    """The RC service's env as [{key, value}], credentials masked."""
+def _env_rows(doc: dict, overrides: dict | None = None) -> list[dict]:
+    """The RC service's env as [{key, value, override}], credentials masked.
+
+    `override` marks the keys the user set with `env --set`, so the panel can tell
+    those apart from the preset/base defaults -- "remove" means a different thing
+    for each.
+    """
+    own = set(overrides or {})
     svcs = doc.get("services", {})
     rc_svc = svcs.get("rocketchat") or svcs.get("rocketchat-1") or {}
     env = rc_svc.get("environment", {})
     if isinstance(env, dict):
-        return [{"key": k, "value": redact_env(k, str(v))} for k, v in sorted(env.items())]
-    if isinstance(env, list):  # compose list form "K=V"
-        pairs = [(e.split("=", 1) + [""])[:2] for e in env]
-        return [{"key": k, "value": redact_env(k, v)} for k, v in pairs]
-    return []
+        pairs = sorted(env.items())
+    elif isinstance(env, list):  # compose list form "K=V"
+        pairs = [(k, v) for k, v in ((e.split("=", 1) + [""])[:2] for e in env)]
+    else:
+        return []
+    return [{"key": k, "value": redact_env(k, str(v)), "override": k in own}
+            for k, v in pairs]
 
 
 def detail(name: str) -> dict:
@@ -886,7 +912,8 @@ def detail(name: str) -> dict:
         d["state"], d["uptime"], d["health"] = "?", "", ""
         d["containers"] = []
         d["links"] = repro_links(m)
-        d["env"] = _env_rows(runner.read_compose(target))
+        d["env"] = _env_rows(runner.read_compose(target), m.extra.get("env")
+                             if isinstance(m.extra, dict) else None)
         return d
     containers = runner.container_details(target)
     rc = [c for c in containers if c["service"] == "rocketchat" or c["service"].startswith("rocketchat-")]
@@ -903,7 +930,8 @@ def detail(name: str) -> dict:
         d["restarts"] = runner.rc_restart_count(target)
     d["links"] = repro_links(m)
     d["containers"] = containers
-    d["env"] = _env_rows(runner.read_compose(target))
+    d["env"] = _env_rows(runner.read_compose(target), m.extra.get("env")
+                         if isinstance(m.extra, dict) else None)
     return d
 
 

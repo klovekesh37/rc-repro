@@ -771,3 +771,89 @@ def test_http_redirect_is_always_best_effort(tmp_path, monkeypatch):
     # Local mode never wants 80, so a busy 80 is irrelevant to it.
     spec = lc._resolve_tls(_req(https=True), "x", "127.0.0.1")
     assert spec.mode == tls.MODE_LOCAL and spec.http_redirect is False
+
+
+def test_env_overrides_survive_up_force(tmp_path, monkeypatch):
+    """`up --force` rebuilds compose from the spec, so overrides must live in metadata.
+
+    Verified live before this was written: editing only the generated compose file
+    worked until the next `up --force`, which silently dropped the change.
+    """
+    from rc_repro import runner
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    meta = runner.Metadata(
+        name="e", project="rcrepro-e", rc_version="8.6.1", rc_image="i", mongo_tag="8.0",
+        mongo_flavor="official", preset="default", root_url="http://localhost:3000",
+        host_port=3000, version_source="map",
+        extra={"env": {"KEEP_ME": "yes", "GONE": None}})
+    monkeypatch.setattr(runner, "exists", lambda n: True)
+    monkeypatch.setattr(runner, "read_meta", lambda n: meta)
+
+    carried: dict = {}
+    if runner.exists("e"):
+        prev = runner.read_meta("e").extra.get("env")
+        if isinstance(prev, dict):
+            carried.update(prev)
+    carried.update({"NEW": "1"})          # what this run asked for
+    assert carried == {"KEEP_ME": "yes", "GONE": None, "NEW": "1"}, \
+        "existing overrides carry forward; this run's win"
+
+
+def test_set_env_refuses_a_no_op_and_warns_on_load_bearing_keys(tmp_path, monkeypatch):
+    """Load-bearing keys are allowed — reproducing a broken config is the point —
+    but never silently, because the repro stops working and the cause is invisible."""
+    from rc_repro import compose, runner
+    from rc_repro.services import envvars
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(envvars.lifecycle, "require_docker", lambda: None)
+    monkeypatch.setattr(envvars.lifecycle, "resolve_name", lambda n: n)
+
+    with pytest.raises(errors.ValidationError, match="nothing to change"):
+        envvars.set_env("e", {}, [], emit=lambda ev: None)
+
+    meta = runner.Metadata(
+        name="e", project="rcrepro-e", rc_version="8.6.1", rc_image="i", mongo_tag="8.0",
+        mongo_flavor="official", preset="default", root_url="http://localhost:3000",
+        host_port=3000, version_source="map")
+    doc = {"services": {"rocketchat": {"environment": {"PORT": "3000", "KEEP": "1"}},
+                        "rocketchat-2": {"environment": {"PORT": "3000"}}}}
+    monkeypatch.setattr(runner, "read_meta", lambda n: meta)
+    monkeypatch.setattr(runner, "read_compose", lambda n: doc)
+    written = {}
+    monkeypatch.setattr(runner, "write",
+                        lambda n, y, m, files=None: written.update(yaml=y, meta=m))
+    monkeypatch.setattr(runner, "up", lambda n, pull=True: 0)
+
+    events = []
+    r = envvars.set_env("e", {"MONGO_URL": "mongodb://elsewhere", "MY": "v"}, ["KEEP"],
+                        emit=events.append)
+    assert r["restarted"] is True
+    assert any("load-bearing" in str(getattr(e, "message", e)) for e in events), \
+        "MONGO_URL must be called out"
+    # Applied to EVERY rocketchat service, and the unset key is gone from each.
+    out = compose.yaml.safe_load(written["yaml"])
+    for svc in ("rocketchat", "rocketchat-2"):
+        assert out["services"][svc]["environment"]["MY"] == "v", svc
+        assert "KEEP" not in out["services"][svc]["environment"], svc
+    # And it is recorded, so `up --force` keeps it.
+    assert written["meta"].extra["env"] == {"KEEP": None, "MONGO_URL": "mongodb://elsewhere",
+                                            "MY": "v"}
+
+
+def test_set_env_can_write_without_restarting(tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import envvars
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(envvars.lifecycle, "require_docker", lambda: None)
+    monkeypatch.setattr(envvars.lifecycle, "resolve_name", lambda n: n)
+    monkeypatch.setattr(runner, "read_meta", lambda n: runner.Metadata(
+        name="e", project="p", rc_version="8.6.1", rc_image="i", mongo_tag="8.0",
+        mongo_flavor="official", preset="default", root_url="http://localhost:3000",
+        host_port=3000, version_source="map"))
+    monkeypatch.setattr(runner, "read_compose",
+                        lambda n: {"services": {"rocketchat": {"environment": {}}}})
+    monkeypatch.setattr(runner, "write", lambda *a, **k: None)
+    called = []
+    monkeypatch.setattr(runner, "up", lambda n, pull=True: called.append(n) or 0)
+    r = envvars.set_env("e", {"A": "1"}, [], restart=False, emit=lambda ev: None)
+    assert r["restarted"] is False and called == [], "must not touch containers"
