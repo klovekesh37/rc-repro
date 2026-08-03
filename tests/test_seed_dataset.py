@@ -47,6 +47,22 @@ def test_seed_body_reports_actual_message_successes_not_approximate_attempts(mon
     assert "~" not in " ".join(result.get("logs", []))
 
 
+def test_seed_body_summary_distinguishes_dm_rooms_from_messages(monkeypatch):
+    from rc_repro import rcapi, seed
+
+    monkeypatch.setattr(rcapi, "login", lambda *a, **k: (_ for _ in ()).throw(Exception("offline")))
+    plan = seed.plan_from("small", users=2, channels=0, messages=0)
+
+    def post(path, headers, payload):
+        return SimpleNamespace(ok=not path.endswith("chat.postMessage"))
+
+    result = seed._seed_body("http://x", {"h": "1"}, plan, post, lambda _m: None)
+
+    assert result["actual"]["dms"] == 1
+    assert result["actual"]["dm_messages"] == 0
+    assert result["logs"][-1].endswith("DM rooms: 1  DM messages: 0")
+
+
 def test_seed_plan_resolves_dm_count_when_user_override_cannot_form_pairs():
     from rc_repro import seed
 

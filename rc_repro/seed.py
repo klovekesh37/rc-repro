@@ -407,7 +407,6 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
     post_messages("general", names, plan.messages)
 
     # 5. Direct messages between the deterministic pairs in the plan.
-    dms = 0
     for u1, u2 in plan.dm_pairs:
         hdr = ({**tokens[u1].headers(), "Content-Type": "application/json"}
                if u1 in tokens else admin_hdr)
@@ -421,8 +420,10 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
         )
         if ok(dm_message):
             actual["dm_messages"] += 1
-            dms += 1
-    say(f"messages: {actual['messages']} (attempted {attempted['messages']})  DMs: {dms}")
+    say(
+        f"messages: {actual['messages']} (attempted {attempted['messages']})  "
+        f"DM rooms: {actual['dms']}  DM messages: {actual['dm_messages']}"
+    )
 
     return {
         "plan": plan.as_dict(),
