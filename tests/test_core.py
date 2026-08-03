@@ -682,6 +682,31 @@ def test_config_save_survives_chmod_failure(tmp_path, monkeypatch):
     assert not config.config_file().with_name("config.yaml.tmp").exists()
 
 
+def test_config_save_closes_raw_descriptor_when_fdopen_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    real_open = config.os.open
+    opened = []
+
+    def tracking_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def fail_fdopen(*_args, **_kwargs):
+        raise OSError("could not construct file object")
+
+    monkeypatch.setattr(config.os, "open", tracking_open)
+    monkeypatch.setattr(config.os, "fdopen", fail_fdopen)
+
+    with pytest.raises(OSError, match="could not construct file object"):
+        config.save_config({"default_repro": "not-written"})
+
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+    assert not list(config.home().glob("config.yaml.*.tmp"))
+
+
 def test_version_single_source():
     import rc_repro
     # resolved from package metadata (pyproject), never a hardcoded literal

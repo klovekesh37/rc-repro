@@ -175,7 +175,18 @@ def save_config(cfg: dict) -> None:
     body = yaml.safe_dump(cfg, sort_keys=False)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        try:
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            # Ownership transfers only after fdopen returns. If constructing the
+            # file object fails, close the raw descriptor ourselves without
+            # masking the original error if the runtime already closed it.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        with fh:
             fh.write(body)
     except BaseException:
         tmp.unlink(missing_ok=True)
