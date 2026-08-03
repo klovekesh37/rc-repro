@@ -16,6 +16,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Starlette's TestClient has resolved against both clients across supported
+# releases; some releases hard-require httpx2 while older ones use httpx.
 dev = ["pytest>=7", "httpx>=0.27", "httpx2>=2.9", "ruff>=0.6"]
 gui = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9", "websockets>=12"]
 

@@ -346,7 +346,7 @@ def _run_seed(meta: runner.Metadata, profile: str,
         s = seeder.seed(meta.root_url, auth, plan, log=_log)
     except seeder.SeedVerificationError as exc:
         # Preserve the failed plan/readback for a later evidence capture before
-        # translating the validation error into the CLI's exit contract.
+        # translating the runtime failure into the CLI's exit contract.
         lcsvc.persist_seed_result(meta, exc.result)
         if emit is not None:
             raise

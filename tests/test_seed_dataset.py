@@ -40,6 +40,8 @@ def test_seed_body_reports_actual_message_successes_not_approximate_attempts(mon
     result = seed._seed_body("http://x", {"h": "1"}, plan, post, lambda _m: None)
 
     assert result["attempted"]["messages"] == 4
+    assert result["attempted"]["channels"] == 1
+    assert result["attempted"]["groups"] == 0
     assert result["messages"] == 0
     assert result["actual"]["messages"] == 0
     assert "~" not in " ".join(result.get("logs", []))
@@ -62,6 +64,33 @@ def test_seed_plan_never_repeats_a_dm_room_when_users_are_overridden():
 
     assert plan.dm_pairs == [("alice", "bob")]
     assert plan.expected_counts()["dms"] == 1
+
+
+def test_seed_attempts_keep_public_channels_and_private_groups_separate(monkeypatch):
+    from rc_repro import rcapi, seed
+
+    monkeypatch.setattr(rcapi, "login", lambda *a, **k: (_ for _ in ()).throw(Exception("offline")))
+    plan = seed.plan_from("standard", users=1, channels=1, messages=0)
+
+    result = seed._seed_body(
+        "http://x", {"h": "1"}, plan,
+        lambda *_args, **_kwargs: SimpleNamespace(ok=False),
+        lambda _message: None,
+    )
+
+    assert result["attempted"]["channels"] == 1
+    assert result["attempted"]["groups"] == 2
+    assert set(result["attempted"]) == set(result["actual"])
+
+
+def test_seed_verification_failure_is_non_retryable_create_failure():
+    from rc_repro import seed
+
+    failure = seed.SeedVerificationError("readback did not match", {})
+
+    assert failure.code == "CREATE_FAILED"
+    assert failure.exit_code == 7
+    assert failure.http_status == 500
 
 
 def test_seed_verification_exposes_mismatch_diagnostics():

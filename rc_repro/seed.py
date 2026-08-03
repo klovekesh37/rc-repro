@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import requests
 
 from rc_repro import config, rcapi
-from rc_repro.errors import ValidationError
+from rc_repro.errors import CreateFailedError
 from rc_repro.perf import Timings
 
 # Realistic pools; overflow gets a numeric suffix (e.g. alice, bob, …, alice2).
@@ -190,7 +190,7 @@ def channel_name(i: int) -> str:
     return base if grp == 0 else f"{base}-{grp + 1}"
 
 
-class SeedVerificationError(ValidationError):
+class SeedVerificationError(CreateFailedError):
     """A seed wrote data but could not prove it matches its resolved plan."""
 
     def __init__(self, message: str, result: dict) -> None:
@@ -296,7 +296,8 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
     targets = plan.message_targets()
     attempted = {
         "users": plan.users,
-        "channels": plan.channels + len(plan.group_names),
+        "channels": plan.channels,
+        "groups": len(plan.group_names),
         "messages": sum(count for _, count in targets),
         "thread_replies": sum(plan._thread_count(count, plan.rich)
                                for _, count in targets),

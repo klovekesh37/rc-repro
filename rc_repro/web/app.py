@@ -349,7 +349,9 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
         # An omitted preset means "use the saved selector defaults".  Keep the
         # dataclass's legacy default for direct Python callers, while making the
         # HTTP interface obey the same additive config contract as the CLI.
-        payload.setdefault("preset", "")
+        # JSON null has the same meaning as omission at this boundary.
+        if payload.get("preset") is None:
+            payload["preset"] = ""
         creq = lc.CreateReq(**payload)
         job = jobs.submit("create", lc.create_repro, creq, stream_output=True,
                           label=creq.name or creq.version)

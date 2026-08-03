@@ -232,10 +232,14 @@ def test_detail_and_stats_endpoints(monkeypatch):
 def test_create_only_accepts_known_fields(monkeypatch):
     seen = {}
     monkeypatch.setattr(lc, "create_repro",
-                        lambda req, emit, stream_output=False: seen.update(v=req.version) or {"name": "x"})
-    r = client().post("/api/repros", headers=H,
-                      json={"version": "8.5.1", "bogus_field": "drop me"})
-    assert r.status_code == 200 and seen["v"] == "8.5.1"   # unknown key ignored, no crash
+                        lambda req, emit, stream_output=False:
+                        seen.update(version=req.version, preset=req.preset) or {"name": "x"})
+    c = client()
+    r = c.post("/api/repros", headers=H,
+               json={"version": "8.5.1", "preset": None, "bogus_field": "drop me"})
+    assert r.status_code == 200
+    assert wait_job(c, r.json()["job_id"])["status"] == "done"
+    assert seen == {"version": "8.5.1", "preset": ""}
 
 
 # --- GUI against a Kubernetes repro (#17) --------------------------------------

@@ -936,7 +936,7 @@ def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit
         s = seeder.seed(meta.root_url, auth, plan, log=lambda m: info(emit, m.strip(), phase="seed"))
     except seeder.SeedVerificationError as exc:
         # Keep the failed plan/readback available to `evidence` before surfacing
-        # the validation error to CLI, HTTP, or GUI callers.
+        # the runtime failure to CLI, HTTP, or GUI callers.
         persist_seed_result(meta, exc.result)
         raise
     finally:
