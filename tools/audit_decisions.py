@@ -75,16 +75,26 @@ def git_text(*args: str) -> str:
     return result.stdout.strip()
 
 
+def audit_tip() -> str:
+    """Return the contribution tip, ignoring a base-reconciliation merge commit."""
+    fields = git_text("rev-list", "--parents", "-n", "1", "HEAD").split()
+    # A PR branch may merge the moving upstream main into itself to become
+    # mergeable again. Its first parent remains the contribution stack; the merge
+    # commit itself is synchronisation metadata, not one of the audited layers.
+    return fields[1] if len(fields) > 2 else fields[0]
+
+
 def stack_base() -> tuple[str, str]:
     """Find the closest main ref that is an ancestor of the checked-out stack."""
+    tip = audit_tip()
     refs = git_text("for-each-ref", "--format=%(refname)", "refs/heads/main",
                     "refs/remotes").splitlines()
     main_refs = sorted({ref for ref in refs
                         if ref == "refs/heads/main" or ref.endswith("/main")})
     candidates: list[tuple[int, str, str]] = []
     for ref in main_refs:
-        merge_base = git_text("merge-base", "HEAD", ref)
-        count = int(git_text("rev-list", "--count", f"{merge_base}..HEAD"))
+        merge_base = git_text("merge-base", tip, ref)
+        count = int(git_text("rev-list", "--count", f"{merge_base}..{tip}"))
         if count:
             candidates.append((count, ref, merge_base))
     if not candidates:
@@ -94,7 +104,7 @@ def stack_base() -> tuple[str, str]:
 
 
 def stack_commits(base: str) -> list[str]:
-    out = git_text("rev-list", "--reverse", "--topo-order", f"{base}..HEAD")
+    out = git_text("rev-list", "--reverse", "--topo-order", f"{base}..{audit_tip()}")
     return out.splitlines() if out else []
 
 
@@ -196,6 +206,25 @@ def validate_linear_history(base: str, commits: list[str]) -> list[str]:
 def test_stack_tips(commits: list[str]) -> list[str]:
     """Run every contribution commit's own tests from a disposable source archive."""
     failures: list[str] = []
+
+    def extract_archive(tar: tarfile.TarFile, destination: str) -> None:
+        """Extract a Git archive safely on both Python 3.11 and 3.12+."""
+        try:
+            # Python 3.12+ provides the traversal-safe data filter.
+            tar.extractall(destination, filter="data")
+            return
+        except TypeError:
+            # Python 3.11 has no ``filter`` parameter. Apply the same restrictions
+            # explicitly rather than falling back to an unfiltered extraction.
+            root = Path(destination).resolve()
+            for member in tar.getmembers():
+                target = (root / member.name).resolve()
+                if target != root and root not in target.parents:
+                    raise ValueError(f"archive member escapes destination: {member.name}")
+                if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
+                    raise ValueError(f"unsupported archive member: {member.name}")
+                tar.extract(member, destination)
+
     for index, commit in enumerate(commits):
         name = (STACK_LAYERS[index][0] if index < len(STACK_LAYERS)
                 else commit_subject(commit))
@@ -206,7 +235,7 @@ def test_stack_tips(commits: list[str]) -> list[str]:
             continue
         with tempfile.TemporaryDirectory(prefix="rc-repro-stack-audit-") as tmp:
             with tarfile.open(fileobj=io.BytesIO(archive.stdout), mode="r:") as tar:
-                tar.extractall(tmp, filter="data")
+                extract_archive(tar, tmp)
             result = subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=tmp,
                                     capture_output=True, text=True, check=False)
         if result.returncode:

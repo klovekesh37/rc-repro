@@ -1079,7 +1079,7 @@ def list_repros() -> list[dict]:
     status_map = runner.rc_status_by_project() if docker_up else {}
     out = []
     for m in metas:
-        if (m.extra or {}).get("topology") == "kubernetes" if isinstance(m.extra, dict) else False:
+        if isinstance(m.extra, dict) and m.extra.get("topology") == "kubernetes":
             # Ask Kubernetes, not compose: a compose lookup returns nothing for these
             # and `list` would show every Kubernetes repro as unknown forever.
             from rc_repro.services import k8s
