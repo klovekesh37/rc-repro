@@ -297,9 +297,7 @@ def _run_seed(meta: runner.Metadata, profile: str,
                 raise
             _fail(exc)
         if emit is not None:
-            return {"users": summary.get("users"), "channels": summary.get("channels"),
-                    "messages": summary.get("messages"),
-                    "elapsed_s": round(float(summary.get("total_s", 0)), 1)}
+            return {**summary, "elapsed_s": round(float(summary.get("total_s", 0)), 1)}
         _print_seed_result(summary, float(summary.get("total_s", 0)),
                            None, meta)
         return None
@@ -327,12 +325,23 @@ def _run_seed(meta: runner.Metadata, profile: str,
             typer.echo(f"  {m}")
     try:
         s = seeder.seed(meta.root_url, auth, plan, log=_log)
+    except seeder.SeedVerificationError as exc:
+        # Preserve the failed plan/readback for a later evidence capture before
+        # translating the validation error into the CLI's exit contract.
+        lcsvc.persist_seed_result(meta, exc.result)
+        if emit is not None:
+            raise
+        _fail(exc)
+    except errors.ReproError as exc:
+        if emit is not None:
+            raise
+        _fail(exc)
     finally:
         resources = mon.stop() if mon else None   # stop the sampler thread even if seed raises
     total = time.monotonic() - t0
+    lcsvc.persist_seed_result(meta, s)
     if emit is not None:
-        return {"users": plan.users, "channels": plan.channels,
-                "messages": plan.messages, "elapsed_s": round(total, 1)}
+        return {**s, "elapsed_s": round(total, 1)}
     _print_seed_result(s, total, resources, meta)
     return None
 
@@ -412,8 +421,17 @@ def _print_seed_result(s: dict, total: float, resources, meta: runner.Metadata) 
                    f"p99 {fmt_ms(lat['p99'])}  {s.get('latency_hist', '')}")
     row("users", s["users"], d.get("users", 0.0))
     row("channels", s["channels"], d.get("channels", 0.0))
-    row("messages", s["messages"], d.get("messages", 0.0), display=f"~{s['messages']}", extra=lat_str)
+    row("messages", s["messages"], d.get("messages", 0.0), extra=lat_str)
     row("DMs", s["dms"], d.get("dms", 0.0))
+    readback = s.get("readback") or {}
+    verification = s.get("verification") or {}
+    if readback:
+        status = "verified" if verification.get("ok") else "not verified"
+        typer.echo(
+            f"  readback  users {readback.get('users', '?')} · "
+            f"channels {readback.get('channels', '?')} · "
+            f"messages {readback.get('messages', '?')} ({status})"
+        )
     _print_resources(resources or {}, meta.name)
 
 

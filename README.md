@@ -438,9 +438,18 @@ rc-repro seed --name test --users 30 --channels 10 --messages 40   # custom coun
 | `standard` | 20 | 8 | 20 | 5 | yes |
 | `large` | 100 | 20 | 100 | 20 | yes |
 
-`seed` reports a **timing breakdown** (time + rate per phase, message-latency
-p50/p95/p99); add `--stats` for the CPU/RAM cost. `rc-repro api` prints each
-call's latency (`HTTP 200 [admin] in 11ms`).
+Every seed resolves a named plan before making changes. With `--json`, the
+result keeps the requested plan, attempted writes, successful writes, and REST
+readback separate; `verification.ok` is true only when the planned identities,
+room counts, and message totals match. A 2xx write response with zero visible
+messages is therefore reported as a failed verification, not as a successful
+seed. `seed` also reports a **timing breakdown** (time + rate per phase,
+message-latency p50/p95/p99); add `--stats` for the CPU/RAM cost.
+
+The same plan/readback/verification block is retained in the repro record and
+included by `rc-repro evidence`, so a later evidence capture does not depend on
+transient terminal output. `rc-repro api` prints each call's latency (`HTTP 200
+[admin] in 11ms`).
 
 Seed users are `alice`, `bob`, … (password = username). While seeding, email-2FA
 and the API rate limiter are temporarily disabled so it can log in as each user

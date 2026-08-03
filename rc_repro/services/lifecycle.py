@@ -624,12 +624,36 @@ def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit
     t0 = time.monotonic()
     try:
         s = seeder.seed(meta.root_url, auth, plan, log=lambda m: info(emit, m.strip(), phase="seed"))
+    except seeder.SeedVerificationError as exc:
+        # Keep the failed plan/readback available to `evidence` before surfacing
+        # the validation error to CLI, HTTP, or GUI callers.
+        persist_seed_result(meta, exc.result)
+        raise
     finally:
         resources = mon.stop() if mon else None
     s["total_s"] = time.monotonic() - t0
     if resources is not None:
         s["resources_keys"] = sorted(resources)
+    persist_seed_result(meta, s)
     return s
+
+
+def persist_seed_result(meta: runner.Metadata, result: dict) -> None:
+    """Persist only the secret-free Seed Dataset proof needed by evidence."""
+    plan = result.get("plan")
+    if not isinstance(plan, dict):
+        # Test doubles and older callers may return the historical count-only
+        # summary. Do not manufacture a proof record from incomplete data.
+        return
+    proof = {"profile": plan.get("profile", ""), "plan": plan}
+    for key in ("attempted", "actual", "readback", "verification"):
+        value = result.get(key)
+        if isinstance(value, dict):
+            proof[key] = value
+    extra = dict(meta.extra) if isinstance(meta.extra, dict) else {}
+    extra["seed"] = proof
+    meta.extra = extra
+    runner.write_meta(meta.name, meta)
 
 
 # --- read / state -------------------------------------------------------------

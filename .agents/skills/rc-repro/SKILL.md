@@ -70,6 +70,15 @@ rc-repro info --name <name> --json          # URL and admin credentials
 Then drive the workspace to the reported steps. The final line of a streaming
 command is always the result envelope; the lines before it are progress events.
 
+### Verify a Seed Dataset
+
+Seed output is evidence, not just a progress count. Read `data.seed.plan` for
+the resolved identities and expected totals, `data.seed.readback` for what the
+REST API found, and `data.seed.verification` for the exact comparison. Treat a
+missing or false `verification.ok` as unproven; do not infer success from a 2xx
+write or an attempted message count. `rc-repro evidence --name <name> --json`
+retains the same block after the command has finished.
+
 ### Check whether behaviour is version-specific
 
 Create two repros at different versions and compare. Each gets its own name and

@@ -104,6 +104,13 @@ def _licensed(meta) -> dict:
             "source": "reg_token" if supplied else None}
 
 
+def _seed(meta) -> dict | None:
+    """Return the persisted, secret-free Seed Dataset record when one exists."""
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    value = extra.get("seed")
+    return value if isinstance(value, dict) else None
+
+
 #: Only these reasons may appear on a retained run. Anything else is refused so
 #: agents cannot invent a soft justification for leaving state behind.
 _RETAIN_REASONS = frozenset({"persisted preference", "explicit task"})
@@ -171,7 +178,7 @@ def record(name: str, *, retained: bool | None = None,
     retention = resolve_retention(retained=retained, reason=reason,
                                   preferences=prefs)
 
-    return {
+    payload = {
         # Identical shape on both topologies, so a consumer never branches here.
         "repro": {
             "name": meta.name,
@@ -200,6 +207,12 @@ def record(name: str, *, retained: bool | None = None,
         },
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    seed = _seed(meta)
+    # Keep the historical unseeded evidence shape byte-for-byte compatible;
+    # seeded runs gain an additive proof block with plan/readback semantics.
+    if seed is not None:
+        payload["seed"] = seed
+    return payload
 
 
 def write_bundle(name: str, dest: str | Path, payload: dict) -> dict:
