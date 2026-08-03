@@ -7,6 +7,7 @@ scenario. Built-ins are shipped in data/presets; a file of the same name in
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from importlib import resources
 
@@ -72,6 +73,48 @@ class Preset:
     kubernetes_manifests: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class Selection:
+    """A validated public deployment/scenario request.
+
+    ``Preset`` remains the lifecycle aggregate.  This small wrapper carries the
+    selector provenance needed by the public CLI and saved records without
+    introducing a second rendering model.
+    """
+
+    preset: Preset
+    deployment: str
+    scenarios: tuple[str, ...] = ()
+    legacy_preset: str = ""
+    params: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def topology(self) -> str:
+        return self.preset.topology or "compose"
+
+    @property
+    def label(self) -> str:
+        """Stable name fragment for an implicitly named repro."""
+        if self.scenarios:
+            suffix = "-".join(self.scenarios)
+            return suffix if self.deployment == "default" else f"{self.deployment}-{suffix}"
+        if self.legacy_preset and self.legacy_preset not in DEPLOYMENT_PRESETS:
+            return self.legacy_preset
+        return self.deployment
+
+
+# These are the concrete deployment entries in the existing catalog.  They are
+# intentionally separate from renderer names (``compose``/``kubernetes``): an
+# adapter can be shared while applicability remains an explicit pair decision.
+DEPLOYMENT_PRESETS = ("default", "multi-instance", "microservices")
+_DEPLOYMENT_ALIASES = {
+    "compose": "default",
+    "docker": "default",
+    "k8s": "microservices",
+    "kubernetes": "microservices",
+}
+
+
 def _parse(text: str, source: str) -> Preset:
     raw = yaml.safe_load(text) or {}
     if not raw.get("name"):
@@ -117,6 +160,190 @@ def _dynamic_builders() -> dict:
         "multi-instance": multi_instance.build,
         "s3_minio": s3_minio.build,
     }
+
+
+def scenario_names() -> tuple[str, ...]:
+    """Return the built-in scenario names, derived from the shipped catalog."""
+    dynamic = set(_dynamic_builders()) - {"multi-instance"}
+    builtin_dir = resources.files("rc_repro").joinpath("data", "presets")
+    static = {
+        entry.stem for entry in builtin_dir.iterdir()
+        if entry.name.endswith(".yaml") and entry.stem not in DEPLOYMENT_PRESETS
+    }
+    return tuple(sorted(dynamic | static))
+
+
+def deployment_names() -> tuple[str, ...]:
+    """Return the public deployment entries in deterministic order."""
+    return tuple(sorted(DEPLOYMENT_PRESETS))
+
+
+def compatibility_matrix() -> dict[str, tuple[str, ...]]:
+    """Initial proven Deployment Type -> Scenario applicability matrix.
+
+    The matrix is deliberately narrow.  A scenario set with two or more entries
+    is refused until a concrete pair has rendering, conflict, lifecycle, and
+    acceptance proof; this function gives callers a stable way to explain the
+    current boundary without guessing from renderer names.
+    """
+    return {
+        "default": scenario_names(),
+        "multi-instance": (),
+        "microservices": ("ldap",),
+    }
+
+
+def _normalise_deployment(value: str | None) -> str:
+    value = (value or "").strip().lower()
+    if not value:
+        return ""
+    return _DEPLOYMENT_ALIASES.get(value, value)
+
+
+def _normalise_scenarios(values: Iterable[str] | str | None) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        values = [values]
+    elif not isinstance(values, Iterable):
+        values = [str(values)]
+    out: list[str] = []
+    for value in values:
+        # Comma-separated config values are convenient while repeated CLI flags
+        # remain the canonical syntax. Empty pieces are ignored so a trailing
+        # comma does not create a phantom scenario.
+        for item in str(value).split(","):
+            item = item.strip().lower()
+            if item and item not in out:
+                out.append(item)
+    return tuple(out)
+
+
+def _saved_selectors(saved: Mapping | None) -> tuple[str, tuple[str, ...]]:
+    """Read additive selector defaults from config without exposing secrets."""
+    if not isinstance(saved, Mapping):
+        return "", ()
+    nested = saved.get("defaults") if isinstance(saved.get("defaults"), Mapping) else {}
+    deployment = (saved.get("default_deployment") or saved.get("deployment") or
+                  nested.get("deployment") or "")
+    scenarios = (saved.get("default_scenarios") if "default_scenarios" in saved
+                 else saved.get("scenarios", nested.get("scenarios", ())))
+    return _normalise_deployment(str(deployment)), _normalise_scenarios(scenarios)
+
+
+def _deployment_topology(deployment: str) -> str:
+    return "kubernetes" if deployment == "microservices" else "compose"
+
+
+def _selection_error(message: str) -> ValueError:
+    return ValueError(message)
+
+
+def resolve_selection(*, preset: str | None = "", deployment: str | None = "",
+                      scenarios: Iterable[str] | str | None = None,
+                      params: Mapping[str, str] | None = None,
+                      saved: Mapping | None = None) -> Selection:
+    """Resolve public selectors into one validated :class:`Preset` aggregate.
+
+    ``--preset`` is retained as a compatibility alias.  Built-in deployment
+    names are hard deployment aliases; built-in scenario names are soft aliases
+    that may be paired with an explicit deployment.  User YAML remains a legacy
+    preset override and is never silently reinterpreted as a scenario.
+    """
+    params = dict(params or {})
+    raw_preset = (preset or "").strip().lower()
+    explicit_deployment = _normalise_deployment(deployment)
+    explicit_scenarios = _normalise_scenarios(scenarios)
+    scenarios_were_supplied = scenarios is not None
+
+    if explicit_deployment and explicit_deployment not in DEPLOYMENT_PRESETS:
+        valid = ", ".join(deployment_names())
+        raise _selection_error(
+            f"unknown deployment {deployment!r}; valid deployment presets: {valid}")
+
+    # A user file keeps the exact old --preset meaning.  It cannot participate in
+    # the built-in selector model because there is no public custom-scenario
+    # adapter contract yet.
+    user_override = bool(raw_preset and _user_path(raw_preset).exists())
+    if user_override:
+        if explicit_deployment or explicit_scenarios:
+            raise _selection_error(
+                f"custom preset {raw_preset!r} cannot be combined with --deployment "
+                "or --scenario; use the legacy --preset form by itself")
+        resolved = resolve(raw_preset, params=params)
+        deployment_name = ("microservices" if resolved.topology == "kubernetes"
+                           else "default")
+        return Selection(resolved, deployment_name, (), raw_preset, params)
+
+    alias_deployment = ""
+    alias_scenarios: tuple[str, ...] = ()
+    if raw_preset:
+        if raw_preset in DEPLOYMENT_PRESETS:
+            alias_deployment = raw_preset
+        elif raw_preset in scenario_names():
+            alias_scenarios = (raw_preset,)
+        else:
+            # Let the existing resolver produce its established unknown-preset
+            # wording for a name that is neither a built-in alias nor a user file.
+            resolve(raw_preset, params=params)
+
+    saved_deployment, saved_scenarios = _saved_selectors(
+        saved if saved is not None else config.load_config())
+
+    if explicit_deployment and alias_deployment and explicit_deployment != alias_deployment:
+        raise _selection_error(
+            f"deployment conflict: --preset {raw_preset!r} selects "
+            f"{alias_deployment!r}, but --deployment selects {explicit_deployment!r}")
+
+    if raw_preset:
+        chosen_deployment = explicit_deployment or alias_deployment or "default"
+        chosen_scenarios = explicit_scenarios if scenarios_were_supplied else alias_scenarios
+        # A scenario alias is intentionally soft: --preset ldap plus
+        # --deployment microservices is the new composable form.
+        if alias_scenarios and scenarios_were_supplied:
+            chosen_scenarios = _normalise_scenarios((*alias_scenarios, *explicit_scenarios))
+    else:
+        # Saved values are defaults per selector: choosing one explicitly keeps
+        # the other saved selector unless it is also overridden on the command
+        # line. A legacy --preset is the explicit whole-request form above.
+        chosen_deployment = explicit_deployment or saved_deployment or "default"
+        chosen_scenarios = explicit_scenarios if scenarios_were_supplied else saved_scenarios
+
+    if chosen_deployment not in DEPLOYMENT_PRESETS:
+        valid = ", ".join(deployment_names())
+        raise _selection_error(
+            f"unknown deployment {chosen_deployment!r}; valid deployment presets: {valid}")
+
+    shadowed = [scenario for scenario in chosen_scenarios
+                if _user_path(scenario).exists()]
+    if shadowed:
+        raise _selection_error(
+            f"custom preset {shadowed[0]!r} shadows the built-in scenario; use "
+            f"--preset {shadowed[0]!r} by itself, or rename the custom preset before "
+            "using --scenario")
+
+    if len(chosen_scenarios) > 1:
+        requested = ", ".join(chosen_scenarios)
+        raise _selection_error(
+            f"scenario set [{requested}] is not supported yet; the current public "
+            "matrix proves zero or one scenario per deployment. Use one scenario, "
+            "or a legacy preset alias")
+
+    matrix = compatibility_matrix()
+    unsupported = [s for s in chosen_scenarios
+                   if s not in matrix.get(chosen_deployment, ())]
+    if unsupported:
+        supported = ", ".join(matrix.get(chosen_deployment, ())) or "none"
+        raise _selection_error(
+            f"deployment {chosen_deployment!r} does not support scenario "
+            f"{unsupported[0]!r}; supported scenarios: {supported}")
+
+    if chosen_scenarios:
+        scenario_name = chosen_scenarios[0]
+        resolved = resolve(scenario_name, _deployment_topology(chosen_deployment), params)
+    else:
+        resolved = resolve(chosen_deployment, _deployment_topology(chosen_deployment), params)
+    return Selection(resolved, chosen_deployment, chosen_scenarios, raw_preset, params)
 
 
 def _scenario_definitions() -> dict[str, Scenario]:

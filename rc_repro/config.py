@@ -3,7 +3,7 @@
 State lives under ~/.rc-repro (override with RC_REPRO_HOME):
 
     ~/.rc-repro/
-      config.yaml            # default_repro, reg_token, rc_image overrides
+      config.yaml            # default_repro, selector defaults, reg_token/overrides
       clients/               # isolated Kubernetes and Helm client state
       presets/               # user/team presets (override built-ins)
       repros/<name>/         # one workspace per repro

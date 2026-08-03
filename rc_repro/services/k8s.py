@@ -858,6 +858,12 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     extra = {_TOPOLOGY: "kubernetes", _NAMESPACE: plan.namespace,
              _CONTEXT: ctx, _FORWARD_PID: pid,
              "chart_version": plan.chart_version}
+    # Additive selector provenance. Existing consumers still read
+    # ``preset=\"microservices\"``; agents that used the new public selectors can
+    # inspect the deployment/scenario choice without parsing Helm values.
+    extra["deployment"] = "microservices"
+    if preset is not None and preset.scenario:
+        extra["scenarios"] = [preset.scenario]
     # Boolean only: evidence and info report whether a token was consumed, never
     # the value. Absent means not supplied, so consumers do not invent True.
     if token_supplied:

@@ -196,7 +196,13 @@ def _render_create_result(result: dict) -> None:
 @app.command()
 def up(
     version: str = typer.Option(..., "--version", "-v", help="Rocket.Chat version, e.g. 6.5.3"),
-    preset: str = typer.Option("default", "--preset", "-p", help="preset to apply"),
+    preset: str = typer.Option("", "--preset", "-p", show_default="default",
+                               help="legacy preset alias (deployment or scenario)"),
+    deployment: str = typer.Option(
+        "", "--deployment", "--deployment-type", "--topology",
+        help="deployment preset: default | multi-instance | microservices"),
+    scenario: list[str] = typer.Option(
+        None, "--scenario", help="reusable scenario (repeat for a scenario set)"),
     name: str = typer.Option("", "--name", "-n", help="repro name (default: derived)"),
     port: int = typer.Option(0, "--port", help="host port (default: first free >= 3000)"),
     root_url: str = typer.Option("", "--root-url", help="override ROOT_URL"),
@@ -225,6 +231,7 @@ def up(
     req = lcsvc.CreateReq(
         version=version, preset=preset, name=name, port=port, root_url=root_url,
         bind=bind, rc_image=rc_image, mongo=mongo, reg_token=reg_token,
+        deployment=deployment, scenario=scenario or None,
         params=_parse_set_params(set_), seed=False, pin=pin,
         wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
         force=force, monitor=monitor, stats=stats if seed else False,

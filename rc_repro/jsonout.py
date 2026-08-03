@@ -297,6 +297,18 @@ def capabilities(app: Any) -> dict:
                       if (getattr(p, "topology", "compose") or "compose") == t)
             for t in topologies
         },
+        # Public selector vocabulary. The compatibility matrix is kept out of
+        # this first additive surface; unsupported requests still return the
+        # structured VALIDATION_FAILED envelope before mutation.
+        "selection": {
+            "deployment_flag": "--deployment",
+            "scenario_flag": "--scenario",
+            "scenario_repeatable": True,
+            "deployment_presets": list(presets.deployment_names()),
+            "scenario_names": list(presets.scenario_names()),
+            "saved_config_keys": ["default_deployment", "default_scenarios"],
+            "legacy_preset_alias": True,
+        },
         # What each topology supports, so an agent or GUI can hide unsupported
         # choices before submission rather than learning only after failure.
         "topology_features": {

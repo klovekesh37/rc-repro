@@ -39,6 +39,24 @@ question is about documented behaviour rather than observed behaviour.
 
 ## Recipes
 
+### Select a deployment and reusable scenario
+
+Use the selector vocabulary reported by `capabilities` when a scenario must run
+on a particular deployment:
+
+```
+rc-repro up --version <X.Y.Z> \
+  --deployment microservices --scenario ldap \
+  --set users=5 --seed --wait --json
+```
+
+`--scenario` is repeatable, but only explicitly proven scenario sets are accepted;
+an unsupported pair or unproven set returns a structured validation error before
+any engine, cluster, or workspace side effect. Read `capabilities` for the
+current error and exit-code contract. Existing `--preset` names remain
+compatibility aliases. Do not infer compatibility from a shared renderer or
+silently fall back to Compose.
+
 ### Reproduce a report at a specific version
 
 ```

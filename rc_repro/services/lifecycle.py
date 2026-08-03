@@ -142,6 +142,11 @@ def pick_host_port(port: int, pre: presets.Preset, exclude: str = "") -> int:
 class CreateReq:
     version: str
     preset: str = "default"
+    # Public selectors. ``preset`` remains the compatibility alias; an empty
+    # value lets the resolver consult saved selector defaults from config.yaml.
+    deployment: str = ""
+    scenario: list[str] | None = None
+    scenarios: list[str] | None = None
     name: str = ""
     port: int = 0
     root_url: str = ""
@@ -164,6 +169,39 @@ class CreateReq:
 
 def _unknown_params(params: dict, pre: presets.Preset) -> list[str]:
     return sorted(set(params) - set(pre.params_help))
+
+
+def _resolve_selection(req: CreateReq, deployment_type: str | None = None) -> presets.Selection:
+    """Resolve a request before any engine, cluster, or workspace side effect."""
+    requested_scenarios = req.scenario
+    if req.scenarios is not None:
+        left = ([requested_scenarios] if isinstance(requested_scenarios, str)
+                else list(requested_scenarios or []))
+        right = [req.scenarios] if isinstance(req.scenarios, str) else list(req.scenarios)
+        requested_scenarios = [*left, *right]
+    has_public_selectors = (bool(req.deployment) or requested_scenarios is not None
+                            or not req.preset)
+    if has_public_selectors:
+        try:
+            return presets.resolve_selection(
+                preset=req.preset, deployment=req.deployment,
+                scenarios=requested_scenarios, params=req.params)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+
+    # Preserve the old resolver call shape for existing integrations and tests.
+    # ``deployment_type`` is still an internal adapter seam for callers that have
+    # not opted into the public selectors.
+    try:
+        pre = presets.resolve(req.preset, deployment_type=deployment_type,
+                              params=req.params) if deployment_type else \
+            presets.resolve(req.preset, params=req.params)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    deployment = "microservices" if pre.topology == "kubernetes" else (
+        req.preset if req.preset in presets.DEPLOYMENT_PRESETS else "default")
+    scenarios = (pre.scenario,) if pre.scenario else ()
+    return presets.Selection(pre, deployment, scenarios, req.preset, req.params)
 
 
 def _guard_project_collision(name: str) -> None:
@@ -243,7 +281,8 @@ def warn_if_unlicensed(req: CreateReq, emit: Emit = null_emit,
         token = token.strip()
     if token:
         return False
-    warn(emit, f"{req.preset!r} is an enterprise feature and no licence was supplied; "
+    label = pre.name or req.preset or "selected deployment"
+    warn(emit, f"{label!r} is an enterprise feature and no licence was supplied; "
                "it will run but may not function as licensed "
                "(pass --reg-token, set RC_REPRO_REG_TOKEN, or store reg_token in "
                "the owner-only config; see cloud.rocket.chat)",
@@ -259,20 +298,22 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *,
     `stream_output=True` streams docker's line output through `emit` (for the web
     job log); False leaves docker's own progress on the terminal (CLI default).
     """
-    try:
-        # Resolve the complete built-in scenario before selecting a deployment
-        # lifecycle. Kubernetes used to dispatch first and therefore never saw
-        # LDAP's parameters, services, or generated assets.
-        if deployment_type is None:
-            # Preserve the old resolver call shape for existing callers and
-            # monkey-patched integrations; the optional target is an internal
-            # seam until the public selector is decided in a later ticket.
-            pre = presets.resolve(req.preset, params=req.params)
-        else:
-            pre = presets.resolve(req.preset, deployment_type=deployment_type,
-                                  params=req.params)
-    except ValueError as exc:
-        raise ValidationError(str(exc)) from exc
+    # Resolve the complete built-in scenario before selecting a deployment
+    # lifecycle. Kubernetes used to dispatch first and therefore never saw LDAP's
+    # parameters, services, or generated assets. The resolver is read-only, so a
+    # bad selector fails before Docker, Kind, Helm, or a workspace is touched.
+    selection = _resolve_selection(req, deployment_type)
+    pre = selection.preset
+
+    uses_public_selectors = (bool(req.deployment) or req.scenario is not None or
+                             req.scenarios is not None or not req.preset)
+    if uses_public_selectors:
+        unknown = _unknown_params(req.params, pre)
+        if unknown:
+            valid = ", ".join(sorted(pre.params_help)) or "(this preset takes no --set params)"
+            raise ValidationError(
+                f"unknown --set param(s) for preset {selection.label!r}: "
+                f"{', '.join(unknown)} - valid: {valid}")
 
     # Licence signal, before dispatch so it fires for every topology and every EE
     # preset. The chart does not validate a licence, so an unlicensed microservices
@@ -303,7 +344,7 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *,
                 "--offline cannot work on the Kubernetes topology: it must pull the "
                 "Helm chart and the container images. Drop --offline, or use a "
                 "Compose preset for a fully offline repro.")
-        name = req.name or derive_name(req.version, req.preset)
+        name = req.name or derive_name(req.version, selection.label)
         # Same three token sources as Compose: request, config file, env override
         # (load_config applies RC_REPRO_REG_TOKEN). Never logged. Strip so a blank
         # value matches warn_if_unlicensed and does not create an empty Secret.
@@ -337,14 +378,8 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *,
     if req.mongo:
         versions.apply_mongo_override(resolved, req.mongo)
 
-    unknown = _unknown_params(req.params, pre)
-    if unknown:
-        valid = ", ".join(sorted(pre.params_help)) or "(this preset takes no --set params)"
-        raise ValidationError(
-            f"unknown --set param(s) for preset {req.preset!r}: {', '.join(unknown)} - valid: {valid}")
-
     wait = req.wait or bool(pre.post_ready) or req.seed
-    repro_name = sanitize(req.name) if req.name else derive_name(req.version, req.preset)
+    repro_name = sanitize(req.name) if req.name else derive_name(req.version, selection.label)
     if not repro_name:
         raise ValidationError(f"name {req.name!r} contains no usable characters (want a-z, 0-9, '-')")
     if req.port and not (1024 <= req.port <= 65535):
@@ -376,6 +411,10 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *,
         mongo_flavor=resolved.mongo_flavor, preset=pre.name, root_url=root,
         host_port=host_port, version_source=resolved.source, pinned=req.pin,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    if selection.deployment != "default" or selection.scenarios:
+        meta.extra["deployment"] = selection.deployment
+    if selection.scenarios:
+        meta.extra["scenarios"] = list(selection.scenarios)
     if token:
         # Boolean only; compose.env holds the value for the container, not the record.
         meta.extra["reg_token_supplied"] = True

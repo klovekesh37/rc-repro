@@ -157,7 +157,12 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
     @app.post("/api/repros")
     def create(req: dict = Body(...)):
         allowed = set(lc.CreateReq.__dataclass_fields__)
-        creq = lc.CreateReq(**{k: v for k, v in req.items() if k in allowed})
+        payload = {k: v for k, v in req.items() if k in allowed}
+        # An omitted preset means "use the saved selector defaults".  Keep the
+        # dataclass's legacy default for direct Python callers, while making the
+        # HTTP interface obey the same additive config contract as the CLI.
+        payload.setdefault("preset", "")
+        creq = lc.CreateReq(**payload)
         job = jobs.submit("create", lc.create_repro, creq, stream_output=True)
         return {"job_id": job.id}
 

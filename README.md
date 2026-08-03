@@ -238,6 +238,25 @@ launch one with `--preset`:
 rc-repro up --version 8.5.1 --preset ldap
 ```
 
+For a reusable scenario with a different deployment, use the independent
+selectors. `--scenario` may be repeated, but the currently proven matrix admits
+only one scenario at a time; unsupported pairs fail before Docker, Kind, Helm, or
+workspace creation:
+
+```bash
+rc-repro up --version 8.6.1 \
+  --deployment microservices \
+  --scenario ldap --set users=5 \
+  --seed --seed-profile small --wait
+```
+
+`--deployment` accepts `default`, `multi-instance`, or `microservices` (the
+`--topology` spelling is an alias). Existing `--preset` commands remain valid:
+`--preset ldap` means the default Compose deployment plus LDAP, while
+`--preset microservices` means Kubernetes with no scenario. A scenario preset can
+be paired with an explicit deployment (`--preset ldap --deployment microservices`)
+as the compatibility form of the command above.
+
 | Preset | Brings up | Reproduces |
 |--------|-----------|------------|
 | `default` | RC + Mongo, admin auto-created | anything |
@@ -805,7 +824,7 @@ only for RC < 8 (deprecated in 8.x).
 
 ```
 ~/.rc-repro/                  # override with RC_REPRO_HOME
-├── config.yaml               # default_repro, optional reg_token / rc_image
+├── config.yaml               # default_repro, selector defaults, optional reg_token / rc_image
 ├── clients/                  # isolated kubeconfig and Helm config/cache/data
 ├── presets/                  # your custom/team presets
 ├── reports/                  # benchmark & loadtest markdown reports
@@ -819,6 +838,18 @@ only for RC < 8 (deprecated in 8.x).
 Config values can also come from the environment (env wins over `config.yaml`) —
 handy for CI/scripts: `RC_REPRO_HOME`, `RC_REPRO_REG_TOKEN`, `RC_REPRO_RC_IMAGE`,
 `RC_REPRO_BIND_HOST` (default `127.0.0.1`; the `--bind` flag wins over both).
+
+Selector defaults are additive and optional. They are used only when `up` receives
+no `--preset`, `--deployment`, or `--scenario`:
+
+```yaml
+default_deployment: microservices
+default_scenarios:
+  - ldap
+```
+
+Existing configuration files need no migration; omit these keys to retain the
+Docker default.
 
 ## Development
 
