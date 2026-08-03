@@ -258,7 +258,7 @@ class _FakeK8sRun:
     def docker_server_platform(self):
         return "Docker Engine - Community"
     def run(self, argv, *, check=True):
-        import subprocess, json as _j
+        import subprocess
         out = ""
         if argv[:3] == ["kind", "get", "clusters"]:
             out = "rc-repro-local"

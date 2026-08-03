@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 
 import pytest
 from typer.testing import CliRunner
@@ -440,7 +439,6 @@ def test_k8s_seed_cli_refuses_compose_only_modes(tmp_path, monkeypatch):
 
 def test_k8s_up_seed_stats_refuses_before_provisioning_in_human_and_json_modes(
         tmp_path, monkeypatch):
-    from rc_repro import cli
     from rc_repro.cli import app
     from rc_repro.services import k8s, onboarding
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))

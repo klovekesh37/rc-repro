@@ -18,11 +18,12 @@ from typing import NoReturn, Optional
 import requests
 import typer
 
-from rc_repro import compose, config, errors, jsonout, presets, perf, rcapi, runner, ui, versions
+from rc_repro import config, errors, jsonout, presets, perf, rcapi, runner, ui, versions
 from rc_repro import seed as seeder
 from rc_repro.perf import report as perf_report
 from rc_repro.perf.timings import fmt_ms
 from rc_repro.services import data as datasvc
+from rc_repro.services import doctor as doctorsvc
 from rc_repro.services import envvars as envsvc
 from rc_repro.services import lifecycle as lcsvc
 from rc_repro.services import onboarding as onboardsvc
@@ -2435,7 +2436,7 @@ def doctor(
     # FCOS machines and easy to misread as a volume/permission failure.
     if docker_up:
         kv = runner.docker_kernel_version()
-        mm = _kernel_major_minor(kv) if kv else None
+        mm = doctorsvc._kernel_major_minor(kv) if kv else None
         if mm and mm >= (6, 19):
             line("warn", f"engine kernel {kv} — MongoDB 8.0 will not start (SERVER-121912); "
                          "use an engine on kernel < 6.19 for RC versions that require Mongo 8",
@@ -2483,11 +2484,10 @@ def doctor(
         line("fail", str(exc))
 
     # Repro summary.
-    metas = runner.list_meta()
-    if docker_up and metas:
-        states = runner.project_states() or {}
-        running = sum(1 for m in metas if _pretty_state(states.get(m.project, "")) == "running")
-        typer.echo(f"  repros: {len(metas)} total, {running} running")
+    repros = lcsvc.list_repros() if docker_up else []
+    if repros:
+        running = sum(1 for repro in repros if repro["state"] == "running")
+        typer.echo(f"  repros: {len(repros)} total, {running} running")
 
     # Kubernetes topology readiness. Reported rather than required: the Kubernetes
     # preset is opt-in, so a missing toolchain is a warning for the Docker user and

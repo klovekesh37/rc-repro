@@ -821,7 +821,7 @@ def test_k8s_teardown_with_volumes_forgets_the_record(tmp_path, monkeypatch):
     k8s.create_repro("t5", "8.6.1", offline=True, port=31237, run=_FakeRun())
     assert runner.exists("t5")
     out = k8s.teardown("t5", volumes=True, run=_FakeRun())
-    assert f"record/t5" in out["removed"]
+    assert "record/t5" in out["removed"]
     assert not runner.exists("t5")
     assert out["residual"] == []
 
@@ -1807,6 +1807,34 @@ def test_doctor_accepts_supported_compose_cli_majors(
                          if c["check"] == "compose-version")
     assert compose_check["status"] == status
     assert message in compose_check["message"]
+
+
+def test_doctor_with_running_engine_uses_shared_helpers(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from typer.testing import CliRunner
+    from rc_repro import cli
+    from rc_repro.cli import app
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli.runner, "docker_available", lambda: True)
+    monkeypatch.setattr(cli.runner, "docker_server_version", lambda: "29.1.3")
+    monkeypatch.setattr(cli.runner, "compose_version", lambda: "v5.1.0")
+    monkeypatch.setattr(cli.runner, "docker_kernel_version", lambda: "6.18.0")
+    monkeypatch.setattr(cli.runner, "hub_logged_in", lambda: True)
+    monkeypatch.setattr(cli.runner, "pick_port", lambda: 3000)
+    monkeypatch.setattr(cli.runner, "port_free", lambda _port: True)
+    monkeypatch.setattr(cli.requests, "get",
+                        lambda *_args, **_kwargs: SimpleNamespace(status_code=200))
+    monkeypatch.setattr(cli.shutil, "which", lambda _tool: None)
+    monkeypatch.setattr(cli.lcsvc, "list_repros", lambda: [
+        {"state": "running"}, {"state": "stopped"},
+    ])
+
+    result = CliRunner().invoke(app, ["doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert "engine kernel 6.18.0" in result.output
+    assert "repros: 2 total, 1 running" in result.output
 
 
 def test_doctor_reports_unwritable_k8s_client_state_without_a_traceback(tmp_path, monkeypatch):
