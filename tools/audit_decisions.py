@@ -77,11 +77,15 @@ def git_text(*args: str) -> str:
 
 def audit_tip() -> str:
     """Return the contribution tip, ignoring a base-reconciliation merge commit."""
-    fields = git_text("rev-list", "--parents", "-n", "1", "HEAD").split()
-    # A PR branch may merge the moving upstream main into itself to become
-    # mergeable again. Its first parent remains the contribution stack; the merge
-    # commit itself is synchronisation metadata, not one of the audited layers.
-    return fields[1] if len(fields) > 2 else fields[0]
+    merges = git_text("rev-list", "--first-parent", "--merges", "-n", "1", "HEAD")
+    if merges:
+        fields = git_text("rev-list", "--parents", "-n", "1", merges).split()
+        # A PR branch may merge the moving upstream main into itself to become
+        # mergeable again. Its first parent remains the contribution stack; the
+        # merge commit and any review-only commits after it are synchronisation
+        # metadata, not one of the audited layers.
+        return fields[1]
+    return git_text("rev-parse", "HEAD")
 
 
 def stack_base() -> tuple[str, str]:
