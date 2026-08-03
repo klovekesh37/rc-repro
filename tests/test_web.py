@@ -541,3 +541,60 @@ def test_api_call_maps_a_dead_workspace_to_not_ready(monkeypatch):
 
 def test_api_call_needs_a_token():
     assert client().post("/api/repros/x/call", json={"method": "GET", "path": "/"}).status_code == 401
+
+
+def test_tls_endpoint_probes_this_host_not_the_public_name(monkeypatch):
+    """The GUI check must not let a proxy in front answer for us.
+
+    Probing the public hostname reported Cloudflare's valid edge certificate as the
+    repro's own while its Traefik had none. It dials 127.0.0.1 with the domain as
+    SNI, and reports the public name separately.
+    """
+    from rc_repro import runner as runner_mod
+    from rc_repro import tls as tlsmod
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    meta = runner_mod.Metadata(
+        name="t", project="p", rc_version="8.4.2", rc_image="i", mongo_tag="8.0",
+        mongo_flavor="official", preset="default", root_url="http://localhost:3000",
+        host_port=3000, version_source="map",
+        public_url="https://rc1.example.com",
+        extra={"tls": "acme", "tls_ports": [443]})
+    monkeypatch.setattr(runner_mod, "read_meta", lambda n: meta)
+
+    seen = []
+
+    def fake_verify(host, port=443, timeout=10.0, cafile=None, sni=None):
+        seen.append((host, port, sni))
+        if host == "127.0.0.1":
+            return {"serving": True, "issuer": "CN = YR2", "subject": "CN = rc1.example.com",
+                    "dates": "notAfter=Nov  1 2026", "fallback": False,
+                    "trusted": True, "trusted_via_ca": True, "error": ""}
+        return {"serving": True, "issuer": "CN = Cloudflare Inc ECC CA-3", "subject": "",
+                "dates": "", "fallback": False, "trusted": True,
+                "trusted_via_ca": True, "error": ""}
+
+    monkeypatch.setattr(tlsmod, "verify", fake_verify)
+    r = client().get("/api/repros/t/tls", headers=H)
+    assert r.status_code == 200
+    b = r.json()
+    assert b["issuer"] == "CN = YR2", "must report what THIS host serves"
+    assert b["public_issuer"] == "CN = Cloudflare Inc ECC CA-3"
+    assert b["mode"] == "acme" and b["public_url"] == "https://rc1.example.com"
+    # The local probe carries the domain as SNI; the public probe uses the name.
+    assert ("127.0.0.1", 443, "rc1.example.com") in seen
+    assert ("rc1.example.com", 443, None) in seen
+
+
+def test_tls_endpoint_refuses_a_repro_without_https(monkeypatch):
+    from rc_repro import runner as runner_mod
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(runner_mod, "read_meta", lambda n: runner_mod.Metadata(
+        name="t", project="p", rc_version="8.4.2", rc_image="i", mongo_tag="8.0",
+        mongo_flavor="official", preset="default", root_url="http://localhost:3000",
+        host_port=3000, version_source="map"))
+    r = client().get("/api/repros/t/tls", headers=H)
+    assert r.status_code == 400 and "not created with --https" in r.json()["error"]
+
+
+def test_tls_endpoint_needs_a_token():
+    assert client().get("/api/repros/t/tls").status_code == 401

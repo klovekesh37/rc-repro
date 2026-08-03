@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import yaml
 
 from rc_repro import config
 from rc_repro.presets import Preset
+
+if TYPE_CHECKING:                      # only for the Spec.tls annotation
+    from rc_repro.tls import TlsSpec
 
 
 @dataclass
@@ -29,6 +33,8 @@ class Spec:
     reg_token: str | None
     preset: Preset
     monitoring: bool = False   # --monitor: add Prometheus + Grafana
+    # --https: terminate TLS in a Traefik sidecar. None = plain http, as before.
+    tls: "TlsSpec | None" = None
     container_port: int = config.RC_CONTAINER_PORT
     # Host interface published ports bind to (the official rocketchat-compose
     # BIND_IP pattern). Loopback by default: repros run weak fixed credentials,
@@ -40,7 +46,8 @@ class Spec:
     def from_resolved(cls, resolved, *, project_name: str, root_url: str,
                       host_port: int, reg_token: str | None, preset: Preset,
                       bind_host: str = config.DEFAULT_BIND_HOST,
-                      monitoring: bool = False) -> "Spec":
+                      monitoring: bool = False,
+                      tls: "TlsSpec | None" = None) -> "Spec":
         """Build a Spec from a versions.Resolved plus the launch-time choices."""
         return cls(
             project_name=project_name,
@@ -56,6 +63,7 @@ class Spec:
             preset=preset,
             bind_host=bind_host,
             monitoring=monitoring,
+            tls=tls,
         )
 
 
@@ -312,6 +320,28 @@ def build(spec: Spec) -> dict:
                 svc["ports"] = kept
             else:
                 svc.pop("ports", None)
+
+    # --- optional HTTPS add-on (Traefik terminating TLS) ---
+    if spec.tls:
+        from rc_repro import tls as tlsmod
+        if tlsmod.SERVICE in doc["services"]:
+            # multi-instance already runs its own Traefik as the entry_service.
+            # Merging a second TLS entrypoint into it is doable but subtle (one
+            # command list, one dynamic.yml, two routers), and getting it wrong
+            # yields a repro that boots and serves nothing. Refuse plainly.
+            raise ValueError(
+                f"preset {spec.preset.name!r} already runs {tlsmod.SERVICE!r}; "
+                "--https cannot layer onto it yet - use the preset without --https, "
+                "or a single-instance preset with --https")
+        # Assigned, not _add_depends: that only extends an EXISTING depends_on, and
+        # a freshly built Traefik service has none — so it silently did nothing.
+        doc["services"][tlsmod.SERVICE] = {
+            **tlsmod.service(spec.tls),
+            "depends_on": list(rc_services),
+        }
+        # RC keeps its own published http port. That is what rc-repro's own API
+        # calls use (see Metadata.public_url) so nothing internal has to trust the
+        # local CA, and `curl http://localhost:<port>` still works for debugging.
 
     # --- optional monitoring add-on (Prometheus + Grafana) ---
     if spec.monitoring:

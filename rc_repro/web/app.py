@@ -510,6 +510,33 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
         return {"token": pat, "user_id": auth.user_id, "label": label,
                 "bypass_2fa": bypass_2fa, "root_url": meta.root_url}
 
+    @app.get("/api/repros/{name}/tls")
+    def tls_state(name: str):
+        """What the repro is ACTUALLY serving over TLS — the GUI's `tls-status`.
+
+        `up --wait` only proves Rocket.Chat booted: it polls the internal http port.
+        Traefik obtains its certificate in the background afterwards and falls back
+        to a self-signed placeholder when ACME fails, so HTTPS needs its own check.
+        """
+        from rc_repro import tls as tlsmod
+        meta = runner.read_meta(lc.resolve_name(name))
+        if not meta.public_url:
+            raise ValidationError(f"{meta.name!r} was not created with --https")
+        mode = str(meta.extra.get("tls") or "")
+        host = meta.public_url.split("://", 1)[1].split(":")[0]
+        port = int((meta.extra.get("tls_ports") or [443])[0])
+        cafile = (str(tlsmod.ca_dir() / tlsmod.CA_CRT)
+                  if mode == tlsmod.MODE_LOCAL else None)
+        # Dial THIS host with the domain as SNI: probing the public name lets a
+        # proxy in front answer instead, and its certificate is not ours.
+        out = tlsmod.verify("127.0.0.1", port, cafile=cafile, sni=host)
+        out.update(mode=mode, public_url=meta.public_url, name=meta.name)
+        if mode == tlsmod.MODE_ACME:
+            pub = tlsmod.verify(host, 443)
+            out["public_issuer"] = pub["issuer"]
+            out["public_error"] = pub["error"]
+        return out
+
     @app.post("/api/repros/{name}/call")
     def api_call(name: str, body: dict = Body(...)):
         """One authenticated REST call against a repro -- the GUI's `rc-repro api`.

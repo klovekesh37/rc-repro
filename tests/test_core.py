@@ -1746,3 +1746,588 @@ def test_webui_handles_every_state_the_backend_can_report():
     # …and each real one is reachable from the status filter.
     for state in lc.TRANSIENT_STATES:
         assert f'value="{state}"' in html, f"status filter cannot select {state!r}"
+
+
+# --- HTTPS add-on (--https) ---------------------------------------------------
+
+
+def _tls_spec(**kw):
+    from rc_repro import tls
+    base = dict(mode=tls.MODE_LOCAL, host="x.rcrepro.localhost", port=8443)
+    base.update(kw)
+    return tls.TlsSpec(**base)
+
+
+def test_tls_root_url_omits_an_implicit_443():
+    """A real domain answers on 443, so the URL must not carry it.
+
+    RC advertises ROOT_URL verbatim; "https://host:443" in an OAuth callback or a
+    mobile workspace URL is a mismatch against the same host without the port.
+    """
+    from rc_repro import tls
+    assert _tls_spec(port=8443).root_url == "https://x.rcrepro.localhost:8443"
+    assert _tls_spec(mode=tls.MODE_ACME, host="rc1.example.com", port=443).root_url \
+        == "https://rc1.example.com"
+
+
+def test_local_ca_is_created_once_and_leaf_carries_the_right_sans(monkeypatch, tmp_path):
+    """The CA is reused, and the leaf gets SANs -- not just a CN.
+
+    Browsers have ignored commonName since Chrome 58, so a cert with only a CN is
+    rejected outright (ERR_CERT_COMMON_NAME_INVALID).
+    """
+    import subprocess
+    from rc_repro import tls
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    key, crt = tls.ensure_ca()
+    assert key.exists() and crt.exists()
+    assert oct(key.stat().st_mode)[-3:] == "600", "the CA key must not be world-readable"
+    before = crt.read_bytes()
+    assert tls.ensure_ca() == (key, crt)
+    assert crt.read_bytes() == before, "ensure_ca must not regenerate an existing CA"
+
+    cert_pem, key_pem = tls.issue_leaf("x.rcrepro.localhost", ["192.168.1.42"])
+    assert "BEGIN CERTIFICATE" in cert_pem and "PRIVATE KEY" in key_pem
+    leaf = tmp_path / "leaf.crt"
+    leaf.write_text(cert_pem, encoding="utf-8")
+    text = subprocess.run(["openssl", "x509", "-in", str(leaf), "-noout", "-text"],
+                          capture_output=True, text=True).stdout
+    assert "DNS:x.rcrepro.localhost" in text
+    assert "DNS:localhost" in text            # keeps the existing http habits working
+    assert "IP Address:192.168.1.42" in text  # a LAN IP, which Let's Encrypt cannot issue
+    assert "IP Address:127.0.0.1" in text
+    # And it must actually chain to the CA, not merely parse.
+    v = subprocess.run(["openssl", "verify", "-CAfile", str(crt), str(leaf)],
+                       capture_output=True, text=True)
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+def test_https_adds_traefik_and_leaves_rocketchats_own_port_published():
+    """RC keeps its http port so rc-repro's own API calls need no CA.
+
+    login/PAT/seed/loadtest all use meta.root_url in 70+ places; pointing those at
+    a locally-signed https URL would fail verification in every one of them.
+    """
+    pre = presets.load("default")
+    res = versions.resolve("8.6.1", offline=True)
+    st = _tls_spec()
+    spec = compose.Spec.from_resolved(
+        res, project_name="rcrepro-x", root_url=st.root_url, host_port=3000,
+        reg_token=None, preset=pre, tls=st)
+    doc = compose.build(spec)
+
+    assert "traefik" in doc["services"]
+    t = doc["services"]["traefik"]
+    assert t["ports"] == ["127.0.0.1:8443:443"]
+    assert t["depends_on"] == ["rocketchat"], "must not route before RC exists"
+    # RC advertises https, but still publishes its own plain port.
+    assert doc["services"]["rocketchat"]["environment"]["ROOT_URL"] == st.root_url
+    assert doc["services"]["rocketchat"]["ports"] == ["127.0.0.1:3000:3000"]
+
+
+def test_https_refuses_to_layer_onto_a_preset_that_already_runs_traefik():
+    """multi-instance owns its own Traefik; two would fight over the entrypoint.
+
+    Silently merging produced a repro that booted and served nothing, with the
+    reason only in `docker compose logs traefik`.
+    """
+    import pytest
+    pre = presets.load("multi-instance", {"instances": "2"})
+    res = versions.resolve("8.6.1", offline=True)
+    spec = compose.Spec.from_resolved(
+        res, project_name="rcrepro-x", root_url="https://x", host_port=3000,
+        reg_token=None, preset=pre, tls=_tls_spec())
+    with pytest.raises(ValueError, match="already runs"):
+        compose.build(spec)
+
+
+def test_acme_flags_map_to_traefik_resolver_args():
+    from rc_repro import tls
+    prod = tls.service(_tls_spec(mode=tls.MODE_ACME, host="rc1.example.com", port=443,
+                                 acme_email="ops@example.com"))
+    cmd = " ".join(prod["command"])
+    assert "--certificatesresolvers.le.acme.email=ops@example.com" in cmd
+    assert "acme.tlschallenge=true" in cmd, "default challenge needs only :443"
+    assert "caserver" not in cmd, "production must not point at the staging directory"
+    # acme.json lives outside the workspace, so `down --volumes` cannot force a
+    # re-issue (5 certs per identical hostname per 7 days).
+    assert any(str(tls.acme_dir()) in v for v in prod["volumes"])
+
+    stg = tls.service(_tls_spec(mode=tls.MODE_ACME, host="rc1.example.com", port=443,
+                                acme_email="a@b.c", acme_staging=True))
+    assert "acme-staging-v02" in " ".join(stg["command"])
+
+    # :80 and the permanent redirect to https, matching the official
+    # rocketchat-compose Traefik files. Decided by the caller (it has to probe the
+    # port), so the builder just honours the flag.
+    plain = tls.service(_tls_spec(mode=tls.MODE_ACME, host="h", port=443,
+                                  acme_email="a@b.c"))
+    assert "--entryPoints.web.address=:80" not in plain["command"]
+    assert "80:80" not in plain["ports"]
+
+    redir = tls.service(_tls_spec(mode=tls.MODE_ACME, host="h", port=443,
+                                  acme_email="a@b.c", http_redirect=True))
+    cmd = redir["command"]
+    assert "--entryPoints.web.address=:80" in cmd
+    assert "--entryPoints.web.http.redirections.entryPoint.to=websecure" in cmd
+    assert "--entryPoints.web.http.redirections.entryPoint.scheme=https" in cmd
+    assert "--entryPoints.web.http.redirections.entryPoint.permanent=true" in cmd
+    assert "80:80" in redir["ports"]
+
+    # Local mode is on an allocated port, so a redirect does not apply at all.
+    assert tls.can_redirect_http(tls.MODE_LOCAL, 8443) is False
+    assert tls.can_redirect_http(tls.MODE_ACME, 443) is True
+    assert tls.can_redirect_http(tls.MODE_OWN, 443) is True
+
+
+def test_dynamic_config_uses_a_static_pair_locally_and_a_resolver_for_acme():
+    from rc_repro import tls
+    local = dict(tls.files(_tls_spec(), ["rocketchat"], "CERT", "KEY"))
+    assert local["tls/certs/tls.crt"] == "CERT" and local["tls/certs/tls.key"] == "KEY"
+    assert "certFile: /etc/traefik/certs/tls.crt" in local["tls/dynamic.yml"]
+    assert "certResolver" not in local["tls/dynamic.yml"]
+
+    acme = dict(tls.files(_tls_spec(mode=tls.MODE_ACME, host="h", port=443), ["rocketchat"]))
+    assert "tls/certs/tls.crt" not in acme, "ACME certs come from Traefik, not the workspace"
+    assert "certResolver: le" in acme["tls/dynamic.yml"]
+    # The DDP websocket must not be bounced between instances mid-session.
+    assert "sticky" in acme["tls/dynamic.yml"] and "secure: true" in acme["tls/dynamic.yml"]
+
+
+def test_own_cert_is_validated_before_traefik_would_silently_fail(tmp_path):
+    import pytest
+    from rc_repro import tls
+    from rc_repro.errors import ValidationError
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    with pytest.raises(ValidationError, match="no such file"):
+        tls.read_own_cert(str(cert), str(key))
+    cert.write_text("not a cert", encoding="utf-8")
+    key.write_text("-----BEGIN PRIVATE KEY-----", encoding="utf-8")
+    with pytest.raises(ValidationError, match="not a PEM certificate"):
+        tls.read_own_cert(str(cert), str(key))
+    cert.write_text("-----BEGIN CERTIFICATE-----", encoding="utf-8")
+    key.write_text("nope", encoding="utf-8")
+    with pytest.raises(ValidationError, match="not a PEM private key"):
+        tls.read_own_cert(str(cert), str(key))
+
+
+def test_metadata_external_url_prefers_https_and_survives_an_old_repro_json(tmp_path, monkeypatch):
+    """public_url is additive: a repro.json written before it must still load."""
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = runner.Metadata(
+        name="x", project="rcrepro-x", rc_version="8.6.1", rc_image="i", mongo_tag="8.0",
+        mongo_flavor="official", preset="default", root_url="http://localhost:3000",
+        host_port=3000, version_source="map")
+    assert m.external_url == "http://localhost:3000"       # no TLS -> unchanged
+    m.public_url = "https://x.rcrepro.localhost:8443"
+    assert m.external_url == "https://x.rcrepro.localhost:8443"
+
+    runner.write("x", "services: {}\n", m)
+    (runner.workspace("x") / "repro.json").write_text(
+        json.dumps({"name": "x", "project": "rcrepro-x", "rc_version": "8.6.1",
+                    "rc_image": "i", "mongo_tag": "8.0", "mongo_flavor": "official",
+                    "preset": "default", "root_url": "http://localhost:3000",
+                    "host_port": 3000, "version_source": "map"}), encoding="utf-8")
+    old = runner.read_meta("x")
+    assert old.public_url == "" and old.external_url == "http://localhost:3000"
+
+
+def test_privileged_port_is_not_reported_busy_just_because_we_cannot_bind_it(monkeypatch):
+    """443 is publishable even though an unprivileged process cannot bind it.
+
+    The docker daemon runs as root, so `ports: 443:443` works fine. bind() as the
+    calling user raises EACCES, and treating that as "in use" made
+    `up --https --domain ...` refuse 443 on every non-root machine with nothing
+    listening on it at all.
+    """
+    import socket
+    from rc_repro import runner
+
+    real_socket = socket.socket
+
+    class FakeSock:
+        """Nothing is listening; bind() fails the way a privileged port does."""
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def settimeout(self, _t): pass
+        def setsockopt(self, *a): pass
+        def connect_ex(self, _addr): return 111          # ECONNREFUSED: no listener
+        def bind(self, addr):
+            if addr[1] < 1024:
+                raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(socket, "socket", FakeSock)
+    assert runner.port_free(443) is True
+    assert runner.port_free(8443) is True
+
+    # A real listener must still register as busy — the connect() probe catches it.
+    class Listening(FakeSock):
+        def connect_ex(self, _addr): return 0
+    monkeypatch.setattr(socket, "socket", Listening)
+    assert runner.port_free(443) is False
+    assert runner.port_free(8443) is False
+
+    # And a genuine EADDRINUSE on an unprivileged port is still busy.
+    class InUse(FakeSock):
+        def bind(self, addr): raise OSError(98, "Address already in use")
+    monkeypatch.setattr(socket, "socket", InUse)
+    assert runner.port_free(8443) is False
+    socket.socket = real_socket
+
+
+def test_staging_notes_never_claim_the_certificate_is_trusted():
+    """A Let's Encrypt STAGING root is in no trust store — that is the point.
+
+    The notes said "Publicly trusted, so the mobile app accepts it with nothing to
+    install" for staging too, which sent people hunting for a broken workspace when
+    the browser warning was the correct, expected outcome.
+    """
+    from rc_repro import tls
+    spec = tls.TlsSpec(mode=tls.MODE_ACME, host="rc1.example.com", port=443,
+                       acme_email="a@b.c", acme_staging=True)
+    text = " ".join(tls.notes(spec, "rc1")).lower()
+    assert "staging" in text
+    assert "not trusted" in text, "staging must say plainly that it is untrusted"
+    assert "publicly trusted" not in text
+    assert "success signal" in text, "a warning on staging is expected, not a failure"
+    # And it must say how to get a real one.
+    assert "without --acme-staging" in text
+    # The name is threaded in, so the hint is copy-pasteable.
+    assert "tls-status --name rc1" in " ".join(tls.notes(spec, "rc1"))
+
+    prod = tls.TlsSpec(mode=tls.MODE_ACME, host="rc1.example.com", port=443,
+                       acme_email="a@b.c")
+    assert "publicly trusted" in " ".join(tls.notes(prod, "rc1")).lower()
+
+
+def test_dns_preflight_rules_out_what_acme_cannot_possibly_reach(monkeypatch):
+    """Catch the certain-to-fail cases before an attempt spends quota.
+
+    Let's Encrypt allows 5 failed validations per hostname per hour, so a
+    misconfiguration that is knowable up front must not cost one.
+    """
+    from rc_repro import tls
+    monkeypatch.setattr(tls, "resolves_to", lambda h: [])
+    ok, msg = tls.dns_preflight("nope.example.com")
+    assert not ok and "does not resolve" in msg
+
+    monkeypatch.setattr(tls, "resolves_to", lambda h: ["127.0.0.1"])
+    ok, msg = tls.dns_preflight("local.example.com")
+    assert not ok and "cannot reach" in msg
+
+    monkeypatch.setattr(tls, "resolves_to", lambda h: ["192.168.1.5", "10.0.0.4"])
+    ok, _ = tls.dns_preflight("lan.example.com")
+    assert not ok, "private-only must fail: ACME connects from the public internet"
+
+    # RFC 5737 documentation ranges (203.0.113.0/24 etc.) count as private to
+    # Python, and rightly so -- nobody serves a workspace from one. Use a real
+    # routable address here.
+    monkeypatch.setattr(tls, "resolves_to", lambda h: ["93.184.216.34"])
+    ok, msg = tls.dns_preflight("rc1.example.com")
+    assert ok and "93.184.216.34" in msg
+    monkeypatch.setattr(tls, "resolves_to", lambda h: ["192.168.1.5", "93.184.216.34"])
+    assert tls.dns_preflight("rc1.example.com")[0]
+
+
+def test_verify_reads_a_real_endpoint_and_separates_the_two_trust_questions(tmp_path, monkeypatch):
+    """verify() must report an untrusted-but-working endpoint as working.
+
+    Staging and local-CA certs are untrusted by design; refusing to look at them
+    would report "broken" for a setup behaving exactly as intended. And `trusted`
+    (system store) must stay distinct from `trusted_via_ca` (chains to a given CA),
+    else local mode always claims trust and hides whether trust-ca has run.
+    """
+    import socket as _socket
+    import ssl
+    import threading
+    from rc_repro import tls
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    _, ca_crt = tls.ensure_ca()
+    cert_pem, key_pem = tls.issue_leaf("localhost")
+    cf, kf = tmp_path / "s.crt", tmp_path / "s.key"
+    cf.write_text(cert_pem, encoding="utf-8")
+    kf.write_text(key_pem, encoding="utf-8")
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cf), str(kf))
+    srv = _socket.socket()
+    srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(5)
+    stop = threading.Event()
+
+    def serve():
+        srv.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                c, _ = srv.accept()
+            except (TimeoutError, OSError):
+                continue
+            try:
+                with ctx.wrap_socket(c, server_side=True):
+                    pass
+            except OSError:
+                pass
+            finally:
+                c.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        r = tls.verify("localhost", port, timeout=5, cafile=str(ca_crt))
+        assert r["serving"] is True and not r["error"]
+        assert "rc-repro local CA" in r["issuer"]
+        assert "localhost" in r["subject"]
+        assert r["fallback"] is False
+        assert r["trusted_via_ca"] is True, "must chain to the CA it was handed"
+        assert r["trusted"] is False, "the system store does not know this CA"
+    finally:
+        stop.set()
+        srv.close()
+        t.join(timeout=3)
+
+    # Nothing listening -> reported, not raised.
+    dead = tls.verify("127.0.0.1", port, timeout=2, cafile=str(ca_crt))
+    assert dead["serving"] is False and dead["error"]
+
+
+def test_dns_preflight_falls_back_to_public_resolvers(monkeypatch):
+    """The question is "what will Let's Encrypt see?", not "what does /etc/resolv.conf say?".
+
+    A lab or corporate resolver with a stale negative cache reported a perfectly
+    good public record as absent, and the hard failure blocked a valid setup.
+    """
+    import socket
+    from rc_repro import tls
+
+    def no_local_answer(*a, **k):
+        raise OSError("resolver has nothing for this name")
+
+    monkeypatch.setattr(socket, "getaddrinfo", no_local_answer)
+    monkeypatch.setattr(tls, "_dig",
+                        lambda h, r: ["104.21.71.43"] if r == "1.1.1.1" else [])
+    assert tls.resolves_to("chatrepo.example.org") == ["104.21.71.43"]
+    # public=False is the "only what this machine sees" variant.
+    assert tls.resolves_to("chatrepo.example.org", public=False) == []
+
+
+def test_preflight_refuses_an_inbound_challenge_behind_a_tls_terminating_proxy(monkeypatch):
+    """An orange-clouded record cannot pass tlsalpn, and the error says why.
+
+    Cloudflare terminates TLS at its edge, so Let's Encrypt validates against
+    Cloudflare's certificate and never reaches this host. dns-01 is unaffected: it
+    only reads a TXT record.
+    """
+    from rc_repro import tls
+    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["104.21.71.43", "172.67.143.25"])
+    ok, msg = tls.dns_preflight("chatrepo.example.org", "tlsalpn")
+    assert not ok
+    assert "Cloudflare" in msg and "--acme-challenge dns" in msg
+    assert "CF_DNS_API_TOKEN" in msg, "must say where the token goes"
+    ok, msg = tls.dns_preflight("chatrepo.example.org", "dns")
+    assert ok and "no inbound access" in msg
+
+    # A normal public origin still passes the inbound challenges.
+    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["93.184.216.34"])
+    assert tls.dns_preflight("rc1.example.org", "tlsalpn")[0]
+
+
+def test_dns_challenge_ignores_where_the_name_points(monkeypatch):
+    """dns-01 needs no inbound reachability, so private/loopback answers are fine."""
+    from rc_repro import tls
+    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["10.0.0.5"])
+    assert tls.dns_preflight("internal.example.org", "dns")[0]
+    # ...but an inbound challenge to the same name cannot work.
+    assert not tls.dns_preflight("internal.example.org", "tlsalpn")[0]
+
+
+def test_staging_and_production_use_separate_acme_storage():
+    """Traefik keys stored certs by RESOLVER name, not by CA server.
+
+    Pointing one resolver at staging and then at production leaves the staging
+    certificate in storage and keeps serving it -- the well-known "delete
+    acme.json when you switch" trap. Separate files make the switch real.
+    """
+    from rc_repro import tls
+
+    def storage(staging):
+        spec = tls.TlsSpec(mode=tls.MODE_ACME, host="h", port=443,
+                           acme_email="a@b.c", acme_staging=staging)
+        return [a for a in tls.service(spec)["command"] if ".acme.storage=" in a][0]
+
+    assert storage(True) != storage(False)
+    assert tls.ACME_FILE_STAGING in storage(True)
+    assert storage(False).endswith("/" + tls.ACME_FILE)
+    # Only the staging run may point at the staging directory.
+    stg = tls.TlsSpec(mode=tls.MODE_ACME, host="h", port=443, acme_email="a@b.c",
+                      acme_staging=True)
+    prod = tls.TlsSpec(mode=tls.MODE_ACME, host="h", port=443, acme_email="a@b.c")
+    assert "acme-staging-v02" in " ".join(tls.service(stg)["command"])
+    assert "acme-staging-v02" not in " ".join(tls.service(prod)["command"])
+
+
+def test_dns_credentials_are_required_and_provider_agnostic(tmp_path, monkeypatch):
+    """Every lego provider reads its OWN variables, so this checks the file, not keys.
+
+    Mounting the env file only "if it exists" let a missing file through, and
+    Traefik then ran with no credentials and failed opaquely minutes later.
+    """
+    from rc_repro import tls
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    for provider in ("cloudflare", "route53", "digitalocean", "gcloud", "azuredns"):
+        ok, msg = tls.dns_credentials(provider)
+        assert not ok
+        assert str(tls.dns_env_path()) in msg
+        # Point at THAT provider's documentation, not Cloudflare's.
+        assert f"{tls.LEGO_PROVIDER_DOCS}{provider}/" in msg
+
+    env = tls.dns_env_path()
+    env.parent.mkdir(parents=True, exist_ok=True)
+    env.write_text("# a comment\n\n", encoding="utf-8")
+    ok, msg = tls.dns_credentials("route53")
+    assert not ok and "no KEY=VALUE" in msg
+
+    # Any provider's variables satisfy it, and values are never echoed back.
+    env.write_text("AWS_ACCESS_KEY_ID=AKIAsecret\nAWS_SECRET_ACCESS_KEY=hunter2\n",
+                   encoding="utf-8")
+    ok, msg = tls.dns_credentials("route53")
+    assert ok and "AWS_ACCESS_KEY_ID" in msg and "AWS_SECRET_ACCESS_KEY" in msg
+    assert "AKIAsecret" not in msg and "hunter2" not in msg
+
+    # And the file is mounted unconditionally, not "if it exists".
+    spec = tls.TlsSpec(mode=tls.MODE_ACME, host="h", port=443, acme_email="a@b.c",
+                       acme_challenge="dns", acme_dns_provider="route53")
+    assert tls.service(spec)["env_file"] == [str(env)]
+
+
+def test_verify_can_present_a_different_sni_than_the_address_it_dials():
+    """tls-status must probe THIS host, not the public name.
+
+    Checking the hostname meant a proxy in front (Cloudflare's orange cloud)
+    answered instead, and its valid edge certificate was reported as ours while
+    our own Traefik had none.
+    """
+    import inspect
+    from rc_repro import tls
+    sig = inspect.signature(tls.verify)
+    assert "sni" in sig.parameters
+    src = inspect.getsource(tls.verify)
+    assert "server_hostname=servername" in src
+    assert "server_hostname=host" not in src, "every handshake must honour sni"
+
+
+def test_acme_router_declares_the_domain_it_needs_a_certificate_for():
+    """Traefik must be TOLD the domain, because the rule has no Host() matcher.
+
+    Traefik derives what to request from a router's Host() rule. This rule is
+    PathPrefix(`/`) on purpose, so the workspace also answers on localhost — which
+    left ACME with nothing to ask for: it logs "no domain found" and silently
+    serves its default certificate, indistinguishable from a failed challenge with
+    no request ever having been made.
+    """
+    from rc_repro import tls
+    spec = tls.TlsSpec(mode=tls.MODE_ACME, host="testrepo.kestron.org", port=443,
+                       acme_email="a@b.c")
+    y = dict(tls.files(spec, ["rocketchat"]))["tls/dynamic.yml"]
+    assert "certResolver: le" in y
+    assert "domains:" in y
+    assert '- main: "testrepo.kestron.org"' in y
+
+    # Static-certificate modes must NOT carry a resolver or a domains block.
+    local = dict(tls.files(tls.TlsSpec(host="x.rcrepro.localhost", port=8443),
+                           ["rocketchat"], "C", "K"))["tls/dynamic.yml"]
+    assert "certResolver" not in local and "domains:" not in local
+
+
+def test_dns01_does_not_require_the_host_to_resolve(monkeypatch):
+    """dns-01 reads a TXT at _acme-challenge.<host>; the host needs no A record.
+
+    Requiring one refused setups that would have issued perfectly well — you can
+    get a certificate before pointing the name anywhere.
+    """
+    from rc_repro import tls
+    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: [])
+    ok, msg = tls.dns_preflight("testrepo.kestron.org", "dns")
+    assert ok and "fine for dns-01" in msg
+    # An inbound challenge still needs the name to resolve, and now points at the
+    # alternative that does not.
+    ok, msg = tls.dns_preflight("testrepo.kestron.org", "tlsalpn")
+    assert not ok and "--acme-challenge dns" in msg
+
+
+def test_reachability_gaps_separate_a_valid_cert_from_a_reachable_workspace(monkeypatch):
+    """Issuance succeeding is not the same as the name being reachable.
+
+    dns-01 issues with no DNS record and no public route, after which the summary
+    advertises an https URL nothing outside the machine can open. Proven against a
+    real run: a production certificate was issued and served correctly while the
+    hostname had no record at all and Traefik was bound to 127.0.0.1.
+    """
+    from rc_repro import tls
+    spec = tls.TlsSpec(mode=tls.MODE_ACME, host="testrepo.example.org", port=443,
+                       acme_email="a@b.c", acme_challenge="dns",
+                       acme_dns_provider="cloudflare")
+
+    # No DNS record and loopback-bound: both gaps named.
+    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: [])
+    monkeypatch.setattr(tls, "host_has_public_address", lambda: False)
+    gaps = tls.reachability_gaps(spec, "127.0.0.1")
+    assert any("no DNS record" in g for g in gaps)
+    assert any("bound to 127.0.0.1" in g for g in gaps)
+
+    # Public bind but no public address on the host -> still unreachable.
+    gaps = tls.reachability_gaps(spec, "0.0.0.0")
+    assert any("no public address" in g for g in gaps)
+    assert not any("bound to" in g for g in gaps)
+
+    # Record exists, public bind, routable host -> nothing to warn about.
+    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["93.184.216.34"])
+    monkeypatch.setattr(tls, "host_has_public_address", lambda: True)
+    assert tls.reachability_gaps(spec, "0.0.0.0") == []
+    # ...but binding to loopback is still a gap even with good DNS.
+    assert tls.reachability_gaps(spec, "127.0.0.1") == [
+        "the workspace is bound to 127.0.0.1"]
+
+
+def test_domain_is_normalized_the_way_the_official_docs_require():
+    """The Rocket.Chat compose docs say DOMAIN must have no scheme or trailing slash.
+
+    They say it because people get it wrong, and unguarded it corrupted three
+    things at once: ROOT_URL became "https://https://host", the ACME `domains`
+    entry became a value Let's Encrypt rejects, and the TLS SNI name never matched.
+    """
+    import pytest
+    from rc_repro import tls
+    from rc_repro.errors import ValidationError
+
+    # One obvious meaning -> corrected, and the correction is reported.
+    for given in ("rc1.example.com", "https://rc1.example.com", "http://rc1.example.com/",
+                  "RC1.Example.COM.", "  rc1.example.com  ", "rc1.example.com."):
+        host, note = tls.normalize_domain(given)
+        assert host == "rc1.example.com", given
+        if given != "rc1.example.com":
+            assert note, f"{given!r} was changed silently"
+
+    # Ambiguous or unsupported -> refused, because silently dropping part of what
+    # was asked for is worse than saying no.
+    for given, expect in [
+        ("rc1.example.com:8443", "contains a port"),
+        ("rc1.example.com/chat", "contains a path"),
+        ("*.example.com", "is a wildcard"),
+        ("bad_host.example.com", "not a valid hostname"),
+        ("-x.example.com", "not a valid hostname"),
+        ("https://", "empty"),
+    ]:
+        with pytest.raises(ValidationError, match=expect):
+            tls.normalize_domain(given)
+
+    # And the normalized host is what reaches ROOT_URL and the ACME domains block.
+    host, _ = tls.normalize_domain("HTTPS://RC1.Example.COM/")
+    spec = tls.TlsSpec(mode=tls.MODE_ACME, host=host, port=443, acme_email="a@b.c")
+    assert spec.root_url == "https://rc1.example.com"
+    y = dict(tls.files(spec, ["rocketchat"]))["tls/dynamic.yml"]
+    assert '- main: "rc1.example.com"' in y

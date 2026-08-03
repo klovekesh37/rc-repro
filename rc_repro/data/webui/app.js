@@ -192,6 +192,7 @@ const PENDING = new Map();
 const BUSY_VERB = {
   Stop: "Stopping", Start: "Starting", Restart: "Restarting", Down: "Removing",
   "Make default": "Setting default", "API token": "Minting",
+  "Check TLS": "Checking",
 };
 const pendingOn = (name) => PENDING.get(name) || "";
 
@@ -306,6 +307,14 @@ function renderDetail() {
     actions.append(dBtn("API call", () => openCall(d.name), "",
       "Send an authenticated REST call to this workspace and see the response "
       + "— the same request `rc-repro api` makes."));
+    // `up --wait` only proves RC booted (it polls the internal http port). Traefik
+    // gets its certificate in the background afterwards and falls back to a dummy
+    // when ACME fails, so HTTPS needs its own check.
+    if (d.public_url) {
+      actions.append(dBtn("Check TLS", () => doTlsStatus(d.name), "",
+        "Make a real TLS connection and report the certificate actually being "
+        + "served — the same check as `rc-repro tls-status`."));
+    }
   } else if (d.state === "stopped") {
     actions.append(dBtn("Start", () => doState(d.name, "start")));
   } else if (d.state === "down") {
@@ -354,6 +363,11 @@ function renderTab() {
     // during a create); nothing ever showed it afterwards.
     if (typeof d.restarts === "number" && d.restarts > 0) {
       grid.append(kv("RC restarts", String(d.restarts), d.restarts >= 2 ? "bad" : "warn"));
+    }
+    // With --https the external URL differs from the port above, and which kind of
+    // certificate it is decides whether a browser will trust it — so say both.
+    if (d.public_url) {
+      grid.append(kv("HTTPS", TLS_LABEL[d.tls] || "on", "green"));
     }
     body.append(grid);
     if (d.state === "restarting" || (d.restarts || 0) >= 2) {
@@ -1269,6 +1283,109 @@ function renderPresetParams() {
     box.append(el("label", {}, `--set ${key}`, el("input", { name: "set:" + key, placeholder: help })));
   }
 }
+// ---- HTTPS: certificate check ------------------------------------------------
+const TLS_LABEL = {
+  local: "local CA (run trust-ca)",
+  acme: "Let's Encrypt",
+  own: "supplied certificate",
+};
+
+function doTlsStatus(name) {
+  return runAction(name, "Check TLS", async () => {
+    const r = await api(`/api/repros/${name}/tls`);
+    const lines = [`${r.public_url}`, ""];
+    if (!r.serving) {
+      lines.push(`NOT serving TLS on this host's port ${r.port}`, `  ${r.error}`, "",
+                 "Rocket.Chat itself is fine on its plain http port — this is the TLS layer.");
+    } else {
+      lines.push(`Issuer   ${r.issuer || "?"}`, `Subject  ${r.subject || "?"}`,
+                 `Expires  ${(r.dates || "").replace("notAfter=", "")}`, "");
+      if (r.fallback) {
+        lines.push("This is Traefik's built-in placeholder certificate, so ACME never "
+                 + "succeeded. Check the logs for 'acme'.");
+      } else if (r.mode === "local") {
+        lines.push(r.trusted_via_ca ? "Serving rc-repro's local CA."
+                                    : "WARNING: does not chain to rc-repro's CA.");
+        lines.push(r.trusted ? "This machine trusts it — trust-ca has been run."
+                             : "Not trusted here yet: run `rc-repro trust-ca` once.");
+      } else if (r.trusted) {
+        lines.push("Serving a certificate this machine trusts.");
+      } else {
+        lines.push("Serving a real certificate that this machine does not trust — "
+                 + "normal for Let's Encrypt staging.");
+      }
+      if (r.public_issuer && r.public_issuer !== r.issuer) {
+        lines.push("", `The public name serves a DIFFERENT certificate (${r.public_issuer}).`,
+                   "That is what a proxy in front looks like (Cloudflare orange cloud).");
+      } else if (r.public_error) {
+        lines.push("", `The public name is not reachable from here: ${r.public_error}`);
+      }
+    }
+    $("#pat-title").textContent = `TLS: ${name}`;
+    $("#pat-body").textContent = lines.join("\n");
+    PAT_HEADERS = "";
+    $("#pat-dialog").showModal();
+  });
+}
+
+// ---- HTTPS section of the create dialog -------------------------------------
+// One <select> drives which fields are relevant, because the three modes need
+// completely different inputs and showing all of them at once invites the
+// contradictions the API then has to reject (--tls-cert AND --acme-email, etc).
+const HTTPS_MODE_HINT = {
+  "": "",
+  local: "A certificate signed by rc-repro's own CA. Works offline, no domain, no rate"
+       + " limits. Browsers warn until `rc-repro trust-ca` has been run once. A phone"
+       + " cannot use it — use Let's Encrypt for mobile.",
+  acme: "Traefik obtains a real, publicly trusted certificate. Needs a domain you"
+      + " control. Getting a certificate and being reachable at the name are separate"
+      + " things — the job log says so if the name has no DNS record or the workspace"
+      + " is bound to loopback.",
+  own: "Paths are read on the machine running rc-repro, not uploaded from the browser.",
+};
+
+function syncHttpsFields() {
+  const mode = $("#https-mode").value;
+  $("#https-mode-hint").textContent = HTTPS_MODE_HINT[mode] || "";
+  const show = {
+    "https-local": mode === "local",
+    "https-acme": mode === "acme",
+    "https-own": mode === "own",
+    // Both Let's Encrypt and a supplied certificate are tied to a hostname.
+    "https-domain": mode === "acme" || mode === "own",
+  };
+  for (const [cls, on] of Object.entries(show)) {
+    for (const el of document.querySelectorAll("." + cls)) el.hidden = !on;
+  }
+}
+
+function applyHttpsToRequest(f, req) {
+  const mode = f.https_mode ? f.https_mode.value : "";
+  if (!mode) return true;
+  req.https = true;
+  const val = (k) => (f[k] && f[k].value.trim()) || "";
+  if (mode === "local") {
+    if (val("tls_san")) req.tls_san = val("tls_san");
+    return true;
+  }
+  if (!val("domain")) { toast("HTTPS: a domain is required for this mode"); return false; }
+  req.domain = val("domain");
+  if (mode === "own") {
+    if (!val("tls_cert") || !val("tls_key")) {
+      toast("HTTPS: both the certificate and the key path are required"); return false;
+    }
+    req.tls_cert = val("tls_cert");
+    req.tls_key = val("tls_key");
+    return true;
+  }
+  // acme. Email may be blank when it is remembered in config; the challenge, the
+  // DNS provider and whether a public bind is needed are all derived server-side,
+  // so the form does not ask for them.
+  if (val("acme_email")) req.acme_email = val("acme_email");
+  req.acme_staging = !!(f.acme_staging && f.acme_staging.checked);
+  return true;
+}
+
 async function submitCreate() {
   const f = $("#create-form");
   const req = {
@@ -1287,6 +1404,7 @@ async function submitCreate() {
     if (f[k] && f[k].value.trim()) req[k] = f[k].value.trim();
   }
   for (const k of ["pin", "offline", "no_pull"]) if (f[k] && f[k].checked) req[k] = true;
+  if (!applyHttpsToRequest(f, req)) return;      // validates before closing the dialog
   // One choice, not two checkboxes: either flag bypasses reuse, and `fresh` already
   // implies `force`, so ticking both was meaningless.
   const existing = f.existing ? f.existing.value : "reuse";
@@ -1309,6 +1427,7 @@ $("#filter").addEventListener("input", (e) => { view.filter = e.target.value.tri
 $("#status-filter").addEventListener("change", (e) => { view.status = e.target.value; render(); });
 $("#sort-by").addEventListener("change", (e) => { view.sort = e.target.value; render(); });
 $("#preset-select").addEventListener("change", renderPresetParams);
+$("#https-mode").addEventListener("change", syncHttpsFields);
 // The profile only means anything when seeding is on, so don't show it otherwise.
 function syncCreateSeed() {
   $("#create-seed-profile-row").hidden = !$("#create-form").seed.checked;

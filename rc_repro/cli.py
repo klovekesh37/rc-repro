@@ -89,6 +89,15 @@ def _ascii(text: str) -> str:
     return text.translate(_ASCII_MAP)
 
 
+def _tls_label(meta: runner.Metadata) -> str:
+    """How the cert was obtained, for the summary panel."""
+    return {
+        "local": "local CA (rc-repro trust-ca)",
+        "acme": "Let's Encrypt",
+        "own": "supplied certificate",
+    }.get(str(meta.extra.get("tls") or ""), "enabled")
+
+
 def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | None = None) -> None:
     """The boxed repro summary (URL + login + versions), shared by up/ready/info,
     followed by multi-instance URLs. Title is the repro name only — kept pure
@@ -98,9 +107,14 @@ def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | No
         ("Rocket.Chat", meta.rc_version),
         ("MongoDB", f"{meta.mongo_tag} ({meta.mongo_flavor})"),
         ("Preset", meta.preset),
-        ("URL", meta.root_url),
+        # external_url, not root_url: with --https the browser wants the https URL,
+        # while root_url stays the plain http one rc-repro's own API calls use.
+        ("URL", meta.external_url),
         ("Login", f"{config.ADMIN_USERNAME} / {config.ADMIN_PASSWORD}"),
     ]
+    if meta.public_url:
+        rows.append(("TLS", _tls_label(meta)))
+        rows.append(("Direct HTTP", meta.root_url))
     rows += extra_rows or []
     ui.panel(meta.name, rows)
     n = meta.extra.get("instances")
@@ -162,6 +176,15 @@ def up(
     force: bool = typer.Option(False, "--force", help="overwrite an existing repro"),
     monitor: bool = typer.Option(False, "--monitor", help="also add Prometheus + Grafana (RC metrics dashboard)"),
     stats: bool = typer.Option(False, "--stats", help="with --seed: report the CPU/RAM cost of seeding"),
+    https: bool = typer.Option(False, "--https", help="serve over HTTPS using rc-repro's own local CA — no domain needed (run `rc-repro trust-ca` once). For a real certificate, use --domain instead"),
+    domain: str = typer.Option("", "--domain", help="serve over HTTPS at this hostname, e.g. rc1.example.com. Gets a Let's Encrypt certificate, or uses --tls-cert/--tls-key if given. Implies --https"),
+    tls_cert: str = typer.Option("", "--tls-cert", help="use this PEM certificate chain instead of asking Let's Encrypt (needs --tls-key and --domain)"),
+    tls_key: str = typer.Option("", "--tls-key", help="private key for --tls-cert"),
+    acme_staging: bool = typer.Option(False, "--acme-staging", help="ask Let's Encrypt STAGING for the certificate — do this first: it proves the whole path works without spending the production quota"),
+    acme_email: str = typer.Option("", "--acme-email", help="[usually not needed] Let's Encrypt contact email; remembered via `rc-repro config set acme.email`", hidden=True),
+    acme_challenge: str = typer.Option("", "--acme-challenge", help="[usually not needed] force tlsalpn | dns. Inferred: dns when ~/.rc-repro/acme/dns.env exists, else tlsalpn", hidden=True),
+    acme_dns_provider: str = typer.Option("", "--acme-dns-provider", help="[usually not needed] lego DNS provider name; inferred from the variables in dns.env", hidden=True),
+    tls_san: str = typer.Option("", "--tls-san", help="[usually not needed] with --https: extra names/IPs in the local certificate, e.g. your LAN IP", hidden=True),
 ) -> None:
     """Create and start a version-matched Rocket.Chat repro."""
     # Orchestration lives in the shared service layer (same code the web GUI
@@ -174,6 +197,13 @@ def up(
         params=_parse_set_params(set_), seed=False, pin=pin,
         wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
         force=force, monitor=monitor,
+        https=https, domain=domain, tls_san=tls_san, tls_cert=tls_cert, tls_key=tls_key,
+        acme_email=acme_email, acme_staging=acme_staging,
+        # "" means "not given", so the service layer may infer it. tlsalpn is both
+        # the default and a valid explicit choice, hence the separate flag.
+        acme_challenge=(acme_challenge or "tlsalpn"),
+        acme_challenge_given=bool(acme_challenge),
+        acme_dns_provider=acme_dns_provider,
     )
     try:
         result = lcsvc.create_repro(req, emit=_cli_emit, stream_output=False)
@@ -456,7 +486,7 @@ def list_cmd() -> None:
         flag = "*" if r["default"] else (" " if not r["pinned"] else "·")
         typer.echo(
             f"{flag}{r['name']:<19} {r['rc_version']:<9} {r['mongo_tag']:<7} "
-            f"{r['host_port']:<6} {r['state']:<10} {r['root_url']}"
+            f"{r['host_port']:<6} {r['state']:<10} {r.get('public_url') or r['root_url']}"
         )
     typer.echo("\n* = default repro   · = pinned")
 
@@ -470,6 +500,219 @@ def info(name: str = typer.Option("", "--name", "-n")) -> None:
     ui.hint(f"  api  : rc-repro api --name {m.name} GET /api/v1/me")
     ui.hint(f"  curl : {m.root_url}/api/info")
     _print_notes(m)
+
+
+# Settings worth remembering, shown name -> config.yaml key. An allowlist, so a
+# typo cannot write junk into the config file.
+_CONFIG_KEYS: dict[str, str] = {
+    "acme.email": "acme_email",
+    "acme.dns_provider": "acme_dns_provider",
+}
+
+
+@app.command(name="config")
+def config_cmd(
+    action: str = typer.Argument("list", help="list | get | set | unset"),
+    key: str = typer.Argument("", help="e.g. acme.email"),
+    value: str = typer.Argument("", help="the value, for `set`"),
+) -> None:
+    """Read or write remembered settings, so they need not be retyped every run.
+
+    Keys: acme.email, acme.dns_provider. Stored in ~/.rc-repro/config.yaml.
+    """
+    if action == "list":
+        cfg = config.load_config()
+        for shown, stored in _CONFIG_KEYS.items():
+            typer.echo(f"  {shown:20} {cfg.get(stored) or '(unset)'}")
+        return
+    if key not in _CONFIG_KEYS:
+        _err(f"unknown key {key!r} (want: {', '.join(_CONFIG_KEYS)})")
+    stored = _CONFIG_KEYS[key]
+    if action == "get":
+        typer.echo(config.load_config().get(stored) or "")
+        return
+    if action == "unset":
+        config.update_config(lambda c: c.pop(stored, None))
+        ui.ok(f"✓ {key} unset.")
+        return
+    if action == "set":
+        if not value:
+            _err(f"`config set {key}` needs a value")
+        config.update_config(lambda c: c.__setitem__(stored, value))
+        ui.ok(f"✓ {key} = {value}")
+        return
+    _err(f"unknown action {action!r} (want: list | get | set | unset)")
+
+
+@app.command(name="tls-status")
+def tls_status(name: str = typer.Option("", "--name", "-n")) -> None:
+    """Report what is ACTUALLY being served over HTTPS for a repro.
+
+    `up --wait` only proves Rocket.Chat booted -- it polls the internal http port.
+    Traefik obtains certificates in the background AFTER it starts and falls back
+    to a self-signed dummy when ACME fails, so a repro can look ready while HTTPS
+    serves nothing usable. This makes the real TLS connection and says so.
+    """
+    from rc_repro import tls as tlsmod
+    m = runner.read_meta(_resolve_name(name))
+    if not m.public_url:
+        ui.warn(f"  ⚠ {m.name!r} was not created with --https - it serves plain HTTP "
+                f"at {m.root_url}.")
+        raise typer.Exit(1)
+
+    mode = str(m.extra.get("tls") or "")
+    host = m.public_url.split("://", 1)[1].split(":")[0]
+    port = int(m.extra.get("tls_ports", [443])[0])
+    cafile = str(tlsmod.ca_dir() / tlsmod.CA_CRT) if mode == tlsmod.MODE_LOCAL else None
+    typer.echo(f"Checking {m.public_url} ...")
+
+    # Probe THIS host, not the hostname, so a proxy in front cannot answer for us.
+    # Checking only the public name reported Cloudflare's edge certificate as
+    # "serving HTTPS, trusted" while our own Traefik had no certificate at all.
+    r = tlsmod.verify("127.0.0.1", port, cafile=cafile, sni=host)
+
+    if not r["serving"]:
+        ui.warn(f"  ✗ nothing is serving TLS on this host's port {port} - {r['error']}")
+        _tls_troubleshoot(m, mode, host, port)
+        raise typer.Exit(1)
+    rows = [("Endpoint", f"{host}:{port}"), ("Issuer", r["issuer"] or "?"),
+            ("Subject", r["subject"] or "?"), ("Expires", r["dates"].replace("notAfter=", ""))]
+    ui.panel(f"TLS: {m.name}", rows)
+
+    if r["fallback"]:
+        # Traefik's own placeholder: it started, but never got a real certificate.
+        ui.warn("  ✗ this is Traefik's built-in placeholder certificate, which means "
+                "ACME never succeeded.")
+        _tls_troubleshoot(m, mode, host, port)
+        raise typer.Exit(1)
+
+    # For a real domain, also report what the PUBLIC name serves. If a proxy sits in
+    # front (Cloudflare's orange cloud), that is a different certificate from ours,
+    # and saying so beats letting the two be confused for each other.
+    if mode == tlsmod.MODE_ACME:
+        pub = tlsmod.verify(host, 443)
+        if not pub["serving"]:
+            ui.warn(f"  ⚠ {host}:443 is not reachable from here ({pub['error']}) — "
+                    "this host serves TLS, but the public name does not resolve to it "
+                    "or nothing forwards to it.")
+        elif pub["issuer"] and pub["issuer"] != r["issuer"]:
+            ui.warn(f"  ⚠ {host} is fronted by something else: it serves a certificate "
+                    f"issued by {pub['issuer']!r}, not the one this host serves "
+                    f"({r['issuer']!r}).")
+            ui.hint("  That is what an orange-clouded Cloudflare record looks like. "
+                    "Clients get the proxy's certificate, not this one.")
+    if mode == tlsmod.MODE_LOCAL:
+        # Two separate facts: is it OUR certificate, and has trust-ca been run?
+        if not r["trusted_via_ca"]:
+            ui.warn("  ✗ serving a certificate that does not chain to rc-repro's CA.")
+            _tls_troubleshoot(m, mode, host, port)
+            raise typer.Exit(1)
+        ui.ok("  ✓ serving HTTPS with rc-repro's local CA.")
+        if r["trusted"]:
+            ui.hint("  This machine trusts it — `trust-ca` has been run; no browser warnings.")
+        else:
+            ui.hint("  Not trusted by this machine yet. Run `rc-repro trust-ca` once to "
+                    "silence browser warnings (the warning itself is harmless locally).")
+        return
+    if r["trusted"]:
+        ui.ok("  ✓ serving HTTPS with a certificate this machine trusts.")
+        return
+    # Untrusted is EXPECTED for staging.
+    if mode == tlsmod.MODE_ACME:
+        ui.ok("  ✓ serving HTTPS with a real Let's Encrypt-issued certificate.")
+        ui.hint("  Not trusted here, which is normal for --acme-staging: DNS and the "
+                "challenge both worked.")
+        ui.hint("  For a trusted certificate, re-run the SAME command without "
+                "--acme-staging:")
+        ui.hint("    " + _promote_command(m, host))
+    else:
+        ui.ok("  ✓ serving HTTPS.")
+        ui.hint("  This machine does not trust the issuer; that may be fine if the "
+                "clients that matter do.")
+
+
+def _promote_command(m: runner.Metadata, host: str) -> str:
+    """The staging -> production command, rebuilt from what this repro ACTUALLY used.
+
+    Guessing it dropped --acme-challenge/--acme-dns-provider and bolted on
+    --bind 0.0.0.0, so the suggestion silently switched challenge type and failed.
+    """
+    x = m.extra if isinstance(m.extra, dict) else {}
+    challenge = str(x.get("tls_challenge") or "tlsalpn")
+    parts = [f"rc-repro up -v {m.rc_version}", f"--name {m.name}", "--https",
+             f"--domain {host}",
+             f"--acme-email {x.get('tls_email') or '<you@example.com>'}"]
+    if challenge != "tlsalpn":
+        parts.append(f"--acme-challenge {challenge}")
+    if challenge == "dns" and x.get("tls_dns_provider"):
+        parts.append(f"--acme-dns-provider {x['tls_dns_provider']}")
+    # Only the inbound challenges need a public bind; dns-01 does not, and adding
+    # it would expose a workspace running admin/admin123 for no reason.
+    if challenge == "tlsalpn":
+        parts.append("--bind 0.0.0.0")
+    parts += ["--force", "--wait"]
+    return " ".join(parts)
+
+
+def _tls_troubleshoot(m: runner.Metadata, mode: str, host: str, port: int) -> None:
+    """The next things to actually check, ordered by how often they are the cause."""
+    ui.hint(f"  Rocket.Chat itself is fine at {m.root_url} - this is the TLS layer.")
+    if mode == "acme":
+        ui.hint("  Most likely, in order:")
+        ui.hint(f"    1. inbound TCP/{port} not reachable from the internet "
+                "(cloud security group / host firewall)")
+        ui.hint(f"    2. DNS: `dig +short {host}` must return this host's PUBLIC IP")
+        ui.hint("    3. behind Cloudflare's orange cloud? it terminates TLS, so "
+                "tlsalpn cannot work - put a provider token in "
+                "~/.rc-repro/acme/dns.env to switch to dns-01")
+        ui.hint(f"  What Traefik says:  rc-repro logs --name {m.name} | grep -i acme")
+        ui.hint("  Debug on staging (--acme-staging): production allows only 5 failed "
+                f"validations per hour for {host}.")
+    else:
+        ui.hint(f"  Check Traefik started:  rc-repro logs --name {m.name} | grep -i traefik")
+
+
+@app.command(name="trust-ca")
+def trust_ca(
+    uninstall: bool = typer.Option(False, "--uninstall", help="remove it again"),
+    show: bool = typer.Option(False, "--show", help="just print the CA path and fingerprint"),
+) -> None:
+    """Install rc-repro's local CA so `--https` repros are trusted without warnings.
+
+    Only needed for `up --https` on its own (the local-CA mode). A Let's Encrypt
+    or self-supplied certificate is already trusted, so this does nothing for those.
+    """
+    from rc_repro import tls as tlsmod
+    key, crt = tlsmod.ensure_ca()
+    if show:
+        typer.echo(f"CA certificate: {crt}")
+        typer.echo(f"CA key:         {key}  (keep private)")
+        _run_and_echo(["openssl", "x509", "-in", str(crt), "-noout",
+                       "-subject", "-fingerprint", "-sha256", "-dates"])
+        return
+    try:
+        installed, how = tlsmod.trust(crt, uninstall=uninstall)
+    except errors.ReproError as exc:
+        _err(str(exc))
+    if installed:
+        ui.ok(f"✓ CA {'removed from' if uninstall else 'installed into'} {how}.")
+        ui.hint("  Restart the browser to pick it up. Firefox keeps its own store — "
+                "if it still warns, import the CA under Settings → Privacy → Certificates.")
+    else:
+        ui.warn(f"  ⚠ could not {'remove' if uninstall else 'install'} it automatically "
+                f"on this platform ({how}).")
+        typer.echo(tlsmod.manual_trust_instructions(crt, uninstall=uninstall))
+
+
+def _run_and_echo(cmd: list[str]) -> None:
+    import subprocess
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        ui.warn(f"  ⚠ {cmd[0]} failed: {exc}")
+        return
+    for line in (r.stdout or "").splitlines():
+        typer.echo(f"  {line}")
 
 
 @app.command()

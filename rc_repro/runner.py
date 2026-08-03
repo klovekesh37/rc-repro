@@ -49,7 +49,18 @@ class Metadata:
     version_source: str
     pinned: bool = False
     created_at: str = ""
+    # External https URL when `up --https` was used. Kept SEPARATE from root_url,
+    # which stays the plain http://localhost:<port> that rc-repro's own API calls
+    # (login, PAT, seeding, load tests) use. Pointing those at a locally-signed
+    # https URL would fail certificate verification in 71 call sites; RC still
+    # advertises this one as its ROOT_URL, which is what the browser needs.
+    public_url: str = ""
     extra: dict = field(default_factory=dict)
+
+    @property
+    def external_url(self) -> str:
+        """What a human/browser should open — the https URL if there is one."""
+        return self.public_url or self.root_url
 
 
 def project_name(name: str) -> str:
@@ -133,7 +144,7 @@ def used_ports() -> set[int]:
         # Preset side services (Keycloak/Mailpit/MinIO…) and the monitoring
         # add-on (Prometheus/Grafana) publish fixed host ports recorded at `up` —
         # claimed too, so RC port allocation avoids them.
-        for key in ("sidecar_ports", "monitoring_ports"):
+        for key in ("sidecar_ports", "monitoring_ports", "tls_ports"):
             claimed = m.extra.get(key) if isinstance(m.extra, dict) else None
             if isinstance(claimed, list):
                 ports.update(int(p) for p in claimed if isinstance(p, int) or str(p).isdigit())
@@ -164,6 +175,14 @@ def port_free(port: int) -> bool:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("0.0.0.0", port))
+            return True
+        except PermissionError:
+            # A privileged port (<1024) cannot be bound by an unprivileged user,
+            # but the DOCKER DAEMON can — it runs as root, so `ports: 443:443`
+            # publishes fine. Treating EACCES as "in use" made `up --https
+            # --domain ...` refuse 443 on every non-root machine, with nothing
+            # actually listening on it. Nobody is holding it; we just can't probe
+            # this way. The connect() check above already caught a real listener.
             return True
         except (OSError, OverflowError):
             return False
