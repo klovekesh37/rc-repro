@@ -442,7 +442,8 @@ def d13_licence_gate():
     # mirror of the false PASS the contract warns about.
     src = read("rc_repro/services/lifecycle.py")
     warns = "LICENSE_ABSENT_EE_PRESET" in src and "warn_if_unlicensed" in src
-    reachable = "warn_if_unlicensed(req, emit)" in src
+    create_body = _function_body("rc_repro/services/lifecycle.py", "create_repro")
+    reachable = bool(re.search(r"\bwarn_if_unlicensed\s*\(", create_body))
     in_evidence = '"license"' in read("rc_repro/services/evidence.py")
     return (warns and reachable and in_evidence), "licence signalling", \
         f"warning_defined={warns} called_in_create={reachable} in_evidence={in_evidence}"

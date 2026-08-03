@@ -75,3 +75,21 @@ def test_current_checkout_has_the_curated_git_stack_without_local_stack_branches
     assert ok, detail
     assert covered.startswith("Git-derived stack commits=")
     assert "stack/" not in detail
+
+
+def test_licence_gate_accepts_the_preflight_argument(monkeypatch):
+    sources = {
+        "rc_repro/services/lifecycle.py": """
+def warn_if_unlicensed(req, emit, pre):
+    return \"LICENSE_ABSENT_EE_PRESET\"
+
+def create_repro(req, emit, pre):
+    warn_if_unlicensed(req, emit, pre)
+""",
+        "rc_repro/services/evidence.py": '{"license": {}}',
+    }
+    monkeypatch.setattr(audit, "read", sources.get)
+
+    ok, _covered, detail = audit.d13_licence_gate()
+
+    assert ok, detail
