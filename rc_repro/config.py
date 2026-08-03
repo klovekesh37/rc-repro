@@ -12,9 +12,14 @@ State lives under ~/.rc-repro (override with RC_REPRO_HOME):
 from __future__ import annotations
 
 import os
+import threading
+import uuid
 from pathlib import Path
 
 import yaml
+
+# Serialises read-modify-write of config.yaml (see update_config).
+_CONFIG_LOCK = threading.Lock()
 
 # Container-internal Rocket.Chat port. The published host port is chosen per repro.
 RC_CONTAINER_PORT = 3000
@@ -155,25 +160,19 @@ def load_config(with_env: bool = True) -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    """Persist config.yaml with owner-only permissions.
+    """Persist config.yaml atomically with owner-only permissions.
 
-    config.yaml can hold `reg_token` (a Rocket.Chat Cloud registration token that
-    applies an EE license), so it must not be world-readable. The default umask
-    would produce 0644, hence the explicit modes here.
-
-    Written via a temp file opened 0600 and then renamed, so the content is never
-    briefly visible at wider permissions and readers never see a partial file.
-    Same rename-is-atomic reasoning as runner._atomic_write.
+    config.yaml can hold a Rocket.Chat Cloud registration token, so it must not
+    be world-readable. A per-process temporary name avoids concurrent writers
+    clobbering one another before the atomic rename.
     """
     root = home()
     root.mkdir(parents=True, exist_ok=True)
     _chmod_quietly(root, DIR_MODE)
 
     path = config_file()
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     body = yaml.safe_dump(cfg, sort_keys=False)
-    # os.open with mode=0600 so the file is never readable by others, even for an
-    # instant. O_TRUNC because a previous crash may have left a stale temp file.
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -181,10 +180,15 @@ def save_config(cfg: dict) -> None:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    # os.open only applies FILE_MODE when creating; an existing temp file keeps
-    # its old mode, so set it explicitly before the rename publishes it.
     _chmod_quietly(tmp, FILE_MODE)
     os.replace(tmp, path)
-    # Tighten a file that predates this behaviour (rename carries the temp file's
-    # mode, so this is belt-and-braces for odd filesystems).
     _chmod_quietly(path, FILE_MODE)
+
+
+def update_config(mutate) -> dict:
+    """Read-modify-write config.yaml under a lock; ``mutate(cfg)`` edits in place."""
+    with _CONFIG_LOCK:
+        cfg = load_config(with_env=False)
+        mutate(cfg)
+        save_config(cfg)
+        return cfg

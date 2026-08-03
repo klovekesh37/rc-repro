@@ -26,6 +26,15 @@ def analyze(summary: dict, *, rcmetrics: dict | None = None, mongo: dict | None 
     timeline.spike_recovery()'s result for a --spike run."""
     findings: list[str] = []
 
+    # -1. Nothing was measured. A run that issued no requests emits no latency
+    # keys at all (handleSummary drops undefined values), and every `.get(k, 0)`
+    # below would read that absence as a measured 0ms — ending in "the workspace
+    # has headroom at this load" for a test that never ran.
+    if summary.get("p95") is None or summary.get("count") == 0:
+        return ["No requests were recorded, so this run says nothing about the "
+                "workspace - the load generator produced no measurements. Check "
+                "that k6 could reach the target and that the scenario ran."]
+
     # 0. Spike recovery — only worth a finding when it did NOT bounce back.
     if spike:
         if spike.get("recovered_after_s") is None:

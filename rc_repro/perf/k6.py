@@ -26,6 +26,9 @@ SCENARIOS = ("messages", "login", "read", "mixed", "journey", "webhook", "badbot
 # In-network address of the monitor stack's Prometheus (loadtest --live).
 PROM_RW_URL = "http://prometheus:9090/api/v1/write"
 
+# Passed via an 0600 --env-file rather than the argv (see run()).
+_SECRET_ENV = ("RC_TOKEN", "RC_PASS")
+
 
 def run(
     name: str,
@@ -90,6 +93,16 @@ def run(
     if extra_env:
         env.update({k: v for k, v in extra_env.items() if v is not None})
 
+    # RC_TOKEN is a bypass-2FA PAT and RC_PASS the admin password. Passed as
+    # `-e K=V` they sit in the argv, readable by any local user via `ps` /
+    # /proc/<pid>/cmdline for the whole run and via `docker inspect` afterwards.
+    # An 0600 env file in the already-bind-mounted dir avoids that. Only these two
+    # go in the file: everything else is harmless, and a user-supplied value (a
+    # custom scenario's RC_BODY) could contain a newline, which the KEY=VALUE file
+    # format cannot represent.
+    secret_env = {k: v for k, v in env.items() if k in _SECRET_ENV}
+    plain_env = {k: v for k, v in env.items() if k not in _SECRET_ENV}
+
     network = runner.project_name(name) + "_default"
     cmd = ["docker", "run", "--rm", "--network", network, "-v", f"{dest}:/k6"]
     # Run as the host user so k6 can write /k6/summary.json into the bind-mounted
@@ -98,8 +111,15 @@ def run(
     # (mac/win) ignores this but the flag is harmless there. (POSIX only.)
     if hasattr(os, "getuid"):
         cmd += ["--user", f"{os.getuid()}:{os.getgid()}"]
-    for k, v in env.items():
+    for k, v in plain_env.items():
         cmd += ["-e", f"{k}={v}"]
+    envfile = dest / "k6.env"
+    envfile.unlink(missing_ok=True)
+    if secret_env:
+        envfile.write_text("".join(f"{k}={v}\n" for k, v in secret_env.items()),
+                           encoding="utf-8")
+        os.chmod(envfile, 0o600)
+        cmd += ["--env-file", str(envfile)]
     cmd += [K6_IMAGE, "run"]
     if timeline:
         # Stream every measurement so rc-repro can build latency-over-time buckets.
@@ -111,7 +131,10 @@ def run(
 
     # k6 writes its banner/progress to stdout. `quiet` (--json mode) reroutes it
     # to stderr so stdout stays a single parseable JSON object for CI/scripts.
-    subprocess.run(cmd, stdout=sys.stderr if quiet else None)
+    try:
+        subprocess.run(cmd, stdout=sys.stderr if quiet else None)
+    finally:
+        envfile.unlink(missing_ok=True)   # never leave the PAT on disk
     if not summary.exists():
         raise RuntimeError(
             "k6 produced no summary (see output above) — could it reach the target, "

@@ -23,6 +23,7 @@ from rc_repro import seed as seeder
 from rc_repro.perf import report as perf_report
 from rc_repro.perf.timings import fmt_ms
 from rc_repro.services import data as datasvc
+from rc_repro.services import envvars as envsvc
 from rc_repro.services import lifecycle as lcsvc
 from rc_repro.services import onboarding as onboardsvc
 from rc_repro.services import evidence as evidencesvc
@@ -79,22 +80,6 @@ def _login(meta: runner.Metadata) -> rcapi.Auth:
     return rcapi.login(meta.root_url, mailpit_url=meta.extra.get(config.EXTRA_MAILPIT_URL))
 
 
-def _pretty_state(status: str) -> str:
-    """Friendly label from a `docker compose ls` status.
-
-    Status aggregates all services, e.g. 'exited(1), running(3)' — the official
-    mongo flavor always has an exited one-shot mongo-init, so check for ANY
-    running container first rather than the leading token.
-    """
-    if not status:
-        return "down"           # no containers -> a plain `down`
-    if "running(" in status:
-        return "running"
-    if "exited(" in status:
-        return "stopped"        # `stop`-paused (all containers exited)
-    return status.split("(")[0]
-
-
 def _parse_set_params(set_: list[str] | None) -> dict[str, str]:
     """Parse repeated `--set KEY=VALUE` options into a preset params dict."""
     params: dict[str, str] = {}
@@ -124,6 +109,15 @@ def _ascii(text: str) -> str:
     return text.translate(_ASCII_MAP)
 
 
+def _tls_label(meta: runner.Metadata) -> str:
+    """How the cert was obtained, for the summary panel."""
+    return {
+        "local": "local CA (rc-repro trust-ca)",
+        "acme": "Let's Encrypt",
+        "own": "supplied certificate",
+    }.get(str(meta.extra.get("tls") or ""), "enabled")
+
+
 def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | None = None) -> None:
     """The boxed repro summary (URL + login + versions), shared by up/ready/info,
     followed by multi-instance URLs. Title is the repro name only — kept pure
@@ -133,9 +127,14 @@ def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | No
         ("Rocket.Chat", meta.rc_version),
         ("MongoDB", f"{meta.mongo_tag} ({meta.mongo_flavor})"),
         ("Preset", meta.preset),
-        ("URL", meta.root_url),
+        # external_url, not root_url: with --https the browser wants the https URL,
+        # while root_url stays the plain http one rc-repro's own API calls use.
+        ("URL", meta.external_url),
         ("Login", f"{config.ADMIN_USERNAME} / {config.ADMIN_PASSWORD}"),
     ]
+    if meta.public_url:
+        rows.append(("TLS", _tls_label(meta)))
+        rows.append(("Direct HTTP", meta.root_url))
     rows += extra_rows or []
     ui.panel(meta.name, rows)
     n = meta.extra.get("instances")
@@ -222,6 +221,17 @@ def up(
     monitor: bool = typer.Option(False, "--monitor", help="also add Prometheus + Grafana (RC metrics dashboard)"),
     stats: bool = typer.Option(False, "--stats", help="with --seed: report the CPU/RAM cost of seeding"),
     json_out: bool = typer.Option(False, "--json", help="stream NDJSON progress, then one result envelope"),
+    https: bool = typer.Option(False, "--https", help="serve over HTTPS using rc-repro's own local CA — no domain needed (run `rc-repro trust-ca` once). For a real certificate, use --domain instead"),
+    domain: str = typer.Option("", "--domain", help="serve over HTTPS at this hostname, e.g. rc1.example.com. Gets a Let's Encrypt certificate, or uses --tls-cert/--tls-key if given. Implies --https"),
+    tls_cert: str = typer.Option("", "--tls-cert", help="use this PEM certificate chain instead of asking Let's Encrypt (needs --tls-key and --domain)"),
+    tls_key: str = typer.Option("", "--tls-key", help="private key for --tls-cert"),
+    acme_staging: bool = typer.Option(False, "--acme-staging", help="ask Let's Encrypt STAGING for the certificate — do this first: it proves the whole path works without spending the production quota"),
+    acme_email: str = typer.Option("", "--acme-email", help="[usually not needed] Let's Encrypt contact email; remembered via `rc-repro config set acme.email`", hidden=True),
+    acme_challenge: str = typer.Option("", "--acme-challenge", help="[usually not needed] force tlsalpn | dns. Inferred: dns when ~/.rc-repro/acme/dns.env exists, else tlsalpn", hidden=True),
+    acme_dns_provider: str = typer.Option("", "--acme-dns-provider", help="[usually not needed] lego DNS provider name; inferred from the variables in dns.env", hidden=True),
+    env: list[str] = typer.Option(None, "--env", "-e", help="extra raw env var KEY=VALUE (repeatable). Persisted, so `up --force` keeps it; change it later with `rc-repro env`"),
+    setting: list[str] = typer.Option(None, "--setting", help="Rocket.Chat SETTING Id=VALUE (repeatable) — adds the OVERWRITE_SETTING_ prefix a setting needs"),
+    tls_san: str = typer.Option("", "--tls-san", help="[usually not needed] with --https: extra names/IPs in the local certificate, e.g. your LAN IP", hidden=True),
 ) -> None:
     """Create and start a version-matched Rocket.Chat repro."""
     # Orchestration lives in the shared service layer (same code the web GUI
@@ -235,6 +245,14 @@ def up(
         params=_parse_set_params(set_), seed=False, pin=pin,
         wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
         force=force, monitor=monitor, stats=stats if seed else False,
+        https=https, domain=domain, tls_san=tls_san, tls_cert=tls_cert, tls_key=tls_key,
+        acme_email=acme_email, acme_staging=acme_staging,
+        # "" means "not given", so the service layer may infer it. tlsalpn is both
+        # the default and a valid explicit choice, hence the separate flag.
+        env={**envsvc.parse_set(env or []), **envsvc.as_setting(setting or [])},
+        acme_challenge=(acme_challenge or "tlsalpn"),
+        acme_challenge_given=bool(acme_challenge),
+        acme_dns_provider=acme_dns_provider,
     )
     if json_out:
         writer = jsonout.EventWriter()
@@ -507,7 +525,6 @@ def _clear_default_if(name: str) -> None:
         cfg.pop("default_repro", None)
         config.save_config(cfg)
 
-
 @app.command()
 def down(
     name: str = typer.Option("", "--name", "-n"),
@@ -661,9 +678,7 @@ def use(name: str = typer.Argument(..., help="repro to make the default")) -> No
     """Set the default repro for name-less commands."""
     if not runner.exists(name):
         _err(f"no repro named {name!r}")
-    cfg = config.load_config(with_env=False)   # read-modify-WRITE: file only
-    cfg["default_repro"] = name
-    config.save_config(cfg)
+    config.update_config(lambda cfg: cfg.__setitem__("default_repro", name))
     ui.ok(f"✓ default repro is now {name!r}.")
 
 
@@ -686,7 +701,7 @@ def list_cmd(
         flag = "*" if r["default"] else (" " if not r["pinned"] else "·")
         typer.echo(
             f"{flag}{r['name']:<19} {r['rc_version']:<9} {r['mongo_tag']:<7} "
-            f"{r['host_port']:<6} {r['state']:<10} {r['root_url']}"
+            f"{r['host_port']:<6} {r['state']:<10} {r.get('public_url') or r['root_url']}"
         )
     typer.echo("\n* = default repro   · = pinned")
 
@@ -713,6 +728,264 @@ def info(
     ui.hint(f"  api  : rc-repro api --name {m.name} GET /api/v1/me")
     ui.hint(f"  curl : {m.root_url}/api/info")
     _print_notes(m)
+
+
+# Settings worth remembering, shown name -> config.yaml key. An allowlist, so a
+# typo cannot write junk into the config file.
+_CONFIG_KEYS: dict[str, str] = {
+    "acme.email": "acme_email",
+    "acme.dns_provider": "acme_dns_provider",
+}
+
+
+@app.command(name="config")
+def config_cmd(
+    action: str = typer.Argument("list", help="list | get | set | unset"),
+    key: str = typer.Argument("", help="e.g. acme.email"),
+    value: str = typer.Argument("", help="the value, for `set`"),
+) -> None:
+    """Read or write remembered settings, so they need not be retyped every run.
+
+    Keys: acme.email, acme.dns_provider. Stored in ~/.rc-repro/config.yaml.
+    """
+    if action == "list":
+        cfg = config.load_config()
+        for shown, stored in _CONFIG_KEYS.items():
+            typer.echo(f"  {shown:20} {cfg.get(stored) or '(unset)'}")
+        return
+    if key not in _CONFIG_KEYS:
+        _err(f"unknown key {key!r} (want: {', '.join(_CONFIG_KEYS)})")
+    stored = _CONFIG_KEYS[key]
+    if action == "get":
+        typer.echo(config.load_config().get(stored) or "")
+        return
+    if action == "unset":
+        config.update_config(lambda c: c.pop(stored, None))
+        ui.ok(f"✓ {key} unset.")
+        return
+    if action == "set":
+        if not value:
+            _err(f"`config set {key}` needs a value")
+        config.update_config(lambda c: c.__setitem__(stored, value))
+        ui.ok(f"✓ {key} = {value}")
+        return
+    _err(f"unknown action {action!r} (want: list | get | set | unset)")
+
+
+@app.command(name="env")
+def env_cmd(
+    name: str = typer.Option("", "--name", "-n"),
+    set_: list[str] = typer.Option(None, "--set", help="raw env var KEY=VALUE (repeatable)"),
+    setting: list[str] = typer.Option(None, "--setting", help="Rocket.Chat SETTING Id=VALUE (repeatable) — adds the OVERWRITE_SETTING_ prefix for you, which a setting needs to take effect"),
+    unset: list[str] = typer.Option(None, "--unset", help="KEY to remove entirely, including a preset default (repeatable)"),
+    no_restart: bool = typer.Option(False, "--no-restart", help="write the change but don't recreate the container yet"),
+) -> None:
+    """Show or change a repro's Rocket.Chat environment variables.
+
+    With no --set/--unset, lists the effective environment (credentials masked) and
+    marks which keys you have overridden.
+
+    An env var cannot be changed inside a running container, so applying a change
+    recreates the Rocket.Chat container. MongoDB keeps running and its volume is
+    untouched, so no data is lost and it takes seconds.
+    """
+    if not set_ and not setting and not unset:
+        cur = envsvc.current(name)
+        rows = [(e["key"], e["value"] + ("   <- yours" if e["override"] else ""))
+                for e in cur["env"]]
+        ui.panel(f"env: {cur['name']}", rows)
+        if cur["overrides"]:
+            ui.hint("  your overrides: " + ", ".join(cur["overrides"]))
+        else:
+            ui.hint("  no overrides — this is the preset/base environment.")
+        ui.hint("  a Rocket.Chat setting: rc-repro env --setting Some_Setting_Id=value" +
+                (f" --name {cur['name']}" if name else ""))
+        ui.hint("  a raw env var:        rc-repro env --set KEY=VALUE" +
+                (f" --name {cur['name']}" if name else ""))
+        return
+    try:
+        sets = {**envsvc.parse_set(set_ or []), **envsvc.as_setting(setting or [])}
+        result = envsvc.set_env(name, sets, list(unset or []),
+                                restart=not no_restart, emit=_cli_emit)
+    except errors.ReproError as exc:
+        _err(str(exc))
+    verb = "applied" if result["restarted"] else "written (not yet applied)"
+    ui.ok(f"✓ env {verb} on {result['name']!r}.")
+    for o in result["overrides"]:
+        typer.echo(f"    {o['key']} = " + ("(removed)" if o["removed"] else o["value"]))
+    if result["restarted"]:
+        ui.hint(f"  verify: rc-repro env --name {result['name']}")
+
+
+@app.command(name="tls-status")
+def tls_status(name: str = typer.Option("", "--name", "-n")) -> None:
+    """Report what is ACTUALLY being served over HTTPS for a repro.
+
+    `up --wait` only proves Rocket.Chat booted -- it polls the internal http port.
+    Traefik obtains certificates in the background AFTER it starts and falls back
+    to a self-signed dummy when ACME fails, so a repro can look ready while HTTPS
+    serves nothing usable. This makes the real TLS connection and says so.
+    """
+    from rc_repro import tls as tlsmod
+    m = runner.read_meta(_resolve_name(name))
+    if not m.public_url:
+        ui.warn(f"  ⚠ {m.name!r} was not created with --https - it serves plain HTTP "
+                f"at {m.root_url}.")
+        raise typer.Exit(1)
+
+    mode = str(m.extra.get("tls") or "")
+    host = m.public_url.split("://", 1)[1].split(":")[0]
+    port = int(m.extra.get("tls_ports", [443])[0])
+    cafile = str(tlsmod.ca_dir() / tlsmod.CA_CRT) if mode == tlsmod.MODE_LOCAL else None
+    typer.echo(f"Checking {m.public_url} ...")
+
+    # Probe THIS host, not the hostname, so a proxy in front cannot answer for us.
+    # Checking only the public name reported Cloudflare's edge certificate as
+    # "serving HTTPS, trusted" while our own Traefik had no certificate at all.
+    r = tlsmod.verify("127.0.0.1", port, cafile=cafile, sni=host)
+
+    if not r["serving"]:
+        ui.warn(f"  ✗ nothing is serving TLS on this host's port {port} - {r['error']}")
+        _tls_troubleshoot(m, mode, host, port)
+        raise typer.Exit(1)
+    rows = [("Endpoint", f"{host}:{port}"), ("Issuer", r["issuer"] or "?"),
+            ("Subject", r["subject"] or "?"), ("Expires", r["dates"].replace("notAfter=", ""))]
+    ui.panel(f"TLS: {m.name}", rows)
+
+    if r["fallback"]:
+        # Traefik's own placeholder: it started, but never got a real certificate.
+        ui.warn("  ✗ this is Traefik's built-in placeholder certificate, which means "
+                "ACME never succeeded.")
+        _tls_troubleshoot(m, mode, host, port)
+        raise typer.Exit(1)
+
+    # For a real domain, also report what the PUBLIC name serves. If a proxy sits in
+    # front (Cloudflare's orange cloud), that is a different certificate from ours,
+    # and saying so beats letting the two be confused for each other.
+    if mode == tlsmod.MODE_ACME:
+        pub = tlsmod.verify(host, 443)
+        if not pub["serving"]:
+            ui.warn(f"  ⚠ {host}:443 is not reachable from here ({pub['error']}) — "
+                    "this host serves TLS, but the public name does not resolve to it "
+                    "or nothing forwards to it.")
+        elif pub["issuer"] and pub["issuer"] != r["issuer"]:
+            ui.warn(f"  ⚠ {host} is fronted by something else: it serves a certificate "
+                    f"issued by {pub['issuer']!r}, not the one this host serves "
+                    f"({r['issuer']!r}).")
+            ui.hint("  That is what an orange-clouded Cloudflare record looks like. "
+                    "Clients get the proxy's certificate, not this one.")
+    if mode == tlsmod.MODE_LOCAL:
+        # Two separate facts: is it OUR certificate, and has trust-ca been run?
+        if not r["trusted_via_ca"]:
+            ui.warn("  ✗ serving a certificate that does not chain to rc-repro's CA.")
+            _tls_troubleshoot(m, mode, host, port)
+            raise typer.Exit(1)
+        ui.ok("  ✓ serving HTTPS with rc-repro's local CA.")
+        if r["trusted"]:
+            ui.hint("  This machine trusts it — `trust-ca` has been run; no browser warnings.")
+        else:
+            ui.hint("  Not trusted by this machine yet. Run `rc-repro trust-ca` once to "
+                    "silence browser warnings (the warning itself is harmless locally).")
+        return
+    if r["trusted"]:
+        ui.ok("  ✓ serving HTTPS with a certificate this machine trusts.")
+        return
+    # Untrusted is EXPECTED for staging.
+    if mode == tlsmod.MODE_ACME:
+        ui.ok("  ✓ serving HTTPS with a real Let's Encrypt-issued certificate.")
+        ui.hint("  Not trusted here, which is normal for --acme-staging: DNS and the "
+                "challenge both worked.")
+        ui.hint("  For a trusted certificate, re-run the SAME command without "
+                "--acme-staging:")
+        ui.hint("    " + _promote_command(m, host))
+    else:
+        ui.ok("  ✓ serving HTTPS.")
+        ui.hint("  This machine does not trust the issuer; that may be fine if the "
+                "clients that matter do.")
+
+
+def _promote_command(m: runner.Metadata, host: str) -> str:
+    """The staging -> production command, rebuilt from what this repro ACTUALLY used.
+
+    Guessing it dropped --acme-challenge/--acme-dns-provider and bolted on
+    --bind 0.0.0.0, so the suggestion silently switched challenge type and failed.
+    """
+    x = m.extra if isinstance(m.extra, dict) else {}
+    challenge = str(x.get("tls_challenge") or "tlsalpn")
+    parts = [f"rc-repro up -v {m.rc_version}", f"--name {m.name}", "--https",
+             f"--domain {host}",
+             f"--acme-email {x.get('tls_email') or '<you@example.com>'}"]
+    if challenge != "tlsalpn":
+        parts.append(f"--acme-challenge {challenge}")
+    if challenge == "dns" and x.get("tls_dns_provider"):
+        parts.append(f"--acme-dns-provider {x['tls_dns_provider']}")
+    # Only the inbound challenges need a public bind; dns-01 does not, and adding
+    # it would expose a workspace running admin/admin123 for no reason.
+    if challenge == "tlsalpn":
+        parts.append("--bind 0.0.0.0")
+    parts += ["--force", "--wait"]
+    return " ".join(parts)
+
+
+def _tls_troubleshoot(m: runner.Metadata, mode: str, host: str, port: int) -> None:
+    """The next things to actually check, ordered by how often they are the cause."""
+    ui.hint(f"  Rocket.Chat itself is fine at {m.root_url} - this is the TLS layer.")
+    if mode == "acme":
+        ui.hint("  Most likely, in order:")
+        ui.hint(f"    1. inbound TCP/{port} not reachable from the internet "
+                "(cloud security group / host firewall)")
+        ui.hint(f"    2. DNS: `dig +short {host}` must return this host's PUBLIC IP")
+        ui.hint("    3. behind Cloudflare's orange cloud? it terminates TLS, so "
+                "tlsalpn cannot work - put a provider token in "
+                "~/.rc-repro/acme/dns.env to switch to dns-01")
+        ui.hint(f"  What Traefik says:  rc-repro logs --name {m.name} | grep -i acme")
+        ui.hint("  Debug on staging (--acme-staging): production allows only 5 failed "
+                f"validations per hour for {host}.")
+    else:
+        ui.hint(f"  Check Traefik started:  rc-repro logs --name {m.name} | grep -i traefik")
+
+
+@app.command(name="trust-ca")
+def trust_ca(
+    uninstall: bool = typer.Option(False, "--uninstall", help="remove it again"),
+    show: bool = typer.Option(False, "--show", help="just print the CA path and fingerprint"),
+) -> None:
+    """Install rc-repro's local CA so `--https` repros are trusted without warnings.
+
+    Only needed for `up --https` on its own (the local-CA mode). A Let's Encrypt
+    or self-supplied certificate is already trusted, so this does nothing for those.
+    """
+    from rc_repro import tls as tlsmod
+    key, crt = tlsmod.ensure_ca()
+    if show:
+        typer.echo(f"CA certificate: {crt}")
+        typer.echo(f"CA key:         {key}  (keep private)")
+        _run_and_echo(["openssl", "x509", "-in", str(crt), "-noout",
+                       "-subject", "-fingerprint", "-sha256", "-dates"])
+        return
+    try:
+        installed, how = tlsmod.trust(crt, uninstall=uninstall)
+    except errors.ReproError as exc:
+        _err(str(exc))
+    if installed:
+        ui.ok(f"✓ CA {'removed from' if uninstall else 'installed into'} {how}.")
+        ui.hint("  Restart the browser to pick it up. Firefox keeps its own store — "
+                "if it still warns, import the CA under Settings → Privacy → Certificates.")
+    else:
+        ui.warn(f"  ⚠ could not {'remove' if uninstall else 'install'} it automatically "
+                f"on this platform ({how}).")
+        typer.echo(tlsmod.manual_trust_instructions(crt, uninstall=uninstall))
+
+
+def _run_and_echo(cmd: list[str]) -> None:
+    import subprocess
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        ui.warn(f"  ⚠ {cmd[0]} failed: {exc}")
+        return
+    for line in (r.stdout or "").splitlines():
+        typer.echo(f"  {line}")
 
 
 @app.command()
@@ -1184,22 +1457,43 @@ def _print_diag(rcm: dict, mongo_slow: dict | None, tl: dict | None,
                 typer.secho("  " + cont, fg=typer.colors.CYAN)
 
 
+def _load_shape(ctx: dict) -> str:
+    """The offered-load shape recorded in a run context ('spike 10:100' / 'ramp
+    10:200' / '50 VUs'), for panels and baseline-mismatch warnings."""
+    if ctx.get("spike"):
+        return f"spike {ctx['spike']}"
+    if ctx.get("ramp"):
+        return f"ramp {ctx['ramp']}"
+    return f"{ctx.get('vus', '?')} VUs"
+
+
+def _metric(summary: dict, key: str, fmt: str = "{:.0f}ms") -> str:
+    """A summary metric for display, or '-' when it was not measured.
+
+    A zero-request run emits no latency/checks keys at all, so `.get(key, 0)`
+    would present an absent measurement as a confident 0ms."""
+    v = summary.get(key)
+    return "-" if v is None else fmt.format(v)
+
+
 def _print_loadtest(ctx: dict, summary: dict, slo_results: list[dict]) -> None:
     from rc_repro.perf import slo as slo_mod
     rows = [
-        ("throughput", f"{summary.get('rps', 0):.1f} req/s   ({summary.get('count', 0):.0f} requests)"),
-        ("latency", f"p50 {summary.get('p50', 0):.0f}ms  p90 {summary.get('p90', 0):.0f}ms  "
-                    f"p95 {summary.get('p95', 0):.0f}ms  p99 {summary.get('p99', 0):.0f}ms"),
-        ("", f"avg {summary.get('avg', 0):.0f}ms  min {summary.get('min', 0):.0f}ms  "
-             f"max {summary.get('max', 0):.0f}ms"),
-        ("errors", f"{summary.get('error_rate', 0) * 100:.2f}%   checks {summary.get('checks_rate', 0) * 100:.0f}% ok"),
+        ("throughput", f"{_metric(summary, 'rps', '{:.1f}')} req/s   "
+                       f"({_metric(summary, 'count', '{:.0f}')} requests)"),
+        ("latency", f"p50 {_metric(summary, 'p50')}  p90 {_metric(summary, 'p90')}  "
+                    f"p95 {_metric(summary, 'p95')}  p99 {_metric(summary, 'p99')}"),
+        ("", f"avg {_metric(summary, 'avg')}  min {_metric(summary, 'min')}  "
+             f"max {_metric(summary, 'max')}"),
+        ("errors", f"{_metric(summary, 'error_rate', '{:.2%}')}   "
+                   f"checks {_metric(summary, 'checks_rate', '{:.0%}')} ok"),
     ]
     breakdown = _status_breakdown(summary)
     if breakdown:
         rows.append(("responses", breakdown))
     if ctx.get("constrained"):
         rows.append(("constrained", ctx["constrained"]))
-    load = (f"ramp {ctx['ramp']}" if ctx.get("ramp") else f"{ctx['vus']} VUs") + f" / {ctx['duration']}"
+    load = _load_shape(ctx) + f" / {ctx['duration']}"
     if ctx.get("users"):
         load += f", {ctx['users']} users"
     ui.panel(f"loadtest {ctx.get('label', ctx['scenario'])} ({load})", rows)
@@ -1455,6 +1749,9 @@ def loadtest(
     except RuntimeError as exc:
         _err(str(exc))   # raises typer.Exit; finally still runs (mon stopped, limiter restored)
     finally:
+        # users.json holds live seeded-user auth tokens — delete it FIRST, so no
+        # later restore step failing can leave credentials on disk.
+        (runner.workspace(m.name) / "loadtest" / "users.json").unlink(missing_ok=True)
         if sampler:
             rcm_report = sampler.stop()
         if mon:
@@ -1472,11 +1769,14 @@ def loadtest(
             except Exception:  # noqa: BLE001
                 _warn("  ⚠ could not restore the Prometheus metrics setting")
         if mongo_prior:
-            mongoprof.stop(m.name, mongo_prior)
+            # Wrapped like its neighbours: an exception here would skip the
+            # resource-cap restore below and leave the containers capped.
+            try:
+                mongoprof.stop(m.name, mongo_prior)
+            except Exception:  # noqa: BLE001
+                _warn("  ⚠ could not restore the Mongo profiler level")
         for problem in constrain_mod.restore(applied_constraints):
             _warn(f"  ⚠ could not restore resource limits — {problem}")
-        # users.json holds seeded-user tokens — don't leave them on disk.
-        (runner.workspace(m.name) / "loadtest" / "users.json").unlink(missing_ok=True)
 
     # Collect the diagnosis artifacts (profile entries survive the level reset).
     mongo_slow = mongoprof.collect(m.name, since_ms) if (diag and mongo_prior) else None
@@ -1487,13 +1787,20 @@ def loadtest(
         points.unlink(missing_ok=True)   # can be tens of MB — don't leave it around
 
     ctx = {"name": m.name, "version": m.rc_version, "scenario": scenario, "vus": vus,
-           "duration": duration, "ramp": ramp, "target": target, "label": label,
-           "users": len(users), "constrained": snapshot.get("constraints", "")}
+           "duration": duration, "ramp": ramp, "spike": spike, "target": target,
+           "label": label, "users": len(users),
+           "constrained": snapshot.get("constraints", "")}
     slo_results = slo_mod.evaluate(rules, summary) if rules else []
     compare_rows = baseline.compare({"summary": summary}, base) if base else []
     if base and (base.get("ctx") or {}).get("scenario") not in (None, scenario):
         _warn(f"  ⚠ baseline {compare!r} was a {(base['ctx']or{}).get('scenario')!r} run — "
               f"comparing across scenarios")
+    # Load shape too, not just scenario: a spike baseline diffed against a steady
+    # run compares different offered loads, which the deltas can't account for.
+    if base and _load_shape(base.get("ctx") or {}) != _load_shape(ctx):
+        _warn(f"  ⚠ baseline {compare!r} ran a different load shape "
+              f"({_load_shape(base.get('ctx') or {})} vs {_load_shape(ctx)}) — "
+              "deltas reflect the offered load, not just the workspace")
     if base and (base.get("snapshot") or {}).get("constraints") != snapshot.get("constraints"):
         _warn(f"  ⚠ baseline {compare!r} ran under different resource constraints "
               f"({(base.get('snapshot') or {}).get('constraints') or 'none'} vs "
@@ -2069,12 +2376,6 @@ def versions_cmd(
         typer.echo(f"  note         : {r.note}")
 
 
-def _kernel_major_minor(kv: str | None) -> tuple[int, int] | None:
-    """(major, minor) from a kernel string like '6.19.7-200.fc43.aarch64', or None."""
-    m = re.match(r"(\d+)\.(\d+)", kv or "")
-    return (int(m.group(1)), int(m.group(2))) if m else None
-
-
 @app.command()
 def doctor(
     json_out: bool = typer.Option(False, "--json", help="emit the stable preflight record instead of a report"),
@@ -2088,9 +2389,9 @@ def doctor(
     """
     counts = {"ok": 0, "warn": 0, "fail": 0}
     marks = {
-        "ok": ("✓", typer.colors.GREEN),
-        "warn": ("⚠", typer.colors.YELLOW),
-        "fail": ("✗", typer.colors.RED),
+        "ok": ("\u2713", typer.colors.GREEN),
+        "warn": ("\u26a0", typer.colors.YELLOW),
+        "fail": ("\u2717", typer.colors.RED),
     }
     checks: list[dict] = []
 

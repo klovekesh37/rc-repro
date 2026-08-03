@@ -5,7 +5,7 @@ Reuses the shared Keycloak scaffolding (_keycloak), but ships an OIDC client
 instead of a SAML one. OIDC authenticates with a client id + a fixed client
 secret (no signing certs), so there's no runtime cert fetch.
 
-THE ONE GOTCHA (see docs/oidc-design.md §5): OIDC's `url` is used by BOTH the
+THE ONE GOTCHA: OIDC's `url` is used by BOTH the
 browser (authorize) and RC's backend (token/userinfo). We use a single shared
 hostname `keycloak:8080` — RC's backend resolves it over the compose network; the
 browser resolves it via a one-line hosts entry `127.0.0.1  keycloak` (rc-repro

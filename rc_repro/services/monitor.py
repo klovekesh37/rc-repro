@@ -68,6 +68,12 @@ def detach(name: str, emit: Emit = null_emit) -> dict:
     except Exception:  # noqa: BLE001 - best-effort; the repro may be stopped
         pass
     runner.rm_services(m.name, list(monitoring.SERVICES))
+    # Remove the volumes while they are still DECLARED. `docker compose down -v`
+    # only removes declared volumes, so dropping them from the doc below without
+    # deleting them first orphans prometheus_tsdb/grafana_data/loki_data forever.
+    for bad in runner.remove_volumes(m.name, list(monitoring.VOLUMES)):
+        warn(emit, f"could not remove monitoring volume {bad} - remove it by hand",
+             phase="done")
     for s in monitoring.SERVICES:
         doc.get("services", {}).pop(s, None)
     for v in monitoring.VOLUMES:

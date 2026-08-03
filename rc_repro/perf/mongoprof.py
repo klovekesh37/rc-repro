@@ -44,24 +44,45 @@ def _last_json(out: str):
     return None
 
 
+def _as_int(value, default: int) -> int:
+    """Coerce a value parsed out of a shell's stdout. `null`, a missing key, or a
+    shell that serialised a NumberLong as an object must not raise here — this
+    runs inside the callers' `finally`."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def start(name: str, slowms: int = 100) -> dict | None:
-    """Enable profiling (level 1, > slowms) on the rocketchat DB. Returns the
-    prior {was, slowms} for `stop`, or None if profiling isn't available."""
+    """Enable profiling (level 1, > slowms) on the rocketchat DB.
+
+    Returns the state `stop` needs, or None if nothing was changed. Note the
+    ordering: setProfilingLevel has ALREADY taken effect by the time we look at
+    the output, so an unparseable prior state still returns a marker (assuming
+    the default level 0). Returning None there would leave the profiler running
+    for the life of the repro, writing an entry for every slow op.
+    """
     js = (
         "var prev = db.getProfilingStatus();"
         f"db.setProfilingLevel(1, {int(slowms)});"   # numeric arg: works in old shells too
         'print(JSON.stringify({was: prev.was, slowms: prev.slowms}));'
     )
     out = _eval(name, js)
-    prior = _last_json(out) if out else None
-    return prior if isinstance(prior, dict) and "was" in prior else None
+    if out is None:
+        return None      # no usable shell -> the enable never ran, nothing to undo
+    prior = _last_json(out)
+    if isinstance(prior, dict) and "was" in prior:
+        return prior
+    return {"was": 0, "slowms": 100, "prior_unknown": True}
 
 
 def stop(name: str, prior: dict | None) -> None:
     """Restore the prior profiling level (best-effort)."""
     if not prior:
         return
-    js = f"db.setProfilingLevel({int(prior.get('was', 0))}, {int(prior.get('slowms', 100))});"
+    js = (f"db.setProfilingLevel({_as_int(prior.get('was'), 0)}, "
+          f"{_as_int(prior.get('slowms'), 100)});")
     _eval(name, js)
 
 

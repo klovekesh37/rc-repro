@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import re
 import threading
-import time
 from dataclasses import dataclass, field
 
 from rc_repro import runner
@@ -34,11 +33,18 @@ METRICS = {
 _LINE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([0-9.eE+-]+)\s*$")
 
 # require('http') instead of fetch(): works on every Node version RC ever shipped.
+# setTimeout bounds the request: a saturated event loop — exactly what this
+# sampler exists to detect — can accept the connection and then never finish the
+# response, which would hang `node` (and the exec around it) indefinitely.
 _FETCH_JS = (
-    "require('http').get('http://localhost:9458/metrics',function(r){"
+    "var q=require('http').get('http://localhost:9458/metrics',function(r){"
     "var d='';r.on('data',function(c){d+=c});r.on('end',function(){console.log(d)})"
-    "}).on('error',function(){process.exit(1)})"
+    "}).on('error',function(){process.exit(1)});"
+    "q.setTimeout(5000,function(){q.destroy();process.exit(1)})"
 )
+
+# Belt to the JS timeout's braces: bound the exec itself too.
+_SAMPLE_TIMEOUT_S = 15.0
 
 
 def parse_prom(text: str) -> dict[str, float]:
@@ -87,6 +93,10 @@ class RCMetricsSampler:
     _series: dict[str, ServiceSeries] = field(default_factory=dict)
     _stop: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
+    # `join` below uses a timeout, so the worker may still be live when stop()
+    # reads _series. Guard both sides or the read can hit "dictionary changed
+    # size during iteration".
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def start(self) -> "RCMetricsSampler":
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -96,9 +106,12 @@ class RCMetricsSampler:
     def _run(self) -> None:
         while not self._stop.is_set():
             for svc in self.services:
-                rc, text = runner.compose_exec_capture(self.name, svc, ["node", "-e", _FETCH_JS])
+                rc, text = runner.compose_exec_capture(
+                    self.name, svc, ["node", "-e", _FETCH_JS], timeout=_SAMPLE_TIMEOUT_S)
                 if rc == 0 and text:
-                    self._series.setdefault(svc, ServiceSeries()).add(parse_prom(text))
+                    parsed = parse_prom(text)
+                    with self._lock:
+                        self._series.setdefault(svc, ServiceSeries()).add(parsed)
             self._stop.wait(self.interval)
 
     def stop(self) -> dict:
@@ -107,4 +120,5 @@ class RCMetricsSampler:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=10)
-        return {svc: s.summary() for svc, s in self._series.items() if s.summary()}
+        with self._lock:
+            return {svc: s.summary() for svc, s in list(self._series.items()) if s.summary()}

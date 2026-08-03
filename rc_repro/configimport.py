@@ -22,8 +22,13 @@ from rc_repro import config, rcapi
 # Values a support dump uses to mask a secret it won't export (this dump uses
 # "XXXXXXXX"; others use bullets/asterisks/hashes). We can't apply these (they
 # aren't the real value), so skip rather than write the mask as a garbage value.
-# 4+ chars of a single mask alphabet; case-insensitive so "xxxx" matches too.
-_REDACTED_RE = re.compile(r"^[X*•·●▪#.]{4,}$", re.IGNORECASE)
+#
+# 4+ repeats of ONE character, via a backreference. A character class matched any
+# MIXTURE instead ("x.x.x.x", "*.*.*.*", "Xx.#*"), and "." inside [...] is a
+# literal dot, so a legitimate dotted value was classified as a masked secret:
+# silently dropped from the import AND reported to the operator as "the dump
+# masked this". Case-insensitive so "xxxx" still matches.
+_REDACTED_RE = re.compile(r"^([X*•·●▪#])\1{3,}$", re.IGNORECASE)
 
 # Never import these — they identify the customer's specific install or would
 # break local access. Exact ids and id-prefixes (trailing '*').

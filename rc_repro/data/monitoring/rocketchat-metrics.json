@@ -1368,7 +1368,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "c237959a-39f5-402e-bd9c-92b2247a153c"
+            "uid": "DS_PROMETHEUS"
           },
           "editorMode": "code",
           "expr": "nodejs_heap_size_used_bytes{tenant_id=\"$Cluster\", namespace=\"$Namespace\"}",
@@ -2204,7 +2204,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "VyR1AxdVk"
+            "uid": "DS_PROMETHEUS"
           },
           "editorMode": "code",
           "expr": "increase(rocketchat_message_sent{tenant_id=\"$Cluster\", namespace=\"$Namespace\"}[30m])",
@@ -2855,7 +2855,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "000000001"
+            "uid": "DS_PROMETHEUS"
           },
           "editorMode": "code",
           "expr": "rocketchat_ddp_connected_users{tenant_id=\"$Cluster\", namespace=\"$Namespace\"}",
@@ -2870,7 +2870,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "000000001"
+            "uid": "DS_PROMETHEUS"
           },
           "editorMode": "code",
           "expr": "users_connected{tenant_id=\"$Cluster\", namespace=\"$Namespace\"}",
@@ -6167,7 +6167,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "c237959a-39f5-402e-bd9c-92b2247a153c"
+            "uid": "DS_PROMETHEUS"
           },
           "editorMode": "code",
           "expr": "sum(increase(rocketchat_rest_api_count{tenant_id=\"$Cluster\", namespace=\"$Namespace\"}[5m])) / (sum(users_connected{tenant_id=\"$Cluster\", namespace=\"$Namespace\"}) + sum(rocketchat_ddp_connected_users{tenant_id=\"$Cluster\", namespace=\"$Namespace\"}))",
@@ -6282,7 +6282,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "VyR1AxdVk"
+            "uid": "DS_PROMETHEUS"
           },
           "editorMode": "code",
           "expr": "(\n  sum(increase(rocketchat_message_sent{tenant_id=\"$Cluster\", namespace=\"$Namespace\"}[30m])) - \n  sum(increase(rocketchat_message_sent{tenant_id=\"$Cluster\", namespace=\"$Namespace\"}[30m] offset $baseline))\n) \n/\nsum(increase(rocketchat_message_sent{tenant_id=\"$Cluster\", namespace=\"$Namespace\"}[30m] offset $baseline))\n",

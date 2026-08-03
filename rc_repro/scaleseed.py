@@ -30,7 +30,14 @@ _SCALE_TAG = "rcrepro_scale"     # stamped on every doc so `seed --scale --clear
 # NOTE: RC prefixes most collections (rocketchat_room, rocketchat_message) but
 # the users collection is plain `users` — the JS below reflects that.
 
+# Room names are whitelisted to [\w-] here, which is what keeps them out of the
+# generated JS as anything but a plain identifier. repr() below is a second layer,
+# NOT a general-purpose JS escaper (Python's \U escape has no JS equivalent), so
+# if this class is ever widened, switch the interpolation to json.dumps().
 _SPEC_RE = re.compile(r"^(users|messages)=(\d+)(?:@([\w-]+))?$")
+
+# A guard against a mistyped digit, not a real ceiling.
+_MAX_DOCS = 20_000_000
 
 
 def parse_scale(spec: str) -> dict:
@@ -46,7 +53,20 @@ def parse_scale(spec: str) -> dict:
             raise ValueError(
                 f"bad --scale term {part!r} (want users=N or messages=N@room)")
         kind, n, room = m.group(1), int(m.group(2)), m.group(3)
+        if kind in out:
+            # Previously last-wins: "messages=10@a,messages=20@b" silently kept
+            # only (20, 'b').
+            raise ValueError(f"--scale sets {kind} more than once - give it once")
+        if n > _MAX_DOCS:
+            raise ValueError(
+                f"{kind}={n:,} exceeds the {_MAX_DOCS:,} safety cap - a mistyped "
+                "digit would otherwise insert for hours with no progress output")
         if kind == "users":
+            if room:
+                # Previously accepted and silently dropped.
+                raise ValueError(
+                    f"users={n} does not take a room (@{room}) - a room only "
+                    "applies to messages=N@room")
             out["users"] = n
         else:
             if not room:
@@ -68,6 +88,14 @@ def _eval(name: str, js: str) -> tuple[int, str]:
         rc, out = runner.compose_exec_capture(
             name, "mongodb", [shell, "--quiet", _URI, "--eval", wrapped])
         if rc == 0:
+            return rc, out
+        if out.strip():
+            # The shell RAN and printed something, so the script executed at least
+            # partly. A non-zero exit here means it was killed mid-flight (OOM,
+            # container stop, Ctrl-C) — NOT that the binary is missing. Falling
+            # through would re-run a non-idempotent insertMany and duplicate every
+            # batch already committed (and, for users, collide on the unique index
+            # because `start` is recounted from the partial state).
             return rc, out
     return 1, out
 

@@ -7,12 +7,16 @@ presets can deep-merge extra services / env / RC patches into it.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import yaml
 
 from rc_repro import config
 from rc_repro.presets import Preset
+
+if TYPE_CHECKING:                      # only for the Spec.tls annotation
+    from rc_repro.tls import TlsSpec
 
 
 @dataclass
@@ -29,6 +33,11 @@ class Spec:
     reg_token: str | None
     preset: Preset
     monitoring: bool = False   # --monitor: add Prometheus + Grafana
+    # --https: terminate TLS in a Traefik sidecar. None = plain http, as before.
+    tls: "TlsSpec | None" = None
+    # `up --env K=V` / `rc-repro env --set`. Applied to every rocketchat service,
+    # last, so it beats the preset. A None value removes the key.
+    env_overrides: dict = field(default_factory=dict)
     container_port: int = config.RC_CONTAINER_PORT
     # Host interface published ports bind to (the official rocketchat-compose
     # BIND_IP pattern). Loopback by default: repros run weak fixed credentials,
@@ -40,7 +49,9 @@ class Spec:
     def from_resolved(cls, resolved, *, project_name: str, root_url: str,
                       host_port: int, reg_token: str | None, preset: Preset,
                       bind_host: str = config.DEFAULT_BIND_HOST,
-                      monitoring: bool = False) -> "Spec":
+                      monitoring: bool = False,
+                      tls: "TlsSpec | None" = None,
+                      env_overrides: dict | None = None) -> "Spec":
         """Build a Spec from a versions.Resolved plus the launch-time choices."""
         return cls(
             project_name=project_name,
@@ -56,6 +67,8 @@ class Spec:
             preset=preset,
             bind_host=bind_host,
             monitoring=monitoring,
+            tls=tls,
+            env_overrides=dict(env_overrides or {}),
         )
 
 
@@ -95,6 +108,16 @@ def _rc_environment(spec: Spec) -> dict:
         env["REG_TOKEN"] = spec.reg_token
     # Preset env (OVERWRITE_SETTING_* etc.) wins over base defaults.
     env.update({k: str(v) for k, v in spec.preset.env.items()})
+    # Explicit user overrides win over everything, including the base keys: this is
+    # a reproduction tool, so pointing MONGO_URL or ROOT_URL somewhere odd is a
+    # legitimate thing to want. `rc-repro env` warns about the ones that break it.
+    # A None value means "remove this key entirely", which is how you unset a base
+    # or preset default rather than merely blanking it.
+    for k, v in (spec.env_overrides or {}).items():
+        if v is None:
+            env.pop(k, None)
+        else:
+            env[k] = str(v)
     return env
 
 
@@ -284,8 +307,51 @@ def build(spec: Spec) -> dict:
     # balancer) instead of rocketchat — the port isn't known until `up`, so it's
     # injected here rather than in the preset.
     entry = spec.preset.entry_service
-    if entry and entry in doc["services"]:
+    if entry:
+        if entry not in doc["services"]:
+            # Silently skipping meant NOTHING published the host port: the repro
+            # booted and was unreachable at its own advertised root_url.
+            raise ValueError(
+                f"preset {spec.preset.name!r} sets entry_service {entry!r}, which is not "
+                f"one of its services ({', '.join(sorted(doc['services']))})")
         doc["services"][entry]["ports"] = [f"{spec.host_port}:80"]
+        # The front-end owns the published port now. Leaving the same host port on
+        # the RC service too binds it twice and `up` fails with "port is already
+        # allocated" — which a single-instance preset setting entry_service (a
+        # custom one; the built-in multi-instance forces instances >= 2) would hit
+        # every time. Drop only the colliding mapping, so multi-instance keeps its
+        # direct per-instance ports on host_port+i.
+        for svc_name, svc in rc_services.items():
+            if svc_name == entry:
+                continue
+            kept = [p for p in svc.get("ports", [])
+                    if str(p).split(":")[0] != str(spec.host_port)]
+            if kept:
+                svc["ports"] = kept
+            else:
+                svc.pop("ports", None)
+
+    # --- optional HTTPS add-on (Traefik terminating TLS) ---
+    if spec.tls:
+        from rc_repro import tls as tlsmod
+        if tlsmod.SERVICE in doc["services"]:
+            # multi-instance already runs its own Traefik as the entry_service.
+            # Merging a second TLS entrypoint into it is doable but subtle (one
+            # command list, one dynamic.yml, two routers), and getting it wrong
+            # yields a repro that boots and serves nothing. Refuse plainly.
+            raise ValueError(
+                f"preset {spec.preset.name!r} already runs {tlsmod.SERVICE!r}; "
+                "--https cannot layer onto it yet - use the preset without --https, "
+                "or a single-instance preset with --https")
+        # Assigned, not _add_depends: that only extends an EXISTING depends_on, and
+        # a freshly built Traefik service has none — so it silently did nothing.
+        doc["services"][tlsmod.SERVICE] = {
+            **tlsmod.service(spec.tls),
+            "depends_on": list(rc_services),
+        }
+        # RC keeps its own published http port. That is what rc-repro's own API
+        # calls use (see Metadata.public_url) so nothing internal has to trust the
+        # local CA, and `curl http://localhost:<port>` still works for debugging.
 
     # --- optional monitoring add-on (Prometheus + Grafana) ---
     if spec.monitoring:
@@ -311,14 +377,24 @@ def _bind_ports(doc: dict, bind: str) -> None:
         ports = svc.get("ports")
         if not ports:
             continue
-        # Prefix only a bare "port" or "host:container" mapping whose first field
-        # is numeric. A mapping already carrying an IP ("127.0.0.1:8025:8025",
-        # two colons) is left alone — otherwise it'd become a double-IP mapping.
-        svc["ports"] = [
-            f"{bind}:{p}" if str(p).count(":") < 2 and str(p).split(":", 1)[0].isdigit()
-            else str(p)
-            for p in ports
-        ]
+        out: list[str] = []
+        for p in ports:
+            s = str(p)
+            if s.count(":") >= 2:
+                # Already IP-qualified ("127.0.0.1:8025:8025") — prefixing again
+                # would produce a double-IP mapping.
+                out.append(s)
+            elif s.count(":") == 1 and s.split(":", 1)[0].isdigit():
+                out.append(f"{bind}:{s}")                 # "8025:8025"
+            elif s.isdigit():
+                # A BARE container port. "127.0.0.1:8025" would be parsed as
+                # host:container with an invalid host port, so use compose's
+                # IP::CONTAINER form: an ephemeral host port, still bound to
+                # `bind` rather than every interface.
+                out.append(f"{bind}::{s}")
+            else:
+                out.append(s)
+        svc["ports"] = out
 
 
 def to_yaml(doc: dict) -> str:

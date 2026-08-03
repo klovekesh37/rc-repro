@@ -63,6 +63,9 @@ class ResourceMonitor:
     _stop: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
     _t0: float = 0.0
+    # stop() joins with a timeout, and report()/mem_slopes() are also callable
+    # while the sampler runs, so reads and writes of _series must not interleave.
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def start(self) -> "ResourceMonitor":
         self._t0 = time.monotonic()
@@ -80,7 +83,9 @@ class ResourceMonitor:
                 parts = line.split("\t")
                 if len(parts) >= 3:
                     used, limit = _parse_mem(parts[2])
-                    self._series.setdefault(parts[0], []).append((t, _parse_cpu(parts[1]), used, limit))
+                    with self._lock:
+                        self._series.setdefault(parts[0], []).append(
+                            (t, _parse_cpu(parts[1]), used, limit))
             self._stop.wait(self.interval)
 
     def stop(self) -> dict:
@@ -100,7 +105,7 @@ class ResourceMonitor:
         endpoint slope) — the soak-test leak signal. Empty unless the monitor ran
         for at least `min_span_s` (short runs say nothing about leaks)."""
         out: dict[str, float] = {}
-        for name, series in self._series.items():
+        for name, series in self._snapshot().items():
             if len(series) < 2:
                 continue
             span = series[-1][0] - series[0][0]
@@ -109,10 +114,16 @@ class ResourceMonitor:
             out[name] = (series[-1][2] - series[0][2]) / span * 3600
         return out
 
+    def _snapshot(self) -> dict:
+        """A shallow copy of the series taken under the lock, so callers can read
+        it while the sampler thread is still appending."""
+        with self._lock:
+            return {name: list(series) for name, series in self._series.items()}
+
     def report(self, window: tuple[float, float] | None = None) -> dict:
         """Per-container ContainerStats, optionally restricted to a (t0,t1) window."""
         out: dict[str, ContainerStats] = {}
-        for name, series in self._series.items():
+        for name, series in self._snapshot().items():
             sel = [s for s in series if window is None or window[0] <= s[0] <= window[1]]
             if not sel:
                 continue

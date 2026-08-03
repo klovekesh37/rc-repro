@@ -64,11 +64,22 @@ export function vuAuth() {
 // the report has full percentiles and per-step call counts.
 const TREND = ["avg", "min", "med", "max", "p(90)", "p(95)", "p(99)", "count"];
 
+const _UNIT_S = { ms: 0.001, s: 1, m: 60, h: 3600 };
+
+// k6 durations are a sum of unit-tagged parts ("30s", "2m", "1m30s", "500ms").
+// Parsing only a SINGLE part silently fell back to 60 for anything compound,
+// so --duration 1m30s ran a 62s spike instead of 90s while the ramp and plain
+// paths (which hand DURATION straight to k6) ran the full 90s.
 function seconds(s) {
-  const m = String(s || "60s").match(/^(\d+(?:\.\d+)?)(s|m|h)?$/);
-  if (!m) return 60;
-  const v = parseFloat(m[1]);
-  return m[2] === "m" ? v * 60 : m[2] === "h" ? v * 3600 : v;
+  const str = String(s || "").trim();
+  const parts = str.match(/\d+(?:\.\d+)?(?:ms|s|m|h)/g);
+  if (!parts || parts.join("") !== str) return 60;   // unrecognised -> old default
+  let total = 0;
+  for (const p of parts) {
+    const m = p.match(/^(\d+(?:\.\d+)?)(ms|s|m|h)$/);
+    total += parseFloat(m[1]) * _UNIT_S[m[2]];
+  }
+  return total || 60;
 }
 
 export function buildOptions() {
@@ -78,11 +89,20 @@ export function buildOptions() {
     // "base:peak" — hold base for a third, jump to peak for a third, drop back
     // for a third (recovery window). 1s ramps keep the jumps sharp.
     const [base, peak] = spike.split(":").map(Number);
-    const third = Math.max(2, Math.floor(seconds(__ENV.DURATION) / 3));
+    // The two 1s transition ramps are part of the requested duration, not extra:
+    // 3*third+2 overshot --duration by up to 60% on short runs, and
+    // timeline.spike_recovery() splits the OBSERVED span into exact thirds, so
+    // the drift pushed peak-load buckets into the "pre-spike baseline" window
+    // and inflated the recovery threshold. Budget the ramps and give the
+    // remainder to the opening hold so the total is exactly --duration.
+    const total = Math.max(9, seconds(__ENV.DURATION));   // 3 holds + 2 ramps, minimum
+    const body = total - 2;
+    const third = Math.max(2, Math.floor(body / 3));
+    const first = Math.max(2, body - 2 * third);
     return {
       startVUs: base, summaryTrendStats: TREND,
       stages: [
-        { duration: `${third}s`, target: base },
+        { duration: `${first}s`, target: base },
         { duration: "1s", target: peak },
         { duration: `${third}s`, target: peak },
         { duration: "1s", target: base },
@@ -113,7 +133,10 @@ export function handleSummary(data) {
   const d = data.metrics.http_req_duration ? data.metrics.http_req_duration.values : {};
   const reqs = data.metrics.http_reqs ? data.metrics.http_reqs.values : { rate: 0, count: 0 };
   const failed = data.metrics.http_req_failed ? data.metrics.http_req_failed.values : { rate: 0 };
-  const checks = data.metrics.checks ? data.metrics.checks.values : { rate: 1 };
+  // No checks executed -> null, NOT a fabricated 1.0. A hard-coded 1 rendered as
+  // "checks 100% ok" for a run that verified nothing; null is what slo.py and the
+  // renderers treat as "not measured".
+  const checks = data.metrics.checks ? data.metrics.checks.values : { rate: null };
   const out = {
     rps: reqs.rate,
     count: reqs.count,

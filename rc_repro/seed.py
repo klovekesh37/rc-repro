@@ -226,17 +226,36 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
     # honoured when we could actually read the setting; unknown -> restore on.)
     email_2fa = "Accounts_TwoFactorAuthentication_By_Email_Enabled"
     rate_limiter = "API_Enable_Rate_Limiter"
-    # Prior values (None = couldn't read). Restore is keyed on the KNOWN-off
-    # state only: an unreadable setting must never leave 2FA disabled, so unknown
-    # (None) restores ON — matching the limiter's "unknown -> restore on" rule.
+    # Prior values (None = the read failed). "Unreadable" is NOT "was on": the
+    # old rule restored ON for both, so a single transient 500 — likely, since
+    # seeding starts the moment RC answers — turned email-2FA on for the ldap /
+    # saml / oidc / livechat presets, which deliberately switch it OFF because
+    # their users have no mailbox here. Only touch a value we actually observed,
+    # and only put back what we actually changed.
     email_2fa_prev = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, email_2fa)
     limiter_was_off = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, rate_limiter) is False
-    _set(email_2fa, False)
+    email_2fa_changed = False
+    _authorship_warning = (
+        "seeded users may not be loginable, so messages will be authored by admin")
+    if email_2fa_prev is None:
+        log(f"  ⚠ could not read the email-2FA setting — leaving it alone; {_authorship_warning}")
+    elif email_2fa_prev:
+        email_2fa_changed = _set(email_2fa, False)
+        if not email_2fa_changed:
+            # Previously silent: the bool was discarded, so a failed disable
+            # surfaced only as "0 usable as authors" further down.
+            log(f"  ⚠ could not disable email-2FA — {_authorship_warning}")
     if not limiter_was_off and not _set(rate_limiter, False):
         log("  ⚠ could not disable the API rate limiter — seed rates may be throttled")
 
     try:
         result = _seed_body(root_url, admin_hdr, plan, post, log)
+        # Keep the setting-restore helper usable in isolation: callers and tests
+        # may replace the write phase with a lightweight stub that has no dataset
+        # observations to verify. Real seed runs always return ``actual`` and
+        # therefore take the REST readback path below.
+        if not isinstance(result, dict) or "actual" not in result:
+            return result
         participants = result.pop("_participants", {})
         result["readback"] = readback(
             root_url, admin, plan, get=session.get, fallback=result.get("actual"),
@@ -252,8 +271,21 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
     finally:
         if not limiter_was_off:
             _set(rate_limiter, True)
-        if email_2fa_prev is not False:   # was on, or unknown -> restore on
+        if email_2fa_changed:
             _set(email_2fa, True)
+
+
+def _message_id(resp) -> str | None:
+    """The posted message's `_id`, or None.
+
+    `.ok` is true for any 2xx, and a front proxy (Traefik fronts the
+    multi-instance preset) can answer 200 with an HTML error page — a raw
+    JSONDecodeError there would abort the entire seed mid-way.
+    """
+    try:
+        return (resp.json().get("message") or {}).get("_id")
+    except (ValueError, AttributeError):
+        return None
 
 
 def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
@@ -331,10 +363,7 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
             # Rich profiles are deterministic now, so the plan can predict the
             # exact number of thread replies instead of reporting an estimate.
             if plan.rich and index % 5 == 0:
-                try:
-                    mid = (response.json().get("message") or {}).get("_id")
-                except (AttributeError, ValueError, TypeError):
-                    mid = None
+                mid = _message_id(response)
                 if mid:
                     tr = timed("messages", "/api/v1/chat.postMessage", hdr_for(members),
                                {"channel": channel_ref, "text": random.choice(_MESSAGES),
@@ -362,9 +391,15 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
     if plan.rich and names:
         for gn in plan.group_names:
             members = random.sample(names, k=min(len(names), 4))
-            if ok(timed("channels", "/api/v1/groups.create", admin_hdr,
-                        {"name": gn, "members": members})):
-                actual["groups"] += 1
+            gr = timed("channels", "/api/v1/groups.create", admin_hdr,
+                       {"name": gn, "members": members})
+            # On a re-seed the group already exists, groups.create fails, and this
+            # run's freshly sampled members are not in it — their posts then 400
+            # (RC can't auto-join a private group). Only author into a group this
+            # run actually created.
+            if gr is None or not gr.ok:
+                continue
+            actual["groups"] += 1
             post_messages(f"#{gn}", members, max(3, plan.messages // 3))
 
     # 4. Messages into the default GENERAL channel (everyone is a member).

@@ -97,17 +97,28 @@ class Applied:
     prior_nano: int         # NanoCpus before we touched it (0 = unlimited)
     prior_mem: int          # Memory bytes before (0 = unlimited)
     prior_swap: int         # MemorySwap before (0/-1 = default/unlimited)
+    # WHICH dimensions apply() actually capped. Without this, restore() writes
+    # both and imposes a memory limit (and disables swap) on a service that was
+    # only ever CPU-capped — a change the test never asked for.
+    set_cpus: bool = False
+    set_mem: bool = False
 
 
 def _inspect_limits(cid: str) -> tuple[int, int, int]:
     r = subprocess.run(
         ["docker", "inspect", "--format",
          "{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}", cid],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=30,
     )
     if r.returncode != 0:
         raise RuntimeError(f"docker inspect failed: {r.stderr.strip()}")
-    nano, mem, swap = (int(x) for x in r.stdout.split())
+    try:
+        nano, mem, swap = (int(x) for x in r.stdout.split())
+    except ValueError as exc:
+        # Anything but three integers (a template mismatch, a truncated read)
+        # must surface as the RuntimeError every caller catches, not a ValueError.
+        raise RuntimeError(
+            f"could not read current limits for {cid[:12]}: {r.stdout.strip()!r}") from exc
     return nano, mem, swap
 
 
@@ -118,7 +129,7 @@ def _update(cid: str, cpus: float | None, mem: str | None) -> None:
     if mem:
         cmd += ["--memory", mem, "--memory-swap", mem]   # same value: no extra swap
     cmd.append(cid)
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         raise RuntimeError(f"docker update failed: {r.stderr.strip()}")
 
@@ -136,44 +147,73 @@ def apply(name: str, per_service: dict[str, dict]) -> list[Applied]:
             for cid in ids:
                 prior = _inspect_limits(cid)
                 _update(cid, lim.get("cpus"), lim.get("mem"))
-                applied.append(Applied(cid, svc, *prior))
+                applied.append(Applied(cid, svc, *prior,
+                                       set_cpus=lim.get("cpus") is not None,
+                                       set_mem=bool(lim.get("mem"))))
     except Exception:
         restore(applied)
         raise
     return applied
 
 
+def _restore_swap(a: Applied, mem: float) -> int:
+    """The MemorySwap value to restore alongside `mem`.
+
+    Docker's MemorySwap: -1 = unlimited, > 0 = an explicit limit, and 0 = "unset",
+    which the runtime reads as TWICE the memory limit. Folding that 0 into
+    "swap == memory" (i.e. no swap at all) restores a stricter configuration than
+    the container started with, so reproduce the 2x default instead.
+    """
+    if not a.prior_mem:            # previously unlimited -> match apply()'s no-extra-swap
+        return int(mem)
+    if a.prior_swap:               # -1 (unlimited) or an explicit byte limit
+        return int(a.prior_swap)
+    return int(a.prior_mem) * 2    # docker's implicit default
+
+
 def restore(applied: list[Applied]) -> list[str]:
-    """Undo `apply`. Prior real limits are restored exactly; a service that was
-    unlimited is restored to the docker VM's full capacity (see module docstring).
-    Returns human-readable problems instead of raising — restore is best-effort."""
+    """Undo `apply`, touching ONLY the dimensions apply() actually capped.
+
+    Prior real limits are restored exactly; a dimension that was unlimited goes
+    back to the docker VM's full capacity (see module docstring). Returns
+    human-readable problems instead of raising: restore runs inside the callers'
+    `finally`, so an exception here would skip their remaining cleanup and mask
+    whatever error triggered it.
+    """
     if not applied:
         return []
     cap = runner.docker_capacity() or (0.0, 0)
     problems: list[str] = []
     for a in applied:
-        cpus = (a.prior_nano / 1e9) if a.prior_nano else cap[0]
-        mem = a.prior_mem if a.prior_mem else cap[1]
-        # Build the restore incrementally so a known CPU limit is still restored
-        # when memory capacity is unknown (docker info failed), instead of the
-        # whole restore being skipped and the test's cap left in place.
         cmd = ["docker", "update"]
-        if cpus:
-            cmd += ["--cpus", f"{cpus:g}"]
-        if mem:
-            # Restore the real prior swap limit when both memory and swap were
-            # actual limits before; a previously-unlimited service matches swap
-            # to memory (what apply() set — no extra swap).
-            swap = a.prior_swap if (a.prior_mem and a.prior_swap) else int(mem)
-            cmd += ["--memory", str(int(mem)), "--memory-swap", str(swap)]
-        if len(cmd) == 2:   # nothing known to restore (docker info failed)
-            problems.append(f"{a.service}: could not determine capacity to restore")
+        unresolved: list[str] = []
+        if a.set_cpus:
+            cpus = (a.prior_nano / 1e9) if a.prior_nano else cap[0]
+            if cpus:
+                cmd += ["--cpus", f"{cpus:g}"]
+            else:
+                unresolved.append("CPU")
+        if a.set_mem:
+            mem = a.prior_mem if a.prior_mem else cap[1]
+            if mem:
+                cmd += ["--memory", str(int(mem)),
+                        "--memory-swap", str(_restore_swap(a, mem))]
+            else:
+                unresolved.append("memory")
+        # Report EVERY dimension that could not be put back. Testing only "is the
+        # command still empty" hid the mixed case (one dimension known, the other
+        # not), leaving half the test's cap applied with no warning at all.
+        if unresolved:
+            problems.append(
+                f"{a.service}: could not determine {'/'.join(unresolved)} capacity "
+                "to restore - the test's cap is still applied")
+        if len(cmd) == 2:
             continue
         cmd.append(a.container)
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             if r.returncode != 0:
                 raise RuntimeError(r.stderr.strip())
-        except RuntimeError as exc:
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
             problems.append(f"{a.service}: {exc}")
     return problems

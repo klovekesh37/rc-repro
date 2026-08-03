@@ -548,10 +548,22 @@ def test_parse_scale_messages_without_room_raises():
             raise AssertionError(f"expected ValueError for {bad!r}")
 
 
-def test_parse_scale_room_id_embedded_safely():
-    # room ref is repr()'d into the JS, so a quote can't break out of the string
-    js_room = repr("evil'; db.dropDatabase(); //")
-    assert js_room.startswith(("'", '"')) and "dropDatabase" in js_room
+def test_parse_scale_room_ref_cannot_reach_the_js_unquoted(monkeypatch):
+    # This used to assert on the stdlib's repr() and never touch scaleseed at all,
+    # so the guard it was named for had no coverage. Exercise both layers: the
+    # _SPEC_RE whitelist (the real guard) and the quoted interpolation.
+    from rc_repro import scaleseed
+    captured = {}
+    monkeypatch.setattr(scaleseed, "_eval",
+                        lambda name, js: captured.setdefault("js", js) or (0, '{"inserted": 1}'))
+    scaleseed.bulk_messages("x", 1, "team-chat")
+    assert "'team-chat'" in captured["js"]          # only ever inside a JS literal
+    for bad in ("ev'il", 'ev"il', "ev\\il", "ev\nil", "a b", "a;b", "$where"):
+        try:
+            scaleseed.parse_scale(f"messages=1@{bad}")
+        except ValueError:
+            continue
+        raise AssertionError(f"_SPEC_RE should reject room {bad!r}")
 
 
 def test_yaml_preset_notes_parsed(tmp_path, monkeypatch):
@@ -1121,6 +1133,94 @@ def test_constrain_human():
                             "mongo": {"cpus": 0.5, "mem": None}}) == "rc=2cpu/2g, mongo=0.5cpu"
 
 
+def _fake_run(calls, returncode=0, stdout=""):
+    """subprocess.run stub that records the argv it was handed."""
+    import types
+
+    def run(cmd, **_kw):
+        calls.append(cmd)
+        return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+    return run
+
+
+def test_constrain_restore_only_touches_capped_dimensions(monkeypatch):
+    # A CPU-only --constrain must not make restore() impose a memory limit on a
+    # container that had none (which, with --memory-swap == --memory, would also
+    # disable swap) — restore only puts back what apply() actually changed.
+    from rc_repro.perf import constrain
+    calls = []
+    monkeypatch.setattr(constrain.subprocess, "run", _fake_run(calls))
+    monkeypatch.setattr(constrain.runner, "docker_capacity", lambda: (8.0, 8_000_000_000))
+    a = constrain.Applied("cid1", "rocketchat", 0, 0, 0, set_cpus=True, set_mem=False)
+    assert constrain.restore([a]) == []
+    assert calls == [["docker", "update", "--cpus", "8", "cid1"]]
+
+
+def test_constrain_restore_reports_partial_failure(monkeypatch):
+    # docker info unavailable, a real prior CPU limit but no prior memory limit:
+    # the memory dimension can't be resolved. That must be REPORTED — it used to
+    # be silent whenever the built command was non-empty, so the test's memory
+    # cap stayed applied and the caller printed no warning.
+    from rc_repro.perf import constrain
+    calls = []
+    monkeypatch.setattr(constrain.subprocess, "run", _fake_run(calls))
+    monkeypatch.setattr(constrain.runner, "docker_capacity", lambda: None)
+    a = constrain.Applied("cid1", "rocketchat", 4_000_000_000, 0, 0,
+                          set_cpus=True, set_mem=True)
+    problems = constrain.restore([a])
+    assert len(problems) == 1 and "memory" in problems[0]
+    assert calls == [["docker", "update", "--cpus", "4", "cid1"]]   # CPU still restored
+
+
+def test_constrain_restore_reproduces_implicit_swap_default(monkeypatch):
+    # MemorySwap == 0 next to a real Memory limit is docker's "twice memory"
+    # default, not "unknown". Restoring swap == memory would hand back a
+    # STRICTER config (no swap) than the container started with.
+    from rc_repro.perf import constrain
+    calls = []
+    monkeypatch.setattr(constrain.subprocess, "run", _fake_run(calls))
+    monkeypatch.setattr(constrain.runner, "docker_capacity", lambda: (8.0, 8_000_000_000))
+    a = constrain.Applied("cid1", "mongodb", 0, 2_147_483_648, 0, set_cpus=False, set_mem=True)
+    assert constrain.restore([a]) == []
+    assert calls == [["docker", "update", "--memory", "2147483648",
+                      "--memory-swap", "4294967296", "cid1"]]
+    # an explicit prior swap limit round-trips verbatim; -1 stays unlimited
+    for prior_swap, expected in ((3_000_000_000, "3000000000"), (-1, "-1")):
+        calls.clear()
+        constrain.restore([constrain.Applied("c", "mongodb", 0, 2_147_483_648, prior_swap,
+                                             set_cpus=False, set_mem=True)])
+        assert calls[0][-2] == expected
+
+
+def test_constrain_restore_never_raises(monkeypatch):
+    # restore() runs inside the callers' finally; an OSError escaping it would
+    # skip their remaining cleanup (deleting the seeded-user token file) and mask
+    # whatever error triggered the finally. Report it, don't raise.
+    from rc_repro.perf import constrain
+
+    def boom(*_a, **_k):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(constrain.subprocess, "run", boom)
+    monkeypatch.setattr(constrain.runner, "docker_capacity", lambda: (8.0, 8_000_000_000))
+    problems = constrain.restore(
+        [constrain.Applied("cid1", "rocketchat", 0, 0, 0, set_cpus=True)])
+    assert len(problems) == 1 and "rocketchat" in problems[0]
+
+
+def test_constrain_inspect_limits_bad_output_is_runtime_error(monkeypatch):
+    # Every call site catches RuntimeError; a ValueError from int() would escape
+    # as a raw traceback (CLI) or an InternalError job (GUI).
+    from rc_repro.perf import constrain
+    monkeypatch.setattr(constrain.subprocess, "run", _fake_run([], stdout="<no value>\n"))
+    try:
+        constrain._inspect_limits("cid1")
+    except RuntimeError as exc:
+        assert "cid1" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError for unparseable docker inspect output")
+
+
 def test_rcmetrics_prom_parser():
     from rc_repro.perf import rcmetrics
     text = (
@@ -1227,6 +1327,63 @@ def test_mem_slopes_requires_span():
     slopes = mon.mem_slopes()
     assert round(slopes["rcrepro-x-rocketchat-1"] / 1e6) == 60
     assert "rcrepro-x-mongodb-1" not in slopes
+
+
+def test_verdict_refuses_to_judge_an_unmeasured_run():
+    from rc_repro.perf import verdict
+    # A run that issued no requests emits no latency keys at all (handleSummary
+    # drops undefined values). It used to render as a measured 0ms and end in
+    # "the workspace has headroom at this load" -- a health claim from no data.
+    zero = {"rps": 0, "count": 0, "error_rate": 0, "checks_rate": None,
+            "status": {"2xx": 0, "429": 0, "4xx": 0, "5xx": 0, "other": 0}}
+    for summary in (zero, {}):
+        v = verdict.analyze(summary)
+        assert len(v) == 1
+        assert "No requests were recorded" in v[0]
+        assert "headroom" not in v[0]
+
+
+def test_loadtest_markdown_marks_unmeasured_metrics():
+    from rc_repro.perf import report
+    zero = {"rps": 0, "count": 0, "error_rate": 0, "checks_rate": None}
+    ctx = {"name": "r", "version": "8.5.1", "scenario": "messages", "vus": 10,
+           "duration": "30s", "ramp": "", "target": "http://rocketchat:3000", "users": 0}
+    md = report.loadtest_markdown(ctx, zero, [], None, {})
+    assert "| latency p95 | - |" in md          # not "**0ms**"
+    assert "| checks passed | - |" in md        # not "100.0%"
+    # a measured run is formatted exactly as before
+    real = {"rps": 50.0, "count": 100, "p50": 10.0, "p90": 20.0, "p95": 66.0,
+            "p99": 88.0, "avg": 12.0, "min": 3.0, "max": 99.0,
+            "error_rate": 0.0123, "checks_rate": 1.0}
+    md2 = report.loadtest_markdown(ctx, real, [], None, {})
+    assert "| latency p95 | **66ms** |" in md2
+    assert "| throughput | **50.0 req/s** |" in md2
+    assert "| error rate | 1.23% |" in md2 and "| checks passed | 100.0% |" in md2
+
+
+def test_loadtest_markdown_labels_a_spike_run_as_a_spike():
+    from rc_repro.perf import report
+    # ctx["vus"] is the value the CLI told the user it was IGNORING under --spike,
+    # so reporting it described a load shape that never ran.
+    ctx = {"name": "r", "version": "8.5.1", "scenario": "messages", "vus": 10,
+           "duration": "60s", "ramp": "", "spike": "10:100",
+           "target": "http://rocketchat:3000", "users": 0}
+    md = report.loadtest_markdown(ctx, {"p95": 1.0}, [], None, {})
+    assert "spike 10:100 VUs for 60s" in md and "10 VUs for 60s" not in md
+
+
+def test_loadtest_script_budgets_spike_ramps_and_parses_compound_durations():
+    # No JS runtime here, so assert on the shipped script -- as the other
+    # loadtest-script tests do. The invariants: the two 1s transition ramps are
+    # budgeted out of --duration (3*third+2 overshot it, which also skewed
+    # timeline.spike_recovery's exact-thirds windows), seconds() understands k6's
+    # compound durations (1m30s), and an unrun check set reports null.
+    from importlib import resources
+    js = resources.files("rc_repro").joinpath("data", "loadtest", "common.js").read_text(
+        encoding="utf-8")
+    assert "ms|s|m|h" in js
+    assert "const body = total - 2;" in js
+    assert "rate: null" in js
 
 
 def test_verdict_spike_and_soak_rules():
@@ -1973,3 +2130,1109 @@ def test_cursor_and_copilot_need_no_separate_install():
         with pytest.raises(errors.ValidationError) as ei:
             skill.target_dir(host)
         assert covered_by in str(ei.value)
+
+
+def test_seed_restores_only_the_2fa_value_it_changed(monkeypatch):
+    # "Unreadable" is not "was on". Restoring ON for both turned email-2FA on for
+    # the ldap/saml/oidc/livechat presets, which switch it OFF on purpose.
+    prior = [None]
+    calls = []
+
+    def fake_get(_url, _auth, _pw, sid, **_kw):
+        return {"Accounts_TwoFactorAuthentication_By_Email_Enabled": prior[0],
+                "API_Enable_Rate_Limiter": False}.get(sid)
+
+    def fake_set(_url, _auth, _pw, sid, value, **_kw):
+        calls.append((sid, value))
+        return True
+
+    monkeypatch.setattr(seed.rcapi, "get_setting", fake_get)
+    monkeypatch.setattr(seed.rcapi, "set_setting", fake_set)
+    monkeypatch.setattr(seed, "_seed_body", lambda *_a, **_k: {"ok": True})
+    twofa = "Accounts_TwoFactorAuthentication_By_Email_Enabled"
+    auth = seed.rcapi.Auth(token="t", user_id="u")
+
+    cases = [
+        (None, []),                                 # unreadable -> don't touch it
+        (False, []),                                # already off -> leave it
+        (True, [(twofa, False), (twofa, True)]),     # on -> disable, then restore
+    ]
+    for prior_value, expected in cases:
+        prior[0] = prior_value
+        calls.clear()
+        seed.seed("http://x", auth, seed.PROFILES["small"])
+        assert [c for c in calls if c[0] == twofa] == expected, prior_value
+
+
+def test_seed_does_not_count_failed_dms():
+    class _Resp:
+        def __init__(self, ok):
+            self.ok, self.status_code = ok, 200 if ok else 400
+
+        def json(self):
+            return {"message": {"_id": "m1"}}
+
+    # every im.create is rejected (revoked create-d permission, DM max users)
+    def post(path, _headers, _payload):
+        return _Resp(not path.endswith("im.create"))
+
+    plan = seed.Plan(users=3, channels=1, messages=1, dms=3, rich=False)
+    out = seed._seed_body("http://x", {"h": "1"}, plan, post, lambda _m: None)
+    # was 3: post() returns None only on a TRANSPORT error, so a 400 still counted
+    # and the number reached the benchmark report as workload never created.
+    assert out["dms"] == 0
+
+
+def test_scaleseed_does_not_rerun_a_partially_applied_script(monkeypatch):
+    from rc_repro import scaleseed
+    shells = []
+
+    def killed_midway(_name, _service, args, **_kw):
+        shells.append(args[0])
+        return 137, '{"inserted": 400000}'      # OOM-killed after committing batches
+
+    monkeypatch.setattr(scaleseed.runner, "compose_exec_capture", killed_midway)
+    rc, _out = scaleseed._eval("x", "print(1)")
+    # Falling through to `mongo` would re-run a non-idempotent insertMany and
+    # duplicate every batch already written.
+    assert rc == 137 and shells == ["mongosh"]
+
+    shells.clear()
+
+    def binary_missing(_name, _service, args, **_kw):
+        shells.append(args[0])
+        return 127, ""                          # never started, no output
+
+    monkeypatch.setattr(scaleseed.runner, "compose_exec_capture", binary_missing)
+    scaleseed._eval("x", "print(1)")
+    assert shells == ["mongosh", "mongo"]       # the legacy fallback still applies
+
+
+def test_parse_scale_rejects_ambiguous_and_oversized_specs():
+    from rc_repro import scaleseed
+    for bad in ("users=10@team-chat",             # a room means nothing for users
+                "messages=10@a,messages=20@b",    # silently last-wins before
+                "users=1,users=2",
+                f"users={scaleseed._MAX_DOCS + 1}"):
+        try:
+            scaleseed.parse_scale(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad!r}")
+    assert scaleseed.parse_scale("users=10,messages=20@general") == {
+        "users": 10, "messages": (20, "general")}
+
+
+def test_configimport_redaction_requires_a_single_mask_alphabet():
+    from rc_repro import configimport
+    for masked in ("XXXXXXXX", "xxxx", "****", "######", "●●●●●●", "····"):
+        assert configimport._is_redacted(masked), masked
+    # A character class matched any MIXTURE, and "." inside [...] is a literal
+    # dot -- so real dotted/mixed values were dropped from the import while being
+    # reported to the operator as "the dump masked this secret".
+    for real in ("....", "*.*.*.*", "x.x.x.x", "#.#.#", "Xx.#*", "1.2.3.4",
+                 "a.b.c.d", "XXX"):
+        assert not configimport._is_redacted(real), real
+
+
+def test_login_refuses_an_unfiltered_otp_poll(monkeypatch):
+    from rc_repro import rcapi
+
+    class _R:
+        status_code, ok = 401, False
+        text = '{"error":"totp-required"}'
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(rcapi.requests, "post", lambda *_a, **_k: _R())
+    # Mailpit is a catch-all inbox; with no resolvable recipient the old code
+    # polled unfiltered and could hand back a DIFFERENT user's code.
+    try:
+        rcapi.login("http://x", "alice", "alice", mailpit_url="http://mailpit")
+    except RuntimeError as exc:
+        assert "another user's code" in str(exc)
+    else:
+        raise AssertionError("expected a refusal rather than an unfiltered poll")
+
+
+def test_login_rejects_a_non_200_success_status(monkeypatch):
+    from rc_repro import rcapi
+
+    class _R:
+        status_code, ok = 302, True             # proxy redirect to HTTPS
+        text = "<html>Found</html>"
+
+        def json(self):
+            return {}
+
+        def raise_for_status(self):
+            return None                          # no-op for 3xx, as requests does
+
+    monkeypatch.setattr(rcapi.requests, "post", lambda *_a, **_k: _R())
+    try:
+        rcapi.login("http://x")
+    except RuntimeError as exc:
+        assert "302" in str(exc) and "2FA" in str(exc)
+    else:
+        raise AssertionError("expected a clear error, not the misleading 2FA path")
+
+
+def _spec_for(pre):
+    """A Spec around a hand-built Preset (the shared _spec() takes a preset NAME)."""
+    r = versions.resolve("8.4.1", offline=True)
+    return compose.Spec.from_resolved(
+        r, project_name="rcrepro-t", root_url="http://localhost:3000",
+        host_port=3000, reg_token=None, preset=pre)
+
+
+def test_compose_entry_service_must_exist():
+    from rc_repro.presets import Preset
+    # Silently skipping a bad entry_service meant NOTHING published the host port:
+    # the repro booted unreachable at its own advertised root_url.
+    pre = Preset(name="broken", entry_service="nope", services={"real": {"image": "x"}})
+    try:
+        compose.build(_spec_for(pre))
+    except ValueError as exc:
+        assert "entry_service" in str(exc) and "nope" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for an undefined entry_service")
+
+
+def test_compose_entry_service_takes_the_host_port_from_rc():
+    from rc_repro.presets import Preset
+    # A single-instance preset with an entry_service: RC must give up the published
+    # host port, or it is bound twice and `up` fails "port is already allocated".
+    pre = Preset(name="lb", entry_service="proxy", services={"proxy": {"image": "x"}})
+    doc = compose.build(_spec_for(pre))
+    assert doc["services"]["proxy"]["ports"] == ["127.0.0.1:3000:80"]
+    assert "ports" not in doc["services"]["rocketchat"]
+
+    # multi-instance keeps its direct per-instance ports (host_port + i)
+    multi = Preset(name="lb2", entry_service="proxy", instances=2,
+                   services={"proxy": {"image": "x"}})
+    doc2 = compose.build(_spec_for(multi))
+    assert doc2["services"]["proxy"]["ports"] == ["127.0.0.1:3000:80"]
+    assert doc2["services"]["rocketchat-1"]["ports"] == ["127.0.0.1:3001:3000"]
+    assert doc2["services"]["rocketchat-2"]["ports"] == ["127.0.0.1:3002:3000"]
+
+
+def test_bind_ports_handles_a_bare_container_port():
+    doc = {"services": {
+        "a": {"ports": ["8025:8025"]},           # host:container
+        "b": {"ports": ["127.0.0.1:9000:9000"]},  # already IP-qualified
+        "c": {"ports": ["8025"]},                 # BARE container port
+        "d": {"ports": ["1.2.3.4:5:6"]},
+    }}
+    compose._bind_ports(doc, "127.0.0.1")
+    assert doc["services"]["a"]["ports"] == ["127.0.0.1:8025:8025"]
+    assert doc["services"]["b"]["ports"] == ["127.0.0.1:9000:9000"]   # untouched
+    # "127.0.0.1:8025" would be read as host:container with an invalid host port;
+    # IP::CONTAINER keeps the loopback guarantee with an ephemeral host port.
+    assert doc["services"]["c"]["ports"] == ["127.0.0.1::8025"]
+    assert doc["services"]["d"]["ports"] == ["1.2.3.4:5:6"]
+
+
+def test_read_meta_tolerates_a_field_from_a_newer_version(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    ws = tmp_path / "repros" / "r"
+    ws.mkdir(parents=True)
+    (ws / "docker-compose.yml").write_text("name: rcrepro-r\n", encoding="utf-8")
+    blob = {
+        "name": "r", "project": "rcrepro-r", "rc_version": "8.5.1", "rc_image": "i",
+        "mongo_tag": "8.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3000", "host_port": 3000,
+        "version_source": "map (fallback)",
+        "a_field_from_the_future": {"nested": True},   # written by a newer rc-repro
+    }
+    (ws / "repro.json").write_text(json.dumps(blob), encoding="utf-8")
+    # Metadata(**blob) used to TypeError, and list_meta swallows that -- silently
+    # dropping the repro from `rc-repro list`.
+    m = runner.read_meta("r")
+    assert m.name == "r" and m.host_port == 3000
+    assert [x.name for x in runner.list_meta()] == ["r"]
+
+
+def test_update_config_is_a_locked_read_modify_write(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setenv("RC_REPRO_REG_TOKEN", "ephemeral-secret")
+    config.update_config(lambda cfg: cfg.__setitem__("default_repro", "a"))
+    config.update_config(lambda cfg: cfg.__setitem__("other", 1))
+    raw = config.config_file().read_text(encoding="utf-8")
+    # both updates survive (a read/write pair could lose one), and the env-only
+    # token is never persisted into the file
+    assert config.load_config(with_env=False) == {"default_repro": "a", "other": 1}
+    assert "ephemeral-secret" not in raw
+
+
+def test_resolve_name_rejects_a_name_that_is_not_a_repro(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from rc_repro import errors
+    from rc_repro.services import lifecycle as lcsvc
+    # The name becomes a filesystem path and a compose project name; sanitize()
+    # only runs at creation, so every other entry point validates the shape.
+    for bad in ("../../etc", "..", "Has-Caps", "with space", "semi;colon"):
+        try:
+            lcsvc.resolve_name(bad)
+        except errors.ValidationError:
+            continue
+        raise AssertionError(f"expected ValidationError for {bad!r}")
+
+
+def test_detail_redacts_secret_env_values():
+    from rc_repro.services import lifecycle as lcsvc
+    # The env tab is served to any client holding the session token and used to
+    # carry these verbatim.
+    for key in ("REG_TOKEN", "ADMIN_PASS",
+                "OVERWRITE_SETTING_LDAP_Authentication_Password",
+                "OVERWRITE_SETTING_FileUpload_S3_AWSSecretAccessKey",
+                "MINIO_ROOT_PASSWORD"):
+        assert lcsvc.redact_env(key, "s3cret") == lcsvc.REDACTED, key
+    # non-secrets stay visible -- debugging them is the point of the tab
+    for key, val in (("ROOT_URL", "http://localhost:3000"),
+                     ("MONGO_URL", "mongodb://mongodb:27017/rocketchat"),
+                     ("DEPLOY_METHOD", "docker")):
+        assert lcsvc.redact_env(key, val) == val, key
+    assert lcsvc.redact_env("REG_TOKEN", "") == ""      # empty stays empty
+
+
+def test_k6_keeps_secrets_out_of_the_argv(tmp_path, monkeypatch):
+    import types
+    from rc_repro.perf import k6
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    ws = tmp_path / "repros" / "r"
+    ws.mkdir(parents=True)
+    captured = {}
+
+    def fake_run(cmd, **_kw):
+        captured["cmd"] = cmd
+        (ws / "loadtest" / "summary.json").write_text(json.dumps({"rps": 1}), encoding="utf-8")
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(k6.subprocess, "run", fake_run)
+    k6.run("r", "messages", vus=1, duration="1s", ramp=None,
+           token="PAT-SECRET-VALUE", uid="u1", target="http://rocketchat:3000")
+    argv = " ".join(captured["cmd"])
+    # `ps` / /proc/<pid>/cmdline expose the argv to every local user for the whole
+    # run, and `docker inspect` afterwards.
+    assert "PAT-SECRET-VALUE" not in argv
+    assert config.ADMIN_PASSWORD not in argv
+    assert "--env-file" in captured["cmd"]
+    # non-secret env still rides the argv, and the secret file does not outlive the run
+    assert "RC_URL=http://rocketchat:3000" in captured["cmd"]
+    assert not (ws / "loadtest" / "k6.env").exists()
+
+
+# --- web UI static assets -----------------------------------------------------
+
+def test_webui_hidden_toggles_actually_hide():
+    """`el.hidden = true` must really hide, and must target an id that exists.
+
+    The UA stylesheet's `[hidden] { display: none }` loses to any author rule
+    setting `display` on the same element, and `form label`/`.checks label` both
+    do. Without an explicit `!important` override every hidden-toggle on a label
+    is a silent no-op -- the seed dialog shipped showing "Profile" and "Scale
+    spec" simultaneously in both modes because of exactly this.
+    """
+    import re
+    from importlib import resources
+    webui = resources.files("rc_repro").joinpath("data", "webui")
+    css = webui.joinpath("app.css").read_text(encoding="utf-8")
+    js = webui.joinpath("app.js").read_text(encoding="utf-8")
+    html = webui.joinpath("index.html").read_text(encoding="utf-8")
+
+    assert re.search(r"\[hidden\][^{]*\{[^}]*display:\s*none\s*!important", css), \
+        "app.css must force `[hidden] { display: none !important }`"
+
+    toggled = set(re.findall(r'\$\("#([^"]+)"\)\.hidden\s*=', js))
+    assert toggled, "expected app.js to toggle .hidden on at least one element"
+    missing = sorted(toggled - set(re.findall(r'id="([^"]+)"', html)))
+    assert not missing, f"app.js toggles .hidden on id(s) not in index.html: {missing}"
+
+
+def test_webui_busy_state_is_styled_and_labelled():
+    """Every action that shows a spinner must have a verb, and the classes app.js
+    emits for it must exist in app.css.
+
+    The busy state is assembled from three places -- the label passed to
+    runAction, the BUSY_VERB lookup, and the .spin/.working CSS -- so a rename in
+    any one of them silently degrades to a frozen, unstyled button.
+    """
+    import re
+    from importlib import resources
+    webui = resources.files("rc_repro").joinpath("data", "webui")
+    css = webui.joinpath("app.css").read_text(encoding="utf-8")
+    js = webui.joinpath("app.js").read_text(encoding="utf-8")
+
+    # Keys may be bare (Stop:) or quoted ("Make default":) -- a label with a space
+    # has to be quoted, and reading only bare keys made such an entry invisible
+    # here, so the check passed while the button still said "Make default…".
+    verbs = {bare or quoted for quoted, bare in
+             re.findall(r"(?:\"([^\"]+)\"|(\w+))\s*:\s*\"\w+ing\b",
+                        js[js.index("const BUSY_VERB"):].split("}")[0])}
+    assert verbs, "expected a BUSY_VERB map in app.js"
+
+    # Labels handed to runAction must resolve to a verb, else the button shows the
+    # bare label ("Stop…") instead of "Stopping…".
+    literal = set(re.findall(r'runAction\([^,]+,\s*"([^"]+)"', js))
+    state = set(re.findall(r'\b\w+:\s*"(\w+)"', js[js.index("const STATE_LABEL"):]
+                           .split("}")[0]))
+    missing = sorted((literal | state) - verbs)
+    assert not missing, f"action label(s) with no BUSY_VERB entry: {missing}"
+
+    for cls, sel in [("spin", r"\.spin\s*\{"), ("btn working", r"\.btn\.working"),
+                     ("pill working", r"\.pill\.working")]:
+        assert re.search(sel, css), f"app.js emits class {cls!r} with no rule in app.css"
+    assert re.search(r"@keyframes\s+rc-spin", css), "the .spin animation is undefined"
+    # A spinner that cannot animate must still say what is happening.
+    assert "prefers-reduced-motion" in css
+
+
+def test_webui_handles_every_state_the_backend_can_report():
+    """Each state repro_state() can return must be styled and filterable.
+
+    repro_state() stopped flattening docker's transitional states, so they now
+    reach the dashboard for real. A state the UI does not know about renders with
+    no colour and lands in renderDetail's fallback branch -- which did not exist
+    until these became reachable.
+    """
+    import re
+    from importlib import resources
+    from rc_repro.services import lifecycle as lc
+    webui = resources.files("rc_repro").joinpath("data", "webui")
+    css = webui.joinpath("app.css").read_text(encoding="utf-8")
+    html = webui.joinpath("index.html").read_text(encoding="utf-8")
+
+    for state in ("running", "stopped", "down", "unknown") + lc.TRANSIENT_STATES:
+        assert re.search(rf"\.card\.st-{state}\b", css), f"no card accent for state {state!r}"
+        assert re.search(rf"\.pill\.{state}\b", css), f"no pill colour for state {state!r}"
+    # …and each real one is reachable from the status filter.
+    for state in lc.TRANSIENT_STATES:
+        assert f'value="{state}"' in html, f"status filter cannot select {state!r}"
+
+
+# --- HTTPS add-on (--https) ---------------------------------------------------
+
+
+def _tls_spec(**kw):
+    from rc_repro import tls
+    base = dict(mode=tls.MODE_LOCAL, host="x.rcrepro.localhost", port=8443)
+    base.update(kw)
+    return tls.TlsSpec(**base)
+
+
+def test_tls_root_url_omits_an_implicit_443():
+    """A real domain answers on 443, so the URL must not carry it.
+
+    RC advertises ROOT_URL verbatim; "https://host:443" in an OAuth callback or a
+    mobile workspace URL is a mismatch against the same host without the port.
+    """
+    from rc_repro import tls
+    assert _tls_spec(port=8443).root_url == "https://x.rcrepro.localhost:8443"
+    assert _tls_spec(mode=tls.MODE_ACME, host="rc1.example.com", port=443).root_url \
+        == "https://rc1.example.com"
+
+
+def test_local_ca_is_created_once_and_leaf_carries_the_right_sans(monkeypatch, tmp_path):
+    """The CA is reused, and the leaf gets SANs -- not just a CN.
+
+    Browsers have ignored commonName since Chrome 58, so a cert with only a CN is
+    rejected outright (ERR_CERT_COMMON_NAME_INVALID).
+    """
+    import subprocess
+    from rc_repro import tls
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    key, crt = tls.ensure_ca()
+    assert key.exists() and crt.exists()
+    assert oct(key.stat().st_mode)[-3:] == "600", "the CA key must not be world-readable"
+    before = crt.read_bytes()
+    assert tls.ensure_ca() == (key, crt)
+    assert crt.read_bytes() == before, "ensure_ca must not regenerate an existing CA"
+
+    cert_pem, key_pem = tls.issue_leaf("x.rcrepro.localhost", ["192.168.1.42"])
+    assert "BEGIN CERTIFICATE" in cert_pem and "PRIVATE KEY" in key_pem
+    leaf = tmp_path / "leaf.crt"
+    leaf.write_text(cert_pem, encoding="utf-8")
+    text = subprocess.run(["openssl", "x509", "-in", str(leaf), "-noout", "-text"],
+                          capture_output=True, text=True).stdout
+    assert "DNS:x.rcrepro.localhost" in text
+    assert "DNS:localhost" in text            # keeps the existing http habits working
+    assert "IP Address:192.168.1.42" in text  # a LAN IP, which Let's Encrypt cannot issue
+    assert "IP Address:127.0.0.1" in text
+    # And it must actually chain to the CA, not merely parse.
+    v = subprocess.run(["openssl", "verify", "-CAfile", str(crt), str(leaf)],
+                       capture_output=True, text=True)
+    assert v.returncode == 0, v.stdout + v.stderr
+
+
+def test_https_adds_traefik_and_leaves_rocketchats_own_port_published():
+    """RC keeps its http port so rc-repro's own API calls need no CA.
+
+    login/PAT/seed/loadtest all use meta.root_url in 70+ places; pointing those at
+    a locally-signed https URL would fail verification in every one of them.
+    """
+    pre = presets.load("default")
+    res = versions.resolve("8.6.1", offline=True)
+    st = _tls_spec()
+    spec = compose.Spec.from_resolved(
+        res, project_name="rcrepro-x", root_url=st.root_url, host_port=3000,
+        reg_token=None, preset=pre, tls=st)
+    doc = compose.build(spec)
+
+    assert "traefik" in doc["services"]
+    t = doc["services"]["traefik"]
+    assert t["ports"] == ["127.0.0.1:8443:443"]
+    assert t["depends_on"] == ["rocketchat"], "must not route before RC exists"
+    # RC advertises https, but still publishes its own plain port.
+    assert doc["services"]["rocketchat"]["environment"]["ROOT_URL"] == st.root_url
+    assert doc["services"]["rocketchat"]["ports"] == ["127.0.0.1:3000:3000"]
+
+
+def test_https_refuses_to_layer_onto_a_preset_that_already_runs_traefik():
+    """multi-instance owns its own Traefik; two would fight over the entrypoint.
+
+    Silently merging produced a repro that booted and served nothing, with the
+    reason only in `docker compose logs traefik`.
+    """
+    import pytest
+    pre = presets.load("multi-instance", {"instances": "2"})
+    res = versions.resolve("8.6.1", offline=True)
+    spec = compose.Spec.from_resolved(
+        res, project_name="rcrepro-x", root_url="https://x", host_port=3000,
+        reg_token=None, preset=pre, tls=_tls_spec())
+    with pytest.raises(ValueError, match="already runs"):
+        compose.build(spec)
+
+
+def test_acme_flags_map_to_traefik_resolver_args():
+    from rc_repro import tls
+    prod = tls.service(_tls_spec(mode=tls.MODE_ACME, host="rc1.example.com", port=443,
+                                 acme_email="ops@example.com"))
+    cmd = " ".join(prod["command"])
+    assert "--certificatesresolvers.le.acme.email=ops@example.com" in cmd
+    assert "acme.tlschallenge=true" in cmd, "default challenge needs only :443"
+    assert "caserver" not in cmd, "production must not point at the staging directory"
+    # acme.json lives outside the workspace, so `down --volumes` cannot force a
+    # re-issue (5 certs per identical hostname per 7 days).
+    assert any(str(tls.acme_dir()) in v for v in prod["volumes"])
+
+    stg = tls.service(_tls_spec(mode=tls.MODE_ACME, host="rc1.example.com", port=443,
+                                acme_email="a@b.c", acme_staging=True))
+    assert "acme-staging-v02" in " ".join(stg["command"])
+
+    # :80 and the permanent redirect to https, matching the official
+    # rocketchat-compose Traefik files. Decided by the caller (it has to probe the
+    # port), so the builder just honours the flag.
+    plain = tls.service(_tls_spec(mode=tls.MODE_ACME, host="h", port=443,
+                                  acme_email="a@b.c"))
+    assert "--entryPoints.web.address=:80" not in plain["command"]
+    assert "80:80" not in plain["ports"]
+
+    redir = tls.service(_tls_spec(mode=tls.MODE_ACME, host="h", port=443,
+                                  acme_email="a@b.c", http_redirect=True))
+    cmd = redir["command"]
+    assert "--entryPoints.web.address=:80" in cmd
+    assert "--entryPoints.web.http.redirections.entryPoint.to=websecure" in cmd
+    assert "--entryPoints.web.http.redirections.entryPoint.scheme=https" in cmd
+    assert "--entryPoints.web.http.redirections.entryPoint.permanent=true" in cmd
+    assert "80:80" in redir["ports"]
+
+    # Local mode is on an allocated port, so a redirect does not apply at all.
+    assert tls.can_redirect_http(tls.MODE_LOCAL, 8443) is False
+    assert tls.can_redirect_http(tls.MODE_ACME, 443) is True
+    assert tls.can_redirect_http(tls.MODE_OWN, 443) is True
+
+
+def test_dynamic_config_uses_a_static_pair_locally_and_a_resolver_for_acme():
+    from rc_repro import tls
+    local = dict(tls.files(_tls_spec(), ["rocketchat"], "CERT", "KEY"))
+    assert local["tls/certs/tls.crt"] == "CERT" and local["tls/certs/tls.key"] == "KEY"
+    assert "certFile: /etc/traefik/certs/tls.crt" in local["tls/dynamic.yml"]
+    assert "certResolver" not in local["tls/dynamic.yml"]
+
+    acme = dict(tls.files(_tls_spec(mode=tls.MODE_ACME, host="h", port=443), ["rocketchat"]))
+    assert "tls/certs/tls.crt" not in acme, "ACME certs come from Traefik, not the workspace"
+    assert "certResolver: le" in acme["tls/dynamic.yml"]
+    # The DDP websocket must not be bounced between instances mid-session.
+    assert "sticky" in acme["tls/dynamic.yml"] and "secure: true" in acme["tls/dynamic.yml"]
+
+
+def test_own_cert_is_validated_before_traefik_would_silently_fail(tmp_path):
+    import pytest
+    from rc_repro import tls
+    from rc_repro.errors import ValidationError
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    with pytest.raises(ValidationError, match="no such file"):
+        tls.read_own_cert(str(cert), str(key))
+    cert.write_text("not a cert", encoding="utf-8")
+    key.write_text("-----BEGIN PRIVATE KEY-----", encoding="utf-8")
+    with pytest.raises(ValidationError, match="not a PEM certificate"):
+        tls.read_own_cert(str(cert), str(key))
+    cert.write_text("-----BEGIN CERTIFICATE-----", encoding="utf-8")
+    key.write_text("nope", encoding="utf-8")
+    with pytest.raises(ValidationError, match="not a PEM private key"):
+        tls.read_own_cert(str(cert), str(key))
+
+
+def test_metadata_external_url_prefers_https_and_survives_an_old_repro_json(tmp_path, monkeypatch):
+    """public_url is additive: a repro.json written before it must still load."""
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = runner.Metadata(
+        name="x", project="rcrepro-x", rc_version="8.6.1", rc_image="i", mongo_tag="8.0",
+        mongo_flavor="official", preset="default", root_url="http://localhost:3000",
+        host_port=3000, version_source="map")
+    assert m.external_url == "http://localhost:3000"       # no TLS -> unchanged
+    m.public_url = "https://x.rcrepro.localhost:8443"
+    assert m.external_url == "https://x.rcrepro.localhost:8443"
+
+    runner.write("x", "services: {}\n", m)
+    (runner.workspace("x") / "repro.json").write_text(
+        json.dumps({"name": "x", "project": "rcrepro-x", "rc_version": "8.6.1",
+                    "rc_image": "i", "mongo_tag": "8.0", "mongo_flavor": "official",
+                    "preset": "default", "root_url": "http://localhost:3000",
+                    "host_port": 3000, "version_source": "map"}), encoding="utf-8")
+    old = runner.read_meta("x")
+    assert old.public_url == "" and old.external_url == "http://localhost:3000"
+
+
+def test_privileged_port_is_not_reported_busy_just_because_we_cannot_bind_it(monkeypatch):
+    """443 is publishable even though an unprivileged process cannot bind it.
+
+    The docker daemon runs as root, so `ports: 443:443` works fine. bind() as the
+    calling user raises EACCES, and treating that as "in use" made
+    `up --https --domain ...` refuse 443 on every non-root machine with nothing
+    listening on it at all.
+    """
+    import socket
+    from rc_repro import runner
+
+    real_socket = socket.socket
+
+    class FakeSock:
+        """Nothing is listening; bind() fails the way a privileged port does."""
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def settimeout(self, _t): pass
+        def setsockopt(self, *a): pass
+        def connect_ex(self, _addr): return 111          # ECONNREFUSED: no listener
+        def bind(self, addr):
+            if addr[1] < 1024:
+                raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(socket, "socket", FakeSock)
+    assert runner.port_free(443) is True
+    assert runner.port_free(8443) is True
+
+    # A real listener must still register as busy — the connect() probe catches it.
+    class Listening(FakeSock):
+        def connect_ex(self, _addr): return 0
+    monkeypatch.setattr(socket, "socket", Listening)
+    assert runner.port_free(443) is False
+    assert runner.port_free(8443) is False
+
+    # And a genuine EADDRINUSE on an unprivileged port is still busy.
+    class InUse(FakeSock):
+        def bind(self, addr): raise OSError(98, "Address already in use")
+    monkeypatch.setattr(socket, "socket", InUse)
+    assert runner.port_free(8443) is False
+    socket.socket = real_socket
+
+
+def test_staging_notes_never_claim_the_certificate_is_trusted():
+    """A Let's Encrypt STAGING root is in no trust store — that is the point.
+
+    The notes said "Publicly trusted, so the mobile app accepts it with nothing to
+    install" for staging too, which sent people hunting for a broken workspace when
+    the browser warning was the correct, expected outcome.
+    """
+    from rc_repro import tls
+    spec = tls.TlsSpec(mode=tls.MODE_ACME, host="rc1.example.com", port=443,
+                       acme_email="a@b.c", acme_staging=True)
+    text = " ".join(tls.notes(spec, "rc1")).lower()
+    assert "staging" in text
+    assert "not trusted" in text, "staging must say plainly that it is untrusted"
+    assert "publicly trusted" not in text
+    assert "success signal" in text, "a warning on staging is expected, not a failure"
+    # And it must say how to get a real one.
+    assert "without --acme-staging" in text
+    # The name is threaded in, so the hint is copy-pasteable.
+    assert "tls-status --name rc1" in " ".join(tls.notes(spec, "rc1"))
+
+    prod = tls.TlsSpec(mode=tls.MODE_ACME, host="rc1.example.com", port=443,
+                       acme_email="a@b.c")
+    assert "publicly trusted" in " ".join(tls.notes(prod, "rc1")).lower()
+
+
+def test_dns_preflight_rules_out_what_acme_cannot_possibly_reach(monkeypatch):
+    """Catch the certain-to-fail cases before an attempt spends quota.
+
+    Let's Encrypt allows 5 failed validations per hostname per hour, so a
+    misconfiguration that is knowable up front must not cost one.
+    """
+    from rc_repro import tls
+    monkeypatch.setattr(tls, "resolves_to", lambda h: [])
+    ok, msg = tls.dns_preflight("nope.example.com")
+    assert not ok and "does not resolve" in msg
+
+    monkeypatch.setattr(tls, "resolves_to", lambda h: ["127.0.0.1"])
+    ok, msg = tls.dns_preflight("local.example.com")
+    assert not ok and "cannot reach" in msg
+
+    monkeypatch.setattr(tls, "resolves_to", lambda h: ["192.168.1.5", "10.0.0.4"])
+    ok, _ = tls.dns_preflight("lan.example.com")
+    assert not ok, "private-only must fail: ACME connects from the public internet"
+
+    # RFC 5737 documentation ranges (203.0.113.0/24 etc.) count as private to
+    # Python, and rightly so -- nobody serves a workspace from one. Use a real
+    # routable address here.
+    monkeypatch.setattr(tls, "resolves_to", lambda h: ["93.184.216.34"])
+    ok, msg = tls.dns_preflight("rc1.example.com")
+    assert ok and "93.184.216.34" in msg
+    monkeypatch.setattr(tls, "resolves_to", lambda h: ["192.168.1.5", "93.184.216.34"])
+    assert tls.dns_preflight("rc1.example.com")[0]
+
+
+def test_verify_reads_a_real_endpoint_and_separates_the_two_trust_questions(tmp_path, monkeypatch):
+    """verify() must report an untrusted-but-working endpoint as working.
+
+    Staging and local-CA certs are untrusted by design; refusing to look at them
+    would report "broken" for a setup behaving exactly as intended. And `trusted`
+    (system store) must stay distinct from `trusted_via_ca` (chains to a given CA),
+    else local mode always claims trust and hides whether trust-ca has run.
+    """
+    import socket as _socket
+    import ssl
+    import threading
+    from rc_repro import tls
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    _, ca_crt = tls.ensure_ca()
+    cert_pem, key_pem = tls.issue_leaf("localhost")
+    cf, kf = tmp_path / "s.crt", tmp_path / "s.key"
+    cf.write_text(cert_pem, encoding="utf-8")
+    kf.write_text(key_pem, encoding="utf-8")
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cf), str(kf))
+    srv = _socket.socket()
+    srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(5)
+    stop = threading.Event()
+
+    def serve():
+        srv.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                c, _ = srv.accept()
+            except (TimeoutError, OSError):
+                continue
+            try:
+                with ctx.wrap_socket(c, server_side=True):
+                    pass
+            except OSError:
+                pass
+            finally:
+                c.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        r = tls.verify("localhost", port, timeout=5, cafile=str(ca_crt))
+        assert r["serving"] is True and not r["error"]
+        assert "rc-repro local CA" in r["issuer"]
+        assert "localhost" in r["subject"]
+        assert r["fallback"] is False
+        assert r["trusted_via_ca"] is True, "must chain to the CA it was handed"
+        assert r["trusted"] is False, "the system store does not know this CA"
+    finally:
+        stop.set()
+        srv.close()
+        t.join(timeout=3)
+
+    # Nothing listening -> reported, not raised.
+    dead = tls.verify("127.0.0.1", port, timeout=2, cafile=str(ca_crt))
+    assert dead["serving"] is False and dead["error"]
+
+
+def test_dns_preflight_falls_back_to_public_resolvers(monkeypatch):
+    """The question is "what will Let's Encrypt see?", not "what does /etc/resolv.conf say?".
+
+    A lab or corporate resolver with a stale negative cache reported a perfectly
+    good public record as absent, and the hard failure blocked a valid setup.
+    """
+    import socket
+    from rc_repro import tls
+
+    def no_local_answer(*a, **k):
+        raise OSError("resolver has nothing for this name")
+
+    monkeypatch.setattr(socket, "getaddrinfo", no_local_answer)
+    monkeypatch.setattr(tls, "_dig",
+                        lambda h, r: ["104.21.71.43"] if r == "1.1.1.1" else [])
+    assert tls.resolves_to("chatrepo.example.org") == ["104.21.71.43"]
+    # public=False is the "only what this machine sees" variant.
+    assert tls.resolves_to("chatrepo.example.org", public=False) == []
+
+
+def test_preflight_refuses_an_inbound_challenge_behind_a_tls_terminating_proxy(monkeypatch):
+    """An orange-clouded record cannot pass tlsalpn, and the error says why.
+
+    Cloudflare terminates TLS at its edge, so Let's Encrypt validates against
+    Cloudflare's certificate and never reaches this host. dns-01 is unaffected: it
+    only reads a TXT record.
+    """
+    from rc_repro import tls
+    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["104.21.71.43", "172.67.143.25"])
+    ok, msg = tls.dns_preflight("chatrepo.example.org", "tlsalpn")
+    assert not ok
+    assert "Cloudflare" in msg and "--acme-challenge dns" in msg
+    assert "CF_DNS_API_TOKEN" in msg, "must say where the token goes"
+    ok, msg = tls.dns_preflight("chatrepo.example.org", "dns")
+    assert ok and "no inbound access" in msg
+
+    # A normal public origin still passes the inbound challenges.
+    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["93.184.216.34"])
+    assert tls.dns_preflight("rc1.example.org", "tlsalpn")[0]
+
+
+def test_dns_challenge_ignores_where_the_name_points(monkeypatch):
+    """dns-01 needs no inbound reachability, so private/loopback answers are fine."""
+    from rc_repro import tls
+    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["10.0.0.5"])
+    assert tls.dns_preflight("internal.example.org", "dns")[0]
+    # ...but an inbound challenge to the same name cannot work.
+    assert not tls.dns_preflight("internal.example.org", "tlsalpn")[0]
+
+
+def test_staging_and_production_use_separate_acme_storage():
+    """Traefik keys stored certs by RESOLVER name, not by CA server.
+
+    Pointing one resolver at staging and then at production leaves the staging
+    certificate in storage and keeps serving it -- the well-known "delete
+    acme.json when you switch" trap. Separate files make the switch real.
+    """
+    from rc_repro import tls
+
+    def storage(staging):
+        spec = tls.TlsSpec(mode=tls.MODE_ACME, host="h", port=443,
+                           acme_email="a@b.c", acme_staging=staging)
+        return [a for a in tls.service(spec)["command"] if ".acme.storage=" in a][0]
+
+    assert storage(True) != storage(False)
+    assert tls.ACME_FILE_STAGING in storage(True)
+    assert storage(False).endswith("/" + tls.ACME_FILE)
+    # Only the staging run may point at the staging directory.
+    stg = tls.TlsSpec(mode=tls.MODE_ACME, host="h", port=443, acme_email="a@b.c",
+                      acme_staging=True)
+    prod = tls.TlsSpec(mode=tls.MODE_ACME, host="h", port=443, acme_email="a@b.c")
+    assert "acme-staging-v02" in " ".join(tls.service(stg)["command"])
+    assert "acme-staging-v02" not in " ".join(tls.service(prod)["command"])
+
+
+def test_dns_credentials_are_required_and_provider_agnostic(tmp_path, monkeypatch):
+    """Every lego provider reads its OWN variables, so this checks the file, not keys.
+
+    Mounting the env file only "if it exists" let a missing file through, and
+    Traefik then ran with no credentials and failed opaquely minutes later.
+    """
+    from rc_repro import tls
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    for provider in ("cloudflare", "route53", "digitalocean", "gcloud", "azuredns"):
+        ok, msg = tls.dns_credentials(provider)
+        assert not ok
+        assert str(tls.dns_env_path()) in msg
+        # Point at THAT provider's documentation, not Cloudflare's.
+        assert f"{tls.LEGO_PROVIDER_DOCS}{provider}/" in msg
+
+    env = tls.dns_env_path()
+    env.parent.mkdir(parents=True, exist_ok=True)
+    env.write_text("# a comment\n\n", encoding="utf-8")
+    ok, msg = tls.dns_credentials("route53")
+    assert not ok and "no KEY=VALUE" in msg
+
+    # Any provider's variables satisfy it, and values are never echoed back.
+    env.write_text("AWS_ACCESS_KEY_ID=AKIAsecret\nAWS_SECRET_ACCESS_KEY=hunter2\n",
+                   encoding="utf-8")
+    ok, msg = tls.dns_credentials("route53")
+    assert ok and "AWS_ACCESS_KEY_ID" in msg and "AWS_SECRET_ACCESS_KEY" in msg
+    assert "AKIAsecret" not in msg and "hunter2" not in msg
+
+    # And the file is mounted unconditionally, not "if it exists".
+    spec = tls.TlsSpec(mode=tls.MODE_ACME, host="h", port=443, acme_email="a@b.c",
+                       acme_challenge="dns", acme_dns_provider="route53")
+    assert tls.service(spec)["env_file"] == [str(env)]
+
+
+def test_verify_can_present_a_different_sni_than_the_address_it_dials():
+    """tls-status must probe THIS host, not the public name.
+
+    Checking the hostname meant a proxy in front (Cloudflare's orange cloud)
+    answered instead, and its valid edge certificate was reported as ours while
+    our own Traefik had none.
+    """
+    import inspect
+    from rc_repro import tls
+    sig = inspect.signature(tls.verify)
+    assert "sni" in sig.parameters
+    src = inspect.getsource(tls.verify)
+    assert "server_hostname=servername" in src
+    assert "server_hostname=host" not in src, "every handshake must honour sni"
+
+
+def test_acme_router_declares_the_domain_it_needs_a_certificate_for():
+    """Traefik must be TOLD the domain, because the rule has no Host() matcher.
+
+    Traefik derives what to request from a router's Host() rule. This rule is
+    PathPrefix(`/`) on purpose, so the workspace also answers on localhost — which
+    left ACME with nothing to ask for: it logs "no domain found" and silently
+    serves its default certificate, indistinguishable from a failed challenge with
+    no request ever having been made.
+    """
+    from rc_repro import tls
+    spec = tls.TlsSpec(mode=tls.MODE_ACME, host="testrepo.kestron.org", port=443,
+                       acme_email="a@b.c")
+    y = dict(tls.files(spec, ["rocketchat"]))["tls/dynamic.yml"]
+    assert "certResolver: le" in y
+    assert "domains:" in y
+    assert '- main: "testrepo.kestron.org"' in y
+
+    # Static-certificate modes must NOT carry a resolver or a domains block.
+    local = dict(tls.files(tls.TlsSpec(host="x.rcrepro.localhost", port=8443),
+                           ["rocketchat"], "C", "K"))["tls/dynamic.yml"]
+    assert "certResolver" not in local and "domains:" not in local
+
+
+def test_dns01_does_not_require_the_host_to_resolve(monkeypatch):
+    """dns-01 reads a TXT at _acme-challenge.<host>; the host needs no A record.
+
+    Requiring one refused setups that would have issued perfectly well — you can
+    get a certificate before pointing the name anywhere.
+    """
+    from rc_repro import tls
+    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: [])
+    ok, msg = tls.dns_preflight("testrepo.kestron.org", "dns")
+    assert ok and "fine for dns-01" in msg
+    # An inbound challenge still needs the name to resolve, and now points at the
+    # alternative that does not.
+    ok, msg = tls.dns_preflight("testrepo.kestron.org", "tlsalpn")
+    assert not ok and "--acme-challenge dns" in msg
+
+
+def test_reachability_gaps_separate_a_valid_cert_from_a_reachable_workspace(monkeypatch):
+    """Issuance succeeding is not the same as the name being reachable.
+
+    dns-01 issues with no DNS record and no public route, after which the summary
+    advertises an https URL nothing outside the machine can open. Proven against a
+    real run: a production certificate was issued and served correctly while the
+    hostname had no record at all and Traefik was bound to 127.0.0.1.
+    """
+    from rc_repro import tls
+    spec = tls.TlsSpec(mode=tls.MODE_ACME, host="testrepo.example.org", port=443,
+                       acme_email="a@b.c", acme_challenge="dns",
+                       acme_dns_provider="cloudflare")
+
+    # No DNS record and loopback-bound: both gaps named.
+    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: [])
+    monkeypatch.setattr(tls, "host_has_public_address", lambda: False)
+    gaps = tls.reachability_gaps(spec, "127.0.0.1")
+    assert any("no DNS record" in g for g in gaps)
+    assert any("bound to 127.0.0.1" in g for g in gaps)
+
+    # Public bind but no public address on the host -> still unreachable.
+    gaps = tls.reachability_gaps(spec, "0.0.0.0")
+    assert any("no public address" in g for g in gaps)
+    assert not any("bound to" in g for g in gaps)
+
+    # Record exists, public bind, routable host -> nothing to warn about.
+    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["93.184.216.34"])
+    monkeypatch.setattr(tls, "host_has_public_address", lambda: True)
+    assert tls.reachability_gaps(spec, "0.0.0.0") == []
+    # ...but binding to loopback is still a gap even with good DNS.
+    assert tls.reachability_gaps(spec, "127.0.0.1") == [
+        "the workspace is bound to 127.0.0.1"]
+
+
+def test_domain_is_normalized_the_way_the_official_docs_require():
+    """The Rocket.Chat compose docs say DOMAIN must have no scheme or trailing slash.
+
+    They say it because people get it wrong, and unguarded it corrupted three
+    things at once: ROOT_URL became "https://https://host", the ACME `domains`
+    entry became a value Let's Encrypt rejects, and the TLS SNI name never matched.
+    """
+    import pytest
+    from rc_repro import tls
+    from rc_repro.errors import ValidationError
+
+    # One obvious meaning -> corrected, and the correction is reported.
+    for given in ("rc1.example.com", "https://rc1.example.com", "http://rc1.example.com/",
+                  "RC1.Example.COM.", "  rc1.example.com  ", "rc1.example.com."):
+        host, note = tls.normalize_domain(given)
+        assert host == "rc1.example.com", given
+        if given != "rc1.example.com":
+            assert note, f"{given!r} was changed silently"
+
+    # Ambiguous or unsupported -> refused, because silently dropping part of what
+    # was asked for is worse than saying no.
+    for given, expect in [
+        ("rc1.example.com:8443", "contains a port"),
+        ("rc1.example.com/chat", "contains a path"),
+        ("*.example.com", "is a wildcard"),
+        ("bad_host.example.com", "not a valid hostname"),
+        ("-x.example.com", "not a valid hostname"),
+        ("https://", "empty"),
+    ]:
+        with pytest.raises(ValidationError, match=expect):
+            tls.normalize_domain(given)
+
+    # And the normalized host is what reaches ROOT_URL and the ACME domains block.
+    host, _ = tls.normalize_domain("HTTPS://RC1.Example.COM/")
+    spec = tls.TlsSpec(mode=tls.MODE_ACME, host=host, port=443, acme_email="a@b.c")
+    assert spec.root_url == "https://rc1.example.com"
+    y = dict(tls.files(spec, ["rocketchat"]))["tls/dynamic.yml"]
+    assert '- main: "rc1.example.com"' in y
+
+
+# --- env var overrides (up --env / rc-repro env) -------------------------------
+
+
+def test_env_overrides_beat_the_preset_and_can_remove_a_base_key():
+    """User overrides are applied last, and None removes a key entirely.
+
+    Blanking a base default to "" is not the same as removing it — Rocket.Chat
+    treats an empty value as set — so unset has to delete the key.
+    """
+    pre = presets.load("default")
+    res = versions.resolve("8.6.1", offline=True)
+    spec = compose.Spec.from_resolved(
+        res, project_name="p", root_url="http://x", host_port=3000, reg_token=None,
+        preset=pre, env_overrides={"MY_VAR": "v", "ADMIN_USERNAME": "someone",
+                                   "MONGO_URL": None})
+    env = compose.build(spec)["services"]["rocketchat"]["environment"]
+    assert env["MY_VAR"] == "v"
+    assert env["ADMIN_USERNAME"] == "someone", "an override must beat the base default"
+    assert "MONGO_URL" not in env, "None must delete the key, not blank it"
+    # Untouched keys survive.
+    assert env["ROOT_URL"] == "http://x" and env["PORT"] == "3000"
+
+    # No overrides -> byte-identical to before the feature existed.
+    plain = compose.Spec.from_resolved(
+        res, project_name="p", root_url="http://x", host_port=3000, reg_token=None,
+        preset=pre)
+    assert "MY_VAR" not in compose.build(plain)["services"]["rocketchat"]["environment"]
+
+
+def test_env_overrides_apply_to_every_rocketchat_instance():
+    """multi-instance clones rocketchat into rocketchat-1..N; all must get them."""
+    pre = presets.load("multi-instance", {"instances": "3"})
+    res = versions.resolve("8.6.1", offline=True)
+    spec = compose.Spec.from_resolved(
+        res, project_name="p", root_url="http://x", host_port=3000, reg_token=None,
+        preset=pre, env_overrides={"MY_VAR": "v"})
+    doc = compose.build(spec)
+    rc = [s for s in doc["services"] if s.startswith("rocketchat")]
+    assert len(rc) == 3
+    for svc in rc:
+        assert doc["services"][svc]["environment"]["MY_VAR"] == "v", svc
+
+
+def test_env_var_names_are_validated_before_reaching_compose():
+    """An invalid name produces a compose file docker rejects, so refuse it here."""
+    import pytest
+    from rc_repro.errors import ValidationError
+    from rc_repro.services import envvars
+
+    assert envvars.parse_set(["A=1", "B_2=x=y"]) == {"A": "1", "B_2": "x=y"}
+    assert envvars.parse_set([]) == {}
+    with pytest.raises(ValidationError, match="not KEY=VALUE"):
+        envvars.parse_set(["JUST_A_KEY"])
+    for bad in ("2LEADING=1", "has-hyphen=1", "has space=1", "=1"):
+        with pytest.raises(ValidationError, match="valid environment variable name"):
+            envvars.parse_set([bad])
+    with pytest.raises(ValidationError, match="valid environment variable name"):
+        envvars.check_names(["has-hyphen"])
+
+
+def test_env_rows_mark_which_keys_the_user_set():
+    """The panel offers "remove" on every row, and it means different things.
+
+    Removing an override restores the preset default; removing an inherited key
+    deletes it from the workspace. The panel can only say which if detail() marks
+    them.
+    """
+    from rc_repro.services import lifecycle as lc
+    doc = {"services": {"rocketchat": {"environment": {
+        "MY_VAR": "v", "ADMIN_PASS": "secret", "PORT": "3000"}}}}
+    rows = {r["key"]: r for r in lc._env_rows(doc, {"MY_VAR": "v"})}
+    assert rows["MY_VAR"]["override"] is True
+    assert rows["PORT"]["override"] is False
+    assert rows["ADMIN_PASS"]["value"] == "********", "credentials still masked"
+    # No overrides argument -> nothing marked, and the shape is unchanged.
+    assert all(r["override"] is False for r in lc._env_rows(doc))
+    # compose's list form is handled too.
+    listform = {"services": {"rocketchat": {"environment": ["A=1", "B=2"]}}}
+    assert [r["key"] for r in lc._env_rows(listform, {"A": "1"})] == ["A", "B"]
+    assert lc._env_rows(listform, {"A": "1"})[0]["override"] is True
+
+
+def test_setting_expansion_and_the_bare_setting_id_trap():
+    """A Rocket.Chat SETTING only applies from the environment WITH the prefix.
+
+    Verified against a live 8.6.1 workspace: `Accounts_ShowFormLogin=false` left the
+    setting `True`, while `OVERWRITE_SETTING_Accounts_ShowFormLogin=false` made it
+    `False`. The bare form is accepted by docker and silently does nothing, which is
+    why --setting exists and why a bare setting id is warned about.
+    """
+    from rc_repro.services import envvars
+    assert envvars.SETTING_PREFIX == "OVERWRITE_SETTING_"
+    assert envvars.as_setting(["Message_AllowEditing=false"]) == {
+        "OVERWRITE_SETTING_Message_AllowEditing": "false"}
+    # A value containing '=' survives; only the first separator splits.
+    assert envvars.as_setting(["A_B=x=y"]) == {"OVERWRITE_SETTING_A_B": "x=y"}
+    assert envvars.as_setting([]) == {}
+    # It reuses the same name validation as --set.
+    import pytest
+    from rc_repro.errors import ValidationError
+    with pytest.raises(ValidationError, match="not KEY=VALUE"):
+        envvars.as_setting(["Message_AllowEditing"])
+
+
+def test_bare_setting_warning_asks_the_workspace_and_stays_quiet_when_it_cannot(monkeypatch):
+    """Which names are settings is version-specific, so ask the workspace, not a list.
+
+    And it is only a warning path: an unreachable workspace must not block an env
+    change, since setting env on a repro that is not serving is legitimate.
+    """
+    from rc_repro import rcapi
+    from rc_repro.services import envvars
+    meta = type("M", (), {"name": "e", "root_url": "http://x", "extra": {}})()
+
+    monkeypatch.setattr(envvars.lifecycle, "login", lambda m: object())
+    monkeypatch.setattr(rcapi, "setting_ids",
+                        lambda *a, **k: {"Message_AllowEditing", "Accounts_ShowFormLogin"})
+    seen: list = []
+    envvars.warn_bare_settings(meta, ["Message_AllowEditing", "MY_OWN_VAR"], seen.append)
+    msgs = " ".join(str(getattr(e, "message", e)) for e in seen)
+    assert "Message_AllowEditing is a Rocket.Chat SETTING" in msgs
+    assert "OVERWRITE_SETTING_Message_AllowEditing" in msgs, "must give the fix"
+    assert "MY_OWN_VAR" not in msgs, "a real env var must not be flagged"
+
+    # Already prefixed -> nothing to say, and no API call needed.
+    seen.clear()
+    envvars.warn_bare_settings(meta, ["OVERWRITE_SETTING_Message_AllowEditing"], seen.append)
+    assert seen == []
+
+    # Workspace unreachable -> silent, never fatal.
+    seen.clear()
+    monkeypatch.setattr(envvars.lifecycle, "login",
+                        lambda m: (_ for _ in ()).throw(RuntimeError("not serving")))
+    envvars.warn_bare_settings(meta, ["Message_AllowEditing"], seen.append)
+    assert seen == []
+    seen.clear()
+    monkeypatch.setattr(envvars.lifecycle, "login", lambda m: object())
+    monkeypatch.setattr(rcapi, "setting_ids", lambda *a, **k: None)
+    envvars.warn_bare_settings(meta, ["Message_AllowEditing"], seen.append)
+    assert seen == []
