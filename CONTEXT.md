@@ -5,25 +5,27 @@ reproducing product behaviour and collecting evidence.
 
 ## Language
 
-**Reproduction Specification**:
-A resolved description of the environment to create: its deployment shape,
-rendering backend, reproduction scenarios, and seed dataset.
-_Avoid_: Preset, workload scenario
+**Preset**:
+A named entry in rc-repro's existing catalog that configures a reproduction. A
+preset may describe a deployment type, a reproduction scenario, or both.
+_Avoid_: Reproduction specification, workload scenario
 
-**Deployment Shape**:
-The arrangement of Rocket.Chat application processes in a reproduction, such
-as single-instance, multi-instance, or microservices.
-_Avoid_: Backend, execution target, topology
+**Deployment Type**:
+The supported way Rocket.Chat and its required services are deployed for a
+reproduction, such as the default Compose deployment, Compose multi-instance,
+or Kubernetes microservices.
+_Avoid_: Rendering backend, execution target, scenario
 
-**Rendering Backend**:
-The deployment system that materialises a reproduction specification, such as
-Compose or Kubernetes.
-_Avoid_: Deployment shape, execution target, topology
+**Microservices Deployment**:
+The Kubernetes microservices deployment type in rc-repro's existing preset
+catalog, with the same lifecycle expectations as other deployments.
+_Avoid_: Kubernetes platform, composition framework
 
 **Reproduction Scenario**:
-A compatible product behaviour or integration context included in a
-reproduction, such as LDAP, SAML, email, or object storage.
-_Avoid_: Seed dataset, workload scenario, topology
+A product behaviour or integration context to reproduce, such as LDAP, SAML,
+email, or object storage. A scenario should be reusable across compatible
+deployment types rather than duplicated for each deployment.
+_Avoid_: Deployment type, seed dataset, workload scenario
 
 **Seed Dataset**:
 A named initial state for a reproduction, including its intended users,
@@ -36,11 +38,6 @@ logins, messaging, or a complete user journey.
 _Avoid_: Seed dataset, reproduction scenario, preset
 
 **Execution Target**:
-The runtime location on which a rendering backend operates, such as a local
+The runtime location on which a deployment is created, such as a local
 container engine, a remote container host, or a selected Kubernetes cluster.
-_Avoid_: Deployment shape, rendering backend, scenario
-
-**Preset Alias**:
-A legacy preset name that expands to a partial reproduction specification and
-remains valid for existing users and saved records.
-_Avoid_: Reproduction specification, combined preset
+_Avoid_: Deployment type, scenario
