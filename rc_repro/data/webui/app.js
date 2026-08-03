@@ -1472,7 +1472,6 @@ async function submitCreate() {
     seed_profile: f.seed_profile.value,
     params: {},
   };
-  if (f.seed.checked && f.seed_profile) req.seed_profile = f.seed_profile.value;
   if (!req.version) { toast("version is required"); return; }
   for (const inp of f.querySelectorAll("input[name^='set:']")) {
     if (inp.value.trim()) req.params[inp.name.slice(4)] = inp.value.trim();

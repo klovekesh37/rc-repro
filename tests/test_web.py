@@ -367,8 +367,10 @@ def test_browser_create_form_sends_the_selected_seed_profile():
     root = Path(__file__).resolve().parents[1] / "rc_repro" / "data" / "webui"
     html = (root / "index.html").read_text(encoding="utf-8")
     script = (root / "app.js").read_text(encoding="utf-8")
+    create = script.split("async function submitCreate() {", 1)[1].split("\n}\n\n// ---- wiring", 1)[0]
     assert 'select name="seed_profile"' in html
-    assert "seed_profile: f.seed_profile.value" in script
+    assert "seed_profile: f.seed_profile.value" in create
+    assert "req.seed_profile = f.seed_profile.value" not in create
 
 
 def test_browser_prune_reports_partial_cleanup_and_kind_cluster():
