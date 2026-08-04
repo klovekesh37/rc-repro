@@ -618,6 +618,45 @@ def docker_server_platform() -> str | None:
     return _first_line(["docker", "version", "--format", "{{.Server.Platform.Name}}"])
 
 
+def docker_server_components() -> tuple[str, ...]:
+    """Named components reported by the active Docker-compatible server.
+
+    Podman's compatibility API can expose a generic Linux platform and a
+    ``/var/run/docker.sock`` endpoint while still identifying ``Podman Engine``
+    here. Component names are server facts; unlike finding a local executable,
+    they describe the endpoint Docker commands are actually using.
+    """
+    raw = _first_line([
+        "docker", "version", "--format", "{{json .Server.Components}}",
+    ])
+    if not raw:
+        return ()
+    try:
+        components = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return ()
+    if not isinstance(components, list):
+        return ()
+    return tuple(str(item.get("Name") or "").strip()
+                 for item in components if isinstance(item, dict) and item.get("Name"))
+
+
+def docker_endpoint() -> str | None:
+    """Socket or URL used by the active Docker-compatible endpoint.
+
+    Podman's Docker API does not consistently identify itself in
+    ``Server.Platform.Name``. The active endpoint remains authoritative: a
+    ``podman.sock`` path describes the server Docker commands are actually using,
+    unlike merely finding an unrelated Podman binary on PATH.
+    """
+    configured = os.environ.get("DOCKER_HOST", "").strip()
+    if configured:
+        return configured
+    return _first_line([
+        "docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}",
+    ])
+
+
 def docker_cli_version() -> str | None:
     """Human-readable Docker CLI version without bypassing the runner seam."""
     return _first_line(["docker", "--version"])

@@ -1042,9 +1042,9 @@ def test_k8s_capacity_passes_when_the_engine_is_big_enough():
 def test_k8s_capacity_refuses_a_small_engine_without_a_grant(tmp_path, monkeypatch):
     # Podman's 2 GiB default cannot fit six Deployments and two StatefulSets. The
     # error must name the exact command, and must not re-ask a settled question.
-    from rc_repro.services import k8s
+    from rc_repro.services import k8s, onboarding
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
-    with pytest.raises(errors.ValidationError) as ei:
+    with pytest.raises(errors.PreflightError) as ei:
         k8s.check_capacity(_FakeRun(
             mem_gib=2.0, cpus=5, engine="podman",
             tools=("kind", "kubectl", "helm", "podman")))
@@ -1053,7 +1053,9 @@ def test_k8s_capacity_refuses_a_small_engine_without_a_grant(tmp_path, monkeypat
     assert "rc-repro onboard" in msg
     assert "--grant engine-resize" not in msg
     assert "stops unrelated containers" in msg      # the real cost, stated
-    assert errors.ValidationError.exit_code == 2
+    assert ei.value.exit_code == 3
+    assert ei.value.code == onboarding.CAPACITY_GRANT_REQUIRED
+    assert ei.value.details.get("provider") == "podman"
 
 
 def test_k8s_capacity_resizes_when_granted_and_says_so(tmp_path, monkeypatch):
@@ -1091,9 +1093,10 @@ def test_k8s_capacity_never_guesses_a_cpu_count(tmp_path, monkeypatch):
     from rc_repro.services import onboarding
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
     onboarding.complete(grants=["engine-resize"])
-    with pytest.raises(errors.ValidationError) as ei:
+    with pytest.raises(errors.PreflightError) as ei:
         k8s.check_capacity(_FakeRun(mem_gib=8.0, cpus=2))
     assert "CPU" in str(ei.value)
+    assert ei.value.code == onboarding.CAPACITY_INSUFFICIENT_CPU
 
 
 def test_k8s_capacity_skips_when_the_engine_is_unreachable():
@@ -1109,9 +1112,11 @@ def test_k8s_capacity_will_not_resize_docker_desktop(tmp_path, monkeypatch):
     from rc_repro.services import onboarding
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
     onboarding.complete(grants=["engine-resize"])
-    with pytest.raises(errors.ValidationError) as ei:
+    with pytest.raises(errors.PreflightError) as ei:
         k8s.check_capacity(_FakeRun(mem_gib=2.0, cpus=4))      # no podman on PATH
-    assert "Docker Desktop" in str(ei.value)
+    assert "Docker Desktop" in str(ei.value) or "Docker-compatible" in str(ei.value)
+    assert ei.value.code == onboarding.CAPACITY_RESIZE_UNSUPPORTED
+    assert ei.value.details.get("provider") in ("docker", "docker-compatible")
 
 
 def test_k8s_capacity_will_not_resize_a_separate_podman_install(tmp_path, monkeypatch):
@@ -1122,9 +1127,10 @@ def test_k8s_capacity_will_not_resize_a_separate_podman_install(tmp_path, monkey
         mem_gib=2.0, cpus=4, engine="docker",
         tools=("kind", "kubectl", "helm", "podman"))
 
-    with pytest.raises(errors.ValidationError):
+    with pytest.raises(errors.PreflightError) as ei:
         k8s.check_capacity(fake)
 
+    assert ei.value.code == onboarding.CAPACITY_RESIZE_UNSUPPORTED
     assert not any(call[:2] == ["podman", "machine"] for call in fake.calls)
 
 

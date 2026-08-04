@@ -2123,134 +2123,366 @@ def presets_cmd() -> None:
     ui.hint("run: rc-repro up --version <X.Y.Z> --preset <name> [--set key=value]")
 
 
+def _prompt_choice(prompt: str, choices: list[dict], default: str = "") -> str:
+    """Numbered progressive choice without a full-screen TUI dependency."""
+    if not choices:
+        return default
+    ids = [str(c.get("id", "")) for c in choices]
+    typer.echo(prompt)
+    for i, choice in enumerate(choices, 1):
+        marker = " (default)" if str(choice.get("id", "")) == str(default) else ""
+        typer.echo(f"  {i}. {choice.get('label', choice.get('id'))}{marker}")
+    raw = typer.prompt("Choice", default=str(default or ids[0]), show_default=True)
+    raw = str(raw).strip()
+    if raw.isdigit():
+        idx = int(raw)
+        if 1 <= idx <= len(choices):
+            return str(choices[idx - 1].get("id", ""))
+    if raw in ids:
+        return raw
+    if raw == "" and default:
+        return default
+    raise errors.ValidationError(
+        f"invalid choice {raw!r}; pick 1-{len(choices)} or a known id")
+
+
+def _prompt_scenarios(choices: list[dict], current: list[str]) -> list[str]:
+    if not choices or (len(choices) == 1 and choices[0].get("id") == ""):
+        return []
+    typer.echo("Optional scenario (blank = deployment only):")
+    for index, choice in enumerate(choices, start=1):
+        typer.echo(f"  {index}. {choice.get('label') or choice.get('id')}")
+    default = current[0] if current else ""
+    valid = {str(c.get("id")).lower(): str(c.get("id")) for c in choices}
+    while True:
+        raw = str(typer.prompt(
+            "Scenario", default=default, show_default=bool(default))).strip().lower()
+        if not raw:
+            return []
+        if raw.isdigit() and 1 <= int(raw) <= len(choices):
+            return [str(choices[int(raw) - 1].get("id"))]
+        if raw in valid:
+            return [valid[raw]]
+        ui.warn(
+            f"  unknown scenario {raw!r}; pick 1-{len(choices)} or type an id")
+
+
 @app.command()
 def onboard(
     accept_defaults: bool = typer.Option(False, "--accept-defaults",
                                          help="take every default without prompting (for scripts/CI)"),
     grant: list[str] = typer.Option(None, "--grant",
-                                    help="authority to hand over, repeatable (see --help)"),
+                                    help="authority to hand over, repeatable (owned-cluster, engine-resize)"),
     retain_runs: Optional[bool] = typer.Option(
         None, "--retain-runs/--teardown-by-default",
         help="persist whether agent-driven runs are retained after evidence capture"),
+    deployment: Optional[str] = typer.Option(
+        None, "--deployment",
+        help="default deployment type: default | multi-instance | microservices"),
+    scenario: list[str] = typer.Option(
+        None, "--scenario",
+        help="default scenario (repeatable); empty list clears scenarios when passed as flag with accept-defaults"),
+    seed_profile: Optional[str] = typer.Option(
+        None, "--seed-profile",
+        help="seed dataset for first-run command: none | small | standard | large"),
+    section: Optional[str] = typer.Option(
+        None, "--section",
+        help="reconfigure only one section: deployment|scenarios|seed|cleanup|authority|capacity"),
+    show: bool = typer.Option(
+        False, "--show",
+        help="print the setup snapshot without changing anything"),
     reconfigure: bool = typer.Option(
         False, "--reconfigure",
         help="ask settled human questions again so their answers can be changed"),
     json_out: bool = typer.Option(False, "--json", help="emit the resulting state as JSON"),
 ) -> None:
-    """Answer rc-repro's setup questions once. Later runs never re-ask them.
+    """Goal-first setup: deployment, scenario, seed, cleanup, then Kubernetes only if needed.
 
-    The normal human path is interactive. Automation uses --accept-defaults and
-    supplies every authority it needs explicitly with --grant.
+    Durable choices are asked once. Compose never asks Kubernetes authority or
+    capacity questions. Non-TTY runs use --accept-defaults plus explicit flags.
     """
-    current = onboardsvc.state()
-    environment = onboardsvc.detect_environment()
-    grants = {name for name in onboardsvc.GRANTS
-              if current["grants"].get(onboardsvc.grant_key(name))}
-    grants.update(grant or [])
-    denied: set[str] = set()
-    prefs: dict = {}
-    interactive = not accept_defaults and not json_out
+    # --show is always non-mutating and never blocks on prompts.
+    if show:
+        snap = onboardsvc.setup_snapshot(section=section)
+        if json_out:
+            jsonout.emit(jsonout.envelope("setup", snap))
+            return
+        typer.echo(f"setup completed: {snap['completed']}")
+        typer.echo(f"  deployment: {snap['selection']['deployment']}")
+        typer.echo(f"  scenarios: {', '.join(snap['selection']['scenarios']) or '(none)'}")
+        typer.echo(f"  seed: {snap['selection']['seed_profile']}")
+        typer.echo(f"  retain runs: {snap['selection']['retain_runs']}")
+        if snap["first_run_command"]:
+            typer.echo(f"  first run: {snap['first_run_command']}")
+        else:
+            ui.warn(f"  first run: blocked by {snap['compatibility']['code']}")
+        return
 
-    if json_out and not accept_defaults:
+    structured = any(v is not None for v in (
+        deployment, seed_profile, retain_runs)) or bool(grant) or scenario is not None
+    interactive = not accept_defaults and not json_out and not structured
+
+    if json_out and not accept_defaults and not structured and not show:
         exc = errors.ValidationError(
-            "--json is non-interactive; pair it with --accept-defaults and explicit "
-            "--grant values")
+            "--json is non-interactive; pair it with --accept-defaults, explicit "
+            "flags (--deployment/--scenario/--seed-profile/--grant), or --show")
         jsonout.fail(exc)
 
+    current = onboardsvc.state()
+    environment = onboardsvc.detect_environment()
+    snap = onboardsvc.setup_snapshot(environment=environment, section=section)
+
+    # Returning user with nothing to do: settle silently unless reconfigure/section.
+    has_unanswered_applicable = any(
+        not question.get("answered", False) for question in snap["questions"])
+    if (current["completed"] and not has_unanswered_applicable and
+            not reconfigure and not section and interactive and not structured):
+        typer.echo("Settled choices are unchanged; use --reconfigure or "
+                   "--section <name> to change them.")
+        if snap["first_run_command"]:
+            ui.hint(f"  first run: {snap['first_run_command']}")
+        else:
+            ui.warn(f"  first run: blocked by {snap['compatibility']['code']}")
+        return
+
+    patch: dict = {}
+    if deployment is not None:
+        patch["deployment"] = deployment
+    if scenario is not None:
+        patch["scenarios"] = list(scenario)
+    if seed_profile is not None:
+        patch["seed_profile"] = seed_profile
+    if retain_runs is not None:
+        patch["retain_runs"] = retain_runs
+    if grant:
+        patch["grants"] = {name: True for name in grant}
+
     if interactive:
-        typer.echo("rc-repro setup — durable choices are asked once.\n")
+        typer.echo("rc-repro setup — goal first, durable choices asked once.\n")
         typer.echo("Detected environment")
         typer.echo(f"  OS: {environment['os']} ({environment['architecture']})")
         typer.echo(f"  host: {environment['cpus']} CPUs, "
                    f"{environment['memory_gib']:.1f} GiB memory, "
                    f"{environment['disk_free_gib']:.1f} GiB disk free")
         for tool in ("docker", "compose", "kind", "kubectl", "helm"):
-            typer.echo(f"  {tool}: {environment['tools'][tool]}")
-        if environment["docker_ready"]:
-            typer.echo(f"  container capacity: {environment['engine_cpus']} CPUs, "
-                       f"{environment['engine_memory_gib']:.1f} GiB")
-        readiness = "ready" if environment["microservices_ready"] else "not ready"
-        typer.echo(f"  Kubernetes microservices: {readiness}\n")
+            typer.echo(f"  {tool}: {environment['tools'].get(tool, 'missing')}")
+        if environment.get("docker_ready"):
+            typer.echo(
+                f"  engine ({environment.get('engine_provider', '?')}): "
+                f"{environment['engine_cpus']} CPUs, "
+                f"{environment['engine_memory_gib']:.1f} GiB")
+            if environment.get("engine_kernel_version"):
+                typer.echo(f"  engine kernel: {environment['engine_kernel_version']}")
+        typer.echo("")
 
-        asked = False
-        cluster_key = "owned_cluster"
-        cluster_answered = current["answered_grants"].get(cluster_key, False)
-        if "owned-cluster" not in (grant or []) and (reconfigure or not cluster_answered):
-            typer.echo("rc-repro uses one local Kind cluster and one namespace per repro.")
-            ui.note("  It creates or deletes only resources carrying rc-repro ownership labels.")
-            if typer.confirm(
-                    "May rc-repro create and later delete those owned resources?",
-                    default=current["grants"].get(cluster_key, False)):
-                grants.add("owned-cluster")
-            else:
-                grants.discard("owned-cluster")
-                denied.add("owned-cluster")
-            asked = True
+        draft: dict = {}
+        want_sections = (
+            [section] if section else
+            list(onboardsvc.SETUP_SECTIONS)
+        )
 
-        resize_key = "engine_resize"
-        resize_answered = current["answered_grants"].get(resize_key, False)
-        if (environment["engine_resize_relevant"] and
-                "engine-resize" not in (grant or []) and
-                (reconfigure or not resize_answered)):
-            typer.echo("This container engine is below the measured Kubernetes capacity floor.")
-            ui.warn("  Resizing restarts the engine and stops unrelated containers.")
-            if typer.confirm("May rc-repro stop, resize, and restart it when needed?",
-                             default=current["grants"].get(resize_key, False)):
-                grants.add("engine-resize")
-            else:
-                grants.discard("engine-resize")
-                denied.add("engine-resize")
-            asked = True
+        # Progressive draft: later questions use earlier answers.
+        if "deployment" in want_sections and (
+                reconfigure or section == "deployment" or
+                not snap["persisted"]["answered_deployment"] or not current["completed"]):
+            dep_q = next(q for q in onboardsvc.setup_snapshot(
+                environment=environment, draft=draft)["questions"]
+                         if q["id"] == "deployment")
+            draft["deployment"] = _prompt_choice(
+                dep_q["prompt"], dep_q["choices"],
+                default=str(dep_q.get("value") or "default"))
 
-        retention_answered = current["answered_preferences"].get("retain_runs", False)
-        if retain_runs is not None:
-            prefs["retain_runs"] = retain_runs
-        elif reconfigure or not retention_answered:
+        live = onboardsvc.setup_snapshot(environment=environment, draft=draft)
+        topology = live["selection"]["topology"]
+
+        if "scenarios" in want_sections and (
+                reconfigure or section == "scenarios" or
+                not snap["persisted"]["answered_scenarios"] or not current["completed"]):
+            scen_q = next((q for q in live["questions"] if q["id"] == "scenarios"), None)
+            if scen_q and scen_q["applicable"]:
+                draft["scenarios"] = _prompt_scenarios(
+                    scen_q["choices"], list(scen_q.get("value") or []))
+
+        if "seed" in want_sections and (
+                reconfigure or section == "seed" or
+                not snap["persisted"]["answered_preferences"].get("seed_profile")
+                or not current["completed"]):
+            live = onboardsvc.setup_snapshot(environment=environment, draft=draft)
+            seed_q = next(q for q in live["questions"] if q["id"] == "seed_profile")
+            draft["seed_profile"] = _prompt_choice(
+                seed_q["prompt"], seed_q["choices"],
+                default=str(seed_q.get("value") or "small"))
+
+        if "cleanup" in want_sections and (
+                reconfigure or section == "cleanup" or
+                not snap["persisted"]["answered_preferences"].get("retain_runs")
+                or not current["completed"]):
             typer.echo("\nAgent-driven runs capture evidence and tear down by default.")
-            prefs["retain_runs"] = typer.confirm(
+            draft["retain_runs"] = typer.confirm(
                 "Retain repros after evidence capture instead?",
-                default=bool(current["preferences"].get("retain_runs")))
-            asked = True
+                default=bool(live["selection"].get("retain_runs")))
 
-        if not current["completed"] or reconfigure or asked:
-            typer.echo("\nThe microservices preset is an Enterprise topology.")
+        live = onboardsvc.setup_snapshot(environment=environment, draft=draft)
+        topology = live["selection"]["topology"]
+
+        # Kubernetes-only questions. Compose never reaches these.
+        if topology == "kubernetes":
+            if "authority" in want_sections:
+                cluster_answered = live["persisted"]["answered_grants"].get(
+                    "owned_cluster", False)
+                if reconfigure or section == "authority" or not cluster_answered:
+                    typer.echo("\nrc-repro uses one local Kind cluster and one namespace "
+                               "per repro.")
+                    ui.note("  It creates or deletes only resources with ownership labels.")
+                    owned = typer.confirm(
+                        "May rc-repro create and later delete those owned resources?",
+                        default=bool(live["persisted"]["grants"].get("owned_cluster")))
+                    draft.setdefault("grants", {})
+                    draft["grants"] = {
+                        **dict(draft.get("grants") or {}),
+                        "owned-cluster": owned,
+                    }
+
+            live = onboardsvc.setup_snapshot(environment=environment, draft=draft)
+            cap = live["capacity"]
+            if "capacity" in want_sections and cap.get("applicable"):
+                typer.echo("\nKubernetes capacity")
+                typer.echo(f"  provider: {cap.get('provider')}")
+                typer.echo(
+                    f"  observed: {cap.get('observed_cpu')} CPUs, "
+                    f"{cap.get('observed_memory_gib')} GiB")
+                typer.echo(
+                    f"  required: {cap.get('required_cpu')} CPUs, "
+                    f"{cap.get('required_memory_gib')} GiB")
+                if not cap.get("ready"):
+                    ui.warn(f"  {cap.get('code')}: {cap.get('remediation')}")
+                    if cap.get("verification"):
+                        ui.note(f"  verify: {cap.get('verification')}")
+                resize_q = next(
+                    (q for q in live["questions"] if q["id"] == "engine_resize"), None)
+                resize_answered = live["persisted"]["answered_grants"].get(
+                    "engine_resize", False)
+                if (resize_q and resize_q["applicable"] and
+                        (reconfigure or section == "capacity" or not resize_answered)):
+                    ui.warn("  Resizing restarts the engine and stops unrelated containers.")
+                    granted = typer.confirm(
+                        "May rc-repro stop, resize, and restart the Podman machine?",
+                        default=bool(live["persisted"]["grants"].get("engine_resize")))
+                    draft.setdefault("grants", {})
+                    draft["grants"] = {
+                        **dict(draft.get("grants") or {}),
+                        "engine-resize": granted,
+                    }
+
+            typer.echo("\nThe microservices deployment is an Enterprise topology.")
             ui.warn("  Without a Rocket.Chat Enterprise licence it may not behave as licensed.")
         else:
-            typer.echo("Settled choices are unchanged; use --reconfigure to change them.")
-    else:
-        # Automation defaults only questions that have never been answered. It does
-        # not revoke an earlier standing grant or retention choice on a safe rerun.
-        for name in onboardsvc.GRANTS:
+            # Compose path: never print kubernetes capacity questions.
+            typer.echo("\nCompose deployment selected — Kubernetes authority and "
+                       "capacity questions are skipped.")
+
+        live = onboardsvc.setup_snapshot(environment=environment, draft=draft)
+        typer.echo("\nReview")
+        typer.echo(f"  deployment: {live['review']['deployment']}")
+        typer.echo(f"  scenarios: {', '.join(live['review']['scenarios']) or '(none)'}")
+        typer.echo(f"  seed: {live['review']['seed_profile']}")
+        if live["license"].get("seed_deferred"):
+            ui.warn("  seed is deferred until an Enterprise registration token "
+                    "is supplied")
+        typer.echo(f"  retain runs: {live['review']['retain_runs']}")
+        if live["selection"]["topology"] == "kubernetes":
+            typer.echo(f"  owned-cluster: {live['review']['grants']['owned_cluster']}")
+            typer.echo(f"  engine-resize: {live['review']['grants']['engine_resize']}")
+        if live["first_run_command"]:
+            typer.echo(f"  first run: {live['first_run_command']}")
+        else:
+            ui.warn(
+                f"  first run: blocked by {live['compatibility']['code']}")
+        if not typer.confirm("Apply these choices?", default=True):
+            ui.note("No changes written.")
+            raise typer.Exit(0)
+        patch.update(draft)
+        if "grants" in draft:
+            patch["grants"] = draft["grants"]
+    elif accept_defaults or structured:
+        # Non-interactive: only fill unanswered questions with safe defaults.
+        # Never revoke an earlier standing grant on a safe rerun unless flags say so.
+        if "deployment" not in patch and (
+                not current["completed"] or reconfigure or section == "deployment"):
+            if not snap["persisted"]["answered_deployment"]:
+                patch["deployment"] = snap["selection"]["deployment"] or "default"
+        if "scenarios" not in patch and scenario is None and (
+                not snap["persisted"]["answered_scenarios"] and not current["completed"]):
+            patch["scenarios"] = list(snap["selection"]["scenarios"] or [])
+        if "seed_profile" not in patch and (
+                not snap["persisted"]["answered_preferences"].get("seed_profile")
+                and not current["completed"]):
+            patch["seed_profile"] = "small"
+        if "retain_runs" not in patch and (
+                not snap["persisted"]["answered_preferences"].get("retain_runs")
+                and not current["completed"]):
+            patch["retain_runs"] = False
+        # Deny unanswered grants only when accepting defaults on a fresh machine,
+        # or when the selected deployment needs an explicit grant list.
+        grants_map = dict(patch.get("grants") or {})
+        preview = onboardsvc.setup_snapshot(environment=environment, draft=patch)
+        applicable_grants = {
+            question["grant"] for question in preview["questions"]
+            if question.get("grant")
+        }
+        for name in applicable_grants:
             key = onboardsvc.grant_key(name)
-            if not current["answered_grants"].get(key, False) and name not in grants:
-                denied.add(name)
-        if retain_runs is not None:
-            prefs["retain_runs"] = retain_runs
-        elif not current["answered_preferences"].get("retain_runs", False):
-            prefs["retain_runs"] = False
+            if key in grants_map or name in grants_map:
+                continue
+            if not current["answered_grants"].get(key, False) and accept_defaults:
+                grants_map[name] = False
+        if grants_map:
+            patch["grants"] = grants_map
 
     try:
-        result = onboardsvc.complete(
-            grants=sorted(grants), denied_grants=sorted(denied), preferences=prefs)
+        result_snap = onboardsvc.apply_setup_patch(patch, mark_complete=True)
     except errors.ReproError as exc:
         jsonout.fail(exc) if json_out else _fail(exc)
 
-    first_run = (onboardsvc.FIRST_RUN_COMMAND
-                 if (result["grants"]["owned_cluster"] and
-                     environment.get("microservices_ready", False))
-                 else "rc-repro up --version 8.6.1 --name first-repro --wait")
+    # Re-read environment for the final command so readiness is not stale.
+    result_snap = onboardsvc.setup_snapshot(environment=environment)
+    first_run = result_snap["first_run_command"]
+    state = onboardsvc.state()
+
     if json_out:
-        jsonout.emit(jsonout.envelope(
-            "onboard", {**result, "first_run_command": first_run}))
+        jsonout.emit(jsonout.envelope("onboard", {
+            **state,
+            "setup": result_snap,
+            "first_run_command": first_run,
+            "selection": result_snap["selection"],
+            "capacity": result_snap["capacity"],
+            "compatibility": result_snap["compatibility"],
+            "gates": result_snap["gates"],
+            "actions": result_snap["actions"],
+        }))
         return
+
     ui.ok("✓ onboarding recorded")
+    typer.echo(f"  deployment: {result_snap['selection']['deployment']}")
+    typer.echo(f"  scenarios: {', '.join(result_snap['selection']['scenarios']) or '(none)'}")
+    typer.echo(f"  seed: {result_snap['selection']['seed_profile']}")
+    if result_snap["license"].get("seed_deferred"):
+        ui.warn("  seed is deferred until an Enterprise registration token is supplied")
     for name in sorted(onboardsvc.GRANTS):
         key = onboardsvc.grant_key(name)
-        mark = "granted" if result["grants"].get(key) else "not granted"
-        typer.echo(f"  {name}: {mark}")
-    typer.echo(f"  retain runs: {result['preferences']['retain_runs']}")
-    ui.hint(f"  first run: {first_run}")
-    ui.hint("  change an answer with `rc-repro onboard --reconfigure`")
+        mark = "granted" if state["grants"].get(key) else "not granted"
+        # Only print kubernetes grants when they apply or were answered.
+        if (result_snap["selection"]["topology"] == "kubernetes" or
+                state["answered_grants"].get(key)):
+            typer.echo(f"  {name}: {mark}")
+    typer.echo(f"  retain runs: {state['preferences']['retain_runs']}")
+    if first_run:
+        ui.hint(f"  first run: {first_run}")
+    else:
+        ui.warn(
+            f"  first run: blocked by {result_snap['compatibility']['code']}")
+    ui.hint("  change an answer with `rc-repro onboard --reconfigure` "
+            "or `--section <name>`")
 
 
 skill_app = typer.Typer(help="Install the rc-repro agent skill into an agent host.")

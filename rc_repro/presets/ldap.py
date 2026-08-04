@@ -217,6 +217,11 @@ def _kubernetes(intent: LDAPIntent) -> Preset:
             f"'{_GROUP_CN}'; RC wired for LDAP login. Log in as user1 / user1."
         ),
         topology="kubernetes",
+        # The scenario changes the backing service and Rocket.Chat settings; it
+        # does not make the microservices deployment cease to be an Enterprise
+        # topology.  Preserve that deployment-level requirement so lifecycle
+        # warnings and onboarding next-command guidance remain truthful.
+        requires_license=True,
         source="built-in (scenario)",
         env=env,
         params_help=dict(_PARAMS_HELP),

@@ -154,13 +154,44 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
 
     @app.exception_handler(ReproError)
     async def _repro_error(_: Request, exc: ReproError):
-        return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
-                            status_code=exc.http_status)
+        body: dict = {
+            "error": str(exc),
+            "kind": type(exc).__name__,
+            "code": getattr(exc, "code", "REPRO_ERROR"),
+        }
+        gate = getattr(exc, "as_gate", None)
+        if callable(gate):
+            body["gate"] = gate()
+        details = getattr(exc, "details", None) or {}
+        if details:
+            body["details"] = details
+            for key in ("remediation", "verification", "approve_with",
+                        "supported_action", "side_effects", "provider"):
+                if key in details:
+                    body[key] = details[key]
+        return JSONResponse(body, status_code=exc.http_status)
 
     # --- read (blocking -> def -> threadpool) ---------------------------------
     @app.get("/api/health")
     def health():
         return {"ok": True, "docker": runner.docker_available()}
+
+    @app.get("/api/setup")
+    def get_setup(section: str = ""):
+        """Shared setup snapshot for the GUI stepped dialog."""
+        from rc_repro.services import onboarding as onboardsvc
+        return onboardsvc.setup_snapshot(section=section or None)
+
+    @app.post("/api/setup")
+    def post_setup(body: dict = Body(default={})):
+        """Apply a partial setup patch; returns a fresh snapshot."""
+        from rc_repro.services import onboarding as onboardsvc
+        draft = body.get("draft") if isinstance(body.get("draft"), dict) else None
+        if body.get("preview"):
+            return onboardsvc.setup_snapshot(
+                draft=draft or body, section=body.get("section") or None)
+        return onboardsvc.apply_setup_patch(body, mark_complete=bool(
+            body.get("mark_complete", True)))
 
     @app.get("/api/repros")
     def list_repros():

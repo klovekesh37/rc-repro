@@ -59,15 +59,49 @@
     <span class="sb-right" id="sb-docker">docker: ?</span>
   </footer>
 
+  <!-- Setup dialog (shared snapshot/patch contract) -->
+  <dialog id="setup-dialog" aria-labelledby="setup-title">
+    <form id="setup-form" method="dialog">
+      <h2 id="setup-title">Setup</h2>
+      <p id="setup-step-label" class="hint" role="status"></p>
+      <div id="setup-body"></div>
+      <p id="setup-error" class="hint bad" hidden role="alert"></p>
+      <menu>
+        <button type="button" class="btn" id="setup-cancel">Cancel</button>
+        <button type="button" class="btn" id="setup-back" hidden>Back</button>
+        <button type="button" class="btn" id="setup-legacy">Legacy preset form</button>
+        <button type="button" class="btn primary" id="setup-next">Next</button>
+      </menu>
+    </form>
+  </dialog>
+
   <!-- Create dialog -->
   <dialog id="create-dialog">
     <form id="create-form" method="dialog">
       <h2>New repro</h2>
       <label>Rocket.Chat version <input name="version" placeholder="8.5.1" required></label>
       <p id="version-hint" class="hint"></p>
-      <label>Preset <select name="preset" id="preset-select"></select></label>
-      <p id="preset-desc" class="hint"></p>
-      <div id="preset-params"></div>
+      <div id="create-selector-mode">
+        <label>Deployment
+          <select name="deployment" id="create-deployment">
+            <option value="default">default (Compose)</option>
+            <option value="multi-instance">multi-instance (Compose)</option>
+            <option value="microservices">microservices (Kubernetes)</option>
+          </select>
+        </label>
+        <label>Scenario (optional)
+          <select name="scenario" id="create-scenario">
+            <option value="">(none)</option>
+          </select>
+        </label>
+        <p id="create-selector-hint" class="hint"></p>
+      </div>
+      <details class="adv" id="create-legacy-preset">
+        <summary>Legacy single-preset path</summary>
+        <label>Preset <select name="preset" id="preset-select"></select></label>
+        <p id="preset-desc" class="hint"></p>
+        <div id="preset-params"></div>
+      </details>
       <label>Host port (blank = auto) <input name="port" type="number" min="1024" max="65535" placeholder="auto"></label>
       <div class="checks">
         <label><input type="checkbox" name="monitor"> Monitoring (Prometheus + Grafana)</label>

@@ -32,6 +32,13 @@ class ReproError(Exception):
     code = "REPRO_ERROR"
     exit_code = 1
 
+    def __init__(self, message: str = "", *, code: str | None = None,
+                 details: dict | None = None) -> None:
+        super().__init__(message)
+        if code:
+            self.code = code
+        self.details = dict(details or {})
+
 
 class ValidationError(ReproError):
     """Bad input (port range, name, unknown --set param, bad version/preset)."""
@@ -68,6 +75,18 @@ class DockerError(ReproError):
     exit_code = 3      # preflight/engine problem: run `rc-repro doctor`
 
 
+class PreflightError(ReproError):
+    """Environment or capacity preflight refused the request (exit 3).
+
+    Distinct from ValidationError (bad caller input) and DockerError (engine
+    unreachable for compose). Capacity shortfalls and unsupported resize paths
+    use this so they never masquerade as a successful preflight.
+    """
+    http_status = 409
+    code = "PREFLIGHT_FAILED"
+    exit_code = 3
+
+
 class CreateFailedError(ReproError):
     """A create hit a condition that cannot self-heal, so waiting is pointless.
 
@@ -93,20 +112,20 @@ class AuthorityGateError(ReproError):
     exit_code = 6
 
     def __init__(self, message: str, *, kind: str = "", subject: str = "",
-                 approve_with: str = "", code: str | None = None) -> None:
-        super().__init__(message)
+                 approve_with: str = "", code: str | None = None,
+                 details: dict | None = None) -> None:
+        super().__init__(message, code=code, details=details)
         self.kind = kind                  # e.g. "cluster", "retention"
         self.subject = subject            # what the gate is about
         self.approve_with = approve_with  # exact command for a human to run
-        if code:
-            # Gates are reported with a specific code (GATE_UNAPPROVED_CLUSTER,
-            # GATE_DELETE_UNOWNED, ...) while sharing one exception type.
-            self.code = code
 
     def as_gate(self) -> dict:
         """The gate as a plain dict, for a machine-readable error payload."""
-        return {"kind": self.kind, "subject": self.subject,
-                "approve_with": self.approve_with}
+        out = {"kind": self.kind, "subject": self.subject,
+               "approve_with": self.approve_with}
+        if self.details:
+            out["details"] = dict(self.details)
+        return out
 
 
 #: Every authority gate rc-repro can raise, declared rather than invented at the

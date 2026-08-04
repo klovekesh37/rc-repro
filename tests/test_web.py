@@ -373,6 +373,20 @@ def test_browser_create_form_sends_the_selected_seed_profile():
     assert "req.seed_profile = f.seed_profile.value" not in create
 
 
+def test_browser_setup_submits_only_applicable_grants_and_clears_stale_scenarios():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "rc_repro" / "data" / "webui"
+    script = (root / "app.js").read_text(encoding="utf-8")
+    setup = script.split("async function openSetup(force) {", 1)[1].split(
+        "// ---- create dialog", 1)[0]
+
+    assert "for (const q of (SETUP.snap.questions || []))" in setup
+    assert "if (q.grant) SETUP.draft.grants[q.grant] = !!q.value;" in setup
+    assert '"owned-cluster": !!(SETUP.snap.persisted.grants' not in setup
+    assert "SETUP.draft.scenarios = []" in setup
+    assert "hasUnanswered" in setup
+
+
 def test_browser_prune_reports_partial_cleanup_and_kind_cluster():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1] / "rc_repro" / "data" / "webui"

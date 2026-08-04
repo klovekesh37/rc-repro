@@ -1500,18 +1500,23 @@ def test_seed_channel_names_unique():
 def test_error_taxonomy_codes_and_exit_codes_are_distinct():
     from rc_repro import errors
     subs = [errors.ValidationError, errors.ConflictError, errors.NotFoundError,
-            errors.NotReadyError, errors.DockerError, errors.CreateFailedError,
-            errors.AuthorityGateError]
+            errors.NotReadyError, errors.DockerError, errors.PreflightError,
+            errors.CreateFailedError, errors.AuthorityGateError]
     codes = [c.code for c in subs]
-    exits = [c.exit_code for c in subs]
     assert len(set(codes)) == len(codes), "error codes must be unique"
-    assert len(set(exits)) == len(exits), "exit codes must be unique per cause"
     # every subclass stays a ReproError so existing handlers keep catching it
     assert all(issubclass(c, errors.ReproError) for c in subs)
+    exits = [c.exit_code for c in subs]
     # exit 0 is success and must never be an error's code
     assert 0 not in exits
     # every exit code is documented in the published map
     assert all(e in errors.EXIT_CODES for e in exits)
+    # PreflightError and DockerError share exit 3 (preflight bucket) by design.
+    assert errors.DockerError.exit_code == errors.PreflightError.exit_code == 3
+    # Other base classes keep distinct process exits.
+    other = [c.exit_code for c in subs
+             if c not in (errors.DockerError, errors.PreflightError)]
+    assert len(set(other)) == len(other)
 
 
 def test_not_ready_and_create_failed_stay_distinct():
@@ -1909,12 +1914,22 @@ def test_interactive_onboarding_shows_facts_persists_authority_and_does_not_reas
         "tools": {"docker": "Docker 29.6.1", "compose": "Docker Compose v5.3.1",
                   "kind": "kind v0.32.0", "kubectl": "Client Version: v1.36.1",
                   "helm": "v3.21.3"},
-        "docker_ready": True, "engine_memory_gib": 15.6, "engine_cpus": 4,
+        "docker_ready": True, "engine_provider": "podman",
+        "engine_memory_gib": 15.6, "engine_cpus": 4,
         "missing_kubernetes_tools": [], "microservices_ready": True,
-        "engine_resize_relevant": False,
+        "engine_resize_supported": False, "engine_resize_relevant": False,
     })
 
-    first = CliRunner().invoke(app, ["onboard"], input="y\nn\n")
+    # Goal-first: microservices deployment, no scenario, small seed, no retain,
+    # grant owned-cluster, review apply.
+    first = CliRunner().invoke(app, ["onboard"], input=(
+        "microservices\n"   # deployment
+        "\n"                # scenario none
+        "small\n"           # seed
+        "n\n"               # retain_runs
+        "y\n"               # owned-cluster
+        "y\n"               # apply review
+    ))
     assert first.exit_code == 0, first.output
     assert "Detected environment" in first.output
     assert "create and later delete those owned resources" in first.output
@@ -1943,14 +1958,24 @@ def test_interactive_onboarding_prints_a_first_command_the_detected_machine_can_
         "cpus": 2, "memory_gib": 3.8, "disk_free_gib": 75.0,
         "tools": {"docker": "Docker 29.6.1", "compose": "Docker Compose v5.3.1",
                   "kind": "missing", "kubectl": "missing", "helm": "missing"},
-        "docker_ready": True, "engine_memory_gib": 3.8, "engine_cpus": 2,
+        "docker_ready": True, "engine_provider": "docker",
+        "engine_memory_gib": 3.8, "engine_cpus": 2,
         "missing_kubernetes_tools": ["kind", "kubectl", "helm"],
-        "microservices_ready": False, "engine_resize_relevant": False,
+        "microservices_ready": False, "engine_resize_supported": False,
+        "engine_resize_relevant": False,
     })
 
-    result = CliRunner().invoke(app, ["onboard"], input="y\nn\n")
+    # Compose path: no Kubernetes authority questions.
+    result = CliRunner().invoke(app, ["onboard"], input=(
+        "default\n"   # deployment
+        "\n"          # scenario
+        "none\n"      # seed
+        "n\n"         # retain
+        "y\n"         # apply
+    ))
 
     assert result.exit_code == 0, result.output
+    assert "Kubernetes authority" in result.output or "skipped" in result.output
     assert onboarding.FIRST_RUN_COMMAND not in result.output
     assert "rc-repro up --version 8.6.1 --name first-repro --wait" in result.output
 
@@ -1964,6 +1989,10 @@ def test_environment_detection_routes_docker_commands_through_runner(tmp_path, m
     monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.6.1")
     monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version v5.3.1")
     monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(runner, "docker_server_platform", lambda: "Docker Engine - Community")
+    monkeypatch.setattr(runner, "docker_server_components", lambda: ("Engine",))
+    monkeypatch.setattr(runner, "docker_endpoint", lambda: "unix:///var/run/docker.sock")
+    monkeypatch.setattr(runner, "docker_kernel_version", lambda: "6.18.0")
     monkeypatch.setattr(k8s, "engine_capacity", lambda: (15.6, 4))
     monkeypatch.setattr(k8s, "engine_resize_supported", lambda: False)
 
@@ -1971,6 +2000,66 @@ def test_environment_detection_routes_docker_commands_through_runner(tmp_path, m
 
     assert detected["tools"]["docker"] == "Docker version 29.6.1"
     assert detected["tools"]["compose"] == "Docker Compose version v5.3.1"
+    assert detected["engine_provider"] == "docker"
+
+
+def test_runner_reads_active_server_component_names(monkeypatch):
+    from rc_repro import runner
+    monkeypatch.setattr(
+        runner, "_first_line",
+        lambda _cmd: '[{"Name":"Podman Engine"},{"Name":"Conmon"}]')
+
+    assert runner.docker_server_components() == ("Podman Engine", "Conmon")
+
+
+def test_environment_detection_recognises_active_podman_socket(tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s, onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(onboarding, "_version_line", lambda tool, *args: f"{tool} ok")
+    monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.6.1")
+    monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version v5.3.1")
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(
+        runner, "docker_server_platform", lambda: "linux/arm64/fedora-43")
+    monkeypatch.setattr(runner, "docker_server_components", lambda: ("Engine",))
+    monkeypatch.setattr(
+        runner, "docker_endpoint",
+        lambda: "unix:///Users/test/.local/share/containers/podman/machine/podman.sock")
+    monkeypatch.setattr(runner, "docker_kernel_version", lambda: "6.18.0")
+    monkeypatch.setattr(k8s, "engine_capacity", lambda: (15.6, 4))
+    monkeypatch.setattr(k8s, "engine_resize_supported", lambda: True)
+
+    detected = onboarding.detect_environment()
+
+    assert detected["engine_provider"] == "podman"
+
+
+def test_environment_detection_recognises_podman_server_component(
+        tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s, onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(onboarding, "_version_line", lambda tool, *args: f"{tool} ok")
+    monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.7.1")
+    monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version 5.3.1")
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(
+        runner, "docker_server_platform", lambda: "linux/arm64/fedora-43")
+    monkeypatch.setattr(
+        runner, "docker_server_components", lambda: ("Podman Engine", "Conmon"))
+    monkeypatch.setattr(
+        runner, "docker_endpoint", lambda: "unix:///var/run/docker.sock")
+    monkeypatch.setattr(runner, "docker_kernel_version", lambda: "6.19.7-200.fc43")
+    monkeypatch.setattr(k8s, "engine_capacity", lambda: (5.8, 5))
+    monkeypatch.setattr(k8s, "engine_resize_supported", lambda: True)
+
+    detected = onboarding.detect_environment()
+
+    assert detected["engine_provider"] == "podman"
+    assert detected["engine_kernel_version"] == "6.19.7-200.fc43"
 
 
 @pytest.mark.parametrize(
@@ -1987,6 +2076,10 @@ def test_environment_only_offers_resize_for_a_supported_memory_shortfall(
     monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.6.1")
     monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version v5.3.1")
     monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(runner, "docker_server_platform", lambda: "Podman Engine")
+    monkeypatch.setattr(runner, "docker_server_components", lambda: ("Podman Engine",))
+    monkeypatch.setattr(runner, "docker_endpoint", lambda: "unix:///var/run/docker.sock")
+    monkeypatch.setattr(runner, "docker_kernel_version", lambda: "6.18.0")
     monkeypatch.setattr(k8s, "engine_capacity", lambda: capacity)
     monkeypatch.setattr(k8s, "engine_resize_supported", lambda: resize_supported)
 

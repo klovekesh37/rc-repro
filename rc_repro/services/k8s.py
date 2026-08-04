@@ -178,6 +178,12 @@ class _Runner:
     def docker_server_platform(self) -> str | None:
         return runner.docker_server_platform()
 
+    def docker_server_components(self) -> tuple[str, ...]:
+        return runner.docker_server_components()
+
+    def docker_endpoint(self) -> str | None:
+        return runner.docker_endpoint()
+
     def run(self, argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
         env = _client_env() if argv and argv[0] in {"kind", "kubectl", "helm"} else None
         return subprocess.run(argv, capture_output=True, text=True, check=check,
@@ -1222,7 +1228,12 @@ def engine_resize_supported(run: _Runner | None = None) -> bool:
     if not run.which("podman"):
         return False
     try:
-        if "podman" not in (run.docker_server_platform() or "").lower():
+        from rc_repro.services import onboarding
+        endpoint_probe = getattr(run, "docker_endpoint", lambda: None)
+        components_probe = getattr(run, "docker_server_components", lambda: ())
+        provider = onboarding.classify_engine_provider(
+            run.docker_server_platform(), endpoint_probe(), components_probe())
+        if provider != "podman":
             return False
         machine_result = run.run(
             ["podman", "machine", "inspect", "--format", "{{.State}}"],
@@ -1235,18 +1246,22 @@ def engine_resize_supported(run: _Runner | None = None) -> bool:
 
 def check_capacity(run: _Runner | None = None, emit: Emit = null_emit,
                    cfg: dict | None = None) -> None:
-    """Refuse, or silently fix, an engine too small for the microservices topology.
+    """Refuse, or fix under grant, an engine too small for microservices.
 
     The floor is measured, not guessed: peak working set 3.49 GiB and ~3.5 of 4
     cores during convergence, so 6 GiB and 4 CPUs is the lowest defensible floor and
     CPU is the binding constraint. A memory-only check would pass a 2-core host that
     then crawls and trips its own readiness probes.
 
-    Resizing stops the engine, which stops unrelated containers, so it happens only
-    under the standing grant a human gave once at onboarding. Without that grant this
-    is a preflight failure (exit 3) naming the exact command, and it does not re-ask:
-    re-asking a settled question is what onboarding exists to prevent.
+    Provider classification never assumes Podman from a Docker-compatible endpoint.
+    Resizing stops the engine, so it happens only under the standing grant a human
+    gave once at onboarding. Without that grant this is a preflight failure (exit 3)
+    with a stable capacity code, and it does not re-ask: re-asking a settled question
+    is what onboarding exists to prevent.
     """
+    from rc_repro.errors import PreflightError
+    from rc_repro.services import onboarding
+
     run = run or _Runner()
     mem_gib, cpus = engine_capacity(run)
     if mem_gib == 0.0 and cpus == 0:
@@ -1256,54 +1271,69 @@ def check_capacity(run: _Runner | None = None, emit: Emit = null_emit,
     if mem_gib >= FLOOR_MEMORY_GIB and cpus >= FLOOR_CPUS:
         return
 
-    shortfall = []
-    if mem_gib < FLOOR_MEMORY_GIB:
-        shortfall.append(f"{mem_gib:.1f} GiB memory (need {FLOOR_MEMORY_GIB:g})")
-    if cpus < FLOOR_CPUS:
-        shortfall.append(f"{cpus} CPUs (need {FLOOR_CPUS})")
-    detail = " and ".join(shortfall)
+    provider = "unavailable"
+    try:
+        endpoint_probe = getattr(run, "docker_endpoint", lambda: None)
+        components_probe = getattr(run, "docker_server_components", lambda: ())
+        provider = onboarding.classify_engine_provider(
+            run.docker_server_platform(), endpoint_probe(), components_probe())
+    except OSError:
+        provider = "docker-compatible"
 
-    if cpus < FLOOR_CPUS:
-        # CPU cannot be raised by the memory resize, and guessing a CPU count for
-        # someone's machine is not rc-repro's call.
-        raise ValidationError(
-            f"the microservices preset needs {FLOOR_CPUS} CPUs and "
-            f"{FLOOR_MEMORY_GIB:g} GiB; this engine has {detail}. Raise the engine's "
-            f"CPU allocation, or use a Compose preset instead.")
+    env = {
+        "docker_ready": True,
+        "engine_provider": provider,
+        "engine_memory_gib": mem_gib,
+        "engine_cpus": cpus,
+        "missing_kubernetes_tools": [],
+        "engine_resize_supported": engine_resize_supported(run),
+        "engine_resize_relevant": (
+            mem_gib < FLOOR_MEMORY_GIB and cpus >= FLOOR_CPUS and
+            engine_resize_supported(run)),
+    }
+    assessment = onboarding.capacity_assessment(
+        env, deployment="microservices", cfg=cfg)
+    code = assessment.get("code") or onboarding.CAPACITY_INSUFFICIENT_MEMORY
+    details = {
+        "provider": assessment.get("provider"),
+        "observed_cpu": assessment.get("observed_cpu"),
+        "observed_memory_gib": assessment.get("observed_memory_gib"),
+        "required_cpu": assessment.get("required_cpu"),
+        "required_memory_gib": assessment.get("required_memory_gib"),
+        "supported_action": assessment.get("supported_action"),
+        "side_effects": list(assessment.get("side_effects") or []),
+        "remediation": assessment.get("remediation") or "",
+        "verification": assessment.get("verification") or "",
+        "approve_with": assessment.get("approve_with") or "",
+    }
 
-    if not engine_resize_supported(run):
-        raise ValidationError(
-            f"the microservices preset needs {FLOOR_MEMORY_GIB:g} GiB; this engine "
-            f"has {detail}, but the active endpoint is not a running Podman machine "
-            "that rc-repro can resize. Raise Docker Desktop's memory, increase the "
-            "Docker host's memory, or use a Compose preset instead.")
+    if code == onboarding.CAPACITY_INSUFFICIENT_MEMORY and \
+            assessment.get("supported_action") == "engine_resize" and \
+            onboarding.state(cfg)["grants"].get("engine_resize"):
+        shortfall = []
+        if mem_gib < FLOOR_MEMORY_GIB:
+            shortfall.append(f"{mem_gib:.1f} GiB memory (need {FLOOR_MEMORY_GIB:g})")
+        if cpus < FLOOR_CPUS:
+            shortfall.append(f"{cpus} CPUs (need {FLOOR_CPUS})")
+        detail = " and ".join(shortfall)
+        events.warn(emit, f"engine has {detail}; resizing it now, which restarts the "
+                          f"engine and stops unrelated containers", phase="preflight")
+        target = str(int(FLOOR_MEMORY_GIB * 1024))
+        run.run(["podman", "machine", "stop"], check=False)
+        run.run(["podman", "machine", "set", "--memory", target], check=False)
+        run.run(["podman", "machine", "start"], check=False)
+        mem_gib, cpus = engine_capacity(run)
+        if mem_gib < FLOOR_MEMORY_GIB:
+            raise CreateFailedError(
+                f"resized the engine but it still reports {mem_gib:.1f} GiB; "
+                f"raise it manually with `{_resize_command(int(FLOOR_MEMORY_GIB * 1024))}`")
+        events.info(emit, f"engine now has {mem_gib:.1f} GiB", phase="preflight")
+        return
 
-    from rc_repro.services import onboarding
-    granted = onboarding.state(cfg)["grants"].get("engine_resize")
-
-    if not granted:
-        grant_command = onboarding.grant_command("engine-resize", cfg)
-        raise ValidationError(
-            f"the microservices preset needs {FLOOR_MEMORY_GIB:g} GiB; this engine "
-            f"has {detail}. Either raise it yourself with "
-            f"`{_resize_command(int(FLOOR_MEMORY_GIB * 1024))}`, or grant rc-repro "
-            f"permission to do it with `{grant_command}` "
-            f"(note that restarting the engine stops unrelated containers).")
-
-    # Granted: act, but report it as an event rather than doing it silently. The
-    # grant covers the action, not hiding it.
-    events.warn(emit, f"engine has {detail}; resizing it now, which restarts the "
-                      f"engine and stops unrelated containers", phase="preflight")
-    target = str(int(FLOOR_MEMORY_GIB * 1024))
-    run.run(["podman", "machine", "stop"], check=False)
-    run.run(["podman", "machine", "set", "--memory", target], check=False)
-    run.run(["podman", "machine", "start"], check=False)
-    mem_gib, cpus = engine_capacity(run)
-    if mem_gib < FLOOR_MEMORY_GIB:
-        raise CreateFailedError(
-            f"resized the engine but it still reports {mem_gib:.1f} GiB; "
-            f"raise it manually with `{_resize_command(int(FLOOR_MEMORY_GIB * 1024))}`")
-    events.info(emit, f"engine now has {mem_gib:.1f} GiB", phase="preflight")
+    message = assessment.get("remediation") or (
+        f"the microservices preset needs {FLOOR_CPUS} CPUs and "
+        f"{FLOOR_MEMORY_GIB:g} GiB; capacity preflight failed ({code})")
+    raise PreflightError(message, code=code, details=details)
 
 
 #: Pod conditions that no amount of waiting will fix, mapped to a stable error code.

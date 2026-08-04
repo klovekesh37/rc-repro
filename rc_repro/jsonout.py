@@ -77,6 +77,14 @@ def error_envelope(exc: errors.ReproError) -> dict:
         # An authority gate carries what to ask a human to run. Never something
         # the caller may run itself.
         err["gate"] = gate()
+    details = getattr(exc, "details", None)
+    if details:
+        err["details"] = details
+        # Capacity/authority recovery fields the GUI routes on.
+        for key in ("remediation", "verification", "approve_with",
+                    "supported_action", "side_effects", "provider"):
+            if key in details and key not in err:
+                err[key] = details[key]
     return {
         "schema": "rc-repro.error.v1",
         "contract": CONTRACT,
@@ -196,6 +204,22 @@ def _error_codes() -> list[str]:
     # only finds the base "GATE". The declared registry supplies the rest, otherwise
     # a caller could not anticipate a gate it is required to stop on.
     seen.update(errors.GATE_CODES)
+    # Capacity codes are raised as PreflightError(code=...) and also appear on the
+    # setup contract; publish them so agents can branch without scraping prose.
+    try:
+        from rc_repro.services import onboarding as _ob
+        for name in (
+            "CAPACITY_OK", "CAPACITY_INSUFFICIENT_CPU",
+            "CAPACITY_INSUFFICIENT_MEMORY", "CAPACITY_RESIZE_UNSUPPORTED",
+            "CAPACITY_ENGINE_UNAVAILABLE", "CAPACITY_TOOLS_MISSING",
+            "CAPACITY_GRANT_REQUIRED",
+            "COMPATIBILITY_OK", "COMPATIBILITY_MONGODB_KERNEL_UNSUPPORTED",
+        ):
+            val = getattr(_ob, name, None)
+            if isinstance(val, str):
+                seen.add(val)
+    except Exception:  # noqa: BLE001 - discovery must stay offline-safe
+        pass
     return sorted(seen)
 
 

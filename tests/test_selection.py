@@ -31,6 +31,7 @@ def test_independent_selectors_render_ldap_for_kubernetes():
 
     assert selected.label == "microservices-ldap"
     assert selected.preset.topology == "kubernetes"
+    assert selected.preset.requires_license is True
     assert selected.preset.scenario == "ldap"
     assert selected.preset.scenario_params["users"] == 4
 
