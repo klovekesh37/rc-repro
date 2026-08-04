@@ -167,7 +167,11 @@ def record(name: str, *, retained: bool | None = None,
         services = [{"service": c.get("service", ""), "state": c.get("state", ""),
                      "status": c.get("status", "")}
                     for c in runner.container_details(target)]
-        state = lifecycle._pretty_state(runner.rc_state(target)) if runner.docker_available() else "unknown"
+        rc_status = next((c["status"] for c in services
+                          if c["service"] == "rocketchat" or
+                          c["service"].startswith("rocketchat-")), "")
+        state = (lifecycle.repro_state(rc_status, bool(services))
+                 if runner.docker_available() else "unknown")
         engine = {"docker_version": runner.docker_server_version(),
                   "compose_version": runner.compose_version()}
 

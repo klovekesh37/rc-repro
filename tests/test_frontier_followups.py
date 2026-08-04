@@ -161,7 +161,14 @@ def test_evidence_retention_reason_and_default(tmp_path, monkeypatch):
         root_url="http://localhost:3000", host_port=3000, version_source="map",
     )
     runner.write("e1", "services: {}\n", meta)
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(runner, "container_details", lambda _name: [
+        {"service": "mongo", "state": "running", "status": "Up 2 minutes"},
+        {"service": "rocketchat", "state": "restarting",
+         "status": "Restarting (1) 5 seconds ago"},
+    ])
     payload = evidence.record("e1")
+    assert payload["runtime"]["state"] == "restarting"
     assert payload["retention"]["retained"] is False
     assert payload["retention"]["reason"] is None
     assert "down --name e1 --volumes --yes" in payload["retention"]["cleanup"]

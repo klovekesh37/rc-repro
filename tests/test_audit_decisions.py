@@ -63,6 +63,29 @@ def test_stack_layer_check_rejects_a_layer_that_absorbs_another_path():
     assert "actual paths=" in failures[0]
 
 
+def test_linear_history_allows_a_merge_after_the_curated_milestones():
+    commits = [f"commit-{index}" for index in range(1, 12)]
+    parents = {commits[0]: ["original-base"]}
+    parents.update({commit: [commits[index - 1]]
+                    for index, commit in enumerate(commits[1:], start=1)})
+    parents[commits[9]] = [commits[8], "moving-upstream-main"]
+
+    assert audit.validate_linear_history(commits, parents.__getitem__) == []
+
+
+def test_linear_history_rejects_a_merge_inside_the_curated_milestones():
+    commits = [f"commit-{index}" for index in range(1, 10)]
+    parents = {commits[0]: ["original-base"]}
+    parents.update({commit: [commits[index - 1]]
+                    for index, commit in enumerate(commits[1:], start=1)})
+    parents[commits[4]] = [commits[3], "unexpected-parent"]
+
+    failures = audit.validate_linear_history(commits, parents.__getitem__)
+
+    assert len(failures) == 1
+    assert "expected only commit-4" in failures[0]
+
+
 def test_current_checkout_has_the_curated_git_stack_without_local_stack_branches():
     checkout = subprocess.run(
         ["git", "rev-parse", "--is-inside-work-tree"], cwd=ROOT,

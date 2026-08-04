@@ -194,12 +194,27 @@ def validate_stack_layers(commits: list[str], paths_for=commit_paths,
     return failures
 
 
-def validate_linear_history(base: str, commits: list[str]) -> list[str]:
+def commit_parents(commit: str) -> list[str]:
+    return git_text("rev-list", "--parents", "-n", "1", commit).split()[1:]
+
+
+def validate_linear_history(commits: list[str], parents_for=commit_parents) -> list[str]:
+    """Verify the curated milestones are a linear, independently reviewable stack.
+
+    Follow-up commits may legitimately include merges from a moving upstream main.
+    Those merges must not retroactively invalidate the nine curated milestones.
+    """
     failures: list[str] = []
-    expected_parent = base
-    for commit in commits:
-        fields = git_text("rev-list", "--parents", "-n", "1", commit).split()
-        parents = fields[1:]
+    if not commits:
+        return failures
+    first_parents = parents_for(commits[0])
+    if len(first_parents) != 1:
+        failures.append(
+            f"{commits[0][:8]} parents={first_parents} expected one base parent")
+        return failures
+    expected_parent = first_parents[0]
+    for commit in commits[:len(STACK_LAYERS)]:
+        parents = parents_for(commit)
         if parents != [expected_parent]:
             failures.append(
                 f"{commit[:8]} parents={parents} expected only {expected_parent[:8]}")
@@ -253,7 +268,7 @@ def audit_stack_history(*, run_tip_tests: bool = True):
     commits = stack_commits(base)
     curated = commits[:len(STACK_LAYERS)]
     failures = validate_stack_layers(commits)
-    failures.extend(validate_linear_history(base, commits))
+    failures.extend(validate_linear_history(curated))
     if run_tip_tests and not failures:
         failures.extend(test_stack_tips(commits))
     covered = [f"{commit[:8]}:{name}" for commit, (name, _subject, _paths)
