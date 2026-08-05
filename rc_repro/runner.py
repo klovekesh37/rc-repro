@@ -72,17 +72,31 @@ def workspace(name: str) -> Path:
 
 
 def exists(name: str) -> bool:
-    return (workspace(name) / "docker-compose.yml").exists()
+    """Whether a repro exists, judged by its metadata record.
+
+    repro.json rather than docker-compose.yml: the record is topology-neutral (a
+    Kubernetes repro renders values.yaml instead), and `write` writes it last, so
+    its presence also means the workspace finished being written.
+    """
+    return (workspace(name) / "repro.json").exists()
 
 
 def write(name: str, compose_yaml: str, meta: Metadata,
-          files: list[tuple[str, str]] | None = None) -> None:
+          files: list[tuple[str, str]] | None = None,
+          artifact_name: str = "docker-compose.yml") -> None:
+    """Persist a repro's workspace: its rendered artifact plus repro.json.
+
+    `artifact_name` is the rendered deployment artifact. Compose repros write
+    docker-compose.yml (the default, so every existing caller is unchanged);
+    Kubernetes repros write values.yaml. Evidence hashes whichever one is there,
+    so reproducibility works the same either way.
+    """
     ws = workspace(name)
     ws.mkdir(parents=True, exist_ok=True)
     # Write atomically (temp + rename): an interruption mid-write must not leave a
     # half-written repro.json that read_meta would choke on, nor a compose file
     # out of sync with its metadata.
-    _atomic_write(ws / "docker-compose.yml", compose_yaml)
+    _atomic_write(ws / artifact_name, compose_yaml)
     _atomic_write(ws / "repro.json", json.dumps(asdict(meta), indent=2))
     # Preset-generated files (e.g. a seeded LDIF that a service mounts).
     # `{{ROOT_URL}}` is substituted with the repro's URL — presets are built
@@ -108,6 +122,16 @@ def read_meta(name: str) -> Metadata:
     if not isinstance(blob, dict):
         raise TypeError("repro.json is not a JSON object")
     return Metadata(**{k: v for k, v in blob.items() if k in _META_FIELDS})
+
+
+def write_meta(name: str, meta: Metadata) -> None:
+    """Rewrite just repro.json, leaving the rendered artifact alone.
+
+    For updating a fact that changes during a repro's life (a re-established
+    port-forward's pid) without re-rendering the deployment artifact, which would
+    make evidence's hash churn for no reason.
+    """
+    _atomic_write(workspace(name) / "repro.json", json.dumps(asdict(meta), indent=2))
 
 
 def read_compose(name: str) -> dict:
@@ -589,8 +613,62 @@ def docker_server_version() -> str | None:
     return _first_line(["docker", "version", "--format", "{{.Server.Version}}"])
 
 
+def docker_server_platform() -> str | None:
+    """Product name for the active Docker-compatible server endpoint."""
+    return _first_line(["docker", "version", "--format", "{{.Server.Platform.Name}}"])
+
+
+def docker_server_components() -> tuple[str, ...]:
+    """Named components reported by the active Docker-compatible server.
+
+    Podman's compatibility API can expose a generic Linux platform and a
+    ``/var/run/docker.sock`` endpoint while still identifying ``Podman Engine``
+    here. Component names are server facts; unlike finding a local executable,
+    they describe the endpoint Docker commands are actually using.
+    """
+    raw = _first_line([
+        "docker", "version", "--format", "{{json .Server.Components}}",
+    ])
+    if not raw:
+        return ()
+    try:
+        components = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return ()
+    if not isinstance(components, list):
+        return ()
+    return tuple(str(item.get("Name") or "").strip()
+                 for item in components if isinstance(item, dict) and item.get("Name"))
+
+
+def docker_endpoint() -> str | None:
+    """Socket or URL used by the active Docker-compatible endpoint.
+
+    Podman's Docker API does not consistently identify itself in
+    ``Server.Platform.Name``. The active endpoint remains authoritative: a
+    ``podman.sock`` path describes the server Docker commands are actually using,
+    unlike merely finding an unrelated Podman binary on PATH.
+    """
+    configured = os.environ.get("DOCKER_HOST", "").strip()
+    if configured:
+        return configured
+    return _first_line([
+        "docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}",
+    ])
+
+
+def docker_cli_version() -> str | None:
+    """Human-readable Docker CLI version without bypassing the runner seam."""
+    return _first_line(["docker", "--version"])
+
+
 def compose_version() -> str | None:
     return _first_line(["docker", "compose", "version", "--short"])
+
+
+def compose_version_line() -> str | None:
+    """Human-readable Compose version without bypassing the runner seam."""
+    return _first_line(["docker", "compose", "version"])
 
 
 def docker_kernel_version() -> str | None:

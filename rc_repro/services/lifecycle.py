@@ -47,8 +47,10 @@ def derive_name(version: str, preset: str) -> str:
 # --- preconditions ------------------------------------------------------------
 
 def require_docker() -> None:
+    # DockerError, not NotReadyError: an absent engine is a preflight problem the
+    # caller must fix (exit 3), not a "still starting, poll again" state (exit 5).
     if not runner.docker_available():
-        raise NotReadyError("Docker isn't running. Start Docker Desktop and try again.")
+        raise DockerError("Docker isn't running. Start Docker Desktop and try again.")
 
 
 def resolve_name(name: str | None) -> str:
@@ -158,6 +160,11 @@ def pick_host_port(port: int, pre: presets.Preset, exclude: str = "") -> int:
 class CreateReq:
     version: str
     preset: str = "default"
+    # Public selectors. ``preset`` remains the compatibility alias; an empty
+    # value lets the resolver consult saved selector defaults from config.yaml.
+    deployment: str = ""
+    scenario: list[str] | None = None
+    scenarios: list[str] | None = None
     name: str = ""
     port: int = 0
     root_url: str = ""
@@ -359,6 +366,39 @@ def _unknown_params(params: dict, pre: presets.Preset) -> list[str]:
     return sorted(set(params) - set(pre.params_help))
 
 
+def _resolve_selection(req: CreateReq, deployment_type: str | None = None) -> presets.Selection:
+    """Resolve a request before any engine, cluster, or workspace side effect."""
+    requested_scenarios = req.scenario
+    if req.scenarios is not None:
+        left = ([requested_scenarios] if isinstance(requested_scenarios, str)
+                else list(requested_scenarios or []))
+        right = [req.scenarios] if isinstance(req.scenarios, str) else list(req.scenarios)
+        requested_scenarios = [*left, *right]
+    has_public_selectors = (bool(req.deployment) or requested_scenarios is not None
+                            or not req.preset)
+    if has_public_selectors:
+        try:
+            return presets.resolve_selection(
+                preset=req.preset, deployment=req.deployment,
+                scenarios=requested_scenarios, params=req.params)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+
+    # Preserve the old resolver call shape for existing integrations and tests.
+    # ``deployment_type`` is still an internal adapter seam for callers that have
+    # not opted into the public selectors.
+    try:
+        pre = presets.resolve(req.preset, deployment_type=deployment_type,
+                              params=req.params) if deployment_type else \
+            presets.resolve(req.preset, params=req.params)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    deployment = "microservices" if pre.topology == "kubernetes" else (
+        req.preset if req.preset in presets.DEPLOYMENT_PRESETS else "default")
+    scenarios = (pre.scenario,) if pre.scenario else ()
+    return presets.Selection(pre, deployment, scenarios, req.preset, req.params)
+
+
 def _guard_project_collision(name: str) -> None:
     """Refuse to create when a docker compose project of the same derived name
     already exists but belongs to a DIFFERENT workspace.
@@ -386,12 +426,141 @@ def login(meta: runner.Metadata) -> rcapi.Auth:
     return rcapi.login(meta.root_url, mailpit_url=meta.extra.get(config.EXTRA_MAILPIT_URL))
 
 
-def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool = False) -> dict:
+#: Compose-only create flags and why each has no Kubernetes equivalent. Refused
+#: rather than silently ignored: a flag accepted and then doing nothing is the exact
+#: failure the contract exists to remove, and each of these could only be honoured by
+#: guessing at a mapping that is not the same object. Refusing names the reason and
+#: leaves the door open to implement a real equivalent later.
+_COMPOSE_ONLY_FLAGS: dict[str, str] = {
+    "fresh": "discards the compose data volume; the Kubernetes data lives in a PVC, "
+             "which is a different object. Use `down --volumes` then recreate.",
+    "force": "recreates over a compose project; a Kubernetes namespace collision is a "
+             "different failure. Pick another --name, or `down` the existing repro.",
+    "monitor": "attaches the Prometheus/Grafana compose sidecars on fixed host ports; "
+               "nothing renders them into a cluster yet.",
+    "stats": "reads container resources through the compose project; the Kubernetes "
+             "equivalent needs metrics-server.",
+}
+
+
+def _reject_compose_only_flags(req: CreateReq) -> None:
+    set_flags = [f for f in _COMPOSE_ONLY_FLAGS if getattr(req, f, False)]
+    if not set_flags:
+        return
+    reasons = "; ".join(f"--{f} {_COMPOSE_ONLY_FLAGS[f]}" for f in set_flags)
+    raise ValidationError(
+        f"{', '.join('--' + f for f in set_flags)} "
+        f"{'is' if len(set_flags) == 1 else 'are'} not supported on the Kubernetes "
+        f"topology: {reasons}")
+
+
+def warn_if_unlicensed(req: CreateReq, emit: Emit = null_emit,
+                       pre: presets.Preset | None = None) -> bool:
+    """Warn when an enterprise preset is created without a licence.
+
+    Returns whether the warning fired, so a caller (and a test) can tell. The code
+    LICENSE_ABSENT_EE_PRESET is stable; the message is not. A registration token may
+    arrive on the request or from the RC_REPRO_REG_TOKEN env override, so both count
+    as a licence being supplied.
+    """
+    if pre is None:
+        try:
+            pre = presets.resolve(req.preset, params=req.params)
+        except Exception:  # noqa: BLE001 - a bad preset is reported later, not here
+            return False
+    if not getattr(pre, "requires_license", False):
+        return False
+    # Strip: whitespace-only must not count as a licence (same rule as k8s create).
+    token = (req.reg_token or config.load_config().get("reg_token") or "")
+    if isinstance(token, str):
+        token = token.strip()
+    if token:
+        return False
+    label = pre.name or req.preset or "selected deployment"
+    warn(emit, f"{label!r} is an enterprise feature and no licence was supplied; "
+               "it will run but may not function as licensed "
+               "(pass --reg-token, set RC_REPRO_REG_TOKEN, or store reg_token in "
+               "the owner-only config; see cloud.rocket.chat)",
+         phase="preflight", code="LICENSE_ABSENT_EE_PRESET")
+    return True
+
+
+def create_repro(req: CreateReq, emit: Emit = null_emit, *,
+                 stream_output: bool = False,
+                 deployment_type: str | None = None) -> dict:
     """Create-or-reuse a repro. Returns a result dict (meta + boot/seed info).
 
     `stream_output=True` streams docker's line output through `emit` (for the web
     job log); False leaves docker's own progress on the terminal (CLI default).
     """
+    # Resolve the complete built-in scenario before selecting a deployment
+    # lifecycle. Kubernetes used to dispatch first and therefore never saw LDAP's
+    # parameters, services, or generated assets. The resolver is read-only, so a
+    # bad selector fails before Docker, Kind, Helm, or a workspace is touched.
+    selection = _resolve_selection(req, deployment_type)
+    pre = selection.preset
+
+    uses_public_selectors = (bool(req.deployment) or req.scenario is not None or
+                             req.scenarios is not None or not req.preset)
+    if uses_public_selectors:
+        unknown = _unknown_params(req.params, pre)
+        if unknown:
+            valid = ", ".join(sorted(pre.params_help)) or "(this preset takes no --set params)"
+            raise ValidationError(
+                f"unknown --set param(s) for preset {selection.label!r}: "
+                f"{', '.join(unknown)} - valid: {valid}")
+
+    # Licence signal, before dispatch so it fires for every topology and every EE
+    # preset. The chart does not validate a licence, so an unlicensed microservices
+    # run comes up present but not necessarily functioning as licensed; a warn event
+    # with a stable code lets an agent branch on it without reading prose, and it is
+    # a warning rather than a refusal because the chart itself installs without one.
+    warn_if_unlicensed(req, emit, pre)
+
+    # Topology dispatch. One line, delegating wholesale, so the Compose body below
+    # stays exactly as it was and the web GUI gets the same routing as the CLI.
+    if pre.topology == "kubernetes":
+        from rc_repro.services import k8s, onboarding
+        # The gate lives on the Kubernetes path, not on every command: the Docker
+        # default has always worked with zero config and must keep doing so (the map
+        # makes Docker the default), while the microservices path can resize the
+        # engine and provision a cluster, which is exactly the authority onboarding
+        # exists to have a human grant once. An un-onboarded agent gets exit 6 here
+        # with the command to ask a human to run, rather than inventing a baseline.
+        onboarding.require_onboarded()
+        onboarding.require_grant("owned-cluster")
+        _reject_compose_only_flags(req)
+        if req.offline:
+            # --offline promises no network, but the Kubernetes path must pull the
+            # chart and the images, so it cannot honour that. Saying so is better
+            # than half-running: version resolution would use the shipped map while
+            # helm and the pulls still hit the network, which is a confusing lie.
+            raise ValidationError(
+                "--offline cannot work on the Kubernetes topology: it must pull the "
+                "Helm chart and the container images. Drop --offline, or use a "
+                "Compose preset for a fully offline repro.")
+        name = req.name or derive_name(req.version, selection.label)
+        # Same three token sources as Compose: request, config file, env override
+        # (load_config applies RC_REPRO_REG_TOKEN). Never logged. Strip so a blank
+        # value matches warn_if_unlicensed and does not create an empty Secret.
+        token = (req.reg_token or config.load_config().get("reg_token") or "")
+        if isinstance(token, str):
+            token = token.strip()
+        result = k8s.create_repro(name, req.version, offline=req.offline,
+                                  rc_image=req.rc_image or "", mongo=req.mongo or "",
+                                  port=req.port, reg_token=token, preset=pre, emit=emit)
+        # Seed requires a ready admin. Force the wait path when seed is set, so
+        # GUI/API create-and-seed match CLI create-and-seed without double work.
+        need_wait = req.wait or req.seed
+        if need_wait:
+            # --wait must mean the same thing on both topologies, or a caller that
+            # asked to block gets an unready repro and no error.
+            result.update(wait_and_finalize(runner.read_meta(name), emit))
+            result["waited"] = True
+        if req.seed:
+            result["seed"] = run_seed_inline(
+                runner.read_meta(name), req.seed_profile, req.stats, emit)
+        return result
     require_docker()
     cfg = config.load_config()
 
@@ -404,18 +573,8 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
     if req.mongo:
         versions.apply_mongo_override(resolved, req.mongo)
 
-    try:
-        pre = presets.load(req.preset, req.params)
-    except ValueError as exc:
-        raise ValidationError(str(exc)) from exc
-    unknown = _unknown_params(req.params, pre)
-    if unknown:
-        valid = ", ".join(sorted(pre.params_help)) or "(this preset takes no --set params)"
-        raise ValidationError(
-            f"unknown --set param(s) for preset {req.preset!r}: {', '.join(unknown)} - valid: {valid}")
-
     wait = req.wait or bool(pre.post_ready) or req.seed
-    repro_name = sanitize(req.name) if req.name else derive_name(req.version, req.preset)
+    repro_name = sanitize(req.name) if req.name else derive_name(req.version, selection.label)
     if not repro_name:
         raise ValidationError(f"name {req.name!r} contains no usable characters (want a-z, 0-9, '-')")
     if req.port and not (1024 <= req.port <= 65535):
@@ -431,7 +590,9 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         check_monitor_ports(exclude=repro_name)
     host_port = pick_host_port(req.port, pre, exclude=repro_name)
     root = req.root_url or f"http://localhost:{host_port}"
-    token = req.reg_token or cfg.get("reg_token") or ""
+    token = (req.reg_token or cfg.get("reg_token") or "")
+    if isinstance(token, str):
+        token = token.strip()
     bind_host = req.bind or cfg.get("bind_host") or config.DEFAULT_BIND_HOST
     tlsspec = _resolve_tls(req, repro_name, bind_host, exclude=repro_name, emit=emit)
     if req.bind_public and bind_host not in ("0.0.0.0", "::"):
@@ -477,6 +638,13 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         host_port=host_port, version_source=resolved.source, pinned=req.pin,
         public_url=public,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    if selection.deployment != "default" or selection.scenarios:
+        meta.extra["deployment"] = selection.deployment
+    if selection.scenarios:
+        meta.extra["scenarios"] = list(selection.scenarios)
+    if token:
+        # Boolean only; compose.env holds the value for the container, not the record.
+        meta.extra["reg_token_supplied"] = True
     if pre.post_ready:
         meta.extra["post_ready"] = pre.post_ready
     if pre.notes:
@@ -670,23 +838,67 @@ def wait_serving(meta: runner.Metadata, emit: Emit, timeout: float) -> dict:
         raise NotReadyError(str(exc) + hint) from exc
 
 
-def finalize(meta: runner.Metadata, emit: Emit):
-    try:
-        auth = login(meta)
-        if rcapi.complete_setup_wizard(meta.root_url, auth, config.ADMIN_PASSWORD):
-            info(emit, "setup wizard skipped - no registration needed.", phase="post_ready")
-        return auth
-    except Exception:  # noqa: BLE001 - finalize is best-effort
-        return None
+def finalize(meta: runner.Metadata, emit: Emit, *, required: bool = False):
+    """Make the advertised first admin usable after HTTP readiness.
+
+    Compose keeps this best-effort because custom-admin presets may deliberately
+    replace the fixed account. Kubernetes always provisions that account through
+    the chart, so readiness is incomplete until login and wizard completion work.
+    The main deployment can answer /api/info before first-user creation finishes;
+    retry that bounded startup race rather than returning a false success.
+    """
+    attempts = 6 if required else 1
+    for attempt in range(attempts):
+        try:
+            auth = login(meta)
+            if rcapi.complete_setup_wizard(
+                    meta.root_url, auth, config.ADMIN_PASSWORD):
+                # Local setup only. Do not imply Enterprise registration or
+                # licensing is complete or unnecessary.
+                info(emit, "local setup wizard completed; admin is usable",
+                     phase="post_ready")
+                return auth
+        except Exception:  # noqa: BLE001 - retried below or best-effort for Compose
+            pass
+        if attempt + 1 < attempts:
+            info(emit, "waiting for the first admin to become usable",
+                 phase="post_ready")
+            time.sleep(2)
+    if required:
+        raise NotReadyError(
+            f"{meta.name!r} is serving, but its first admin and setup-wizard state "
+            f"are not usable yet; retry `rc-repro ready --name {meta.name}`")
+    return None
 
 
 def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: float = 300.0) -> dict:
-    started = time.monotonic()
-    served = wait_serving(meta, emit, timeout)
-    elapsed = int(time.monotonic() - started)
-    auth = finalize(meta, emit)
+    """Wait until the repro serves, then run the post-ready steps.
+
+    Dispatches here rather than at each call site: the CLI's `ready`, its `--json`
+    variant, and the web GUI all call this, and guarding three callers separately is
+    how one of them gets missed. On Kubernetes the URL is a port-forward that may
+    have died, so it is revived before waiting rather than timed out against.
+    """
+    is_kubernetes = (isinstance(meta.extra, dict) and
+                     meta.extra.get("topology") == "kubernetes")
+    if is_kubernetes:
+        # Dispatch fully to the Kubernetes wait, not just revive-then-wait_serving.
+        # wait_serving's is_alive/tick read compose state (runner.rc_state), which is
+        # empty for a Kubernetes repro, and it has no terminal-pod detection, so a
+        # stuck pull would sit out the timeout instead of aborting (exit 7). k8s.
+        # wait_ready owns both. This is what the non-json `ready` and the GUI use, so
+        # they must get the same behaviour as the --json path, not a compose wait.
+        from rc_repro.services import k8s
+        result = k8s.wait_ready(meta.name, timeout=timeout, emit=emit)
+        elapsed = result.get("booted_s", 0)
+        running = result.get("version", "?")
+    else:
+        started = time.monotonic()
+        served = wait_serving(meta, emit, timeout)
+        elapsed = int(time.monotonic() - started)
+        running = served.get("version", "?")
+    auth = finalize(meta, emit, required=is_kubernetes)
     postready.run_post_ready(meta, auth, emit)
-    running = served.get("version", "?")
     if running != "?" and not meta.rc_version.startswith(running):
         warn(emit, f"running version {running} != requested {meta.rc_version}", phase="wait")
     info(emit, "ready", phase="done", pct=100.0)
@@ -696,7 +908,19 @@ def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: fl
 # --- seed (inline, used by create --seed) -------------------------------------
 
 def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit) -> dict:
+    """Ordinary REST seed shared by create --seed, seed, HTTP API, and GUI.
+
+    Kubernetes reachability is a port-forward that may have died; revive it
+    before login. Compose-only resource statistics are refused before any
+    monitor starts or seed mutation occurs.
+    """
     from rc_repro import perf
+    if stats and _is_kubernetes(meta):
+        raise ValidationError(
+            "--stats / seed resource statistics are not supported on the "
+            "Kubernetes topology: they require the Compose resource monitor. "
+            "Use the ordinary REST seed without --stats.")
+    ensure_reachable(meta.name)
     try:
         auth = login(meta)
     except Exception as exc:  # noqa: BLE001
@@ -710,22 +934,48 @@ def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit
     t0 = time.monotonic()
     try:
         s = seeder.seed(meta.root_url, auth, plan, log=lambda m: info(emit, m.strip(), phase="seed"))
+    except seeder.SeedVerificationError as exc:
+        # Keep the failed plan/readback available to `evidence` before surfacing
+        # the runtime failure to CLI, HTTP, or GUI callers.
+        persist_seed_result(meta, exc.result)
+        raise
     finally:
         resources = mon.stop() if mon else None
     s["total_s"] = time.monotonic() - t0
     if resources is not None:
         s["resources_keys"] = sorted(resources)
+    persist_seed_result(meta, s)
     return s
+
+
+def persist_seed_result(meta: runner.Metadata, result: dict) -> None:
+    """Persist only the secret-free Seed Dataset proof needed by evidence."""
+    plan = result.get("plan")
+    if not isinstance(plan, dict):
+        # Test doubles and older callers may return the historical count-only
+        # summary. Do not manufacture a proof record from incomplete data.
+        return
+    proof = {"profile": plan.get("profile", ""), "plan": plan}
+    for key in ("attempted", "actual", "readback", "verification"):
+        value = result.get(key)
+        if isinstance(value, dict):
+            proof[key] = value
+    extra = dict(meta.extra) if isinstance(meta.extra, dict) else {}
+    extra["seed"] = proof
+    meta.extra = extra
+    runner.write_meta(meta.name, meta)
 
 
 # --- read / state -------------------------------------------------------------
 
 def _summary(meta: runner.Metadata) -> dict:
+    from rc_repro.services import access
     d = {
         "name": meta.name, "rc_version": meta.rc_version, "mongo_tag": meta.mongo_tag,
         "mongo_flavor": meta.mongo_flavor, "preset": meta.preset, "root_url": meta.root_url,
         "host_port": meta.host_port, "login": {"user": config.ADMIN_USERNAME, "password": config.ADMIN_PASSWORD},
         "pinned": meta.pinned, "notes": list(meta.extra.get("notes", []) if isinstance(meta.extra, dict) else []),
+        "access": access.handoff(meta.host_port, meta.root_url),
     }
     n = meta.extra.get("instances") if isinstance(meta.extra, dict) else None
     if n:
@@ -734,6 +984,8 @@ def _summary(meta: runner.Metadata) -> dict:
     if isinstance(meta.extra, dict) and meta.extra.get("monitoring"):
         d["monitoring"] = True
         d["grafana_url"] = f"http://localhost:{config.MONITOR_PORTS[1]}"
+    if isinstance(meta.extra, dict) and meta.extra.get("reg_token_supplied"):
+        d["reg_token_supplied"] = True
     return d
 
 
@@ -827,6 +1079,22 @@ def list_repros() -> list[dict]:
     status_map = runner.rc_status_by_project() if docker_up else {}
     out = []
     for m in metas:
+        if isinstance(m.extra, dict) and m.extra.get("topology") == "kubernetes":
+            # Ask Kubernetes, not compose: a compose lookup returns nothing for these
+            # and `list` would show every Kubernetes repro as unknown forever.
+            from rc_repro.services import k8s
+            try:
+                state = k8s.aggregate_state(k8s.pods(m.name))
+            except Exception:  # noqa: BLE001 - cluster gone or unreachable
+                state = "?"
+            uptime, health = "", ""
+            out.append({"name": m.name, "rc_version": m.rc_version, "mongo_tag": m.mongo_tag,
+                        "host_port": m.host_port, "root_url": m.root_url, "state": state,
+                        "preset": m.preset, "pinned": m.pinned, "default": m.name == default,
+                        "monitoring": False, "created_at": m.created_at,
+                        "uptime": uptime, "health": health, "grafana_url": None,
+                        "links": [{"label": "Rocket.Chat", "url": m.root_url}]})
+            continue
         rc_status = status_map.get(m.project, "")
         # `states` is only consulted for "does this project have ANY container",
         # never for the state itself -- see repro_state().
@@ -892,6 +1160,12 @@ def detail(name: str) -> dict:
     containers + the RC service's env vars."""
     target = resolve_name(name)
     m = runner.read_meta(target)
+    # Topology dispatch, same one-line pattern as create_repro. The Kubernetes
+    # record uses the identical {service, state, status} container shape, so a
+    # caller reads it without knowing which topology produced it.
+    if isinstance(m.extra, dict) and m.extra.get("topology") == "kubernetes":
+        from rc_repro.services import k8s
+        return k8s.detail(target)
     d = _summary(m)
     # The env tab masks credentials and tells the reader that the workspace's
     # docker-compose.yml is the source of truth for a real value (see redact_env)
@@ -937,6 +1211,18 @@ def detail(name: str) -> dict:
 
 def set_state(name: str, action: str) -> None:
     target = resolve_name(name)
+    if topology_of_repro(target) == "kubernetes":
+        from rc_repro.services import k8s
+        if action != "restart":
+            # start/stop have no clean Kubernetes analogue: scaling to zero and back
+            # is not the same as stopping a container, and silently doing something
+            # different is worse than saying so.
+            raise ValidationError(
+                f"{action!r} is not supported on the Kubernetes topology; use "
+                f"`rc-repro down --name {target}` and recreate, or `restart`")
+        if k8s.restart(target, emit=null_emit) != 0:
+            raise DockerError(f"rollout restart failed for {target!r}")
+        return
     fn = {"start": runner.start, "stop": runner.stop, "restart": runner.restart}.get(action)
     if fn is None:
         raise ValidationError(f"unknown action {action!r} (want start|stop|restart)")
@@ -960,9 +1246,51 @@ def _clear_default_if(name: str) -> None:
     config.update_config(mutate)
 
 
+def topology_of_repro(name: str) -> str:
+    """An existing repro's topology, read from its record.
+
+    Separate from _topology_of, which answers for a preset before a repro exists.
+    Every verb that touches a live repro dispatches on this, because a Kubernetes
+    repro has no compose project and running `docker compose` against it either
+    fails or, worse, silently does nothing.
+    """
+    try:
+        meta = runner.read_meta(name)
+    except Exception:  # noqa: BLE001 - half-written or absent record
+        return "compose"
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    return extra.get("topology", "compose") or "compose"
+
+
+def _topology_of(preset_name: str) -> str:
+    """The preset's topology, defaulting to compose if it cannot be loaded.
+
+    A failure to load is not this function's problem to report: the Compose path
+    raises a proper ValidationError for an unknown preset a few lines later, and
+    guessing "kubernetes" here would route a typo into the wrong lifecycle.
+    """
+    try:
+        return getattr(presets.load(preset_name), "topology", "compose") or "compose"
+    except Exception:  # noqa: BLE001
+        return "compose"
+
+
 def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: Emit = null_emit) -> dict:
-    require_docker()
     target = resolve_name(name)
+    if topology_of_repro(target) == "kubernetes":
+        from rc_repro.services import onboarding
+        onboarding.require_grant("owned-cluster")
+        from rc_repro.services import k8s
+        if volumes and not confirm:
+            raise ValidationError(f"deleting {target!r}'s data and record is irreversible - "
+                                  "pass confirm=true")
+        result = k8s.teardown(target, volumes=volumes, emit=emit)
+        if volumes:
+            _clear_default_if(target)
+        # residual is authoritative: a partial teardown must not report success.
+        result["removed_ok"] = not result.get("residual")
+        return result
+    require_docker()
     if volumes and not confirm:
         raise ValidationError(f"deleting {target!r}'s data volume and record is irreversible - "
                               "pass confirm=true")
@@ -975,6 +1303,10 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
     return {"name": target, "removed": volumes}
 
 
+def _is_kubernetes(meta) -> bool:
+    return isinstance(meta.extra, dict) and meta.extra.get("topology") == "kubernetes"
+
+
 def prunable() -> list[str]:
     """Names of repros that are safe to prune: not pinned and with no containers
     (a plain `down`). Raises DockerError if docker can't be queried — deleting on
@@ -983,17 +1315,64 @@ def prunable() -> list[str]:
     states = runner.project_states()
     if states is None:
         raise DockerError("couldn't query docker compose projects - not pruning (is Docker healthy?)")
-    return [m.name for m in runner.list_meta() if not m.pinned and m.project not in states]
+    out = []
+    for m in runner.list_meta():
+        if m.pinned:
+            continue
+        if _is_kubernetes(m):
+            # A Kubernetes repro's `project` is its namespace, which is never in the
+            # compose project list, so the compose rule below would classify a
+            # RUNNING repro as prunable and delete it. Ask Kubernetes instead, and
+            # treat any uncertainty as "not prunable": deleting on ambiguity is the
+            # one mistake prune must never make.
+            try:
+                from rc_repro.services import k8s
+                if k8s.pods(m.name):
+                    continue          # still has pods: live, do not prune
+            except Exception:  # noqa: BLE001 - cluster unreachable: cannot tell
+                continue
+            out.append(m.name)
+            continue
+        if m.project not in states:
+            out.append(m.name)
+    return out
+
+
+def prune_plan() -> dict:
+    """Return the records and shared cluster that an explicit prune may remove."""
+    from rc_repro.services import k8s
+    return {"targets": prunable(), "cluster": k8s.cluster_prune_status()}
 
 
 def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
-    targets = prunable()
-    if not targets:
-        return {"targets": [], "removed": []}
+    from rc_repro.services import k8s
+    plan = prune_plan()
+    targets = plan["targets"]
+    cluster_target = bool(plan["cluster"].get("prunable"))
+    if not targets and not cluster_target:
+        return {"targets": [], "removed": [], "cluster": plan["cluster"]}
     if not confirm:
-        raise ValidationError(f"prune deletes {len(targets)} down repro(s) incl. data - pass confirm=true")
+        detail = f"{len(targets)} down repro(s) incl. data"
+        if plan["cluster"].get("exists"):
+            detail += " and the owned Kind cluster once it is empty"
+        raise ValidationError(f"prune deletes {detail} - pass confirm=true")
+    if cluster_target or any(topology_of_repro(name) == "kubernetes" for name in targets):
+        from rc_repro.services import onboarding
+        onboarding.require_grant("owned-cluster")
     removed = []
     for name in targets:
+        # Dispatch: a Kubernetes repro has no compose project, so runner.down would
+        # no-op and runner.remove would delete the record while leaking the recorded
+        # port-forward and lingering namespace. k8s.teardown kills the forward (with
+        # the identity check, so never a stranger) and deletes the namespace, which
+        # is the orphan-forward reclaim for a pruned repro.
+        if topology_of_repro(name) == "kubernetes":
+            from rc_repro.services import k8s
+            k8s.teardown(name, volumes=True, emit=emit)
+            _clear_default_if(name)
+            removed.append(name)
+            info(emit, f"pruned {name!r}", phase="done")
+            continue
         if runner.down(name, volumes=True) != 0:
             warn(emit, f"could not clean up {name!r} - skipping", phase="done")
             continue
@@ -1001,4 +1380,71 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         _clear_default_if(name)
         removed.append(name)
         info(emit, f"pruned {name!r}", phase="done")
-    return {"targets": targets, "removed": removed}
+    # This must run even when there were no down records. `down --volumes` removes
+    # the final record before a later `prune`, which is exactly when the shared empty
+    # cluster is the only remaining target. The helper rechecks labels and refuses on
+    # ambiguity, so a race cannot turn this into deletion of a live repro.
+    cluster = k8s.prune_cluster(emit=emit)
+    return {"targets": targets, "removed": removed, "cluster": cluster}
+
+
+def stale_forwards() -> list[dict]:
+    """Kubernetes repros whose recorded port-forward is no longer alive-and-ours.
+
+    The truly-orphaned case (a forward whose repro record was deleted without killing
+    it) cannot be found from here: once the record is gone the pid is lost, and the
+    #19 identity check means we will not go hunting arbitrary pids to kill. So this
+    reports the recoverable case, a live repro whose tunnel died, which `ready` or
+    any HTTP verb re-establishes on demand. `doctor` surfaces it so a stuck repro has
+    a visible cause rather than a silent one.
+    """
+    out = []
+    for m in runner.list_meta():
+        if not (isinstance(m.extra, dict) and m.extra.get("topology") == "kubernetes"):
+            continue
+        from rc_repro.services import k8s
+        if k8s.forward_state(m) == "down":
+            out.append({"name": m.name, "host_port": m.host_port})
+    return out
+
+
+# --- cross-topology preconditions ----------------------------------------------
+#
+# The parity table in the design enumerated eleven verbs, but the CLI has
+# twenty-five. The fourteen it omitted still touch a repro, so each needs one of two
+# things: reachability fixed up before it talks HTTP, or an honest refusal. Silently
+# running a compose-shaped command against a Kubernetes repro is the failure mode
+# these two helpers exist to prevent.
+
+def ensure_reachable(name: str, emit: Emit = null_emit) -> None:
+    """Make a repro's URL usable before something talks HTTP to it.
+
+    On Compose the published port is always there. On Kubernetes it is a port-forward
+    that dies with whatever started it, so every HTTP-using verb has to revive it
+    first or it fails for a reason that has nothing to do with what was asked.
+    """
+    if topology_of_repro(name) != "kubernetes":
+        return
+    from rc_repro.services import k8s
+    meta = runner.read_meta(name)
+    pid = k8s.ensure_port_forward(meta, emit)
+    if pid and pid != (meta.extra or {}).get("k8s_forward_pid"):
+        meta.extra = {**(meta.extra or {}), "k8s_forward_pid": pid}
+        runner.write_meta(name, meta)
+
+
+def require_compose_topology(name: str, verb: str, why: str = "") -> None:
+    """Refuse a Compose-only verb on a non-Compose repro, naming the reason.
+
+    Per the contract: a flag or command that is accepted and then does nothing is
+    the afternoon-wasting failure rc-repro exists to remove. Refusing with exit 2 is
+    the honest answer until a Kubernetes equivalent exists.
+    """
+    topology = topology_of_repro(name)
+    if topology == "compose":
+        return
+    detail = f" {why}" if why else ""
+    raise ValidationError(
+        f"`{verb}` is not supported on the {topology} topology yet.{detail} "
+        f"Use a Compose preset for this, or `rc-repro info --name {name} --json` "
+        f"to inspect the repro instead.")

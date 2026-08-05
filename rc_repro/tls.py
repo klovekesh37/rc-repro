@@ -199,7 +199,9 @@ def ensure_ca() -> tuple[Path, Path]:
     os.chmod(key, 0o600)
     _openssl("req", "-x509", "-new", "-nodes", "-key", str(key), "-sha256",
              "-days", str(_CA_DAYS), "-out", str(crt),
-             "-subj", "/CN=rc-repro local CA/O=rc-repro")
+             "-subj", "/CN=rc-repro local CA/O=rc-repro",
+             "-addext", "basicConstraints=critical,CA:TRUE",
+             "-addext", "keyUsage=critical,keyCertSign,cRLSign")
     return key, crt
 
 
@@ -869,4 +871,3 @@ def notes(spec: TlsSpec, name: str = "<name>") -> list[str]:
         "Trusted wherever your certificate's issuer is trusted.",
         "Confirm what is being served:  rc-repro tls-status --name " + name,
     ]
-

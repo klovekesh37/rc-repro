@@ -1,0 +1,24 @@
+name: microservices
+description: >-
+  Rocket.Chat microservices on Kubernetes, using the official Helm chart on an
+  rc-repro-owned local kind cluster. Docker remains rc-repro's default; this is
+  the opt-in Kubernetes topology.
+# Routes create/ready/teardown to services/k8s.py instead of the Compose path.
+topology: kubernetes
+# Microservices are an enterprise feature. The chart does not validate a licence,
+# so an unlicensed repro comes up with the services present but not necessarily
+# functioning as licensed. rc-repro warns and records the licence state in
+# evidence rather than blocking, because the chart itself installs happily
+# without one and being stricter would misrepresent what is being modelled.
+requires_license: true
+# Compose-shaped fields stay empty: this preset builds Helm values, not services.
+env: {}
+depends_on: []
+services: {}
+rocketchat: {}
+notes:
+  - "Kubernetes topology: needs kind, kubectl and helm on PATH."
+  - "Measured floor: 6 GiB memory and 4 CPUs allocatable (8 GiB recommended)."
+  - "CPU is the binding constraint during start-up, not memory."
+  - "Rocket.Chat 8.2+ requires MongoDB 8.0, which cannot start on an engine kernel 6.19 or newer (SERVER-121912). Use a 7.x line on such a host."
+  - "MongoDB runs as a single-node replica set from the official image, not the chart's Bitnami subchart, which publishes amd64-only images."

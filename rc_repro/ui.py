@@ -29,9 +29,15 @@ def note(msg: str) -> None:
     typer.secho(msg, fg=typer.colors.CYAN)
 
 
-def die(msg: str) -> NoReturn:
+def die(msg: str, exit_code: int = 1) -> NoReturn:
+    """Print an error and exit.
+
+    `exit_code` defaults to 1 so every existing caller is unchanged; pass a
+    specific code (see errors.EXIT_CODES) when the cause is known, so scripts
+    and agents can branch without parsing this message.
+    """
     fail(f"error: {msg}")
-    raise typer.Exit(1)
+    raise typer.Exit(exit_code)
 
 
 def hint(msg: str) -> None:

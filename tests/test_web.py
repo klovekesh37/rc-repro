@@ -24,6 +24,16 @@ def client(host="http://localhost"):
     return TestClient(create_app(token=TOKEN), base_url=host)
 
 
+def wait_job(c, job_id: str):
+    import time
+    for _ in range(100):
+        state = c.get(f"/api/jobs/{job_id}", headers=H).json()
+        if state["status"] != "running":
+            return state
+        time.sleep(0.02)
+    raise AssertionError(f"job {job_id} did not finish: {state}")
+
+
 def test_health_needs_no_token():
     r = client().get("/api/health")
     assert r.status_code == 200 and "docker" in r.json()
@@ -222,10 +232,231 @@ def test_detail_and_stats_endpoints(monkeypatch):
 def test_create_only_accepts_known_fields(monkeypatch):
     seen = {}
     monkeypatch.setattr(lc, "create_repro",
-                        lambda req, emit, stream_output=False: seen.update(v=req.version) or {"name": "x"})
-    r = client().post("/api/repros", headers=H,
-                      json={"version": "8.5.1", "bogus_field": "drop me"})
-    assert r.status_code == 200 and seen["v"] == "8.5.1"   # unknown key ignored, no crash
+                        lambda req, emit, stream_output=False:
+                        seen.update(version=req.version, preset=req.preset) or {"name": "x"})
+    c = client()
+    r = c.post("/api/repros", headers=H,
+               json={"version": "8.5.1", "preset": None, "bogus_field": "drop me"})
+    assert r.status_code == 200
+    assert wait_job(c, r.json()["job_id"])["status"] == "done"
+    assert seen == {"version": "8.5.1", "preset": ""}
+
+
+# --- GUI against a Kubernetes repro (#17) --------------------------------------
+#
+# The GUI calls the same service layer as the CLI, so it inherits every topology
+# dispatch. These drive the real HTTP endpoints through the real service layer with
+# only the kubectl/helm runner faked, so a create routes to the Kubernetes path, the
+# detail panel reads Kubernetes state, and teardown removes the namespace. That is
+# the server-side integration the audit flagged as the likeliest place the dispatch
+# bug class still hid. It does not test the browser JS or SSE rendering.
+
+class _FakeK8sRun:
+    """Minimal kubectl/helm/kind stand-in: enough for create/detail/teardown to run
+    without a cluster. Inlined rather than cross-imported so the web tests do not
+    depend on tests/ being an importable package."""
+    def __init__(self):
+        self.forwards = []
+    def which(self, tool):
+        return f"/usr/bin/{tool}"
+    def docker_server_platform(self):
+        return "Docker Engine - Community"
+    def run(self, argv, *, check=True):
+        import subprocess
+        out = ""
+        if argv[:3] == ["kind", "get", "clusters"]:
+            out = "rc-repro-local"
+        elif "config" in argv and "current-context" in argv:
+            out = "kind-rc-repro-local"
+        elif argv[:2] == ["docker", "info"]:
+            out = f"{8 * 1024**3} 4" if "MemTotal" in argv[-1] else "6.8.0-generic"
+        elif "configmap" in argv and "rc-repro-cluster-owner" in argv:
+            out = ('{"metadata":{"labels":{"app.kubernetes.io/managed-by":"rc-repro"}},'
+                   '"data":{"cluster":"rc-repro-local"}}')
+        elif "jsonpath={.metadata.labels}" in argv:
+            out = '{"app.kubernetes.io/managed-by":"rc-repro"}'
+        elif "jsonpath={.status.containerStatuses[0].ready}" in argv:
+            out = "true"
+        elif "rs.status().ok" in argv:
+            out = "1"
+        elif argv[:3] == ["helm", "search", "repo"]:
+            out = '[{"version":"7.0.2","app_version":"8.6.1"}]'
+        elif argv[-1] == "json" and "pods" in argv:
+            out = '{"items":[]}'
+        return subprocess.CompletedProcess(argv, 0, out, "")
+    def apply(self, *a):
+        pass
+    def install(self, *a, **k):
+        import subprocess
+        return subprocess.CompletedProcess(["helm", "install"], 0, "", "")
+    def sleep(self, s):
+        pass
+    def port_forward(self, ctx, ns, host_port):
+        self.forwards.append((ns, host_port)); return 424242
+
+
+def _k8s_client(tmp_path, monkeypatch):
+    import time
+    from rc_repro.services import k8s, onboarding
+    _FakeRun = _FakeK8sRun
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=["engine-resize", "owned-cluster"])
+    fake = _FakeRun()
+    monkeypatch.setattr(k8s, "_Runner", lambda: fake)
+    # wait_ready would poll a real cluster; the GUI's create does not wait, but be safe
+    monkeypatch.setattr(k8s, "wait_ready",
+                        lambda n, timeout=600.0, emit=None, run=None: {"booted_s": 1, "port_forward": "up"})
+    return TestClient(create_app(token=TOKEN), base_url="http://localhost"), time
+
+
+def test_gui_creates_a_kubernetes_repro_through_the_job(tmp_path, monkeypatch):
+    c, time = _k8s_client(tmp_path, monkeypatch)
+    r = c.post("/api/repros", json={"version": "8.6.1", "preset": "microservices",
+                                    "name": "gui1", "port": 33001}, headers=H)
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+    for _ in range(50):
+        st = c.get(f"/api/jobs/{job_id}", headers=H).json()
+        if st["status"] != "running":
+            break
+        time.sleep(0.1)
+    assert st["status"] == "done", st.get("error")
+    assert st["result"]["topology"] == "kubernetes"
+    assert st["result"]["namespace"] == "rc-repro-gui1"
+
+
+def test_gui_k8s_create_consumes_env_registration_token_without_exposure(
+        tmp_path, monkeypatch):
+    c, _ = _k8s_client(tmp_path, monkeypatch)
+    secret = "GUI-SECRET-MUST-NOT-PRINT"
+    monkeypatch.setenv("RC_REPRO_REG_TOKEN", secret)
+
+    response = c.post("/api/repros", headers=H, json={
+        "version": "8.6.1", "preset": "microservices",
+        "name": "gui-token", "port": 33010,
+    })
+    state = wait_job(c, response.json()["job_id"])
+
+    assert state["status"] == "done", state.get("error")
+    assert state["result"]["reg_token_supplied"] is True
+    assert secret not in str(state)
+
+
+def test_gui_k8s_create_and_seed_preserves_profile_once(tmp_path, monkeypatch):
+    c, _ = _k8s_client(tmp_path, monkeypatch)
+    seen = []
+    monkeypatch.setattr(lc, "wait_and_finalize",
+                        lambda meta, emit=None: {"booted_s": 1, "running_version": "8.6.1"})
+    monkeypatch.setattr(lc, "run_seed_inline",
+                        lambda meta, profile, stats, emit: seen.append(
+                            (profile, stats)) or {"users": 3})
+
+    response = c.post("/api/repros", headers=H, json={
+        "version": "8.6.1", "preset": "microservices", "name": "gui-seed",
+        "port": 33011, "seed": True, "seed_profile": "large",
+    })
+    state = wait_job(c, response.json()["job_id"])
+
+    assert state["status"] == "done", state.get("error")
+    assert seen == [("large", False)]
+    assert state["result"]["seed"] == {"users": 3}
+
+
+def test_browser_create_form_sends_the_selected_seed_profile():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "rc_repro" / "data" / "webui"
+    html = (root / "index.html").read_text(encoding="utf-8")
+    script = (root / "app.js").read_text(encoding="utf-8")
+    create = script.split("async function submitCreate() {", 1)[1].split("\n}\n\n// ---- wiring", 1)[0]
+    assert 'select name="seed_profile"' in html
+    assert "seed_profile: f.seed_profile.value" in create
+    assert "req.seed_profile = f.seed_profile.value" not in create
+
+
+def test_browser_setup_submits_only_applicable_grants_and_clears_stale_scenarios():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "rc_repro" / "data" / "webui"
+    script = (root / "app.js").read_text(encoding="utf-8")
+    setup = script.split("async function openSetup(force) {", 1)[1].split(
+        "// ---- create dialog", 1)[0]
+
+    assert "for (const q of (SETUP.snap.questions || []))" in setup
+    assert "if (q.grant) SETUP.draft.grants[q.grant] = !!q.value;" in setup
+    assert '"owned-cluster": !!(SETUP.snap.persisted.grants' not in setup
+    assert "SETUP.draft.scenarios = []" in setup
+    assert "hasUnanswered" in setup
+
+
+def test_browser_prune_reports_partial_cleanup_and_kind_cluster():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "rc_repro" / "data" / "webui"
+    script = (root / "app.js").read_text(encoding="utf-8")
+    report = script.split("function reportPrune(r) {", 1)[1].split("\n}", 1)[0]
+    action = script.split("async function doPrune() {", 1)[1].split("\n}", 1)[0]
+
+    assert "r.targets" in report and "r.removed" in report
+    assert "could not be cleaned up" in report
+    assert "r.cluster?.deleted" in report and "deleted empty Kind cluster" in report
+    assert "reportPrune(r);" in action
+
+
+def test_gui_detail_reads_kubernetes_state(tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    c, _ = _k8s_client(tmp_path, monkeypatch)
+    k8s.create_repro("gui2", "8.6.1", offline=True, port=33002, run=k8s._Runner())
+    monkeypatch.setattr(k8s, "pods", lambda name, run=None: [
+        {"service": "rc-rocketchat-x", "state": "running", "status": "1/1 ready"}])
+    r = c.get("/api/repros/gui2/detail", headers=H)
+    assert r.status_code == 200
+    d = r.json()
+    # the panel must read Kubernetes state, not a compose lookup that returns "?"
+    assert d["topology"] == "kubernetes" and d["state"] == "running"
+    assert d["port_forward"] in ("up", "down")
+
+
+def test_gui_teardown_removes_a_kubernetes_repro(tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    c, _ = _k8s_client(tmp_path, monkeypatch)
+    k8s.create_repro("gui3", "8.6.1", offline=True, port=33003, run=k8s._Runner())
+    assert runner.exists("gui3")
+    r = c.request("DELETE", "/api/repros/gui3", params={"volumes": True, "confirm": True}, headers=H)
+    assert r.status_code == 200
+    assert "namespace/rc-repro-gui3" in r.json()["removed"]
+    assert not runner.exists("gui3")
+
+
+def test_gui_stats_refuses_kubernetes_rather_than_reporting_zeros(tmp_path, monkeypatch):
+    # The audit's other GUI finding: stats read compose container stats and would
+    # report a confident 0% on Kubernetes. It must refuse instead.
+    from rc_repro.services import k8s
+    c, _ = _k8s_client(tmp_path, monkeypatch)
+    k8s.create_repro("gui4", "8.6.1", offline=True, port=33004, run=k8s._Runner())
+    r = c.get("/api/repros/gui4/stats", headers=H)
+    assert r.status_code == 400          # ValidationError -> 400 via the error handler
+
+
+def test_gui_seed_jobs_refuse_every_compose_only_k8s_mode(tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    c, _ = _k8s_client(tmp_path, monkeypatch)
+    k8s.create_repro("gui-guards", "8.6.1", offline=True, port=33012,
+                     run=k8s._Runner())
+    def unexpected_reconcile(name):
+        raise AssertionError(f"validation must precede port-forward repair: {name}")
+
+    monkeypatch.setattr(lc, "ensure_reachable", unexpected_reconcile)
+
+    requests = [
+        c.post("/api/repros/gui-guards/seed", headers=H, json={"stats": True}),
+        c.post("/api/repros/gui-guards/scale", headers=H,
+               json={"scale": "users=5"}),
+        c.delete("/api/repros/gui-guards/scale", headers=H),
+    ]
+    states = [wait_job(c, response.json()["job_id"]) for response in requests]
+
+    assert all(state["status"] == "error" for state in states)
+    assert all(state["error_kind"] == "ValidationError" for state in states)
+    assert all("kubernetes" in (state["error"] or "").lower() for state in states)
 
 
 def test_security_headers_are_set():

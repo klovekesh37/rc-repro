@@ -154,13 +154,44 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
 
     @app.exception_handler(ReproError)
     async def _repro_error(_: Request, exc: ReproError):
-        return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
-                            status_code=exc.http_status)
+        body: dict = {
+            "error": str(exc),
+            "kind": type(exc).__name__,
+            "code": getattr(exc, "code", "REPRO_ERROR"),
+        }
+        gate = getattr(exc, "as_gate", None)
+        if callable(gate):
+            body["gate"] = gate()
+        details = getattr(exc, "details", None) or {}
+        if details:
+            body["details"] = details
+            for key in ("remediation", "verification", "approve_with",
+                        "supported_action", "side_effects", "provider"):
+                if key in details:
+                    body[key] = details[key]
+        return JSONResponse(body, status_code=exc.http_status)
 
     # --- read (blocking -> def -> threadpool) ---------------------------------
     @app.get("/api/health")
     def health():
         return {"ok": True, "docker": runner.docker_available()}
+
+    @app.get("/api/setup")
+    def get_setup(section: str = ""):
+        """Shared setup snapshot for the GUI stepped dialog."""
+        from rc_repro.services import onboarding as onboardsvc
+        return onboardsvc.setup_snapshot(section=section or None)
+
+    @app.post("/api/setup")
+    def post_setup(body: dict = Body(default={})):
+        """Apply a partial setup patch; returns a fresh snapshot."""
+        from rc_repro.services import onboarding as onboardsvc
+        draft = body.get("draft") if isinstance(body.get("draft"), dict) else None
+        if body.get("preview"):
+            return onboardsvc.setup_snapshot(
+                draft=draft or body, section=body.get("section") or None)
+        return onboardsvc.apply_setup_patch(body, mark_complete=bool(
+            body.get("mark_complete", True)))
 
     @app.get("/api/repros")
     def list_repros():
@@ -225,6 +256,11 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
     def stats(name: str):
         from rc_repro.perf import resources as R
         target = lc.resolve_name(name)
+        # Same guard as the CLI's `stats`: this reads container stats from the
+        # compose project, so on Kubernetes it would report zeros rather than fail,
+        # and a panel confidently showing 0% CPU is worse than an empty one.
+        lc.require_compose_topology(target, "stats",
+                                    "It reads container stats from the compose project.")
         ids = runner.container_ids(target)
         prefix = f"{config.PROJECT_PREFIX}{target}-"
         cpu = mem = 0.0
@@ -340,7 +376,14 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
     @app.post("/api/repros")
     def create(req: dict = Body(...)):
         allowed = set(lc.CreateReq.__dataclass_fields__)
-        creq = lc.CreateReq(**{k: v for k, v in req.items() if k in allowed})
+        payload = {k: v for k, v in req.items() if k in allowed}
+        # An omitted preset means "use the saved selector defaults".  Keep the
+        # dataclass's legacy default for direct Python callers, while making the
+        # HTTP interface obey the same additive config contract as the CLI.
+        # JSON null has the same meaning as omission at this boundary.
+        if payload.get("preset") is None:
+            payload["preset"] = ""
+        creq = lc.CreateReq(**payload)
         job = jobs.submit("create", lc.create_repro, creq, stream_output=True,
                           label=creq.name or creq.version)
         return {"job_id": job.id}

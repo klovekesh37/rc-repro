@@ -97,16 +97,11 @@ def _rc_environment(spec: Spec) -> dict:
         "DEPLOY_PLATFORM": "compose",
         "MONGO_URL": config.MONGO_URL,
         "ALLOW_UNSAFE_QUERY_AND_FIELDS_API_PARAMS": "true",
-        # Every repro should be usable out of the box: skip the setup wizard
-        # (rc-repro also finalizes it over the API on `ready`) and auto-provision
-        # the first admin. Presets only add their scenario-specific settings.
-        "OVERWRITE_SETTING_Show_Setup_Wizard": "completed",
-        "INITIAL_USER": "yes",
-        "ADMIN_USERNAME": config.ADMIN_USERNAME,
-        "ADMIN_NAME": config.ADMIN_NAME,
-        "ADMIN_EMAIL": config.ADMIN_EMAIL,
-        "ADMIN_PASS": config.ADMIN_PASSWORD,
     }
+    # Every repro should be usable out of the box: skip the setup wizard
+    # (rc-repro also finalizes it over the API on `ready`) and auto-provision
+    # the first admin. Presets only add their scenario-specific settings.
+    env.update(config.first_admin_env())
     if spec.oplog:  # RC < 8 only; deprecated in 8.x
         env["MONGO_OPLOG_URL"] = config.MONGO_OPLOG_URL
     if spec.reg_token:

@@ -47,8 +47,29 @@ async function api(path, opts = {}) {
   if (opts.body) headers["Content-Type"] = "application/json";
   const r = await fetch(path, Object.assign({}, opts, { headers }));
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  if (!r.ok) {
+    const err = new Error(data.error || `HTTP ${r.status}`);
+    err.code = data.code || "";
+    err.kind = data.kind || "";
+    err.gate = data.gate || null;
+    err.details = data.details || {};
+    err.remediation = data.remediation || (data.details && data.details.remediation) || "";
+    err.approve_with = data.approve_with || (data.gate && data.gate.approve_with) || "";
+    err.verification = data.verification || (data.details && data.details.verification) || "";
+    err.supported_action = data.supported_action || "";
+    err.raw = data;
+    throw err;
+  }
   return data;
+}
+
+function formatApiError(e) {
+  const parts = [e.message || String(e)];
+  if (e.code) parts.push(`code: ${e.code}`);
+  if (e.remediation) parts.push(e.remediation);
+  if (e.approve_with) parts.push(`approve: ${e.approve_with}`);
+  if (e.verification) parts.push(`verify: ${e.verification}`);
+  return parts.join(" · ");
 }
 
 // ---- repro list (master) ----------------------------------------------------
@@ -110,7 +131,7 @@ function render() {
   if (!ALL_REPROS.length) grid.append(el("p", { class: "empty" }, "No repros yet. Click “+ New repro”."));
   else if (!list.length) grid.append(el("p", { class: "empty" }, "No repros match this filter."));
   for (const r of list) grid.append(card(r));
-  grid.append(el("div", { class: "card new", onclick: openCreate },
+  grid.append(el("div", { class: "card new", onclick: () => openSetup(false), role: "button", tabindex: "0" },
     el("div", { class: "plus" }, "+"),
     el("div", { class: "t" }, "New repro"),
     el("div", { class: "s" }, "Spin up a fresh RC + Mongo sandbox")));
@@ -813,11 +834,17 @@ async function showLogs(name) {
 }
 function reportPrune(r) {
   const targets = (r.targets || []).length, removed = (r.removed || []).length;
-  if (!targets) { toast("nothing to prune", "info"); return; }
-  if (removed === targets) { toast(`pruned ${removed}`, "ok"); return; }
+  const clusterDeleted = !!r.cluster?.deleted;
+  const cluster = clusterDeleted ? "; deleted empty Kind cluster" : "";
+  if (!targets) {
+    toast(clusterDeleted ? "deleted empty Kind cluster" : "nothing to prune",
+          clusterDeleted ? "ok" : "info");
+    return;
+  }
+  if (removed === targets) { toast(`pruned ${removed}${cluster}`, "ok"); return; }
   // lifecycle.prune() warns per-repro through emit, and the endpoint is synchronous
   // so those warnings are discarded -- the shortfall is the only signal we get.
-  toast(`pruned ${removed} of ${targets}; ${targets - removed} could not be cleaned up`);
+  toast(`pruned ${removed} of ${targets}; ${targets - removed} could not be cleaned up${cluster}`);
 }
 
 // Prune is the same story as Stop -- a synchronous call that removes containers
@@ -836,7 +863,7 @@ async function withBusy(btn, verb, fn) {
   }
 }
 async function doPrune() {
-  if (!confirm("Delete every 'down' repro, including data volumes and records?")) return;
+  if (!confirm("Delete every 'down' repro, including data volumes and records, plus the empty rc-repro-owned Kind cluster?")) return;
   await withBusy($("#btn-prune"), "Pruning…", async () => {
     try {
       const r = await api("/api/prune", { method: "POST", body: JSON.stringify({ confirm: true }) });
@@ -1331,19 +1358,285 @@ async function openJobs() {
 // among them, which is what re-renders a finished job's result table.
 function reopenJob(j) { streamJob(j.id, jobTitle(j), JOB_RESULT_RENDERER[j.kind]); }
 
+// ---- setup dialog (shared snapshot/patch contract) --------------------------
+const SETUP = {
+  snap: null,
+  draft: {},
+  steps: [],
+  index: 0,
+};
+
+function setupStepIds(snap) {
+  // Applicable question sections only, then review.
+  const order = ["deployment", "scenarios", "seed", "cleanup", "authority", "capacity"];
+  const present = new Set((snap.questions || []).map((q) => q.section));
+  const steps = order.filter((s) => present.has(s));
+  steps.push("review");
+  return steps;
+}
+
+function focusFirstIn(container) {
+  if (!container) return;
+  const target = container.querySelector(
+    "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])");
+  if (target && typeof target.focus === "function") target.focus();
+}
+
+async function openSetup(force) {
+  try {
+    SETUP.snap = await api("/api/setup");
+  } catch (e) { toast(formatApiError(e)); return; }
+  // A completed marker does not settle questions introduced later or made
+  // applicable by a deployment change.
+  const hasUnanswered = (SETUP.snap.questions || []).some((q) => !q.answered);
+  if (SETUP.snap.completed && !hasUnanswered && !force) {
+    openCreate();
+    return;
+  }
+  SETUP.draft = {
+    deployment: SETUP.snap.selection.deployment,
+    scenarios: (SETUP.snap.selection.scenarios || []).slice(),
+    seed_profile: SETUP.snap.selection.seed_profile,
+    retain_runs: SETUP.snap.selection.retain_runs,
+    grants: {},
+  };
+  for (const q of (SETUP.snap.questions || [])) {
+    if (q.grant) SETUP.draft.grants[q.grant] = !!q.value;
+  }
+  SETUP.steps = setupStepIds(SETUP.snap);
+  SETUP.index = 0;
+  $("#setup-error").hidden = true;
+  renderSetupStep();
+  $("#setup-dialog").showModal();
+  focusFirstIn($("#setup-body"));
+}
+
+async function refreshSetupPreview() {
+  SETUP.snap = await api("/api/setup", {
+    method: "POST",
+    body: JSON.stringify({ preview: true, draft: SETUP.draft }),
+  });
+  SETUP.steps = setupStepIds(SETUP.snap);
+  if (SETUP.index >= SETUP.steps.length) SETUP.index = SETUP.steps.length - 1;
+}
+
+function renderSetupStep() {
+  const body = $("#setup-body");
+  body.innerHTML = "";
+  const step = SETUP.steps[SETUP.index] || "review";
+  $("#setup-step-label").textContent =
+    `Step ${SETUP.index + 1} of ${SETUP.steps.length}: ${step}`;
+  $("#setup-back").hidden = SETUP.index === 0;
+  $("#setup-next").textContent = step === "review" ? "Apply" : "Next";
+
+  if (step === "review") {
+    const r = SETUP.snap.review || {};
+    body.append(el("div", { class: "setup-review" },
+      el("p", {}, `Deployment: ${r.deployment || "?"}`),
+      el("p", {}, `Scenarios: ${(r.scenarios || []).join(", ") || "(none)"}`),
+      el("p", {}, `Seed: ${r.seed_profile || "?"}`),
+      ...(r.license && r.license.required ? [
+        el("p", { class: r.license.supplied ? "hint" : "hint bad" },
+          `Enterprise license: ${r.license.supplied ? "supplied" : "required"}`),
+        ...(r.license.seed_deferred ? [
+          el("p", { class: "hint bad" },
+            "Seed is deferred until a registration token is supplied."),
+        ] : []),
+      ] : []),
+      el("p", {}, `Retain runs: ${r.retain_runs ? "yes" : "no"}`),
+      el("p", { class: r.first_run_command ? "" : "hint bad" },
+        r.first_run_command
+          ? `First run: ${r.first_run_command}`
+          : `First run blocked: ${(SETUP.snap.compatibility || {}).code || "compatibility gate"}`)));
+    const gates = SETUP.snap.gates || [];
+    if (gates.length) {
+      const box = el("div", { class: "setup-gates", role: "status" });
+      for (const g of gates) {
+        box.append(el("p", { class: "hint bad" },
+          `${g.code || g.kind}: ${g.remediation || g.message || ""}`));
+        if (g.approve_with) box.append(el("p", { class: "hint" }, `Approve: ${g.approve_with}`));
+      }
+      body.append(box);
+    }
+    return;
+  }
+
+  const questions = (SETUP.snap.questions || []).filter((q) => q.section === step);
+  for (const q of questions) {
+    const field = el("fieldset", { class: "setup-q", "data-qid": q.id });
+    field.append(el("legend", {}, q.prompt || q.id));
+    if (q.kind === "boolean") {
+      const checked = q.id === "retain_runs" ? !!SETUP.draft.retain_runs
+        : q.id === "owned_cluster" ? !!SETUP.draft.grants["owned-cluster"]
+        : q.id === "engine_resize" ? !!SETUP.draft.grants["engine-resize"]
+        : !!q.value;
+      field.append(el("label", {},
+        el("input", { type: "checkbox", name: q.id, checked: checked ? "checked" : null }),
+        " Yes"));
+    } else if (q.kind === "choice" || q.kind === "multi_choice") {
+      const sel = el("select", { name: q.id, "aria-label": q.prompt || q.id });
+      if (q.kind === "multi_choice" || q.id === "scenarios") {
+        sel.append(el("option", { value: "" }, "(none)"));
+      }
+      for (const c of (q.choices || [])) {
+        const opt = el("option", { value: c.id }, c.label || c.id);
+        const cur = q.id === "scenarios"
+          ? (SETUP.draft.scenarios || [])[0] || ""
+          : (SETUP.draft[q.id] != null ? SETUP.draft[q.id] : q.value);
+        if (String(c.id) === String(cur)) opt.selected = true;
+        sel.append(opt);
+      }
+      field.append(sel);
+    } else {
+      field.append(el("p", { class: "hint" }, "No choices for this deployment."));
+    }
+    for (const c of (q.consequences || [])) field.append(el("p", { class: "hint" }, c));
+    body.append(field);
+  }
+  if (step === "capacity" && SETUP.snap.capacity && SETUP.snap.capacity.applicable) {
+    const cap = SETUP.snap.capacity;
+    body.append(el("div", { class: "setup-capacity", role: "status" },
+      el("p", {}, `Provider: ${cap.provider}`),
+      el("p", {}, `Observed: ${cap.observed_cpu} CPUs, ${cap.observed_memory_gib} GiB`),
+      el("p", {}, `Required: ${cap.required_cpu} CPUs, ${cap.required_memory_gib} GiB`),
+      el("p", { class: cap.ready ? "hint" : "hint bad" },
+        `${cap.code || ""}: ${cap.remediation || (cap.ready ? "ready" : "not ready")}`)));
+  }
+}
+
+function collectSetupStep() {
+  const step = SETUP.steps[SETUP.index];
+  if (step === "review") return;
+  for (const field of $("#setup-body").querySelectorAll("fieldset.setup-q")) {
+    const qid = field.getAttribute("data-qid");
+    const input = field.querySelector("input, select");
+    if (!input) continue;
+    if (input.type === "checkbox") {
+      if (qid === "retain_runs") SETUP.draft.retain_runs = !!input.checked;
+      else if (qid === "owned_cluster") {
+        SETUP.draft.grants = SETUP.draft.grants || {};
+        SETUP.draft.grants["owned-cluster"] = !!input.checked;
+      } else if (qid === "engine_resize") {
+        SETUP.draft.grants = SETUP.draft.grants || {};
+        SETUP.draft.grants["engine-resize"] = !!input.checked;
+      }
+    } else if (qid === "scenarios") {
+      SETUP.draft.scenarios = input.value ? [input.value] : [];
+    } else if (qid === "deployment") {
+      if (SETUP.draft.deployment !== input.value) SETUP.draft.scenarios = [];
+      SETUP.draft.deployment = input.value;
+    } else if (qid === "seed_profile") {
+      SETUP.draft.seed_profile = input.value;
+    }
+  }
+}
+
+async function setupNext() {
+  const err = $("#setup-error");
+  err.hidden = true;
+  try {
+    collectSetupStep();
+    const step = SETUP.steps[SETUP.index];
+    if (step === "review") {
+      SETUP.snap = await api("/api/setup", {
+        method: "POST",
+        body: JSON.stringify(Object.assign({ mark_complete: true }, SETUP.draft)),
+      });
+      $("#setup-dialog").close();
+      toast("Setup saved", "ok");
+      openCreate();
+      return;
+    }
+    await refreshSetupPreview();
+    SETUP.index = Math.min(SETUP.index + 1, SETUP.steps.length - 1);
+    // If deployment changed, recompute steps and stay on next logical step.
+    const nextIds = SETUP.steps;
+    if (!nextIds.includes(step) || SETUP.index >= nextIds.length) {
+      SETUP.index = Math.min(SETUP.index, nextIds.length - 1);
+    }
+    renderSetupStep();
+    focusFirstIn($("#setup-body"));
+  } catch (e) {
+    err.hidden = false;
+    err.textContent = formatApiError(e);
+  }
+}
+
+async function setupBack() {
+  collectSetupStep();
+  try { await refreshSetupPreview(); } catch (_) { /* keep draft */ }
+  SETUP.index = Math.max(0, SETUP.index - 1);
+  renderSetupStep();
+  focusFirstIn($("#setup-body"));
+}
+
+$("#setup-cancel").addEventListener("click", () => $("#setup-dialog").close());
+$("#setup-back").addEventListener("click", (e) => { e.preventDefault(); setupBack(); });
+$("#setup-next").addEventListener("click", (e) => { e.preventDefault(); setupNext(); });
+$("#setup-legacy").addEventListener("click", () => {
+  $("#setup-dialog").close();
+  openCreate({ legacy: true });
+});
+$("#setup-dialog").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && e.target && e.target.tagName !== "TEXTAREA") {
+    // Keep keyboard path: Enter advances when focus is not on a multi-line field.
+    if (e.target.tagName === "BUTTON") return;
+    e.preventDefault();
+    setupNext();
+  }
+});
+
 // ---- create dialog ----------------------------------------------------------
 let PRESETS = [];
-async function openCreate() {
-  try { PRESETS = (await api("/api/presets")).presets; } catch (e) { toast(e.message); return; }
+let SETUP_CACHE = null;
+
+async function loadSetupDefaults() {
+  try { SETUP_CACHE = await api("/api/setup"); }
+  catch (_) { SETUP_CACHE = null; }
+  return SETUP_CACHE;
+}
+
+async function openCreate(opts = {}) {
+  try { PRESETS = (await api("/api/presets")).presets; } catch (e) { toast(formatApiError(e)); return; }
+  const setup = await loadSetupDefaults();
   const sel = $("#preset-select");
   sel.innerHTML = "";
   for (const p of PRESETS) sel.append(el("option", { value: p.name }, p.name + (p.requires_license ? " (license)" : "")));
   sel.value = "default";
   renderPresetParams();
+  // Selector defaults from the shared setup contract.
+  const dep = $("#create-deployment");
+  const scen = $("#create-scenario");
+  if (setup && setup.selection) {
+    dep.value = setup.selection.deployment || "default";
+    // Populate scenarios from the live snapshot questions.
+    const scenQ = (setup.questions || []).find((q) => q.id === "scenarios")
+      || (setup.hidden_questions || []).find((q) => q.id === "scenarios");
+    scen.innerHTML = "";
+    scen.append(el("option", { value: "" }, "(none)"));
+    const choices = (scenQ && scenQ.choices) || [];
+    for (const c of choices) {
+      if (!c.id) continue;
+      scen.append(el("option", { value: c.id }, c.label || c.id));
+    }
+    scen.value = (setup.selection.scenarios || [])[0] || "";
+    if (setup.selection.seed_profile && setup.selection.seed_profile !== "none") {
+      $("#create-form").seed.checked = true;
+      $("#create-form").seed_profile.value = setup.selection.seed_profile;
+    }
+    $("#create-selector-hint").textContent =
+      `From setup: ${setup.selection.deployment}` +
+      ((setup.selection.scenarios || []).length
+        ? ` + ${(setup.selection.scenarios || []).join(",")}` : "");
+  }
+  if (opts.legacy) {
+    $("#create-legacy-preset").open = true;
+  }
   $("#create-form").existing.value = "reuse";
   syncCreateSeed();
   $("#version-hint").textContent = "";
   $("#create-dialog").showModal();
+  focusFirstIn($("#create-dialog"));
 }
 function renderPresetParams() {
   const p = PRESETS.find((x) => x.name === $("#preset-select").value);
@@ -1458,14 +1751,23 @@ function applyHttpsToRequest(f, req) {
 
 async function submitCreate() {
   const f = $("#create-form");
+  const legacyOpen = $("#create-legacy-preset") && $("#create-legacy-preset").open;
   const req = {
     version: f.version.value.trim(),
-    preset: f.preset.value,
     port: f.port.value ? parseInt(f.port.value, 10) : 0,
     monitor: f.monitor.checked, seed: f.seed.checked, wait: f.wait.checked,
+    seed_profile: f.seed_profile.value,
     params: {},
   };
-  if (f.seed.checked && f.seed_profile) req.seed_profile = f.seed_profile.value;
+  // Prefer public selectors; legacy preset path remains when that panel is open
+  // and a non-default preset is chosen without deployment overrides.
+  if (legacyOpen && f.preset && f.preset.value && f.preset.value !== "default") {
+    req.preset = f.preset.value;
+  } else {
+    req.preset = "";
+    req.deployment = (f.deployment && f.deployment.value) || "default";
+    req.scenario = (f.scenario && f.scenario.value) ? [f.scenario.value] : [];
+  }
   if (!req.version) { toast("version is required"); return; }
   for (const inp of f.querySelectorAll("input[name^='set:']")) {
     if (inp.value.trim()) req.params[inp.name.slice(4)] = inp.value.trim();
@@ -1485,12 +1787,15 @@ async function submitCreate() {
     req.fresh = true;
   }
   $("#create-dialog").close();
-  try { const { job_id } = await api("/api/repros", { method: "POST", body: JSON.stringify(req) }); streamJob(job_id, `Creating ${req.version} (${req.preset})`, renderCreateResult); }
-  catch (e) { toast(e.message); }
+  const label = req.preset || `${req.deployment || "default"}${(req.scenario || []).length ? "-" + req.scenario.join("-") : ""}`;
+  try {
+    const { job_id } = await api("/api/repros", { method: "POST", body: JSON.stringify(req) });
+    streamJob(job_id, `Creating ${req.version} (${label})`, renderCreateResult);
+  } catch (e) { toast(formatApiError(e)); }
 }
 
 // ---- wiring -----------------------------------------------------------------
-$("#btn-new").addEventListener("click", openCreate);
+$("#btn-new").addEventListener("click", () => openSetup(false));
 $("#btn-refresh").addEventListener("click", loadRepros);
 $("#btn-prune").addEventListener("click", doPrune);
 $("#filter").addEventListener("input", (e) => { view.filter = e.target.value.trim().toLowerCase(); render(); });
@@ -1498,6 +1803,32 @@ $("#status-filter").addEventListener("change", (e) => { view.status = e.target.v
 $("#sort-by").addEventListener("change", (e) => { view.sort = e.target.value; render(); });
 $("#preset-select").addEventListener("change", renderPresetParams);
 $("#https-mode").addEventListener("change", syncHttpsFields);
+if ($("#create-deployment")) {
+  $("#create-deployment").addEventListener("change", async () => {
+    const dep = $("#create-deployment").value;
+    try {
+      const snap = await api("/api/setup", {
+        method: "POST",
+        body: JSON.stringify({ preview: true, draft: { deployment: dep } }),
+      });
+      const scen = $("#create-scenario");
+      const prev = scen.value;
+      scen.innerHTML = "";
+      scen.append(el("option", { value: "" }, "(none)"));
+      const scenQ = (snap.questions || []).find((q) => q.id === "scenarios");
+      for (const c of (scenQ && scenQ.choices) || []) {
+        if (!c.id) continue;
+        scen.append(el("option", { value: c.id }, c.label || c.id));
+      }
+      if ([...scen.options].some((o) => o.value === prev)) scen.value = prev;
+      else scen.value = "";
+      $("#create-selector-hint").textContent =
+        snap.selection.topology === "kubernetes"
+          ? "Kubernetes: capacity and authority come from Setup."
+          : "Compose: no Kubernetes capacity questions apply.";
+    } catch (e) { toast(formatApiError(e)); }
+  });
+}
 // The profile only means anything when seeding is on, so don't show it otherwise.
 function syncCreateSeed() {
   $("#create-seed-profile-row").hidden = !$("#create-form").seed.checked;

@@ -12,6 +12,10 @@ jobs:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # tests/test_audit_decisions.py validates the curated stack against
+          # main; a shallow single-ref checkout cannot supply that contract.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}

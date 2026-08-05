@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+
+# Guided Ubuntu installer for rc-repro's ordinary local Kubernetes prerequisites.
+# This file is published as the `rc-repro-install` release asset. The release
+# workflow stamps the owning repository and immutable tag into the two markers
+# below, so the installed CLI is provenance-matched to the asset that delivered it.
+
+set -Eeuo pipefail
+umask 022
+
+readonly KIND_VERSION="v0.32.0"
+readonly KUBECTL_VERSION="v1.36.1"
+readonly HELM_VERSION="v3.21.3"
+readonly RELEASE_REPOSITORY="__RC_REPRO_RELEASE_REPOSITORY__"
+readonly RELEASE_TAG="__RC_REPRO_RELEASE_TAG__"
+
+log() {
+    printf '\n==> %s\n' "$*"
+}
+
+fail() {
+    printf '\nrc-repro installer stopped: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: bash rc-repro-install
+
+Installs the core rc-repro CLI and its ordinary local-Kubernetes prerequisites
+on Ubuntu 24.04 amd64. The installer uses Docker's signed apt repository and
+checksum-verified upstream binaries for kind, kubectl, and Helm.
+
+It does not create or delete a cluster, resize or restart an engine, retain a
+repro, configure credentials, or expose a service. Those choices belong to
+`rc-repro onboard` and the lifecycle command that follows it.
+EOF
+}
+
+case "${1:-}" in
+    "") ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; fail "unknown argument: $1" ;;
+esac
+
+kernel_name="$(uname -s 2>/dev/null || printf unknown)"
+kernel_release="$(uname -r 2>/dev/null || printf unknown)"
+case "$kernel_name" in
+    Darwin)
+        fail "guided macOS bootstrap is not available yet. Install the core CLI with pipx only after preparing Docker Desktop and the Kubernetes tools separately; this Ubuntu installer made no changes"
+        ;;
+    MINGW*|MSYS*|CYGWIN*)
+        fail "guided Windows bootstrap is not available yet. Use a Docker Desktop-backed WSL2 environment with separately managed prerequisites; this Ubuntu installer made no changes"
+        ;;
+    Linux) ;;
+    *)
+        fail "supported operating system is Ubuntu 24.04 amd64; detected ${kernel_name}"
+        ;;
+esac
+
+if { [[ -r /proc/sys/kernel/osrelease ]] &&
+      grep -qi microsoft /proc/sys/kernel/osrelease; } ||
+   grep -qi microsoft <<<"$kernel_release"; then
+    fail "use a Docker Desktop-backed WSL2 environment with separately managed prerequisites; this Ubuntu host installer will not install a second Docker Engine inside WSL"
+fi
+
+if [[ "${EUID}" -eq 0 ]]; then
+    fail "run this as your ordinary login user without sudo; the installer asks for sudo only where needed"
+fi
+
+install_user="$(id -un)"
+[[ "$install_user" =~ ^[a-z_][a-z0-9_-]*$ ]] \
+    || fail "could not determine a safe ordinary login user"
+install_home="$(getent passwd "$install_user" | awk -F: 'NR == 1 {print $6}')"
+[[ -n "$install_home" && "$install_home" == /* ]] \
+    || fail "could not determine the home directory for $install_user"
+
+[[ -r /etc/os-release ]] || fail "/etc/os-release is missing"
+# shellcheck disable=SC1091
+. /etc/os-release
+[[ "${ID:-}" == "ubuntu" ]] \
+    || fail "supported operating system is Ubuntu 24.04; detected ${PRETTY_NAME:-unknown}"
+[[ "${VERSION_ID:-}" == "24.04" ]] \
+    || fail "supported release is Ubuntu 24.04; detected ${VERSION_ID:-unknown}"
+[[ "$(uname -m)" == "x86_64" && "$(dpkg --print-architecture)" == "amd64" ]] \
+    || fail "supported architecture is amd64/x86_64; detected $(uname -m)"
+
+log "Detected ${PRETTY_NAME:-Ubuntu 24.04}, amd64, user $install_user"
+printf 'Existing tools:\n'
+for tool in docker pipx kind kubectl helm rc-repro; do
+    if command -v "$tool" >/dev/null 2>&1; then
+        printf '  %-10s %s\n' "$tool" "$(command -v "$tool")"
+    else
+        printf '  %-10s absent\n' "$tool"
+    fi
+done
+
+conflicts=()
+for package in docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc; do
+    if dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^ii'; then
+        conflicts+=("$package")
+    fi
+done
+if ((${#conflicts[@]})); then
+    fail "conflicting distribution Docker package(s) found: ${conflicts[*]}. Remove them deliberately, then rerun; this installer will not remove existing software."
+fi
+
+command -v sudo >/dev/null 2>&1 || fail "sudo is required"
+# Cloud images may grant NOPASSWD for commands while `sudo -v` still follows a
+# passworded group rule. Prove an actual command first, then prompt only when
+# the current policy or credential cache requires it.
+if ! sudo -n true 2>/dev/null; then
+    sudo -v || fail "sudo authorisation failed"
+fi
+
+tmp_dir="$(mktemp -d)"
+cleanup() {
+    if [[ -n "${tmp_dir:-}" && "$tmp_dir" == /tmp/* ]]; then
+        rm -rf -- "$tmp_dir"
+    fi
+}
+trap cleanup EXIT
+
+log "Installing signed Ubuntu prerequisites"
+sudo apt-get update
+sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    ca-certificates curl git gnupg pipx python3-venv
+
+log "Configuring Docker's signed apt repository"
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o "$tmp_dir/docker.asc"
+gpg --batch --show-keys "$tmp_dir/docker.asc" >/dev/null 2>&1 \
+    || fail "Docker repository key is not a valid OpenPGP key"
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo install -m 0644 "$tmp_dir/docker.asc" /etc/apt/keyrings/docker.asc
+sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: ${UBUNTU_CODENAME:-${VERSION_CODENAME}}
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+sudo apt-get update
+sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$install_user"
+
+download_checked() {
+    local name="$1"
+    local url="$2"
+    local checksum_url="$3"
+    local target="$tmp_dir/$name"
+    local checksum_file="$tmp_dir/$name.sha256"
+    local expected
+
+    curl -fsSL "$url" -o "$target"
+    curl -fsSL "$checksum_url" -o "$checksum_file"
+    expected="$(awk 'NR == 1 {print $1}' "$checksum_file" | tr -d '\r\n')"
+    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] \
+        || fail "$name published checksum is malformed"
+    printf '%s  %s\n' "$expected" "$target" | sha256sum --check --status \
+        || fail "$name failed its published SHA-256 check"
+    printf '  verified %-28s sha256:%s\n' "$name" "$expected"
+}
+
+log "Installing checksum-verified Kubernetes tools"
+download_checked \
+    kind-linux-amd64 \
+    "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64" \
+    "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64.sha256sum"
+sudo install -m 0755 "$tmp_dir/kind-linux-amd64" /usr/local/bin/kind
+
+download_checked \
+    kubectl \
+    "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+    "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
+sudo install -m 0755 "$tmp_dir/kubectl" /usr/local/bin/kubectl
+
+helm_archive="helm-${HELM_VERSION}-linux-amd64.tar.gz"
+download_checked \
+    "$helm_archive" \
+    "https://get.helm.sh/$helm_archive" \
+    "https://get.helm.sh/$helm_archive.sha256sum"
+tar -xzf "$tmp_dir/$helm_archive" -C "$tmp_dir"
+sudo install -m 0755 "$tmp_dir/linux-amd64/helm" /usr/local/bin/helm
+
+release_repository="$RELEASE_REPOSITORY"
+release_tag="$RELEASE_TAG"
+if [[ "$release_repository" == "__RC_REPRO_RELEASE_REPOSITORY__" ||
+      "$release_tag" == "__RC_REPRO_RELEASE_TAG__" ]]; then
+    release_repository="${RC_REPRO_INSTALL_REPOSITORY:-}"
+    release_tag="${RC_REPRO_INSTALL_TAG:-}"
+    [[ -n "$release_repository" && -n "$release_tag" ]] \
+        || fail "this source copy is not a stamped release asset; contributors must set both RC_REPRO_INSTALL_REPOSITORY and RC_REPRO_INSTALL_TAG to the exact revision under test"
+fi
+[[ "$release_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+    || fail "release repository is malformed"
+[[ "$release_tag" =~ ^[A-Za-z0-9._/-]+$ ]] \
+    || fail "release tag is malformed"
+
+log "Installing the core rc-repro CLI from ${release_repository}@${release_tag}"
+pipx ensurepath >/dev/null
+export PATH="$install_home/.local/bin:$PATH"
+pipx install --force "git+https://github.com/${release_repository}.git@${release_tag}"
+rc_repro_bin="$install_home/.local/bin/rc-repro"
+[[ -x "$rc_repro_bin" ]] || fail "pipx did not create $rc_repro_bin"
+
+log "Installed versions and provenance"
+printf '  %s\n' "$(docker --version)"
+printf '  %s\n' "$(docker compose version)"
+printf '  kind %s\n' "$(kind version)"
+printf '  kubectl %s\n' "$(kubectl version --client 2>/dev/null | head -n 1)"
+printf '  helm %s\n' "$(helm version --short)"
+pipx runpip rc-repro show rc-repro | sed -n -e '/^Name:/p' -e '/^Version:/p' -e '/^Location:/p'
+printf '  source: https://github.com/%s/tree/%s\n' "$release_repository" "$release_tag"
+printf '  Docker packages: signed by /etc/apt/keyrings/docker.asc\n'
+
+log "Running the rc-repro health check"
+if id -Gn | tr ' ' '\n' | grep -qx docker; then
+    "$rc_repro_bin" doctor
+    docker_group_active=true
+else
+    quoted_bin="$(printf '%q' "$rc_repro_bin")"
+    sg docker -c "$quoted_bin doctor"
+    docker_group_active=false
+fi
+
+printf '\nInstallation complete. No cluster or repro was created.\n'
+if [[ "$docker_group_active" != true ]]; then
+    printf '\nDocker access was granted to %s, but Linux applies new group membership\n' "$install_user"
+    printf 'only to a new login session. Log out and back in before the next command.\n'
+fi
+printf '\nNext action:\n  rc-repro onboard\n'

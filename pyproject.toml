@@ -16,7 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "httpx>=0.27", "ruff>=0.6"]
+# Starlette's TestClient has resolved against both clients across supported
+# releases; some releases hard-require httpx2 while older ones use httpx.
+dev = ["pytest>=7", "httpx>=0.27", "httpx2>=2.9", "ruff>=0.6"]
 gui = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9", "websockets>=12"]
 
 [project.scripts]
@@ -26,7 +28,7 @@ rc-repro = "rc_repro.cli:app"
 packages = ["rc_repro", "rc_repro.presets", "rc_repro.perf", "rc_repro.services", "rc_repro.web"]
 
 [tool.setuptools.package-data]
-rc_repro = ["data/*.yaml", "data/presets/*.yaml", "data/monitoring/*.json", "data/loadtest/*.js", "data/webui/*"]
+rc_repro = ["data/*.yaml", "data/presets/*.yaml", "data/monitoring/*.json", "data/loadtest/*.js", "data/webui/*", "data/skill/*.md"]
 
 [tool.ruff]
 line-length = 110

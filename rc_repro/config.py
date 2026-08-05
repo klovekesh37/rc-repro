@@ -3,7 +3,8 @@
 State lives under ~/.rc-repro (override with RC_REPRO_HOME):
 
     ~/.rc-repro/
-      config.yaml            # default_repro, reg_token, rc_image overrides
+      config.yaml            # default_repro, selector defaults, reg_token/overrides
+      clients/               # isolated Kubernetes and Helm client state
       presets/               # user/team presets (override built-ins)
       repros/<name>/         # one workspace per repro
 """
@@ -32,6 +33,23 @@ ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin123"
 ADMIN_EMAIL = "admin@example.com"
 ADMIN_NAME = "Admin"
+
+
+def first_admin_env() -> dict[str, str]:
+    """Rocket.Chat's shared first-user and completed local-setup contract.
+
+    Both Compose and Kubernetes inject this exact map. Do not set
+    ``INITIAL_USER``: Rocket.Chat expects a JSON user object there, and the
+    scalar ``yes`` produces a JSON parse error on boot. The ADMIN_* variables
+    plus the setup-wizard overwrite are the supported first-admin path.
+    """
+    return {
+        "OVERWRITE_SETTING_Show_Setup_Wizard": "completed",
+        "ADMIN_USERNAME": ADMIN_USERNAME,
+        "ADMIN_NAME": ADMIN_NAME,
+        "ADMIN_EMAIL": ADMIN_EMAIL,
+        "ADMIN_PASS": ADMIN_PASSWORD,
+    }
 
 # Host ports published by preset side services. One registry so presets can't
 # silently collide with each other — a new preset picks a port by looking here.
@@ -75,6 +93,25 @@ _ENV_OVERRIDES = {
     "rc_image": "RC_REPRO_RC_IMAGE",
     "bind_host": "RC_REPRO_BIND_HOST",
 }
+
+
+# config.yaml can hold a Cloud registration token (see _ENV_OVERRIDES), so both
+# the file and the state dir are owner-only. No-ops on Windows, where chmod
+# cannot express POSIX bits.
+FILE_MODE = 0o600
+DIR_MODE = 0o700
+
+
+def _chmod_quietly(path: Path, mode: int) -> None:
+    """chmod, ignoring platforms/filesystems that don't support it.
+
+    A failure here must not break saving config: the write is the user's intent,
+    the mode is a hardening measure.
+    """
+    try:
+        os.chmod(path, mode)
+    except (OSError, NotImplementedError):
+        pass
 
 
 def home() -> Path:
@@ -123,29 +160,44 @@ def load_config(with_env: bool = True) -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    """Persist config.yaml atomically (temp file + rename).
+    """Persist config.yaml atomically with owner-only permissions.
 
-    A plain write_text could be read half-written — the web GUI runs service calls
-    on worker threads, so concurrent readers are real.
+    config.yaml can hold a Rocket.Chat Cloud registration token, so it must not
+    be world-readable. A per-process temporary name avoids concurrent writers
+    clobbering one another before the atomic rename.
     """
-    home().mkdir(parents=True, exist_ok=True)
+    root = home()
+    root.mkdir(parents=True, exist_ok=True)
+    _chmod_quietly(root, DIR_MODE)
+
     path = config_file()
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    body = yaml.safe_dump(cfg, sort_keys=False)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
     try:
-        tmp.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)   # no-op after a successful replace
+        try:
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            # Ownership transfers only after fdopen returns. If constructing the
+            # file object fails, close the raw descriptor ourselves without
+            # masking the original error if the runtime already closed it.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        with fh:
+            fh.write(body)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    _chmod_quietly(tmp, FILE_MODE)
+    os.replace(tmp, path)
+    _chmod_quietly(path, FILE_MODE)
 
 
 def update_config(mutate) -> dict:
-    """Read-modify-write config.yaml under a lock; `mutate(cfg)` edits in place.
-
-    Serialised because the GUI's worker threads can otherwise interleave two
-    read-modify-write cycles and lose one of the updates. Reads with
-    with_env=False on purpose: this writes the file back, and an ephemeral
-    RC_REPRO_REG_TOKEN must never be persisted into it.
-    """
+    """Read-modify-write config.yaml under a lock; ``mutate(cfg)`` edits in place."""
     with _CONFIG_LOCK:
         cfg = load_config(with_env=False)
         mutate(cfg)

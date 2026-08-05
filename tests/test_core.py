@@ -8,6 +8,10 @@ building — the parts that don't touch Docker or the network.
 from __future__ import annotations
 
 import json
+import os
+import stat
+
+import pytest
 
 from rc_repro import compose, config, configimport, presets, rcapi, runner, scaleseed, seed, versions
 
@@ -58,6 +62,55 @@ def test_ldap_preset_generates_users():
     assert ldif.count("dn: uid=user") == 3
     assert "openldap" in p.services
     assert p.env["OVERWRITE_SETTING_LDAP_Server_Type"] == ""  # generic, not AD
+
+
+def test_ldap_scenario_resolves_one_intent_for_both_deployments():
+    compose = presets.resolve("ldap", "compose", {"users": "3", "domain": "example.org"})
+    kubernetes = presets.resolve("ldap", "kubernetes", {"users": "3", "domain": "example.org"})
+
+    assert compose.scenario == kubernetes.scenario == "ldap"
+    assert compose.scenario_params == kubernetes.scenario_params == {
+        "users": 3,
+        "domain": "example.org",
+        "base_dn": "dc=example,dc=org",
+    }
+    assert compose.topology == "compose"
+    assert kubernetes.topology == "kubernetes"
+    assert compose.env["OVERWRITE_SETTING_LDAP_Host"] == "openldap"
+    env = kubernetes.env
+    assert env["OVERWRITE_SETTING_LDAP_Host"] == "openldap"
+    assert any("kind: Service" in manifest and "name: openldap" in manifest
+               for manifest in kubernetes.kubernetes_manifests)
+
+
+def test_ldap_scenario_reuses_the_legacy_compose_builder():
+    legacy = presets.load("ldap", {"users": "3", "domain": "example.org"})
+    resolved = presets.resolve("ldap", "compose", {"users": "3", "domain": "example.org"})
+
+    assert resolved.scenario == "ldap"
+    assert resolved.services == legacy.services
+    assert resolved.files == legacy.files
+    assert resolved.env == legacy.env
+    assert resolved.params_help == legacy.params_help
+
+
+def test_scenario_refuses_an_unsupported_deployment_type():
+    with pytest.raises(ValueError, match="does not support deployment type 'nomad'"):
+        presets.resolve("ldap", "nomad")
+
+
+def test_user_yaml_still_shadows_a_built_in_scenario():
+    config.preset_dir().mkdir(parents=True)
+    (config.preset_dir() / "ldap.yaml").write_text(
+        "name: ldap\ndescription: local override\nenv: {CUSTOM: value}\n",
+        encoding="utf-8",
+    )
+
+    resolved = presets.resolve("ldap", params={"users": "3"})
+
+    assert resolved.description == "local override"
+    assert resolved.env == {"CUSTOM": "value"}
+    assert resolved.scenario == ""
 
 
 def test_saml_preset_realm_scales_with_users():
@@ -580,6 +633,78 @@ def test_env_values_never_persisted_to_config_file(tmp_path, monkeypatch):
     assert "SECRET" not in config.config_file().read_text()
     # ...while readers still see the env value
     assert config.load_config()["reg_token"] == "SECRET"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_config_file_is_owner_only(tmp_path, monkeypatch):
+    # config.yaml can hold reg_token (a Cloud registration token applying an EE
+    # license), so the default umask's 0644 would expose it to every local user.
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    config.save_config({"reg_token": "SECRET"})
+    assert stat.S_IMODE(config.config_file().stat().st_mode) == 0o600
+    assert stat.S_IMODE(config.home().stat().st_mode) == 0o700
+    # no temp file left behind
+    assert not config.config_file().with_name("config.yaml.tmp").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_config_file_permissions_tightened_on_rewrite(tmp_path, monkeypatch):
+    # A file written by an older rc-repro is already 0644; saving must fix it
+    # rather than preserve the loose mode. Unknown keys must survive too.
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    config.home().mkdir(parents=True)
+    config.config_file().write_text(
+        "default_repro: old\ncustom_team_key: keep-me\n",
+        encoding="utf-8",
+    )
+    os.chmod(config.config_file(), 0o644)
+    raw = config.load_config(with_env=False)
+    raw["default_repro"] = "new"
+    config.save_config(raw)
+    assert stat.S_IMODE(config.config_file().stat().st_mode) == 0o600
+    reloaded = config.load_config(with_env=False)
+    assert reloaded["default_repro"] == "new"
+    assert reloaded["custom_team_key"] == "keep-me"
+
+
+def test_config_save_survives_chmod_failure(tmp_path, monkeypatch):
+    # Explicit boundary for Windows / filesystems without POSIX mode bits:
+    # chmod may fail, but the write is still the user's intent.
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    def boom(_path, _mode):
+        raise OSError("permission bits unsupported")
+
+    monkeypatch.setattr(config.os, "chmod", boom)
+    config.save_config({"default_repro": "ok"})
+    assert config.config_file().read_text(encoding="utf-8")
+    assert config.load_config(with_env=False)["default_repro"] == "ok"
+    assert not config.config_file().with_name("config.yaml.tmp").exists()
+
+
+def test_config_save_closes_raw_descriptor_when_fdopen_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    real_open = config.os.open
+    opened = []
+
+    def tracking_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def fail_fdopen(*_args, **_kwargs):
+        raise OSError("could not construct file object")
+
+    monkeypatch.setattr(config.os, "open", tracking_open)
+    monkeypatch.setattr(config.os, "fdopen", fail_fdopen)
+
+    with pytest.raises(OSError, match="could not construct file object"):
+        config.save_config({"default_repro": "not-written"})
+
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+    assert not list(config.home().glob("config.yaml.*.tmp"))
 
 
 def test_version_single_source():
@@ -1367,6 +1492,762 @@ def test_seed_usernames_avoid_userN_collision():
 def test_seed_channel_names_unique():
     names = [seed.channel_name(i) for i in range(30)]
     assert len(set(names)) == len(names)
+
+
+# --- error taxonomy / exit codes ----------------------------------------------
+
+
+def test_error_taxonomy_codes_and_exit_codes_are_distinct():
+    from rc_repro import errors
+    subs = [errors.ValidationError, errors.ConflictError, errors.NotFoundError,
+            errors.NotReadyError, errors.DockerError, errors.PreflightError,
+            errors.CreateFailedError, errors.AuthorityGateError]
+    codes = [c.code for c in subs]
+    assert len(set(codes)) == len(codes), "error codes must be unique"
+    # every subclass stays a ReproError so existing handlers keep catching it
+    assert all(issubclass(c, errors.ReproError) for c in subs)
+    exits = [c.exit_code for c in subs]
+    # exit 0 is success and must never be an error's code
+    assert 0 not in exits
+    # every exit code is documented in the published map
+    assert all(e in errors.EXIT_CODES for e in exits)
+    # PreflightError and DockerError share exit 3 (preflight bucket) by design.
+    assert errors.DockerError.exit_code == errors.PreflightError.exit_code == 3
+    # Other base classes keep distinct process exits.
+    other = [c.exit_code for c in subs
+             if c not in (errors.DockerError, errors.PreflightError)]
+    assert len(set(other)) == len(other)
+
+
+def test_not_ready_and_create_failed_stay_distinct():
+    # 5 means "still unknown, clock ran out"; 7 means "known dead, stop now".
+    # Collapsing them is what makes callers wait out an already-failed run.
+    from rc_repro import errors
+    assert errors.NotReadyError.exit_code == 5
+    assert errors.CreateFailedError.exit_code == 7
+
+
+def test_authority_gate_carries_approve_with():
+    from rc_repro import errors
+    exc = errors.AuthorityGateError(
+        "cluster 'prod-eu' is not approved", kind="cluster", subject="prod-eu",
+        approve_with="rc-repro use --cluster prod-eu",
+        code="GATE_UNAPPROVED_CLUSTER")
+    assert exc.exit_code == 6
+    assert exc.code == "GATE_UNAPPROVED_CLUSTER"   # per-gate code overrides
+    assert exc.as_gate() == {"kind": "cluster", "subject": "prod-eu",
+                             "approve_with": "rc-repro use --cluster prod-eu"}
+    assert errors.AuthorityGateError.code == "GATE"  # class default untouched
+
+
+def test_http_status_still_intact():
+    # The web API maps on http_status; adding exit codes must not disturb it.
+    from rc_repro import errors
+    assert errors.ValidationError.http_status == 400
+    assert errors.NotFoundError.http_status == 404
+    assert errors.ConflictError.http_status == 409
+    assert errors.DockerError.http_status == 502
+
+
+def test_ui_die_defaults_to_one_and_honours_override():
+    import typer
+    from rc_repro import ui
+    for expected, kwargs in ((1, {}), (6, {"exit_code": 6})):
+        try:
+            ui.die("boom", **kwargs)
+        except typer.Exit as exc:
+            assert exc.exit_code == expected
+        else:
+            raise AssertionError("ui.die must raise typer.Exit")
+
+
+# --- machine-readable output contract -----------------------------------------
+
+
+def test_envelope_shape_and_versions():
+    from rc_repro import jsonout
+    env = jsonout.envelope("info", {"name": "x"})
+    assert set(env) == {"schema", "contract", "rc_repro_version", "generated_at",
+                        "ok", "data", "warnings", "error"}
+    assert env["schema"] == "rc-repro.info.v1"
+    assert env["contract"] == jsonout.CONTRACT == 1
+    assert env["ok"] is True and env["error"] is None
+    # warnings is always a list so callers can iterate without a None check
+    assert env["warnings"] == []
+
+
+def test_error_envelope_uses_the_taxonomy_code():
+    from rc_repro import errors, jsonout
+    env = jsonout.error_envelope(errors.NotFoundError("no repro named 'x'"))
+    assert env["ok"] is False and env["data"] is None
+    assert env["schema"] == "rc-repro.error.v1"
+    assert env["error"]["code"] == "NOT_FOUND"      # stable; message is not
+    assert "gate" not in env["error"]               # only gates carry one
+
+
+def test_error_envelope_carries_gate_for_authority_errors():
+    from rc_repro import errors, jsonout
+    exc = errors.AuthorityGateError("not approved", kind="cluster",
+                                    subject="prod-eu",
+                                    approve_with="rc-repro use --cluster prod-eu",
+                                    code="GATE_UNAPPROVED_CLUSTER")
+    env = jsonout.error_envelope(exc)
+    assert env["error"]["code"] == "GATE_UNAPPROVED_CLUSTER"
+    assert env["error"]["gate"]["approve_with"] == "rc-repro use --cluster prod-eu"
+
+
+def test_list_json_is_one_line_and_empty_is_not_an_error(tmp_path, monkeypatch):
+    import json as _json
+    from typer.testing import CliRunner
+    from rc_repro.cli import app
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    res = CliRunner().invoke(app, ["list", "--json"])
+    assert res.exit_code == 0
+    assert len(res.stdout.strip().splitlines()) == 1   # one object per line
+    payload = _json.loads(res.stdout)
+    assert payload["schema"] == "rc-repro.list.v1"
+    assert payload["data"]["repros"] == []             # [] not a prose line
+
+
+def test_info_json_missing_repro_emits_error_envelope(tmp_path, monkeypatch):
+    import json as _json
+    from typer.testing import CliRunner
+    from rc_repro.cli import app
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    res = CliRunner().invoke(app, ["info", "--name", "no-such-repro", "--json"])
+    assert res.exit_code == 4                          # NOT_FOUND, not a flat 1
+    payload = _json.loads(res.stdout)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "NOT_FOUND"
+
+
+# --- NDJSON progress stream ----------------------------------------------------
+
+
+def _ev(**kw):
+    from rc_repro.services.events import Event
+    kw.setdefault("message", "m")
+    return Event(**kw)
+
+
+def test_event_writer_normalises_unpublished_phases():
+    from rc_repro import jsonout
+    w = jsonout.EventWriter()
+    # a published phase passes through
+    assert w.event(_ev(phase="pull"))["phase"] == "pull"
+    # an unpublished one becomes "info" so the published set really is closed,
+    # and the original is preserved rather than discarded
+    out = w.event(_ev(phase="k6"))
+    assert out["phase"] == "info"
+    assert out["detail"]["phase_raw"] == "k6"
+
+
+def test_event_writer_pct_is_monotonic():
+    from rc_repro import jsonout
+    w = jsonout.EventWriter()
+    assert w.event(_ev(pct=10))["pct"] == 10
+    assert w.event(_ev(pct=40))["pct"] == 40
+    # a service reporting out of order must not make progress go backwards
+    assert w.event(_ev(pct=25))["pct"] == 40
+    assert w.event(_ev(pct=None))["pct"] is None   # unknown stays unknown
+
+
+def test_event_writer_drops_terminal_events(capsys):
+    from rc_repro import jsonout
+    w = jsonout.EventWriter()
+    w.emit(_ev(phase="pull"))
+    w.emit(_ev(phase="done", terminal=True))   # wrapper emits the envelope itself
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 1
+
+
+def test_event_schema_and_published_phases():
+    from rc_repro import jsonout
+    out = jsonout.EventWriter().event(_ev(phase="wait", level="warn", pct=5))
+    assert out["schema"] == "rc-repro.event.v1"
+    assert out["contract"] == jsonout.CONTRACT
+    assert out["level"] == "warn"
+    # the phases the existing Event model already used must all stay published,
+    # or the GUI's current stream would start normalising to "info"
+    for legacy in ("pull", "boot", "wait", "post_ready", "seed", "restore", "done"):
+        assert legacy in jsonout.PHASES
+
+
+def test_json_mode_writes_only_objects_to_stdout(tmp_path, monkeypatch):
+    # Contract: under --json, stdout carries envelope/event objects only. Prose
+    # belongs on stderr. Engine is unavailable here, so this exercises the error
+    # path, which is the one most likely to leak a human-readable line.
+    import json as _json
+    from typer.testing import CliRunner
+    from rc_repro.cli import app
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    # This is an error-wire-format test, not an integration test. Make the
+    # intended preflight failure deterministic on CI hosts that have Docker.
+    monkeypatch.setattr("rc_repro.runner.docker_available", lambda: False)
+    res = CliRunner().invoke(app, ["up", "--version", "8.6.1", "--json"])
+    lines = res.stdout.strip().splitlines()
+    assert lines, "expected at least one object"
+    for ln in lines:
+        _json.loads(ln)          # every stdout line must parse as JSON
+    last = _json.loads(lines[-1])
+    assert last["ok"] is False and last["error"]["code"]
+    assert res.exit_code == last_exit_for(last["error"]["code"])
+
+
+def last_exit_for(code: str) -> int:
+    from rc_repro import errors
+    for cls in (errors.ValidationError, errors.ConflictError, errors.NotFoundError,
+                errors.NotReadyError, errors.DockerError, errors.CreateFailedError):
+        if cls.code == code:
+            return cls.exit_code
+    return 1
+
+
+def test_up_json_streams_events_then_exactly_one_envelope(tmp_path, monkeypatch, capsys):
+    # The happy path, without needing an engine: stand in for the service call and
+    # assert the wire contract holds — events first, exactly one envelope, and it
+    # is last. A real `up` cannot verify this reliably on every host.
+    import json as _json
+    from typer.testing import CliRunner
+    from rc_repro import cli
+    from rc_repro.cli import app
+    from rc_repro.services.events import Event
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    def fake_create(req, emit=None, stream_output=False):
+        for ph, pct in (("preflight", 0), ("resolve", 5), ("pull", 40),
+                        ("boot", 60), ("wait", 80)):
+            emit(Event(f"{ph} step", phase=ph, pct=pct))
+        emit(Event("warn about something", phase="wait", level="warn"))
+        emit(Event("done", phase="done", terminal=True, data={"name": "rc-x"}))
+        return {"name": "rc-x", "waited": True, "booted_s": 12}
+
+    monkeypatch.setattr(cli.lcsvc, "create_repro", fake_create)
+    res = CliRunner().invoke(app, ["up", "--version", "8.6.1", "--json"])
+    assert res.exit_code == 0
+
+    lines = [_json.loads(l) for l in res.stdout.strip().splitlines()]
+    envelopes = [d for d in lines if d["schema"] != "rc-repro.event.v1"]
+    events_ = [d for d in lines if d["schema"] == "rc-repro.event.v1"]
+
+    assert len(envelopes) == 1, "exactly one envelope"
+    assert lines[-1] is envelopes[0], "the envelope must be the last line"
+    assert lines[-1]["schema"] == "rc-repro.up.v1"
+    assert lines[-1]["data"]["name"] == "rc-x"
+    # the terminal event is not published as an event; the envelope replaces it
+    assert len(events_) == 6
+    assert [e["phase"] for e in events_][:5] == ["preflight", "resolve", "pull", "boot", "wait"]
+    # pct never decreases across the stream
+    pcts = [e["pct"] for e in events_ if e["pct"] is not None]
+    assert pcts == sorted(pcts)
+    assert any(e["level"] == "warn" for e in events_)
+
+
+# --- capabilities discovery ----------------------------------------------------
+
+
+def test_capabilities_is_derived_not_hardcoded():
+    from rc_repro import errors, jsonout
+    from rc_repro.cli import app
+    cap = jsonout.capabilities(app)
+    assert cap["contract_versions"] == [jsonout.CONTRACT]
+    # phases and exit codes come straight from their definitions, so they cannot
+    # drift from what the code actually emits
+    assert cap["phases"] == list(jsonout.PHASES)
+    assert cap["exit_codes"] == {str(k): v for k, v in sorted(errors.EXIT_CODES.items())}
+    # every error code in the taxonomy is discoverable
+    assert "NOT_FOUND" in cap["error_codes"]
+    assert "CREATE_FAILED" in cap["error_codes"]
+    # presets are read from the catalog, not a literal list
+    assert "default" in cap["presets"]
+
+
+def test_capabilities_reports_which_verbs_speak_json():
+    from rc_repro import jsonout
+    from rc_repro.cli import app
+    cap = jsonout.capabilities(app)
+    by_name = {c["name"]: c for c in cap["commands"]}
+    for verb in ("up", "ready", "down", "list", "info", "inspect"):
+        assert by_name[verb]["json"] is True, verb
+        assert by_name[verb]["schema"] == f"rc-repro.{verb}.v1"
+    # only the long-running verbs stream events
+    assert by_name["up"]["streams"] is True
+    assert by_name["list"]["streams"] is False
+    # a verb without --json is reported honestly rather than omitted
+    assert by_name["logs"]["json"] is False
+    assert "--name" in by_name["up"]["flags"]
+
+
+def test_capabilities_needs_no_engine(tmp_path, monkeypatch):
+    # A skill calls this before it knows the environment works, so it must answer
+    # with no engine present. Engine checks belong to `doctor`.
+    import json as _json
+    from typer.testing import CliRunner
+    from rc_repro import cli
+    from rc_repro.cli import app
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli.runner, "docker_available", lambda: False)
+    res = CliRunner().invoke(app, ["capabilities"])
+    assert res.exit_code == 0
+    payload = _json.loads(res.stdout)
+    assert payload["schema"] == "rc-repro.capabilities.v1"
+    assert payload["ok"] is True
+
+
+def test_capabilities_discovers_the_kubernetes_topology():
+    # Derived from the catalog, so a preset declaring a new topology becomes
+    # discoverable without touching the capability record.
+    from rc_repro import jsonout
+    from rc_repro.cli import app
+    cap = jsonout.capabilities(app)
+    assert cap["topologies"] == ["compose", "kubernetes"]
+    assert cap["presets_by_topology"]["kubernetes"] == ["microservices"]
+    assert "default" in cap["presets_by_topology"]["compose"]
+
+
+def test_microservices_preset_declares_its_topology_and_licence():
+    from rc_repro import presets
+    p = presets.load("microservices")
+    assert p.topology == "kubernetes"
+    # Microservices are an enterprise feature; the flag is advisory, and evidence
+    # records the actual licence state rather than blocking the run.
+    assert p.requires_license is True
+    # Compose-shaped fields stay empty: this preset builds Helm values.
+    assert p.services == {} and p.env == {}
+
+
+def test_every_other_preset_stays_on_compose():
+    from rc_repro import presets
+    for p in presets.list_presets():
+        if p.name != "microservices":
+            assert p.topology == "compose", p.name
+
+
+def test_lifecycle_dispatches_on_topology(monkeypatch):
+    from rc_repro.services import lifecycle as lc
+    assert lc._topology_of("microservices") == "kubernetes"
+    assert lc._topology_of("default") == "compose"
+    # an unknown preset must not be guessed into the Kubernetes path; the Compose
+    # body raises a proper ValidationError for it moments later
+    assert lc._topology_of("does-not-exist") == "compose"
+
+
+# --- onboarding ----------------------------------------------------------------
+
+
+def test_onboarding_absent_is_an_authority_gate(tmp_path, monkeypatch):
+    # An agent on a fresh machine must not invent its own baseline. It stops with
+    # exit 6 and the exact command to ask a human to run.
+    from rc_repro import errors
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    assert onboarding.state()["completed"] is False
+    with pytest.raises(errors.AuthorityGateError) as ei:
+        onboarding.require_onboarded()
+    exc = ei.value
+    assert exc.exit_code == 6 and exc.code == "GATE_NOT_ONBOARDED"
+    assert exc.as_gate()["approve_with"] == onboarding.ONBOARD_COMMAND
+
+
+def test_onboarding_persists_and_stops_asking(tmp_path, monkeypatch):
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    st = onboarding.complete(grants=["engine-resize"], preferences={"retain_runs": True})
+    assert st["completed"] and st["grants"]["engine_resize"] is True
+    assert st["preferences"]["retain_runs"] is True
+    onboarding.require_onboarded()                 # no raise, ever again
+    onboarding.require_grant("engine-resize")      # granted
+
+
+def test_missing_grant_is_a_gate_but_onboarding_is_not_reasked(tmp_path, monkeypatch):
+    # A missing grant is an unanswered question, which is different from a settled
+    # one. Onboarding stops re-asking what was answered; it does not make rc-repro
+    # silent about authority it was never given.
+    from rc_repro import errors
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(grants=[])                 # onboarded, nothing granted
+    onboarding.require_onboarded()                 # settled: silent
+    with pytest.raises(errors.AuthorityGateError) as ei:
+        onboarding.require_grant("engine-resize")
+    assert ei.value.code == "GATE_ENGINE_RESIZE"
+    assert ei.value.as_gate()["approve_with"] == "rc-repro onboard"
+
+
+def test_settled_grant_denial_points_to_interactive_reconfiguration(tmp_path, monkeypatch):
+    from rc_repro import errors
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.complete(denied_grants=["owned-cluster"])
+
+    with pytest.raises(errors.AuthorityGateError) as ei:
+        onboarding.require_grant("owned-cluster")
+
+    assert ei.value.code == "GATE_OWNED_CLUSTER"
+    assert ei.value.as_gate()["approve_with"] == "rc-repro onboard --reconfigure"
+
+
+def test_onboarding_updates_only_answers_supplied_by_this_run(tmp_path, monkeypatch):
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    first = onboarding.complete(
+        grants=["owned-cluster"], denied_grants=["engine-resize"],
+        preferences={"retain_runs": True})
+    assert first["grants"] == {"owned_cluster": True, "engine_resize": False}
+    assert all(first["answered_grants"].values())
+    second = onboarding.complete(grants=["engine-resize"])
+    assert second["grants"] == {"owned_cluster": True, "engine_resize": True}
+    assert second["preferences"]["retain_runs"] is True
+    assert second["clusters"] == ["rc-repro-local"]
+
+
+def test_interactive_onboarding_shows_facts_persists_authority_and_does_not_reask(
+        tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from rc_repro.cli import app
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding, "detect_environment", lambda: {
+        "os": "Ubuntu 24.04.4 LTS", "os_version": "24.04", "architecture": "x86_64",
+        "cpus": 4, "memory_gib": 15.6, "disk_free_gib": 75.0,
+        "tools": {"docker": "Docker 29.6.1", "compose": "Docker Compose v5.3.1",
+                  "kind": "kind v0.32.0", "kubectl": "Client Version: v1.36.1",
+                  "helm": "v3.21.3"},
+        "docker_ready": True, "engine_provider": "podman",
+        "engine_memory_gib": 15.6, "engine_cpus": 4,
+        "missing_kubernetes_tools": [], "microservices_ready": True,
+        "engine_resize_supported": False, "engine_resize_relevant": False,
+    })
+
+    # Goal-first: microservices deployment, no scenario, small seed, no retain,
+    # grant owned-cluster, review apply.
+    first = CliRunner().invoke(app, ["onboard"], input=(
+        "microservices\n"   # deployment
+        "\n"                # scenario none
+        "small\n"           # seed
+        "n\n"               # retain_runs
+        "y\n"               # owned-cluster
+        "y\n"               # apply review
+    ))
+    assert first.exit_code == 0, first.output
+    assert "Detected environment" in first.output
+    assert "create and later delete those owned resources" in first.output
+    assert "Enterprise topology" in first.output
+    assert onboarding.FIRST_RUN_COMMAND in first.output
+    saved = onboarding.state()
+    assert saved["grants"]["owned_cluster"] is True
+    assert saved["preferences"]["retain_runs"] is False
+    assert saved["answered_grants"]["engine_resize"] is False
+
+    second = CliRunner().invoke(app, ["onboard"], input="")
+    assert second.exit_code == 0, second.output
+    assert "Settled choices are unchanged" in second.output
+    assert "May rc-repro" not in second.output
+    assert onboarding.state()["grants"] == saved["grants"]
+
+
+def test_interactive_onboarding_prints_a_first_command_the_detected_machine_can_run(
+        tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+    from rc_repro.cli import app
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding, "detect_environment", lambda: {
+        "os": "Ubuntu 24.04.4 LTS", "os_version": "24.04", "architecture": "x86_64",
+        "cpus": 2, "memory_gib": 3.8, "disk_free_gib": 75.0,
+        "tools": {"docker": "Docker 29.6.1", "compose": "Docker Compose v5.3.1",
+                  "kind": "missing", "kubectl": "missing", "helm": "missing"},
+        "docker_ready": True, "engine_provider": "docker",
+        "engine_memory_gib": 3.8, "engine_cpus": 2,
+        "missing_kubernetes_tools": ["kind", "kubectl", "helm"],
+        "microservices_ready": False, "engine_resize_supported": False,
+        "engine_resize_relevant": False,
+    })
+
+    # Compose path: no Kubernetes authority questions.
+    result = CliRunner().invoke(app, ["onboard"], input=(
+        "default\n"   # deployment
+        "\n"          # scenario
+        "none\n"      # seed
+        "n\n"         # retain
+        "y\n"         # apply
+    ))
+
+    assert result.exit_code == 0, result.output
+    assert "Kubernetes authority" in result.output or "skipped" in result.output
+    assert onboarding.FIRST_RUN_COMMAND not in result.output
+    assert "rc-repro up --version 8.6.1 --name first-repro --wait" in result.output
+
+
+def test_environment_detection_routes_docker_commands_through_runner(tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s, onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(onboarding, "_version_line", lambda tool, *args: f"{tool} ok")
+    monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.6.1")
+    monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version v5.3.1")
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(runner, "docker_server_platform", lambda: "Docker Engine - Community")
+    monkeypatch.setattr(runner, "docker_server_components", lambda: ("Engine",))
+    monkeypatch.setattr(runner, "docker_endpoint", lambda: "unix:///var/run/docker.sock")
+    monkeypatch.setattr(runner, "docker_kernel_version", lambda: "6.18.0")
+    monkeypatch.setattr(k8s, "engine_capacity", lambda: (15.6, 4))
+    monkeypatch.setattr(k8s, "engine_resize_supported", lambda: False)
+
+    detected = onboarding.detect_environment()
+
+    assert detected["tools"]["docker"] == "Docker version 29.6.1"
+    assert detected["tools"]["compose"] == "Docker Compose version v5.3.1"
+    assert detected["engine_provider"] == "docker"
+
+
+def test_runner_reads_active_server_component_names(monkeypatch):
+    from rc_repro import runner
+    monkeypatch.setattr(
+        runner, "_first_line",
+        lambda _cmd: '[{"Name":"Podman Engine"},{"Name":"Conmon"}]')
+
+    assert runner.docker_server_components() == ("Podman Engine", "Conmon")
+
+
+def test_environment_detection_recognises_active_podman_socket(tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s, onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(onboarding, "_version_line", lambda tool, *args: f"{tool} ok")
+    monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.6.1")
+    monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version v5.3.1")
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(
+        runner, "docker_server_platform", lambda: "linux/arm64/fedora-43")
+    monkeypatch.setattr(runner, "docker_server_components", lambda: ("Engine",))
+    monkeypatch.setattr(
+        runner, "docker_endpoint",
+        lambda: "unix:///Users/test/.local/share/containers/podman/machine/podman.sock")
+    monkeypatch.setattr(runner, "docker_kernel_version", lambda: "6.18.0")
+    monkeypatch.setattr(k8s, "engine_capacity", lambda: (15.6, 4))
+    monkeypatch.setattr(k8s, "engine_resize_supported", lambda: True)
+
+    detected = onboarding.detect_environment()
+
+    assert detected["engine_provider"] == "podman"
+
+
+def test_environment_detection_recognises_podman_server_component(
+        tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s, onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(onboarding, "_version_line", lambda tool, *args: f"{tool} ok")
+    monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.7.1")
+    monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version 5.3.1")
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(
+        runner, "docker_server_platform", lambda: "linux/arm64/fedora-43")
+    monkeypatch.setattr(
+        runner, "docker_server_components", lambda: ("Podman Engine", "Conmon"))
+    monkeypatch.setattr(
+        runner, "docker_endpoint", lambda: "unix:///var/run/docker.sock")
+    monkeypatch.setattr(runner, "docker_kernel_version", lambda: "6.19.7-200.fc43")
+    monkeypatch.setattr(k8s, "engine_capacity", lambda: (5.8, 5))
+    monkeypatch.setattr(k8s, "engine_resize_supported", lambda: True)
+
+    detected = onboarding.detect_environment()
+
+    assert detected["engine_provider"] == "podman"
+    assert detected["engine_kernel_version"] == "6.19.7-200.fc43"
+
+
+@pytest.mark.parametrize(
+    ("capacity", "resize_supported", "expected"),
+    [((8.0, 2), True, False), ((2.0, 4), False, False), ((2.0, 4), True, True)],
+)
+def test_environment_only_offers_resize_for_a_supported_memory_shortfall(
+        tmp_path, monkeypatch, capacity, resize_supported, expected):
+    from rc_repro import runner
+    from rc_repro.services import k8s, onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(onboarding, "_version_line", lambda tool, *args: f"{tool} ok")
+    monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.6.1")
+    monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version v5.3.1")
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(runner, "docker_server_platform", lambda: "Podman Engine")
+    monkeypatch.setattr(runner, "docker_server_components", lambda: ("Podman Engine",))
+    monkeypatch.setattr(runner, "docker_endpoint", lambda: "unix:///var/run/docker.sock")
+    monkeypatch.setattr(runner, "docker_kernel_version", lambda: "6.18.0")
+    monkeypatch.setattr(k8s, "engine_capacity", lambda: capacity)
+    monkeypatch.setattr(k8s, "engine_resize_supported", lambda: resize_supported)
+
+    assert onboarding.detect_environment()["engine_resize_relevant"] is expected
+
+
+def test_noninteractive_onboarding_needs_accept_defaults_and_explicit_cluster_grant(
+        tmp_path, monkeypatch):
+    import json as _json
+    from typer.testing import CliRunner
+    from rc_repro.cli import app
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding, "detect_environment", lambda: {})
+
+    refused = CliRunner().invoke(app, ["onboard", "--json"])
+    assert refused.exit_code == 2
+    assert "--accept-defaults" in refused.output
+
+    baseline = CliRunner().invoke(app, ["onboard", "--accept-defaults", "--json"])
+    assert baseline.exit_code == 0, baseline.output
+    assert _json.loads(baseline.stdout)["data"]["grants"]["owned_cluster"] is False
+
+    granted = CliRunner().invoke(
+        app, ["onboard", "--accept-defaults", "--grant", "owned-cluster", "--json"])
+    assert granted.exit_code == 0, granted.output
+    assert _json.loads(granted.stdout)["data"]["grants"]["owned_cluster"] is True
+
+
+def test_onboarding_is_additive_and_keeps_existing_keys(tmp_path, monkeypatch):
+    # Never rename or retype an existing key: a config written before onboarding
+    # existed must survive untouched.
+    from rc_repro import config
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    config.save_config({"default_repro": "rc8", "bind_host": "127.0.0.1"})
+    onboarding.complete(grants=["engine-resize"])
+    cfg = config.load_config()
+    assert cfg["default_repro"] == "rc8" and cfg["bind_host"] == "127.0.0.1"
+    assert "config_version" not in cfg          # additive-only, no migration
+    # an unknown preference in the file is ignored rather than honoured
+    cfg["preferences"]["not_a_real_pref"] = True
+    config.save_config(cfg)
+    assert "not_a_real_pref" not in onboarding.state()["preferences"]
+
+
+def test_onboarding_rejects_unknown_grants(tmp_path, monkeypatch):
+    from rc_repro import errors
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    with pytest.raises(errors.ValidationError) as ei:
+        onboarding.complete(grants=["delete-everything"])
+    assert "engine-resize" in str(ei.value)      # names what is available
+
+
+def test_onboarding_never_persists_a_secret(tmp_path, monkeypatch):
+    # A registration token keeps its ephemeral route; onboarding must not bake it in.
+    from rc_repro import config
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("RC_REPRO_REG_TOKEN", "SUPERSECRET")
+    onboarding.complete(grants=[])
+    assert "SUPERSECRET" not in config.config_file().read_text()
+
+
+def test_capabilities_reports_onboarding_state(tmp_path, monkeypatch):
+    from rc_repro import jsonout
+    from rc_repro.cli import app
+    from rc_repro.services import onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    cap = jsonout.capabilities(app)
+    assert cap["onboarding"]["completed"] is False
+    assert cap["onboarding"]["onboard_with"] == onboarding.ONBOARD_COMMAND
+    onboarding.complete(grants=["engine-resize"])
+    assert jsonout.capabilities(app)["onboarding"]["completed"] is True
+
+
+def test_capabilities_bad_config_still_routes_a_human_to_interactive_onboarding(monkeypatch):
+    from rc_repro import jsonout
+    from rc_repro.services import onboarding
+    monkeypatch.setattr(onboarding, "state", lambda: (_ for _ in ()).throw(ValueError("bad")))
+
+    assert jsonout._onboarding_state()["onboard_with"] == "rc-repro onboard"
+
+
+# --- the agent skill bundle ----------------------------------------------------
+
+
+def test_committed_host_copies_match_the_packaged_bundle():
+    """The whole point of one canonical bundle is that copies cannot diverge.
+
+    Without this test the repo's committed .claude/ and .agents/ copies drift from
+    the packaged one, which is exactly the divergent-copy problem the skill design
+    exists to prevent.
+    """
+    from pathlib import Path
+    from rc_repro.services import skill
+    canonical = skill.bundle_text()
+    for rel in (".claude/skills/rc-repro/SKILL.md", ".agents/skills/rc-repro/SKILL.md"):
+        p = Path(rel)
+        assert p.exists(), f"{rel} is missing; copy rc_repro/data/skill/SKILL.md there"
+        assert p.read_text(encoding="utf-8") == canonical, (
+            f"{rel} has drifted from rc_repro/data/skill/SKILL.md")
+
+
+def test_skill_frontmatter_is_restricted_to_the_spec_fields():
+    # Host-only fields stay out of the canonical body: the superset host is the fork
+    # risk here, not a gap.
+    from rc_repro.services import skill
+    text = skill.bundle_text()
+    assert text.startswith("---\n")
+    front = text.split("---", 2)[1]
+    keys = {ln.split(":", 1)[0].strip() for ln in front.strip().splitlines()
+            if ":" in ln and not ln.startswith(" ")}
+    assert keys == {"name", "description"}, keys
+    # description drives activation, so it must name situations, not the tool
+    assert "reproduce" in front.lower()
+
+
+def test_skill_body_delegates_rather_than_duplicating_the_contract():
+    # It must not restate flags or error codes: a skill that disagrees with the
+    # binary is worse than no skill.
+    from rc_repro.services import skill
+    text = skill.bundle_text()
+    assert "rc-repro capabilities" in text          # points at the authority
+    assert "exit 6" in text                         # teaches the gate rule
+    for leaked in ("VALIDATION_FAILED", "ENGINE_UNAVAILABLE", "exit_codes"):
+        assert leaked not in text, f"{leaked} duplicates the contract"
+
+
+def test_skill_install_is_idempotent_and_detects_drift(tmp_path, monkeypatch):
+    from rc_repro import errors
+    from rc_repro.services import skill
+    monkeypatch.setenv("HOME", str(tmp_path))          # never touch the real ~/.claude
+    assert skill.status("claude").state == "absent"
+    st = skill.install("claude")
+    assert st.state == "current"
+    assert skill.install("claude").state == "current"  # idempotent
+
+    # a human edit is detected and never silently overwritten
+    (st.path / "SKILL.md").write_text("locally edited", encoding="utf-8")
+    assert skill.status("claude").state == "modified"
+    with pytest.raises(errors.ConflictError):
+        skill.install("claude")
+    assert skill.install("claude", force=True).state == "current"
+
+
+def test_skill_stale_when_the_recorded_version_differs(tmp_path, monkeypatch):
+    import json as _j
+    from rc_repro.services import skill
+    monkeypatch.setenv("HOME", str(tmp_path))
+    st = skill.install("claude")
+    side = st.path / ".rc-repro-skill.json"
+    data = _j.loads(side.read_text())
+    data["rc_repro_version"] = "0.0.1-old"
+    side.write_text(_j.dumps(data))
+    assert skill.status("claude").state == "stale"
+
+
+def test_cursor_and_copilot_need_no_separate_install():
+    # They read the Claude Code and Codex directories, so a separate copy would be
+    # a divergent copy for no benefit.
+    from rc_repro import errors
+    from rc_repro.services import skill
+    for host, covered_by in (("cursor", "claude"), ("copilot", "codex")):
+        with pytest.raises(errors.ValidationError) as ei:
+            skill.target_dir(host)
+        assert covered_by in str(ei.value)
 
 
 def test_seed_restores_only_the_2fa_value_it_changed(monkeypatch):
