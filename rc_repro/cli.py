@@ -176,6 +176,165 @@ def _print_access(result: dict) -> None:
         ui.hint(f"    note   : {note}")
 
 
+def _print_table(title: str, columns: list[tuple[str, str]], rows: list[dict]) -> None:
+    """Print a small ASCII table without introducing a terminal dependency."""
+    typer.echo(f"\n{title}:")
+    if not rows:
+        typer.echo("  none")
+        return
+    values = []
+    for key, _label in columns:
+        values.append([_ascii(str(row.get(key, "") or "")) for row in rows])
+    widths = [max(len(label), *(len(value) for value in column_values))
+              for (_key, label), column_values in zip(columns, values)]
+    header = "  " + "  ".join(label.ljust(width) for (_key, label), width in zip(columns, widths))
+    typer.echo(header)
+    typer.echo("  " + "  ".join("-" * width for width in widths))
+    for row in rows:
+        typer.echo("  " + "  ".join(
+            _ascii(str(row.get(key, "") or "")).ljust(width)
+            for (key, _label), width in zip(columns, widths)))
+
+
+def _format_count_map(counts: dict | None) -> str:
+    if not isinstance(counts, dict):
+        return "unknown"
+    order = ("users", "channels", "groups", "messages", "thread_replies", "dms", "dm_messages")
+    return " ".join(f"{key}={counts[key]}" for key in order if key in counts) or "none"
+
+
+def _format_service_ports(service: dict) -> str:
+    ports = []
+    for port in service.get("ports") or []:
+        name = port.get("name") or ""
+        prefix = f"{name}:" if name else ""
+        value = f"{port.get('port', '?')}->{port.get('target_port', '?')}"
+        ports.append(prefix + value)
+    return ", ".join(ports)
+
+
+def _print_runtime_detail(detail: dict) -> None:
+    """Render the common runtime details that `info` promises to show."""
+    topology = detail.get("topology", "")
+    rows = [
+        ("state", str(detail.get("state", "unknown"))),
+        ("topology", str(topology)),
+        ("port-forward", str(detail.get("port_forward", "n/a"))),
+    ]
+    if topology == "kubernetes":
+        rows[1:1] = [
+            ("cluster", str(detail.get("cluster", ""))),
+            ("context", str(detail.get("context", ""))),
+            ("namespace", str(detail.get("namespace", ""))),
+            ("chart", f"{detail.get('chart', '')}:{detail.get('chart_version', '')}"),
+        ]
+    else:
+        if detail.get("uptime"):
+            rows.append(("uptime", str(detail["uptime"])))
+        if detail.get("health"):
+            rows.append(("health", str(detail["health"])))
+    ui.panel("runtime", rows, color=typer.colors.CYAN)
+    containers = detail.get("containers") or []
+    _print_table(
+        "Pods" if topology == "kubernetes" else "Services",
+        [("service", "NAME"), ("state", "STATE"), ("status", "STATUS")],
+        containers,
+    )
+
+
+def _inspect_payload(detail: dict, evidence: dict, inventory: dict | None) -> dict:
+    """Build the inspect JSON record without copying admin credentials."""
+    return {
+        "repro": evidence.get("repro", {}),
+        "runtime": evidence.get("runtime", {}),
+        "artifact": evidence.get("artifact", {}),
+        "ownership": evidence.get("ownership", {}),
+        "license": evidence.get("license", {}),
+        "retention": evidence.get("retention", {}),
+        "seed": evidence.get("seed"),
+        "access": detail.get("access"),
+        "cluster": inventory,
+    }
+
+
+def _inspect_target(target: str) -> tuple[dict, dict, dict | None, dict]:
+    """Read the human detail, secret-safe evidence, and optional K8s inventory."""
+    detail = lcsvc.detail(target)
+    evidence = evidencesvc.record(target)
+    inventory = None
+    if detail.get("topology") == "kubernetes":
+        from rc_repro.services import k8s
+        inventory = k8s.inventory(target)
+    return detail, evidence, inventory, _inspect_payload(detail, evidence, inventory)
+
+
+def _render_inspection(detail: dict, evidence: dict, inventory: dict | None) -> None:
+    repro = evidence.get("repro", {})
+    ui.panel(repro.get("name", "repro"), [
+        ("Rocket.Chat", str(repro.get("rc_version", ""))),
+        ("MongoDB", str(repro.get("mongo_tag", ""))),
+        ("Preset", str(repro.get("preset", ""))),
+        ("Topology", str(repro.get("topology", ""))),
+        ("URL", str(repro.get("root_url", ""))),
+    ])
+    _print_runtime_detail(detail)
+    _print_access(detail)
+
+    if inventory is not None:
+        ui.panel("cluster", [
+            ("name", str(inventory.get("cluster", ""))),
+            ("exists", str(inventory.get("cluster_exists", "unknown"))),
+            ("context", str(inventory.get("context", ""))),
+            ("namespace", str(inventory.get("namespace", ""))),
+        ], color=typer.colors.CYAN)
+        nodes = []
+        for node in inventory.get("nodes", []):
+            nodes.append({
+                "name": node.get("name", ""),
+                "status": node.get("status", ""),
+                "roles": ",".join(node.get("roles") or []),
+                "version": node.get("version", ""),
+                "internal_ip": node.get("internal_ip", ""),
+            })
+        _print_table("Nodes", [
+            ("name", "NAME"), ("status", "STATUS"), ("roles", "ROLES"),
+            ("version", "VERSION"), ("internal_ip", "INTERNAL-IP"),
+        ], nodes)
+        services = []
+        for service in inventory.get("services", []):
+            services.append({
+                "name": service.get("name", ""),
+                "type": service.get("type", ""),
+                "cluster_ip": service.get("cluster_ip", ""),
+                "ports": _format_service_ports(service),
+            })
+        _print_table("Cluster services", [
+            ("name", "NAME"), ("type", "TYPE"),
+            ("cluster_ip", "CLUSTER-IP"), ("ports", "PORTS"),
+        ], services)
+        for warning in inventory.get("warnings") or []:
+            ui.warn(f"  warning: {warning}")
+
+    seed = evidence.get("seed")
+    if isinstance(seed, dict):
+        verification = seed.get("verification") or {}
+        ui.panel("seed", [
+            ("profile", str(seed.get("profile", ""))),
+            ("verification", "verified" if verification.get("ok") else "NOT VERIFIED"),
+            ("expected", _format_count_map((seed.get("plan") or {}).get("expected"))),
+            ("writes", _format_count_map(seed.get("actual"))),
+            ("readback", _format_count_map(seed.get("readback"))),
+            ("mismatches", json.dumps(verification.get("mismatches") or {}, sort_keys=True)),
+        ], color=typer.colors.YELLOW if not verification.get("ok") else typer.colors.GREEN)
+
+    retention = evidence.get("retention") or {}
+    ui.panel("retention", [
+        ("retained", str(retention.get("retained", False))),
+        ("reason", str(retention.get("reason") or "")),
+        ("cleanup", str(retention.get("cleanup", ""))),
+    ], color=typer.colors.CYAN)
+
+
 def _render_create_result(result: dict) -> None:
     """Format a create_repro result the way `up` used to (panel + notes + hints)."""
     meta = runner.read_meta(result["name"])
@@ -712,7 +871,7 @@ def info(
     name: str = typer.Option("", "--name", "-n"),
     json_out: bool = typer.Option(False, "--json", help="emit the stable JSON record instead of a panel"),
 ) -> None:
-    """Show a repro's URL, admin credentials and a curl snippet."""
+    """Show a repro's URL, runtime state, pods, admin credentials and a curl snippet."""
     if json_out:
         # Resolve inside the try so a missing repro is reported as an error
         # envelope with its code, not as a bare traceback or a prose line.
@@ -725,10 +884,37 @@ def info(
     target = _resolve_name(name)
     m = runner.read_meta(target)
     _summary_panel(m)
-    _print_access(lcsvc.describe(target))
+    detail = lcsvc.detail(target)
+    _print_runtime_detail(detail)
+    _print_access(detail)
     ui.hint(f"  api  : rc-repro api --name {m.name} GET /api/v1/me")
     ui.hint(f"  curl : {m.root_url}/api/info")
+    ui.hint(f"  full : rc-repro inspect --name {m.name}")
     _print_notes(m)
+
+
+@app.command()
+def inspect(
+    name: str = typer.Option("", "--name", "-n"),
+    json_out: bool = typer.Option(False, "--json", help="emit the secret-safe inspection record"),
+) -> None:
+    """Show one repro plus its read-only Kubernetes cluster inventory.
+
+    Unlike `info`, the JSON record deliberately excludes admin credentials. On
+    Kubernetes it uses rc-repro's owned kubeconfig to collect the Kind cluster,
+    nodes, pods, and namespace services without reading Secrets or changing state.
+    """
+    try:
+        target = lcsvc.resolve_name(name)
+        detail, evidence, inventory, payload = _inspect_target(target)
+    except errors.ReproError as exc:
+        if json_out:
+            jsonout.fail(exc)
+        _fail(exc)
+    if json_out:
+        jsonout.emit(jsonout.envelope("inspect", payload))
+        return
+    _render_inspection(detail, evidence, inventory)
 
 
 # Settings worth remembering, shown name -> config.yaml key. An allowlist, so a

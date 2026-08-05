@@ -140,6 +140,44 @@ def test_k8s_info_json_exposes_remote_access_and_token_boolean(
     }
 
 
+def test_inspect_json_is_secret_safe_and_includes_cluster_inventory(monkeypatch):
+    from rc_repro import cli
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(cli.lcsvc, "resolve_name", lambda _name: "inspect-me")
+    monkeypatch.setattr(cli.lcsvc, "detail", lambda _name: {
+        "name": "inspect-me", "topology": "kubernetes", "state": "running",
+        "port_forward": "up", "cluster": "rc-repro-local",
+        "context": "kind-rc-repro-local", "namespace": "rc-repro-inspect-me",
+        "chart": "rocketchat/rocketchat", "chart_version": "7.0.2",
+        "containers": [], "access": {"mode": "local", "bind": "loopback"},
+    })
+    monkeypatch.setattr(cli.evidencesvc, "record", lambda _name: {
+        "repro": {"name": "inspect-me", "topology": "kubernetes"},
+        "runtime": {"state": "running", "services": []},
+        "artifact": {}, "ownership": {"namespace": "rc-repro-inspect-me"},
+        "license": {"required": True, "supplied": True, "source": "reg_token"},
+        "retention": {"retained": True, "reason": "persisted preference",
+                       "cleanup": "rc-repro down --name inspect-me --volumes --yes"},
+        "seed": None,
+    })
+    monkeypatch.setattr(k8s, "inventory", lambda _name: {
+        "cluster": "rc-repro-local", "context": "kind-rc-repro-local",
+        "namespace": "rc-repro-inspect-me", "cluster_exists": True,
+        "nodes": [{"name": "control-plane", "status": "Ready"}],
+        "services": [{"name": "rc-rocketchat", "type": "ClusterIP", "cluster_ip": "10.0.0.1",
+                       "ports": []}], "warnings": [],
+    })
+
+    result = CliRunner().invoke(cli.app, ["inspect", "--name", "inspect-me", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["data"]["cluster"]["nodes"][0]["status"] == "Ready"
+    assert payload["data"]["runtime"]["state"] == "running"
+    assert "admin123" not in result.stdout
+
+
 def test_retention_defaults_to_teardown():
     r = evidence.resolve_retention(preferences={})
     assert r == {"retained": False, "reason": None}

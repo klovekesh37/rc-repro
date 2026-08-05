@@ -1768,7 +1768,7 @@ def test_capabilities_reports_which_verbs_speak_json():
     from rc_repro.cli import app
     cap = jsonout.capabilities(app)
     by_name = {c["name"]: c for c in cap["commands"]}
-    for verb in ("up", "ready", "down", "list", "info"):
+    for verb in ("up", "ready", "down", "list", "info", "inspect"):
         assert by_name[verb]["json"] is True, verb
         assert by_name[verb]["schema"] == f"rc-repro.{verb}.v1"
     # only the long-running verbs stream events

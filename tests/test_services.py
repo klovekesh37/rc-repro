@@ -935,6 +935,63 @@ def test_k8s_pods_map_to_the_compose_container_shape(tmp_path, monkeypatch):
     assert d["links"][0]["url"] == "http://localhost:31300"
 
 
+def test_k8s_inventory_collects_owned_cluster_nodes_and_services(tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    meta = runner.Metadata(
+        name="inventory", project="rcrepro-inventory", rc_version="8.6.1",
+        rc_image="rocket.chat", mongo_tag="8.0", mongo_flavor="official",
+        preset="microservices", root_url="http://localhost:31310", host_port=31310,
+        version_source="test", extra={
+            "topology": "kubernetes", "k8s_namespace": "rc-repro-inventory",
+            "k8s_context": "kind-rc-repro-local",
+        },
+    )
+    runner.write("inventory", "microservices: {}\n", meta, artifact_name="values.yaml")
+
+    class InventoryRun(_FakeRun):
+        def run(self, argv, *, check=True):
+            import subprocess
+            if argv[:3] == ["kind", "get", "clusters"]:
+                return subprocess.CompletedProcess(argv, 0, "rc-repro-local\n", "")
+            if argv and argv[0] == "kubectl" and "nodes" in argv:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"items": [{
+                    "metadata": {
+                        "name": "rc-repro-local-control-plane",
+                        "labels": {"node-role.kubernetes.io/control-plane": ""},
+                        "creationTimestamp": "2026-08-02T00:00:00Z",
+                    },
+                    "status": {
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "addresses": [{"type": "InternalIP", "address": "172.22.0.2"}],
+                        "nodeInfo": {
+                            "kubeletVersion": "v1.36.1",
+                            "osImage": "Debian GNU/Linux 13 (trixie)",
+                            "kernelVersion": "6.8.0-117-generic",
+                            "containerRuntimeVersion": "containerd://2.3.1",
+                        },
+                    },
+                }]}), "")
+            if argv and argv[0] == "kubectl" and "services" in argv:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"items": [{
+                    "metadata": {"name": "rc-rocketchat"},
+                    "spec": {"type": "ClusterIP", "clusterIP": "10.96.156.88",
+                             "ports": [{"name": "http", "port": 80,
+                                        "targetPort": 3000, "protocol": "TCP"}]},
+                }]}), "")
+            if argv and argv[0] == "kubectl" and "pods" in argv:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"items": []}), "")
+            return super().run(argv, check=check)
+
+    inventory = k8s.inventory("inventory", InventoryRun())
+    assert inventory["cluster"] == "rc-repro-local"
+    assert inventory["cluster_exists"] is True
+    assert inventory["nodes"][0]["status"] == "Ready"
+    assert inventory["nodes"][0]["roles"] == ["control-plane"]
+    assert inventory["services"][0]["ports"][0]["target_port"] == 3000
+
+
 def test_lifecycle_detail_dispatches_to_kubernetes(tmp_path, monkeypatch):
     from rc_repro.services import k8s
     from rc_repro.services import lifecycle as lc

@@ -1164,8 +1164,11 @@ def detail(name: str, run: _Runner | None = None) -> dict:
         "root_url": meta.root_url,
         "host_port": meta.host_port,
         "topology": "kubernetes",
+        "cluster": CLUSTER_NAME,
         "namespace": extra.get(_NAMESPACE, ""),
         "context": extra.get(_CONTEXT, ""),
+        "chart": CHART,
+        "chart_version": extra.get("chart_version", ""),
         "state": aggregate_state(pod_list),
         "containers": pod_list,
         "port_forward": forward_state(meta),
@@ -1174,6 +1177,117 @@ def detail(name: str, run: _Runner | None = None) -> dict:
     }
     if extra.get("reg_token_supplied"):
         result["reg_token_supplied"] = True
+    return result
+
+
+def _node_record(item: dict) -> dict:
+    """Convert a Kubernetes node into a compact, secret-free inspection row."""
+    metadata = item.get("metadata") or {}
+    status = item.get("status") or {}
+    node_info = status.get("nodeInfo") or {}
+    conditions = status.get("conditions") or []
+    ready = next((c.get("status") == "True"
+                  for c in conditions if c.get("type") == "Ready"), False)
+    labels = metadata.get("labels") or {}
+    roles = sorted(
+        key.split("/", 1)[1]
+        for key, value in labels.items()
+        if key.startswith("node-role.kubernetes.io/") and value is not None
+    )
+    addresses = {a.get("type"): a.get("address", "")
+                 for a in status.get("addresses") or []}
+    return {
+        "name": metadata.get("name", ""),
+        "status": "Ready" if ready else "NotReady",
+        "roles": roles,
+        "version": node_info.get("kubeletVersion", ""),
+        "internal_ip": addresses.get("InternalIP", ""),
+        "external_ip": addresses.get("ExternalIP", ""),
+        "os_image": node_info.get("osImage", ""),
+        "kernel_version": node_info.get("kernelVersion", ""),
+        "container_runtime": node_info.get("containerRuntimeVersion", ""),
+        "created_at": metadata.get("creationTimestamp", ""),
+    }
+
+
+def _service_record(item: dict) -> dict:
+    """Convert a Kubernetes Service into a compact, secret-free inspection row."""
+    metadata = item.get("metadata") or {}
+    spec = item.get("spec") or {}
+    ports = []
+    for port in spec.get("ports") or []:
+        ports.append({
+            "name": port.get("name", ""),
+            "protocol": port.get("protocol", "TCP"),
+            "port": port.get("port"),
+            "target_port": port.get("targetPort"),
+            "node_port": port.get("nodePort"),
+        })
+    external = list(spec.get("externalIPs") or [])
+    external += [entry.get("ip", "")
+                 for entry in (item.get("status") or {}).get("loadBalancer", {}).get("ingress") or []
+                 if entry.get("ip")]
+    return {
+        "name": metadata.get("name", ""),
+        "type": spec.get("type", "ClusterIP"),
+        "cluster_ip": spec.get("clusterIP", ""),
+        "external_ips": external,
+        "ports": ports,
+    }
+
+
+def inventory(name: str, run: _Runner | None = None) -> dict:
+    """Collect the read-only cluster inventory needed for a human inspection.
+
+    This deliberately uses rc-repro's owned kubeconfig through ``_kubectl`` and
+    returns partial results with warnings when one read fails. It never reads
+    Secrets and never changes cluster state.
+    """
+    run = run or _Runner()
+    meta = runner.read_meta(name)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    ctx, ns = extra.get(_CONTEXT, ""), extra.get(_NAMESPACE, "")
+    result = {
+        "cluster": CLUSTER_NAME,
+        "context": ctx,
+        "namespace": ns,
+        "cluster_exists": None,
+        "nodes": [],
+        "services": [],
+        "warnings": [],
+    }
+    if not ctx or not ns:
+        result["warnings"].append("the repro has no recorded Kubernetes context or namespace")
+        return result
+
+    try:
+        clusters = run.run(["kind", "get", "clusters"], check=False)
+        if clusters.returncode == 0:
+            result["cluster_exists"] = CLUSTER_NAME in (clusters.stdout or "").split()
+        else:
+            result["warnings"].append("could not inspect Kind cluster names")
+    except OSError as exc:
+        result["warnings"].append(f"could not inspect Kind cluster names: {exc}")
+
+    nodes = _kubectl(run, ctx, "get", "nodes", "-o", "json", check=False)
+    if nodes.returncode == 0:
+        try:
+            result["nodes"] = [_node_record(item)
+                               for item in (json.loads(nodes.stdout or "{}").get("items") or [])]
+        except (TypeError, ValueError):
+            result["warnings"].append("Kubernetes returned invalid node JSON")
+    else:
+        result["warnings"].append("could not inspect cluster nodes")
+
+    services = _kubectl(run, ctx, "-n", ns, "get", "services", "-o", "json", check=False)
+    if services.returncode == 0:
+        try:
+            result["services"] = [_service_record(item)
+                                  for item in (json.loads(services.stdout or "{}").get("items") or [])]
+        except (TypeError, ValueError):
+            result["warnings"].append("Kubernetes returned invalid service JSON")
+    else:
+        result["warnings"].append("could not inspect repro services")
     return result
 
 

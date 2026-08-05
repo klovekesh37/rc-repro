@@ -875,7 +875,8 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `config` | read/write remembered settings (`config set acme.email …`) |
 | `env` | show or change a repro's Rocket.Chat env vars, recreating RC to apply (`--set`, `--unset`, `--no-restart`) |
 | `list` | all repros: version, port, state, URL |
-| `info` | URL, admin creds, snippets, preset notes |
+| `info` | URL, runtime state, pods, port-forward, admin creds, snippets, preset notes |
+| `inspect` | one read-only view of a repro plus its Kubernetes cluster, nodes, pods, and services (`--json` is secret-safe) |
 | `token` / `api` / `pat` | REST auth + calls |
 | `seed` | populate a repro with sample users/channels/messages (`--stats` for CPU/RAM cost; `--scale` for bulk Mongo data-scale prefill) |
 | `config-import` | apply a customer's exported settings (support-dump `*-settings.json`) to a repro; `--dry-run`, `--only` |
@@ -899,7 +900,7 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 
 Run `rc-repro <command> --help` for flags.
 
-`up`, `ready`, `down`, `list`, `info`, `evidence`, `doctor` and `capabilities`
+`up`, `ready`, `down`, `list`, `info`, `inspect`, `evidence`, `doctor` and `capabilities`
 accept `--json` for scripts and agents (see [Agent & JSON interface](#agent--json-interface)).
 
 ## Kubernetes microservices preset
@@ -913,11 +914,22 @@ and teardown lifecycle as every other repro:
 rc-repro onboard                            # interactive, once per machine
 rc-repro up --preset microservices --version 8.6.1 --name first-repro --wait
 rc-repro info --name first-repro            # URL, pods, port-forward state
+rc-repro inspect --name first-repro         # cluster, nodes, pods, and services
 rc-repro evidence --name first-repro --json
 # Open the URL reported by `info`, then reproduce the behaviour.
 rc-repro down --name first-repro --volumes --yes
 rc-repro prune --yes                        # optional: reclaim the empty shared cluster
 ```
+
+`info` is the quick human handoff: it shows the URL, runtime state, pods, and
+port-forward. `inspect` is the read-only deep view: it adds the shared Kind
+cluster, owned context and namespace, node health, and namespace Services. Its
+JSON form uses rc-repro's isolated kubeconfig and intentionally excludes admin
+credentials, registration tokens, and Kubernetes Secret contents, so it can be
+pasted into a case without a hand-written `jq` projection.
+
+The first VPS acceptance run and its remaining seed defects are recorded in
+[`ACCEPTANCE-K8S-SEED-2026-08-05.md`](ACCEPTANCE-K8S-SEED-2026-08-05.md).
 
 Needs `kind`, `kubectl` and `helm` on `PATH`. rc-repro owns one local cluster
 (`rc-repro-local`) with a namespace per repro, so several microservices repros
