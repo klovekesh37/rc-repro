@@ -937,6 +937,12 @@ def detail(name: str) -> dict:
 
 def set_state(name: str, action: str) -> None:
     target = resolve_name(name)
+    # Looked up by a hashable key: `action` arrives from a JSON body, and a dict or
+    # list reached .get() and raised "unhashable type" -- a 500 rather than the
+    # "unknown action" this already knows how to say.
+    if not isinstance(action, str):
+        raise ValidationError(f"action must be a string (want start|stop|restart), "
+                              f"got {type(action).__name__}")
     fn = {"start": runner.start, "stop": runner.stop, "restart": runner.restart}.get(action)
     if fn is None:
         raise ValidationError(f"unknown action {action!r} (want start|stop|restart)")

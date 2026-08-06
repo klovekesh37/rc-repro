@@ -697,3 +697,51 @@ def test_static_assets_must_revalidate_so_an_upgrade_is_not_masked():
     # API responses are not given a blanket directive here; the SSE stream sets its
     # own, and the rest are dynamic anyway.
     assert c.get("/api/health").headers.get("cache-control") is None
+
+
+# --- untyped JSON bodies (#audit) ------------------------------------------------
+#
+# A body field arrives as whatever JSON says it is. Each of these reached code that
+# assumed a string and raised, escaping as an opaque 500 to any caller using the
+# documented HTTP API. The shipped GUI always sends strings, so none were reachable
+# from the browser -- which is exactly why they survived.
+
+def test_create_without_a_version_is_a_400_not_a_500():
+    r = client().post("/api/repros", headers=H, json={"preset": "default"})
+    assert r.status_code == 400 and "version" in r.json()["error"]
+    assert client().post("/api/repros", headers=H, json={}).status_code == 400
+
+
+def test_create_still_accepts_a_valid_body(monkeypatch):
+    monkeypatch.setattr(lc, "create_repro",
+                        lambda req, emit, stream_output=False: {"name": req.version})
+    r = client().post("/api/repros", headers=H, json={"version": "8.5.1", "bogus": 1})
+    assert r.status_code == 200 and r.json()["job_id"].startswith("job_")
+
+
+def test_benchmark_rejects_versions_that_are_not_strings():
+    for bad in (-1, [1, 2], [[]], {"a": 1}, True):
+        r = client().post("/api/benchmark", headers=H, json={"versions": bad})
+        assert r.status_code == 400, f"{bad!r} gave {r.status_code}"
+    assert client().post("/api/benchmark", headers=H,
+                         json={"versions": []}).status_code == 400
+
+
+def test_benchmark_still_accepts_a_list_or_a_csv_string(monkeypatch):
+    from rc_repro.services import perf as perfsvc
+    seen = []
+    monkeypatch.setattr(perfsvc, "run_benchmark",
+                        lambda v, p, o, np, emit=None: seen.append(list(v)) or {})
+    assert client().post("/api/benchmark", headers=H,
+                         json={"versions": ["8.4.2", "8.5.1"]}).status_code == 200
+    assert client().post("/api/benchmark", headers=H,
+                         json={"versions": "8.4.2, 8.5.1"}).status_code == 200
+    assert seen == [["8.4.2", "8.5.1"], ["8.4.2", "8.5.1"]]
+
+
+def test_state_rejects_a_non_string_action(monkeypatch):
+    """`action` reached dict.get() and raised "unhashable type" for a dict/list."""
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    for bad in ({}, [], 5, None):
+        r = client().post("/api/repros/x/state", headers=H, json={"action": bad})
+        assert r.status_code == 400, f"{bad!r} gave {r.status_code}"

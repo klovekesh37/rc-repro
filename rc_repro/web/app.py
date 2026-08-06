@@ -340,7 +340,13 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
     @app.post("/api/repros")
     def create(req: dict = Body(...)):
         allowed = set(lc.CreateReq.__dataclass_fields__)
-        creq = lc.CreateReq(**{k: v for k, v in req.items() if k in allowed})
+        fields = {k: v for k, v in req.items() if k in allowed}
+        # `version` is CreateReq's only required field, so omitting it raised a
+        # TypeError from the constructor -- an opaque 500 for any caller using the
+        # documented HTTP API rather than the GUI (which always sends the key).
+        if not str(fields.get("version") or "").strip():
+            raise ValidationError("`version` is required, e.g. {\"version\": \"8.5.1\"}")
+        creq = lc.CreateReq(**fields)
         job = jobs.submit("create", lc.create_repro, creq, stream_output=True,
                           label=creq.name or creq.version)
         return {"job_id": job.id}
@@ -466,6 +472,14 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
         vers = body.get("versions") or []
         if isinstance(vers, str):
             vers = [v.strip() for v in vers.split(",") if v.strip()]
+        # A non-list, or a list of non-strings, used to reach `", ".join(vers)` in
+        # the label below and TypeError there -- a 500 before the job even started.
+        if not isinstance(vers, list) or not all(isinstance(v, str) for v in vers):
+            raise ValidationError(
+                "`versions` must be a list of version strings, or a comma-separated string")
+        vers = [v.strip() for v in vers if v.strip()]
+        if not vers:
+            raise ValidationError("no versions given, e.g. {\"versions\": \"8.4.2,8.5.1\"}")
         job = jobs.submit("benchmark", perfsvc.run_benchmark, vers,
                           body.get("seed_profile", "standard"),
                           bool(body.get("offline", False)), bool(body.get("no_pull", False)),
