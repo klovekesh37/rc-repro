@@ -89,36 +89,22 @@
         <label>Certificate
           <select name="https_mode" id="https-mode">
             <option value="">Off — plain http://localhost:PORT</option>
-            <option value="local">Local CA — offline, no domain needed (run `rc-repro trust-ca` once)</option>
-            <option value="acme">Let's Encrypt — needs a domain you control</option>
-            <option value="own">I have a certificate — supply the PEM files</option>
+            <option value="acme">Let's Encrypt — a domain that already points here</option>
+            <option value="local">Local certificate — offline, no domain (run `rc-repro trust-ca` once)</option>
           </select>
         </label>
         <p class="hint" id="https-mode-hint"></p>
 
-        <label class="https-local" hidden>Extra names/IPs in the certificate (--tls-san)
-          <input name="tls_san" placeholder="192.168.1.42, rc.lan"></label>
-
-        <label class="https-domain" hidden>Domain <input name="domain" placeholder="rc1.example.com"></label>
-
+        <label class="https-acme" hidden>Domain
+          <input name="domain" placeholder="rc1.example.com"></label>
         <label class="https-acme" hidden>Contact email for Let's Encrypt
           <input name="acme_email" type="email" placeholder="remembered — set once, then leave blank"></label>
-        <div class="checks https-acme" hidden>
-          <label><input type="checkbox" name="acme_staging" checked> Ask the STAGING
-            certificate authority (do this first)</label>
-        </div>
-        <p class="hint https-acme" hidden>Staging proves the whole path works without
-          spending the production quota — a browser warning on staging is the success
-          signal. Production allows only 5 failed validations per hostname per hour.<br>
-          The challenge and DNS provider are worked out for you: <b>dns-01</b> when
-          <code>~/.rc-repro/acme/dns.env</code> exists (with the provider read from the
-          variable names in it), otherwise <b>tlsalpn</b>, which needs inbound TCP/443.
-          Credentials are never read from this form.</p>
-
-        <label class="https-own" hidden>Certificate chain (PEM path on this machine)
-          <input name="tls_cert" placeholder="/path/to/fullchain.pem"></label>
-        <label class="https-own" hidden>Private key (PEM path)
-          <input name="tls_key" placeholder="/path/to/privkey.pem"></label>
+        <p class="hint https-acme" hidden>The same two values the official
+          Rocket.Chat compose asks for (<code>DOMAIN</code> and
+          <code>LETSENCRYPT_EMAIL</code>). Traefik requests the certificate in the
+          background; check it with <b>Check TLS</b> once the workspace is up.<br>
+          The domain has to resolve to this host with port 443 reachable — Let's
+          Encrypt validates by connecting to it. How you arrange that is up to you.</p>
       </details>
 
       <details class="adv">

@@ -471,118 +471,89 @@ def _req(**kw):
     return lc.CreateReq(**base)
 
 
-def test_https_is_implied_by_a_domain_or_a_certificate(tmp_path, monkeypatch):
-    """--domain / --tls-cert mean HTTPS; requiring --https alongside was ceremony.
+def test_https_needs_only_a_domain_and_an_email(tmp_path, monkeypatch):
+    """The two inputs the official docs ask for: DOMAIN and LETSENCRYPT_EMAIL.
 
-    A hostname or a certificate path has no other possible meaning, and the extra
-    flag was pure friction. --https on its own still selects the local-CA mode.
+    --https alongside them was ceremony -- a hostname has no other meaning. --https
+    on its own still selects the local-CA mode, which needs nothing else.
     """
+    from rc_repro import config as cfgmod
     from rc_repro import runner, tls
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     monkeypatch.setattr(runner, "port_free", lambda p: True)
-    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["93.184.216.34"])
 
     # Nothing TLS-ish at all -> no HTTPS.
     assert lc._resolve_tls(_req(), "x", "127.0.0.1") is None
 
-    # A domain alone is enough (email remembered in config).
-    from rc_repro import config as cfgmod
-    cfgmod.update_config(lambda c: c.__setitem__("acme_email", "ops@example.com"))
-    spec = lc._resolve_tls(_req(domain="rc1.example.com"), "x", "")
-    assert spec.mode == tls.MODE_ACME and spec.acme_email == "ops@example.com"
-
-    # A certificate pair alone is enough too.
-    spec = lc._resolve_tls(_req(domain="rc1.example.com", tls_cert="/c.pem",
-                                tls_key="/k.pem"), "x", "")
-    assert spec.mode == tls.MODE_OWN
-
-
-def test_tls_flag_contradictions_are_still_refused(tmp_path, monkeypatch):
-    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    with pytest.raises(errors.ValidationError, match="must be given together"):
-        lc._resolve_tls(_req(https=True, tls_cert="/c.pem"), "x", "127.0.0.1")
-    # Either half alone gets the same, clearer message.
-    with pytest.raises(errors.ValidationError, match="must be given together"):
-        lc._resolve_tls(_req(https=True, tls_key="/k.pem"), "x", "127.0.0.1")
-    with pytest.raises(errors.ValidationError, match="Pick one"):
-        lc._resolve_tls(_req(https=True, tls_cert="/c.pem", tls_key="/k.pem",
-                             acme_email="a@b.c"), "x", "127.0.0.1")
-    with pytest.raises(errors.ValidationError, match="want tlsalpn"):
-        lc._resolve_tls(_req(domain="x.example.com", acme_email="a@b.c",
-                             acme_challenge="bogus", acme_challenge_given=True),
-                        "x", "0.0.0.0")
-    # A domain with no email anywhere says how to fix it, both ways.
-    with pytest.raises(errors.ValidationError, match="config set acme.email"):
-        lc._resolve_tls(_req(domain="x.example.com"), "x", "0.0.0.0")
-
-
-def test_acme_challenge_and_provider_are_inferred(tmp_path, monkeypatch):
-    """Both are answerable from what is already on disk.
-
-    Restating them on every run was the bulk of the flag noise: credentials present
-    means the user set up dns-01, and the variable names say which provider it is.
-    """
-    from rc_repro import runner, tls
-    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    monkeypatch.setattr(runner, "port_free", lambda p: True)
-    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["93.184.216.34"])
-
-    # No credentials file -> the inbound challenge, which needs no setup.
-    spec = lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c"), "x", "")
-    assert spec.acme_challenge == "tlsalpn"
-    assert spec.acme_dns_provider == ""
-
-    # Credentials present -> dns-01, with the provider read from the variable names.
-    env = tls.dns_env_path()
-    env.parent.mkdir(parents=True, exist_ok=True)
-    env.write_text("CF_DNS_API_TOKEN=t\n", encoding="utf-8")
-    spec = lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c"),
-                           "x", "127.0.0.1")
-    assert spec.acme_challenge == "dns" and spec.acme_dns_provider == "cloudflare"
-
-    # An explicit flag always wins over inference.
-    spec = lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c",
-                                acme_challenge="tlsalpn", acme_challenge_given=True),
+    # Domain + email, on one line.
+    spec = lc._resolve_tls(_req(domain="rc1.example.com", acme_email="ops@example.com"),
                            "x", "")
-    assert spec.acme_challenge == "tlsalpn"
+    assert spec.mode == tls.MODE_ACME
+    assert spec.host == "rc1.example.com" and spec.port == 443
+    assert spec.acme_email == "ops@example.com"
+    assert spec.root_url == "https://rc1.example.com"
 
-    # Unrecognisable credentials -> say so and name the flag, rather than guessing.
-    env.write_text("MYSTERY_TOKEN=t\n", encoding="utf-8")
-    with pytest.raises(errors.ValidationError, match="--acme-dns-provider"):
-        lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c"),
-                        "x", "127.0.0.1")
+    # The email is remembered, so later runs need only --domain.
+    cfgmod.update_config(lambda c: c.__setitem__("acme_email", "ops@example.com"))
+    assert lc._resolve_tls(_req(domain="rc2.example.com"), "x", "").acme_email \
+        == "ops@example.com"
+
+    # --https alone stays the local mode, on an allocated port.
+    local = lc._resolve_tls(_req(https=True), "myrepro", "")
+    assert local.mode == tls.MODE_LOCAL and local.port != 443
 
 
-def test_public_bind_is_derived_from_the_challenge_not_demanded(tmp_path, monkeypatch):
-    """An inbound challenge needs a public interface; dns-01 does not.
+def test_a_domain_without_an_email_names_both_ways_to_give_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    with pytest.raises(errors.ValidationError) as ei:
+        lc._resolve_tls(_req(domain="rc1.example.com"), "x", "")
+    msg = str(ei.value)
+    assert "--email" in msg and "config set acme.email" in msg
 
-    That is derivable, so it is derived — failing on a missing --bind made the user
-    work out something the tool already knew. dns-01 stays on loopback, because
-    widening the bind for a challenge that never connects would expose a workspace
-    running admin/admin123 for nothing.
+
+def test_a_domain_publishes_publicly_because_lets_encrypt_connects_in(tmp_path,
+                                                                      monkeypatch):
+    """TLS-ALPN-01 is validated by an inbound connection, so loopback cannot work.
+
+    Derived rather than demanded -- failing on a missing --bind made the user work
+    out something the tool already knew. An explicit --bind still wins.
     """
-    from rc_repro import runner, tls
+    from rc_repro import runner
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     monkeypatch.setattr(runner, "port_free", lambda p: True)
-    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["93.184.216.34"])
 
-    req = _req(domain="rc1.example.com", acme_email="a@b.c",
-               acme_challenge="tlsalpn", acme_challenge_given=True)
+    req = _req(domain="rc1.example.com", acme_email="a@b.c")
     lc._resolve_tls(req, "x", "127.0.0.1")
     assert req.bind_public is True
 
-    env = tls.dns_env_path()
-    env.parent.mkdir(parents=True, exist_ok=True)
-    env.write_text("CF_DNS_API_TOKEN=t\n", encoding="utf-8")
-    req = _req(domain="rc1.example.com", acme_email="a@b.c")
-    lc._resolve_tls(req, "x", "127.0.0.1")
-    assert req.acme_challenge == "dns" and req.bind_public is False
+    explicit = _req(domain="rc1.example.com", acme_email="a@b.c", bind="10.0.0.5")
+    lc._resolve_tls(explicit, "x", "10.0.0.5")
+    assert explicit.bind_public is False
 
-    # An explicit --bind is never overridden.
-    req = _req(domain="rc1.example.com", acme_email="a@b.c", bind="127.0.0.1",
-               acme_challenge="tlsalpn", acme_challenge_given=True)
-    lc._resolve_tls(req, "x", "127.0.0.1")
-    assert req.bind_public is False
+    # The local mode never connects out, so it stays where it was put.
+    local = _req(https=True)
+    lc._resolve_tls(local, "x", "127.0.0.1")
+    assert local.bind_public is False
+
+
+def test_no_reachability_guessing_stands_between_you_and_a_certificate(tmp_path,
+                                                                       monkeypatch):
+    """How traffic reaches this host is the operator's business.
+
+    The old path refused to create the repro when the name did not resolve, resolved
+    privately, or sat behind a proxy -- guesses this process cannot make correctly
+    (it cannot see a tunnel, a port-forward or a firewall), and the single biggest
+    source of confusion here.
+    """
+    from rc_repro import runner, tls
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(runner, "port_free", lambda p: True)
+    for probe in ("dns_preflight", "reachability_gaps", "resolves_to",
+                  "host_has_public_address"):
+        assert not hasattr(tls, probe), f"{probe} should be gone"
+    # A name that resolves nowhere is still accepted.
+    spec = lc._resolve_tls(_req(domain="nowhere.invalid", acme_email="a@b.c"), "x", "")
+    assert spec.mode == tls.MODE_ACME
 
 
 def test_local_https_allocates_a_port_and_a_localhost_host(tmp_path, monkeypatch):
@@ -642,43 +613,11 @@ def test_recreating_an_https_repro_keeps_its_own_tls_port(tmp_path, monkeypatch)
     assert lc._pick_tls_port(exclude="") == 8444
 
 
-def test_dns_challenge_prerequisites_are_checked_before_docker(tmp_path, monkeypatch):
-    """dns-01 needs a credentials file, whatever the provider.
-
-    Left to Traefik this surfaces as an opaque failure minutes later, and for ACME a
-    failed attempt also costs quota.
-    """
-    from rc_repro import runner, tls
-    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["93.184.216.34"])
-    monkeypatch.setattr(runner, "port_free", lambda p: True)
-
-    with pytest.raises(errors.ValidationError, match="needs provider credentials"):
-        lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c",
-                             acme_challenge="dns", acme_challenge_given=True,
-                             acme_dns_provider="route53"), "x", "0.0.0.0")
-
-    env = tls.dns_env_path()
-    env.parent.mkdir(parents=True, exist_ok=True)
-    env.write_text("DO_AUTH_TOKEN=t\n", encoding="utf-8")
-    spec = lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c",
-                                acme_challenge="dns", acme_challenge_given=True,
-                                acme_dns_provider="digitalocean"), "x", "0.0.0.0")
-    assert spec.acme_dns_provider == "digitalocean"
-
-    # http-01 was removed: it needed port 80 as WELL as 443 and did nothing tlsalpn
-    # does not already do. Naming it is now an error, not a third option.
-    with pytest.raises(errors.ValidationError, match="want tlsalpn . dns"):
-        lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c",
-                             acme_challenge="http", acme_challenge_given=True),
-                        "x", "0.0.0.0")
-
 def test_promote_command_reproduces_the_flags_actually_used():
     """The staging -> production hint must be copy-pasteable.
 
-    It was rebuilt from a guess: it dropped --acme-challenge/--acme-dns-provider
-    and added --bind 0.0.0.0, so pasting it silently switched to tlsalpn (which
-    cannot work where dns-01 was needed) and needlessly exposed the workspace.
+    It is the same two flags the workspace was created with, plus --force, so it
+    reproduces the repro rather than describing a different one.
     """
     from rc_repro import runner
     from rc_repro.cli import _promote_command
@@ -690,18 +629,18 @@ def test_promote_command_reproduces_the_flags_actually_used():
             root_url="http://localhost:3000", host_port=3000, version_source="map",
             public_url="https://testrepo.kestron.org", extra={"tls": "acme", **extra})
 
-    dns = _promote_command(meta(tls_challenge="dns", tls_dns_provider="cloudflare",
-                                tls_email="me@example.com"), "testrepo.kestron.org")
-    assert "--acme-challenge dns" in dns
-    assert "--acme-dns-provider cloudflare" in dns
-    assert "--acme-email me@example.com" in dns
-    assert "--bind" not in dns, "dns-01 needs no public bind"
-    assert "--acme-staging" not in dns and "--force" in dns
+    cmd = _promote_command(meta(tls_email="me@example.com"), "testrepo.kestron.org")
+    assert "--domain testrepo.kestron.org" in cmd
+    assert "--email me@example.com" in cmd
+    assert "--force" in cmd and "--wait" in cmd
+    # Nothing that no longer exists as a flag.
+    for dead in ("--acme-challenge", "--acme-dns-provider", "--acme-email",
+                 "--acme-staging", "--tls-cert", "--tls-san"):
+        assert dead not in cmd
 
-    alpn = _promote_command(meta(tls_challenge="tlsalpn", tls_email="me@example.com"),
-                            "rc1.example.com")
-    assert "--bind 0.0.0.0" in alpn, "inbound challenges do need it"
-    assert "--acme-challenge" not in alpn, "tlsalpn is the default; no need to spell it"
+    # No --bind either: the public bind is derived at create time from --domain,
+    # so spelling it in the hint would be noise the user has to understand.
+    assert "--bind" not in cmd
 
 
 def test_detail_exposes_the_https_fields_the_panel_keys_off(tmp_path, monkeypatch):
@@ -743,30 +682,21 @@ def test_http_redirect_is_always_best_effort(tmp_path, monkeypatch):
 
     The official rocketchat-compose files always own 80 and 443, so they can insist.
     We cannot: refusing because something else holds 80 would block --domain for
-    anyone running a web server there, even under dns-01 where 80 plays no part.
-    With http-01 removed, no challenge needs port 80 at all, so there is no case
-    left where a busy 80 has to be fatal.
+    anyone running a web server there. TLS-ALPN-01 validates on 443, so port 80 is
+    only ever a convenience.
     """
     from rc_repro import runner, tls
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["93.184.216.34"])
 
     # 80 free -> redirect on.
     monkeypatch.setattr(runner, "port_free", lambda p: True)
     spec = lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c"), "x", "")
     assert spec.http_redirect is True
 
-    # 80 busy, tlsalpn -> still created, redirect simply off.
+    # 80 busy -> still created, redirect simply off.
     monkeypatch.setattr(runner, "port_free", lambda p: p != 80)
     spec = lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c"), "x", "")
     assert spec.mode == tls.MODE_ACME and spec.http_redirect is False
-
-    # 80 busy, dns-01 -> also created; 80 plays no part in that challenge.
-    env = tls.dns_env_path()
-    env.parent.mkdir(parents=True, exist_ok=True)
-    env.write_text("CF_DNS_API_TOKEN=t\n", encoding="utf-8")
-    spec = lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c"), "x", "")
-    assert spec.acme_challenge == "dns" and spec.http_redirect is False
 
     # Local mode never wants 80, so a busy 80 is irrelevant to it.
     spec = lc._resolve_tls(_req(https=True), "x", "127.0.0.1")
@@ -857,3 +787,159 @@ def test_set_env_can_write_without_restarting(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "up", lambda n, pull=True: called.append(n) or 0)
     r = envvars.set_env("e", {"A": "1"}, [], restart=False, emit=lambda ev: None)
     assert r["restarted"] is False and called == [], "must not touch containers"
+
+
+# --- the two-flag HTTPS surface (#https-domain-email) ---------------------------
+
+def test_up_offers_exactly_two_https_flags():
+    """The official compose asks for DOMAIN and LETSENCRYPT_EMAIL; so do we.
+
+    This grew to nine visible flags across three certificate modes, which is the
+    complaint that prompted the rewrite. The removed ones must be gone from the
+    signature, not merely hidden -- an unreachable code path behind a deleted flag
+    is worse than either.
+    """
+    import inspect
+    from rc_repro.cli import up as up_cmd
+    params = set(inspect.signature(up_cmd).parameters)
+    assert {"domain", "email", "https"} <= params
+    for dead in ("tls_cert", "tls_key", "tls_san", "acme_staging",
+                 "acme_email", "acme_challenge", "acme_dns_provider"):
+        assert dead not in params, f"--{dead.replace('_', '-')} should be gone"
+
+
+def test_createreq_carries_no_dead_tls_fields():
+    """CreateReq is the web API's schema too, so a stale field is a stale endpoint."""
+    fields = set(lc.CreateReq.__dataclass_fields__)
+    for dead in ("tls_cert", "tls_key", "tls_san", "acme_challenge_given"):
+        assert dead not in fields, f"CreateReq.{dead} should be gone"
+    assert {"domain", "acme_email", "https", "acme_staging"} <= fields
+    # These two survive as DERIVED state, not input: _pick_challenge sets them and
+    # no flag reaches them.
+    assert {"acme_challenge", "acme_dns_provider"} <= fields
+
+
+def test_staging_is_reachable_through_config_only(tmp_path, monkeypatch):
+    """Not a flag on `up` -- but Let's Encrypt allows only 5 failed validations per
+    hostname per hour, so a way to rehearse has to exist somewhere."""
+    from rc_repro import config as cfgmod
+    from rc_repro import runner
+    from rc_repro.cli import _CONFIG_KEYS
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(runner, "port_free", lambda p: True)
+    assert "acme.staging" in _CONFIG_KEYS
+
+    cfgmod.update_config(lambda c: c.__setitem__("acme_staging", True))
+    spec = lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c"), "x", "")
+    assert spec.acme_staging is True
+
+
+def test_every_tls_attribute_the_cli_and_web_reach_for_exists():
+    """Catches a module attribute that moved out from under a caller.
+
+    Splitting the local CA into tls_local left `trust-ca` calling tls.ensure_ca(),
+    which ruff cannot see (it is an attribute access, not a name) and no test
+    exercised -- so it would have failed only when a user ran the command.
+    """
+    import ast
+    import pathlib
+
+    from rc_repro import tls, tls_local
+    mods = {"tlsmod": tls, "tls": tls, "tls_local": tls_local}
+    missing = []
+    for rel in ("rc_repro/cli.py", "rc_repro/web/app.py", "rc_repro/compose.py",
+                "rc_repro/services/lifecycle.py"):
+        tree = ast.parse(pathlib.Path(rel).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                    and node.value.id in mods and not hasattr(mods[node.value.id], node.attr)):
+                missing.append(f"{rel}:{node.lineno} {node.value.id}.{node.attr}")
+    assert not missing, "attribute(s) that no longer exist: " + ", ".join(missing)
+
+
+# --- the challenge is derived, never asked for (#https-dns01) ---------------------
+
+def _dns_env(tmp_path, body="CF_DNS_API_TOKEN=secret\n"):
+    from rc_repro import tls
+    path = tls.dns_env_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_tls_alpn_is_the_default_matching_the_official_compose(tmp_path, monkeypatch):
+    from rc_repro import runner
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(runner, "port_free", lambda p: True)
+    spec = lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c"), "x", "")
+    assert spec.acme_challenge == "tlsalpn"
+
+
+def test_dns01_is_selected_when_credentials_exist(tmp_path, monkeypatch):
+    """The presence of the file IS the signal -- nobody creates it by accident.
+
+    It is the only way to issue when Let's Encrypt cannot connect inbound: behind
+    NAT, behind a tunnel, or behind a proxy that terminates TLS in front of you.
+    """
+    from rc_repro import runner
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(runner, "port_free", lambda p: True)
+    _dns_env(tmp_path)
+    req = _req(domain="rc1.example.com", acme_email="a@b.c")
+    spec = lc._resolve_tls(req, "x", "")
+    assert spec.acme_challenge == "dns" and spec.acme_dns_provider == "cloudflare"
+    # dns-01 never accepts an inbound connection, so the workspace must NOT be
+    # widened to 0.0.0.0 -- these repros run admin/admin123.
+    assert req.bind_public is False
+
+
+def test_dns01_provider_inference_is_not_cloudflare_specific(tmp_path, monkeypatch):
+    from rc_repro import tls
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    for body, expected in (("CF_DNS_API_TOKEN=x\n", "cloudflare"),
+                           ("AWS_ACCESS_KEY_ID=x\nAWS_SECRET_ACCESS_KEY=y\n", "route53"),
+                           ("DO_AUTH_TOKEN=x\n", "digitalocean"),
+                           ("HETZNER_API_KEY=x\n", "hetzner"),
+                           ("AZURE_CLIENT_ID=x\n", "azuredns")):
+        _dns_env(tmp_path, body)
+        provider, why = tls.infer_dns_provider()
+        assert provider == expected, f"{body!r} -> {provider!r}"
+        assert "secret" not in why and "=" not in why, "never echo a credential VALUE"
+
+
+def test_unrecognised_credentials_are_refused_not_silently_ignored(tmp_path,
+                                                                   monkeypatch):
+    """Falling back to tlsalpn would ignore a file the user deliberately created."""
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    _dns_env(tmp_path, "SOME_UNKNOWN_THING=x\n")
+    with pytest.raises(errors.ValidationError) as ei:
+        lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c"), "x", "")
+    assert "config set acme.dns_provider" in str(ei.value)
+
+
+def test_an_explicit_provider_overrides_inference(tmp_path, monkeypatch):
+    from rc_repro import config as cfgmod
+    from rc_repro import runner
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(runner, "port_free", lambda p: True)
+    _dns_env(tmp_path, "SOME_UNKNOWN_THING=x\n")
+    cfgmod.update_config(lambda c: c.__setitem__("acme_dns_provider", "exoscale"))
+    spec = lc._resolve_tls(_req(domain="rc1.example.com", acme_email="a@b.c"), "x", "")
+    assert spec.acme_challenge == "dns" and spec.acme_dns_provider == "exoscale"
+
+
+def test_dns01_reaches_traefik_as_flags_and_a_mounted_env_file(tmp_path, monkeypatch):
+    from rc_repro import tls
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    _dns_env(tmp_path)
+    spec = tls.TlsSpec(mode=tls.MODE_ACME, host="rc1.example.com", port=443,
+                       acme_email="a@b.c", acme_challenge="dns",
+                       acme_dns_provider="cloudflare")
+    svc = tls.service(spec)
+    cmd = " ".join(svc["command"])
+    assert "acme.dnschallenge=true" in cmd
+    assert "acme.dnschallenge.provider=cloudflare" in cmd
+    assert "tlschallenge" not in cmd
+    # The token travels in an env_file, never in argv -- `ps` is world-readable.
+    assert svc["env_file"] == [str(tls.dns_env_path())]
+    assert "secret" not in cmd

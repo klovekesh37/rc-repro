@@ -177,17 +177,11 @@ def up(
     force: bool = typer.Option(False, "--force", help="overwrite an existing repro"),
     monitor: bool = typer.Option(False, "--monitor", help="also add Prometheus + Grafana (RC metrics dashboard)"),
     stats: bool = typer.Option(False, "--stats", help="with --seed: report the CPU/RAM cost of seeding"),
-    https: bool = typer.Option(False, "--https", help="serve over HTTPS using rc-repro's own local CA — no domain needed (run `rc-repro trust-ca` once). For a real certificate, use --domain instead"),
-    domain: str = typer.Option("", "--domain", help="serve over HTTPS at this hostname, e.g. rc1.example.com. Gets a Let's Encrypt certificate, or uses --tls-cert/--tls-key if given. Implies --https"),
-    tls_cert: str = typer.Option("", "--tls-cert", help="use this PEM certificate chain instead of asking Let's Encrypt (needs --tls-key and --domain)"),
-    tls_key: str = typer.Option("", "--tls-key", help="private key for --tls-cert"),
-    acme_staging: bool = typer.Option(False, "--acme-staging", help="ask Let's Encrypt STAGING for the certificate — do this first: it proves the whole path works without spending the production quota"),
-    acme_email: str = typer.Option("", "--acme-email", help="[usually not needed] Let's Encrypt contact email; remembered via `rc-repro config set acme.email`", hidden=True),
-    acme_challenge: str = typer.Option("", "--acme-challenge", help="[usually not needed] force tlsalpn | dns. Inferred: dns when ~/.rc-repro/acme/dns.env exists, else tlsalpn", hidden=True),
-    acme_dns_provider: str = typer.Option("", "--acme-dns-provider", help="[usually not needed] lego DNS provider name; inferred from the variables in dns.env", hidden=True),
+    domain: str = typer.Option("", "--domain", help="serve HTTPS at this hostname with a Let's Encrypt certificate. The domain must already point at this host and 443 must be reachable"),
+    email: str = typer.Option("", "--email", help="contact email for Let's Encrypt. Remembered after the first use (`rc-repro config set acme.email`)"),
+    https: bool = typer.Option(False, "--https", help="serve HTTPS with a local certificate instead — no domain needed (run `rc-repro trust-ca` once)"),
     env: list[str] = typer.Option(None, "--env", "-e", help="extra raw env var KEY=VALUE (repeatable). Persisted, so `up --force` keeps it; change it later with `rc-repro env`"),
     setting: list[str] = typer.Option(None, "--setting", help="Rocket.Chat SETTING Id=VALUE (repeatable) — adds the OVERWRITE_SETTING_ prefix a setting needs"),
-    tls_san: str = typer.Option("", "--tls-san", help="[usually not needed] with --https: extra names/IPs in the local certificate, e.g. your LAN IP", hidden=True),
 ) -> None:
     """Create and start a version-matched Rocket.Chat repro."""
     # Orchestration lives in the shared service layer (same code the web GUI
@@ -200,14 +194,8 @@ def up(
         params=_parse_set_params(set_), seed=False, pin=pin,
         wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
         force=force, monitor=monitor,
-        https=https, domain=domain, tls_san=tls_san, tls_cert=tls_cert, tls_key=tls_key,
-        acme_email=acme_email, acme_staging=acme_staging,
-        # "" means "not given", so the service layer may infer it. tlsalpn is both
-        # the default and a valid explicit choice, hence the separate flag.
+        https=https, domain=domain, acme_email=email,
         env={**envsvc.parse_set(env or []), **envsvc.as_setting(setting or [])},
-        acme_challenge=(acme_challenge or "tlsalpn"),
-        acme_challenge_given=bool(acme_challenge),
-        acme_dns_provider=acme_dns_provider,
     )
     try:
         result = lcsvc.create_repro(req, emit=_cli_emit, stream_output=False)
@@ -510,6 +498,14 @@ def info(name: str = typer.Option("", "--name", "-n")) -> None:
 # typo cannot write junk into the config file.
 _CONFIG_KEYS: dict[str, str] = {
     "acme.email": "acme_email",
+    # Not a flag on `up`, on purpose: HTTPS is meant to be --domain plus --email and
+    # nothing else. It stays reachable here because Let's Encrypt allows only 5
+    # failed validations per hostname per hour and 5 duplicate certificates per week
+    # -- without a way to rehearse against staging, a misconfigured first attempt
+    # locks the hostname out for a week.
+    "acme.staging": "acme_staging",
+    # Only needed when the variable names in dns.env do not identify the provider
+    # on their own; normally it is inferred.
     "acme.dns_provider": "acme_dns_provider",
 }
 
@@ -681,26 +677,13 @@ def tls_status(name: str = typer.Option("", "--name", "-n")) -> None:
 
 
 def _promote_command(m: runner.Metadata, host: str) -> str:
-    """The staging -> production command, rebuilt from what this repro ACTUALLY used.
-
-    Guessing it dropped --acme-challenge/--acme-dns-provider and bolted on
-    --bind 0.0.0.0, so the suggestion silently switched challenge type and failed.
-    """
+    """The staging -> production command, rebuilt from what this repro actually used."""
     x = m.extra if isinstance(m.extra, dict) else {}
-    challenge = str(x.get("tls_challenge") or "tlsalpn")
-    parts = [f"rc-repro up -v {m.rc_version}", f"--name {m.name}", "--https",
-             f"--domain {host}",
-             f"--acme-email {x.get('tls_email') or '<you@example.com>'}"]
-    if challenge != "tlsalpn":
-        parts.append(f"--acme-challenge {challenge}")
-    if challenge == "dns" and x.get("tls_dns_provider"):
-        parts.append(f"--acme-dns-provider {x['tls_dns_provider']}")
-    # Only the inbound challenges need a public bind; dns-01 does not, and adding
-    # it would expose a workspace running admin/admin123 for no reason.
-    if challenge == "tlsalpn":
-        parts.append("--bind 0.0.0.0")
-    parts += ["--force", "--wait"]
-    return " ".join(parts)
+    return " ".join([
+        f"rc-repro up -v {m.rc_version}", f"--name {m.name}",
+        f"--domain {host}", f"--email {x.get('tls_email') or '<you@example.com>'}",
+        "--force", "--wait",
+    ])
 
 
 def _tls_troubleshoot(m: runner.Metadata, mode: str, host: str, port: int) -> None:
@@ -731,8 +714,8 @@ def trust_ca(
     Only needed for `up --https` on its own (the local-CA mode). A Let's Encrypt
     or self-supplied certificate is already trusted, so this does nothing for those.
     """
-    from rc_repro import tls as tlsmod
-    key, crt = tlsmod.ensure_ca()
+    from rc_repro import tls_local
+    key, crt = tls_local.ensure_ca()
     if show:
         typer.echo(f"CA certificate: {crt}")
         typer.echo(f"CA key:         {key}  (keep private)")
@@ -740,7 +723,7 @@ def trust_ca(
                        "-subject", "-fingerprint", "-sha256", "-dates"])
         return
     try:
-        installed, how = tlsmod.trust(crt, uninstall=uninstall)
+        installed, how = tls_local.trust(crt, uninstall=uninstall)
     except errors.ReproError as exc:
         _err(str(exc))
     if installed:
@@ -750,7 +733,7 @@ def trust_ca(
     else:
         ui.warn(f"  ⚠ could not {'remove' if uninstall else 'install'} it automatically "
                 f"on this platform ({how}).")
-        typer.echo(tlsmod.manual_trust_instructions(crt, uninstall=uninstall))
+        typer.echo(tls_local.manual_trust_instructions(crt, uninstall=uninstall))
 
 
 def _run_and_echo(cmd: list[str]) -> None:

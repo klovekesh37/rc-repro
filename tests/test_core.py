@@ -1811,16 +1811,16 @@ def test_local_ca_is_created_once_and_leaf_carries_the_right_sans(monkeypatch, t
     rejected outright (ERR_CERT_COMMON_NAME_INVALID).
     """
     import subprocess
-    from rc_repro import tls
+    from rc_repro import tls_local
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    key, crt = tls.ensure_ca()
+    key, crt = tls_local.ensure_ca()
     assert key.exists() and crt.exists()
     assert oct(key.stat().st_mode)[-3:] == "600", "the CA key must not be world-readable"
     before = crt.read_bytes()
-    assert tls.ensure_ca() == (key, crt)
+    assert tls_local.ensure_ca() == (key, crt)
     assert crt.read_bytes() == before, "ensure_ca must not regenerate an existing CA"
 
-    cert_pem, key_pem = tls.issue_leaf("x.rcrepro.localhost", ["192.168.1.42"])
+    cert_pem, key_pem = tls_local.issue_leaf("x.rcrepro.localhost")
     assert "BEGIN CERTIFICATE" in cert_pem and "PRIVATE KEY" in key_pem
     leaf = tmp_path / "leaf.crt"
     leaf.write_text(cert_pem, encoding="utf-8")
@@ -1828,7 +1828,6 @@ def test_local_ca_is_created_once_and_leaf_carries_the_right_sans(monkeypatch, t
                           capture_output=True, text=True).stdout
     assert "DNS:x.rcrepro.localhost" in text
     assert "DNS:localhost" in text            # keeps the existing http habits working
-    assert "IP Address:192.168.1.42" in text  # a LAN IP, which Let's Encrypt cannot issue
     assert "IP Address:127.0.0.1" in text
     # And it must actually chain to the CA, not merely parse.
     v = subprocess.run(["openssl", "verify", "-CAfile", str(crt), str(leaf)],
@@ -1911,7 +1910,6 @@ def test_acme_flags_map_to_traefik_resolver_args():
     # Local mode is on an allocated port, so a redirect does not apply at all.
     assert tls.can_redirect_http(tls.MODE_LOCAL, 8443) is False
     assert tls.can_redirect_http(tls.MODE_ACME, 443) is True
-    assert tls.can_redirect_http(tls.MODE_OWN, 443) is True
 
 
 def test_dynamic_config_uses_a_static_pair_locally_and_a_resolver_for_acme():
@@ -1926,23 +1924,6 @@ def test_dynamic_config_uses_a_static_pair_locally_and_a_resolver_for_acme():
     assert "certResolver: le" in acme["tls/dynamic.yml"]
     # The DDP websocket must not be bounced between instances mid-session.
     assert "sticky" in acme["tls/dynamic.yml"] and "secure: true" in acme["tls/dynamic.yml"]
-
-
-def test_own_cert_is_validated_before_traefik_would_silently_fail(tmp_path):
-    import pytest
-    from rc_repro import tls
-    from rc_repro.errors import ValidationError
-    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
-    with pytest.raises(ValidationError, match="no such file"):
-        tls.read_own_cert(str(cert), str(key))
-    cert.write_text("not a cert", encoding="utf-8")
-    key.write_text("-----BEGIN PRIVATE KEY-----", encoding="utf-8")
-    with pytest.raises(ValidationError, match="not a PEM certificate"):
-        tls.read_own_cert(str(cert), str(key))
-    cert.write_text("-----BEGIN CERTIFICATE-----", encoding="utf-8")
-    key.write_text("nope", encoding="utf-8")
-    with pytest.raises(ValidationError, match="not a PEM private key"):
-        tls.read_own_cert(str(cert), str(key))
 
 
 def test_metadata_external_url_prefers_https_and_survives_an_old_repro_json(tmp_path, monkeypatch):
@@ -2026,42 +2007,15 @@ def test_staging_notes_never_claim_the_certificate_is_trusted():
     assert "publicly trusted" not in text
     assert "success signal" in text, "a warning on staging is expected, not a failure"
     # And it must say how to get a real one.
-    assert "without --acme-staging" in text
+    # Staging is a config key now, not a flag on `up` -- so the way back to a
+    # trusted certificate has to name the command that actually turns it off.
+    assert "config unset acme.staging" in text
     # The name is threaded in, so the hint is copy-pasteable.
     assert "tls-status --name rc1" in " ".join(tls.notes(spec, "rc1"))
 
     prod = tls.TlsSpec(mode=tls.MODE_ACME, host="rc1.example.com", port=443,
                        acme_email="a@b.c")
     assert "publicly trusted" in " ".join(tls.notes(prod, "rc1")).lower()
-
-
-def test_dns_preflight_rules_out_what_acme_cannot_possibly_reach(monkeypatch):
-    """Catch the certain-to-fail cases before an attempt spends quota.
-
-    Let's Encrypt allows 5 failed validations per hostname per hour, so a
-    misconfiguration that is knowable up front must not cost one.
-    """
-    from rc_repro import tls
-    monkeypatch.setattr(tls, "resolves_to", lambda h: [])
-    ok, msg = tls.dns_preflight("nope.example.com")
-    assert not ok and "does not resolve" in msg
-
-    monkeypatch.setattr(tls, "resolves_to", lambda h: ["127.0.0.1"])
-    ok, msg = tls.dns_preflight("local.example.com")
-    assert not ok and "cannot reach" in msg
-
-    monkeypatch.setattr(tls, "resolves_to", lambda h: ["192.168.1.5", "10.0.0.4"])
-    ok, _ = tls.dns_preflight("lan.example.com")
-    assert not ok, "private-only must fail: ACME connects from the public internet"
-
-    # RFC 5737 documentation ranges (203.0.113.0/24 etc.) count as private to
-    # Python, and rightly so -- nobody serves a workspace from one. Use a real
-    # routable address here.
-    monkeypatch.setattr(tls, "resolves_to", lambda h: ["93.184.216.34"])
-    ok, msg = tls.dns_preflight("rc1.example.com")
-    assert ok and "93.184.216.34" in msg
-    monkeypatch.setattr(tls, "resolves_to", lambda h: ["192.168.1.5", "93.184.216.34"])
-    assert tls.dns_preflight("rc1.example.com")[0]
 
 
 def test_verify_reads_a_real_endpoint_and_separates_the_two_trust_questions(tmp_path, monkeypatch):
@@ -2078,8 +2032,9 @@ def test_verify_reads_a_real_endpoint_and_separates_the_two_trust_questions(tmp_
     from rc_repro import tls
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
 
-    _, ca_crt = tls.ensure_ca()
-    cert_pem, key_pem = tls.issue_leaf("localhost")
+    from rc_repro import tls_local
+    _, ca_crt = tls_local.ensure_ca()
+    cert_pem, key_pem = tls_local.issue_leaf("localhost")
     cf, kf = tmp_path / "s.crt", tmp_path / "s.key"
     cf.write_text(cert_pem, encoding="utf-8")
     kf.write_text(key_pem, encoding="utf-8")
@@ -2128,56 +2083,6 @@ def test_verify_reads_a_real_endpoint_and_separates_the_two_trust_questions(tmp_
     assert dead["serving"] is False and dead["error"]
 
 
-def test_dns_preflight_falls_back_to_public_resolvers(monkeypatch):
-    """The question is "what will Let's Encrypt see?", not "what does /etc/resolv.conf say?".
-
-    A lab or corporate resolver with a stale negative cache reported a perfectly
-    good public record as absent, and the hard failure blocked a valid setup.
-    """
-    import socket
-    from rc_repro import tls
-
-    def no_local_answer(*a, **k):
-        raise OSError("resolver has nothing for this name")
-
-    monkeypatch.setattr(socket, "getaddrinfo", no_local_answer)
-    monkeypatch.setattr(tls, "_dig",
-                        lambda h, r: ["104.21.71.43"] if r == "1.1.1.1" else [])
-    assert tls.resolves_to("chatrepo.example.org") == ["104.21.71.43"]
-    # public=False is the "only what this machine sees" variant.
-    assert tls.resolves_to("chatrepo.example.org", public=False) == []
-
-
-def test_preflight_refuses_an_inbound_challenge_behind_a_tls_terminating_proxy(monkeypatch):
-    """An orange-clouded record cannot pass tlsalpn, and the error says why.
-
-    Cloudflare terminates TLS at its edge, so Let's Encrypt validates against
-    Cloudflare's certificate and never reaches this host. dns-01 is unaffected: it
-    only reads a TXT record.
-    """
-    from rc_repro import tls
-    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["104.21.71.43", "172.67.143.25"])
-    ok, msg = tls.dns_preflight("chatrepo.example.org", "tlsalpn")
-    assert not ok
-    assert "Cloudflare" in msg and "--acme-challenge dns" in msg
-    assert "CF_DNS_API_TOKEN" in msg, "must say where the token goes"
-    ok, msg = tls.dns_preflight("chatrepo.example.org", "dns")
-    assert ok and "no inbound access" in msg
-
-    # A normal public origin still passes the inbound challenges.
-    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["93.184.216.34"])
-    assert tls.dns_preflight("rc1.example.org", "tlsalpn")[0]
-
-
-def test_dns_challenge_ignores_where_the_name_points(monkeypatch):
-    """dns-01 needs no inbound reachability, so private/loopback answers are fine."""
-    from rc_repro import tls
-    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["10.0.0.5"])
-    assert tls.dns_preflight("internal.example.org", "dns")[0]
-    # ...but an inbound challenge to the same name cannot work.
-    assert not tls.dns_preflight("internal.example.org", "tlsalpn")[0]
-
-
 def test_staging_and_production_use_separate_acme_storage():
     """Traefik keys stored certs by RESOLVER name, not by CA server.
 
@@ -2203,41 +2108,6 @@ def test_staging_and_production_use_separate_acme_storage():
     assert "acme-staging-v02" not in " ".join(tls.service(prod)["command"])
 
 
-def test_dns_credentials_are_required_and_provider_agnostic(tmp_path, monkeypatch):
-    """Every lego provider reads its OWN variables, so this checks the file, not keys.
-
-    Mounting the env file only "if it exists" let a missing file through, and
-    Traefik then ran with no credentials and failed opaquely minutes later.
-    """
-    from rc_repro import tls
-    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-
-    for provider in ("cloudflare", "route53", "digitalocean", "gcloud", "azuredns"):
-        ok, msg = tls.dns_credentials(provider)
-        assert not ok
-        assert str(tls.dns_env_path()) in msg
-        # Point at THAT provider's documentation, not Cloudflare's.
-        assert f"{tls.LEGO_PROVIDER_DOCS}{provider}/" in msg
-
-    env = tls.dns_env_path()
-    env.parent.mkdir(parents=True, exist_ok=True)
-    env.write_text("# a comment\n\n", encoding="utf-8")
-    ok, msg = tls.dns_credentials("route53")
-    assert not ok and "no KEY=VALUE" in msg
-
-    # Any provider's variables satisfy it, and values are never echoed back.
-    env.write_text("AWS_ACCESS_KEY_ID=AKIAsecret\nAWS_SECRET_ACCESS_KEY=hunter2\n",
-                   encoding="utf-8")
-    ok, msg = tls.dns_credentials("route53")
-    assert ok and "AWS_ACCESS_KEY_ID" in msg and "AWS_SECRET_ACCESS_KEY" in msg
-    assert "AKIAsecret" not in msg and "hunter2" not in msg
-
-    # And the file is mounted unconditionally, not "if it exists".
-    spec = tls.TlsSpec(mode=tls.MODE_ACME, host="h", port=443, acme_email="a@b.c",
-                       acme_challenge="dns", acme_dns_provider="route53")
-    assert tls.service(spec)["env_file"] == [str(env)]
-
-
 def test_verify_can_present_a_different_sni_than_the_address_it_dials():
     """tls-status must probe THIS host, not the public name.
 
@@ -2254,77 +2124,29 @@ def test_verify_can_present_a_different_sni_than_the_address_it_dials():
     assert "server_hostname=host" not in src, "every handshake must honour sni"
 
 
-def test_acme_router_declares_the_domain_it_needs_a_certificate_for():
-    """Traefik must be TOLD the domain, because the rule has no Host() matcher.
+def test_acme_router_uses_a_host_rule_like_the_official_compose():
+    """`Host(`domain`)`, as compose.traefik.yml does it.
 
-    Traefik derives what to request from a router's Host() rule. This rule is
-    PathPrefix(`/`) on purpose, so the workspace also answers on localhost — which
-    left ACME with nothing to ask for: it logs "no domain found" and silently
-    serves its default certificate, indistinguishable from a failed challenge with
-    no request ever having been made.
+    Traefik derives what to REQUEST from the router's Host() matcher. The old rule
+    was PathPrefix(`/`), which names no host, so ACME had nothing to ask for: it
+    logged "no domain found" and silently served its default certificate --
+    indistinguishable from a failed challenge, with no request ever made. Naming
+    the host in the rule removes that failure mode and drops the `domains:` block.
     """
     from rc_repro import tls
     spec = tls.TlsSpec(mode=tls.MODE_ACME, host="testrepo.kestron.org", port=443,
                        acme_email="a@b.c")
     y = dict(tls.files(spec, ["rocketchat"]))["tls/dynamic.yml"]
+    assert "Host(`testrepo.kestron.org`)" in y
     assert "certResolver: le" in y
-    assert "domains:" in y
-    assert '- main: "testrepo.kestron.org"' in y
+    assert "domains:" not in y, "a Host() rule makes the domains block redundant"
 
-    # Static-certificate modes must NOT carry a resolver or a domains block.
+    # The local certificate is loaded from disk, so it keeps the catch-all rule and
+    # carries no resolver.
     local = dict(tls.files(tls.TlsSpec(host="x.rcrepro.localhost", port=8443),
                            ["rocketchat"], "C", "K"))["tls/dynamic.yml"]
-    assert "certResolver" not in local and "domains:" not in local
-
-
-def test_dns01_does_not_require_the_host_to_resolve(monkeypatch):
-    """dns-01 reads a TXT at _acme-challenge.<host>; the host needs no A record.
-
-    Requiring one refused setups that would have issued perfectly well — you can
-    get a certificate before pointing the name anywhere.
-    """
-    from rc_repro import tls
-    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: [])
-    ok, msg = tls.dns_preflight("testrepo.kestron.org", "dns")
-    assert ok and "fine for dns-01" in msg
-    # An inbound challenge still needs the name to resolve, and now points at the
-    # alternative that does not.
-    ok, msg = tls.dns_preflight("testrepo.kestron.org", "tlsalpn")
-    assert not ok and "--acme-challenge dns" in msg
-
-
-def test_reachability_gaps_separate_a_valid_cert_from_a_reachable_workspace(monkeypatch):
-    """Issuance succeeding is not the same as the name being reachable.
-
-    dns-01 issues with no DNS record and no public route, after which the summary
-    advertises an https URL nothing outside the machine can open. Proven against a
-    real run: a production certificate was issued and served correctly while the
-    hostname had no record at all and Traefik was bound to 127.0.0.1.
-    """
-    from rc_repro import tls
-    spec = tls.TlsSpec(mode=tls.MODE_ACME, host="testrepo.example.org", port=443,
-                       acme_email="a@b.c", acme_challenge="dns",
-                       acme_dns_provider="cloudflare")
-
-    # No DNS record and loopback-bound: both gaps named.
-    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: [])
-    monkeypatch.setattr(tls, "host_has_public_address", lambda: False)
-    gaps = tls.reachability_gaps(spec, "127.0.0.1")
-    assert any("no DNS record" in g for g in gaps)
-    assert any("bound to 127.0.0.1" in g for g in gaps)
-
-    # Public bind but no public address on the host -> still unreachable.
-    gaps = tls.reachability_gaps(spec, "0.0.0.0")
-    assert any("no public address" in g for g in gaps)
-    assert not any("bound to" in g for g in gaps)
-
-    # Record exists, public bind, routable host -> nothing to warn about.
-    monkeypatch.setattr(tls, "resolves_to", lambda h, public=True: ["93.184.216.34"])
-    monkeypatch.setattr(tls, "host_has_public_address", lambda: True)
-    assert tls.reachability_gaps(spec, "0.0.0.0") == []
-    # ...but binding to loopback is still a gap even with good DNS.
-    assert tls.reachability_gaps(spec, "127.0.0.1") == [
-        "the workspace is bound to 127.0.0.1"]
+    assert "PathPrefix(`/`)" in local
+    assert "certResolver" not in local
 
 
 def test_domain_is_normalized_the_way_the_official_docs_require():
@@ -2364,7 +2186,7 @@ def test_domain_is_normalized_the_way_the_official_docs_require():
     spec = tls.TlsSpec(mode=tls.MODE_ACME, host=host, port=443, acme_email="a@b.c")
     assert spec.root_url == "https://rc1.example.com"
     y = dict(tls.files(spec, ["rocketchat"]))["tls/dynamic.yml"]
-    assert '- main: "rc1.example.com"' in y
+    assert "Host(`rc1.example.com`)" in y
 
 
 # --- env var overrides (up --env / rc-repro env) -------------------------------

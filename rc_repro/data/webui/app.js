@@ -1597,60 +1597,35 @@ function doTlsStatus(name) {
 }
 
 // ---- HTTPS section of the create dialog -------------------------------------
-// One <select> drives which fields are relevant, because the three modes need
-// completely different inputs and showing all of them at once invites the
-// contradictions the API then has to reject (--tls-cert AND --acme-email, etc).
+// Two modes, and only one of them asks for anything: a domain and an email, the
+// same pair the official Rocket.Chat compose takes as DOMAIN and LETSENCRYPT_EMAIL.
 const HTTPS_MODE_HINT = {
   "": "",
+  acme: "Traefik obtains a real, publicly trusted certificate from Let's Encrypt."
+      + " The domain must already resolve to this host with port 443 reachable —"
+      + " Let's Encrypt validates by connecting to it.",
   local: "A certificate signed by rc-repro's own CA. Works offline, no domain, no rate"
        + " limits. Browsers warn until `rc-repro trust-ca` has been run once. A phone"
        + " cannot use it — use Let's Encrypt for mobile.",
-  acme: "Traefik obtains a real, publicly trusted certificate. Needs a domain you"
-      + " control. Getting a certificate and being reachable at the name are separate"
-      + " things — the job log says so if the name has no DNS record or the workspace"
-      + " is bound to loopback.",
-  own: "Paths are read on the machine running rc-repro, not uploaded from the browser.",
 };
 
 function syncHttpsFields() {
   const mode = $("#https-mode").value;
   $("#https-mode-hint").textContent = HTTPS_MODE_HINT[mode] || "";
-  const show = {
-    "https-local": mode === "local",
-    "https-acme": mode === "acme",
-    "https-own": mode === "own",
-    // Both Let's Encrypt and a supplied certificate are tied to a hostname.
-    "https-domain": mode === "acme" || mode === "own",
-  };
-  for (const [cls, on] of Object.entries(show)) {
-    for (const el of document.querySelectorAll("." + cls)) el.hidden = !on;
-  }
+  for (const el of document.querySelectorAll(".https-acme")) el.hidden = mode !== "acme";
 }
 
 function applyHttpsToRequest(f, req) {
   const mode = f.https_mode ? f.https_mode.value : "";
   if (!mode) return true;
-  req.https = true;
   const val = (k) => (f[k] && f[k].value.trim()) || "";
-  if (mode === "local") {
-    if (val("tls_san")) req.tls_san = val("tls_san");
-    return true;
-  }
-  if (!val("domain")) { toast("HTTPS: a domain is required for this mode"); return false; }
+  if (mode === "local") { req.https = true; return true; }
+  if (!val("domain")) { toast("HTTPS: a domain is required for Let's Encrypt"); return false; }
   req.domain = val("domain");
-  if (mode === "own") {
-    if (!val("tls_cert") || !val("tls_key")) {
-      toast("HTTPS: both the certificate and the key path are required"); return false;
-    }
-    req.tls_cert = val("tls_cert");
-    req.tls_key = val("tls_key");
-    return true;
-  }
-  // acme. Email may be blank when it is remembered in config; the challenge, the
-  // DNS provider and whether a public bind is needed are all derived server-side,
-  // so the form does not ask for them.
+  // The email may be blank when it is remembered in config. Everything else --
+  // the challenge, the port, whether to publish publicly -- is derived server-side,
+  // so the form does not ask for it.
   if (val("acme_email")) req.acme_email = val("acme_email");
-  req.acme_staging = !!(f.acme_staging && f.acme_staging.checked);
   return true;
 }
 

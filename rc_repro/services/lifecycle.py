@@ -186,54 +186,26 @@ class CreateReq:
     force: bool = False
     monitor: bool = False
     stats: bool = False
-    # --https and friends. `https` alone = a certificate from the local openssl CA;
-    # + domain/acme_email = Let's Encrypt; + tls_cert/tls_key = one you supply.
+    # HTTPS. Two ways in, matching the official docs' DOMAIN + LETSENCRYPT_EMAIL:
+    #   --domain [+ --email]  a Let's Encrypt certificate for a public hostname
+    #   --https               a certificate from rc-repro's own local CA, no domain
     https: bool = False
     domain: str = ""
-    tls_san: str = ""              # extra SANs for the local CA, comma-separated
-    tls_cert: str = ""
-    tls_key: str = ""
     acme_email: str = ""
+    # Not a flag: `rc-repro config set acme.staging true`. Let's Encrypt allows 5
+    # failed validations per hostname per hour, so a way to rehearse has to exist --
+    # but it is not part of the everyday two-flag path.
     acme_staging: bool = False
+    # Derived by _pick_challenge, never asked for: dns-01 when provider credentials
+    # exist, otherwise the inbound TLS-ALPN-01 the official compose uses.
     acme_challenge: str = "tlsalpn"
-    # Whether the caller actually named a challenge. Needed because "tlsalpn" is
-    # both the default and a valid explicit choice, so the value alone cannot say
-    # if it may be inferred.
-    acme_challenge_given: bool = False
     acme_dns_provider: str = ""
     # `up --env KEY=VALUE`. Merged over the preset's env; a None value removes a key.
     env: dict = field(default_factory=dict)
-    # Set by _resolve_tls when an inbound ACME challenge requires a public bind.
-    # Derived, not asked for -- an explicit --bind always wins.
+    # Set by _resolve_tls: TLS-ALPN is validated by Let's Encrypt CONNECTING here,
+    # so --domain has to publish on a public interface. Derived, not asked for --
+    # an explicit --bind always wins.
     bind_public: bool = False
-
-
-def _infer_acme(req: CreateReq, cfg: dict) -> None:
-    """Fill in the challenge and DNS provider when the user did not name them.
-
-    Both are answerable from what is already on disk, and making the user restate
-    them every run was the bulk of the flag noise. An explicit flag always wins.
-    """
-    from rc_repro import tls as tlsmod
-
-    if not req.acme_challenge_given:
-        # Credentials present => the user set up dns-01. Otherwise the inbound
-        # challenge, which needs nothing but an open port.
-        req.acme_challenge = "dns" if tlsmod.dns_env_vars() else "tlsalpn"
-    if req.acme_challenge != "dns":
-        return
-    req.acme_dns_provider = (req.acme_dns_provider
-                             or str(cfg.get("acme_dns_provider") or ""))
-    if req.acme_dns_provider:
-        return
-    provider, why = tlsmod.infer_dns_provider()
-    if not provider:
-        raise ValidationError(
-            f"could not tell which DNS provider to use: {why}.\n"
-            "  Name it with --acme-dns-provider (or `rc-repro config set "
-            "acme.dns_provider <name>`).\n"
-            f"  Providers and their variables: {tlsmod.LEGO_PROVIDER_DOCS}")
-    req.acme_dns_provider = provider
 
 
 def _resolve_tls(req: CreateReq, repro_name: str, bind_host: str, exclude: str = "",
@@ -244,70 +216,46 @@ def _resolve_tls(req: CreateReq, repro_name: str, bind_host: str, exclude: str =
     otherwise produces a repro that comes up and serves nothing, with the reason
     only in `docker compose logs traefik`.
     """
-    # Any of these means HTTPS. Requiring --https alongside them was ceremony: a
-    # domain or a certificate path has no other meaning. --https on its own still
-    # selects the local-CA mode, which needs nothing else.
-    if not (req.https or req.domain or req.tls_cert or req.tls_key
-            or req.acme_email or req.tls_san):
+    # A domain means HTTPS; requiring --https alongside it was ceremony. --https on
+    # its own selects the local-CA mode, which needs nothing else.
+    if not (req.https or req.domain or req.acme_email):
         return None
 
     from rc_repro import tls as tlsmod
 
-    # Normalized before anything else reads it: it becomes ROOT_URL, an ACME
-    # `domains` entry and a TLS SNI name, so a scheme or trailing slash surviving
-    # this far corrupts all three at once.
+    # Normalized before anything else reads it: it becomes ROOT_URL, the Host()
+    # router rule and a TLS SNI name, so a scheme or trailing slash surviving this
+    # far corrupts all three at once.
     domain, fixed = (tlsmod.normalize_domain(req.domain) if req.domain else ("", ""))
     if fixed:
         req.domain = domain          # so downstream and repro.json agree with reality
 
-    if bool(req.tls_cert) != bool(req.tls_key):
-        raise ValidationError("--tls-cert and --tls-key must be given together")
-    if req.tls_cert and req.acme_email:
-        raise ValidationError("--tls-cert supplies a certificate; --acme-email would "
-                              "request another. Pick one.")
-
     cfg = config.load_config()
-    if req.tls_cert:
-        mode = tlsmod.MODE_OWN
-    elif domain:
-        # A domain with no certificate path means Let's Encrypt. The email can be
-        # remembered (`rc-repro config set acme.email`) instead of retyped.
+    if domain:
         mode = tlsmod.MODE_ACME
+        # DOMAIN + LETSENCRYPT_EMAIL, the two the official compose asks for. The
+        # email is remembered so only the first run needs it.
         req.acme_email = req.acme_email or str(cfg.get("acme_email") or "")
         if not req.acme_email:
             raise ValidationError(
-                "a Let's Encrypt certificate needs a contact email. Either:\n"
-                "  rc-repro config set acme.email you@example.com     (remembered)\n"
-                "  ...or pass --acme-email on this run.\n"
-                "To use a certificate you already have instead, pass "
-                "--tls-cert/--tls-key.")
+                "a Let's Encrypt certificate needs a contact email:\n"
+                "  rc-repro up ... --domain " + domain + " --email you@example.com\n"
+                "It is remembered after the first use, or set it once with:\n"
+                "  rc-repro config set acme.email you@example.com")
+        req.acme_staging = req.acme_staging or bool(cfg.get("acme_staging"))
+        _pick_challenge(req, cfg, emit)
     else:
         mode = tlsmod.MODE_LOCAL
 
-    if mode == tlsmod.MODE_ACME:
-        _infer_acme(req, cfg)
-    if req.acme_challenge not in ("tlsalpn", "dns"):
-        raise ValidationError(f"--acme-challenge {req.acme_challenge!r} "
-                              "(want tlsalpn | dns)")
-
-    # An inbound challenge is validated by Let's Encrypt CONNECTING here, so it can
-    # only work on a public interface. That is derivable, so derive it rather than
-    # failing on a missing --bind: `bind_public` tells the caller to widen the bind
-    # and warn about the exposure. An explicit --bind always wins.
+    # TLS-ALPN-01 is validated by Let's Encrypt CONNECTING here, so it has to
+    # publish on a public interface. Derived rather than failing on a missing
+    # --bind; an explicit --bind always wins.
     # dns-01 is validated by a TXT record and never connects here, so it stays on
     # loopback -- these repros run fixed weak credentials, and widening the bind for
     # a challenge that does not need it would expose them for nothing.
     req.bind_public = (mode == tlsmod.MODE_ACME
                        and req.acme_challenge == "tlsalpn"
                        and not req.bind)
-
-    # dns-01 credentials: checked here, not left to fail inside Traefik minutes
-    # later. Each lego provider reads its own variables, so this verifies the file
-    # exists and has content, not which keys it holds.
-    if mode == tlsmod.MODE_ACME and req.acme_challenge == "dns":
-        ok, detail = tlsmod.dns_credentials(req.acme_dns_provider)
-        if not ok:
-            raise ValidationError(detail)
 
     host = domain or tlsmod.local_host_for(repro_name)
     # A real domain answers on 443 so the URL carries no port; a .localhost name
@@ -328,8 +276,7 @@ def _resolve_tls(req: CreateReq, repro_name: str, bind_host: str, exclude: str =
     #
     # Best-effort, NOT required: refusing to create the repro because something else
     # holds 80 would block --domain entirely for anyone running a web server there,
-    # even under dns-01 where 80 plays no part. No challenge needs 80 any more, so
-    # there is no case where a busy 80 has to be fatal.
+    # and TLS-ALPN validates on 443, not 80.
     redirect = False
     if tlsmod.can_redirect_http(mode, port):
         redirect = 80 in own or runner.port_free(80)
@@ -341,9 +288,44 @@ def _resolve_tls(req: CreateReq, repro_name: str, bind_host: str, exclude: str =
     return tlsmod.TlsSpec(
         mode=mode, host=host, port=port, acme_email=req.acme_email,
         acme_staging=req.acme_staging, acme_challenge=req.acme_challenge,
-        acme_dns_provider=req.acme_dns_provider,
-        cert_path=req.tls_cert, key_path=req.tls_key,
-        http_redirect=redirect)
+        acme_dns_provider=req.acme_dns_provider, http_redirect=redirect)
+
+
+def _pick_challenge(req: CreateReq, cfg: dict, emit: Emit = null_emit) -> None:
+    """Choose the ACME challenge. Not a flag -- there is a right answer.
+
+    TLS-ALPN-01 is the default and what the official compose uses. It needs Let's
+    Encrypt to reach this host on 443, which is impossible behind NAT, behind a
+    tunnel, or behind a proxy that terminates TLS in front of the origin.
+
+    dns-01 needs none of that: the provider's API writes a TXT record and Let's
+    Encrypt never connects here. So it is selected exactly when credentials for it
+    exist, which is the only signal that says "the operator set this up on purpose".
+    """
+    from rc_repro import tls as tlsmod
+
+    if not tlsmod.dns_env_vars():
+        req.acme_challenge = "tlsalpn"
+        return
+    provider = str(cfg.get("acme_dns_provider") or "")
+    if not provider:
+        provider, why = tlsmod.infer_dns_provider()
+        if not provider:
+            # Credentials are present but unreadable as a provider. Falling back to
+            # tlsalpn silently would ignore a file the user deliberately created.
+            raise ValidationError(
+                f"{tlsmod.dns_env_path()} exists, so dns-01 was assumed, but the "
+                f"provider could not be worked out: {why}.\n"
+                f"  Name it with `rc-repro config set acme.dns_provider <name>` — "
+                f"providers and their variables: {tlsmod.LEGO_PROVIDER_DOCS}\n"
+                f"  Or delete the file to use the inbound challenge instead.")
+    ok, detail = tlsmod.dns_credentials(provider)
+    if not ok:
+        raise ValidationError(detail)
+    req.acme_challenge = "dns"
+    req.acme_dns_provider = provider
+    info(emit, f"using the dns-01 challenge via {provider} ({detail}) — no inbound "
+               "connection needed, so the workspace stays on loopback", phase="tls")
 
 
 def _pick_tls_port(exclude: str = "") -> int:
@@ -529,31 +511,15 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
         from rc_repro import tls as tlsmod
         cert_pem = key_pem = ""
         if tlsspec.mode == tlsmod.MODE_LOCAL:
+            from rc_repro import tls_local
             info(emit, f"issuing a local certificate for {tlsspec.host}", phase="tls")
-            sans = [s for s in (req.tls_san or "").split(",") if s.strip()]
-            cert_pem, key_pem = tlsmod.issue_leaf(tlsspec.host, sans)
-        elif tlsspec.mode == tlsmod.MODE_OWN:
-            cert_pem, key_pem = tlsmod.read_own_cert(tlsspec.cert_path, tlsspec.key_path)
+            cert_pem, key_pem = tls_local.issue_leaf(tlsspec.host)
         else:
-            # Rule out the DNS mistakes that are CERTAIN to fail, before an attempt
-            # spends quota (5 failed validations per hostname per hour). Cannot
-            # prove inbound reachability from here — that depends on NAT/firewalls
-            # this process cannot see — so a pass is necessary, not sufficient.
-            ok, detail = tlsmod.dns_preflight(tlsspec.host, tlsspec.acme_challenge)
-            if not ok:
-                raise ValidationError(detail)
-            info(emit, f"DNS {detail}", phase="tls")
-            if tlsspec.acme_challenge != "dns" and not tlsmod.host_has_public_address():
-                warn(emit, "no interface on this host has a public address, so an "
-                           "inbound challenge can only work through a port-forward. "
-                           "If validation fails, use --acme-challenge dns.", phase="tls")
-            gaps = tlsmod.reachability_gaps(tlsspec, bind_host)
-            if gaps:
-                warn(emit, "the certificate will be valid, but the workspace will NOT "
-                           f"be reachable at {tlsspec.root_url} — {'; '.join(gaps)}. "
-                           "Locally: curl --resolve "
-                           f"{tlsspec.host}:{tlsspec.port}:127.0.0.1 {tlsspec.root_url}",
-                     phase="tls")
+            # No reachability checks. Whether the domain resolves here, and how
+            # traffic gets to this host, is the operator's business -- rc-repro
+            # cannot see a tunnel, a port-forward or a firewall from in here, and
+            # refusing to create the repro over a guess was the single biggest
+            # source of confusion in this path.
             info(emit, f"requesting a certificate from Let's Encrypt "
                        f"({'staging' if tlsspec.acme_staging else 'production'}) "
                        f"for {tlsspec.host} — Traefik does this in the background; "
@@ -567,11 +533,6 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
         meta.extra["tls"] = tlsspec.mode
         meta.extra["tls_ports"] = [tlsspec.port]
         if tlsspec.mode == tlsmod.MODE_ACME:
-            # Recorded so `tls-status` can print a promote command that actually
-            # works. Without these it rebuilt a guess that dropped the challenge
-            # flags and added --bind, i.e. a copy-pasteable command that fails.
-            meta.extra["tls_challenge"] = tlsspec.acme_challenge
-            meta.extra["tls_dns_provider"] = tlsspec.acme_dns_provider
             meta.extra["tls_staging"] = tlsspec.acme_staging
             meta.extra["tls_email"] = tlsspec.acme_email
         meta.extra.setdefault("notes", [])

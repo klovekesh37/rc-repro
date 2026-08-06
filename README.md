@@ -20,7 +20,7 @@ Prefer a UI? `rc-repro serve` opens a local web dashboard for everything below
 - [Everyday use](#everyday-use) — commands & lifecycle
 - [Web GUI](#web-gui) — `rc-repro serve`, a local dashboard
 - [Scenarios](#scenarios) — presets (LDAP, SAML, email, …) & monitoring
-- [HTTPS](#https) — local CA, Let's Encrypt, or your own certificate
+- [HTTPS](#https) — a domain and an email, or a local certificate
 - [Environment variables](#environment-variables) — `rc-repro env`, change settings on a running repro
 - [Data & performance](#data--performance) — sample data, data-scale prefill, config import, backup/restore, upgrade testing, benchmarking, load testing
 - [API testing](#api-testing)
@@ -377,96 +377,127 @@ monitoring stack (file-SD Prometheus + provisioned Grafana).
 
 # HTTPS
 
-`up --https` / `up --domain` — serve a repro over TLS. Terminated by a Traefik sidecar; Rocket.Chat's `ROOT_URL`
-becomes the https URL, which is what makes OAuth/SAML redirects, `Secure` cookies,
+`up --domain` — serve a repro over TLS with a Let's Encrypt certificate, the same
+two inputs the [official Rocket.Chat compose](https://docs.rocket.chat/docs/deploy-with-docker-docker-compose#3c-configure-domain-and-reverse-proxy)
+takes as `DOMAIN` and `LETSENCRYPT_EMAIL`:
+
+```bash
+rc-repro up -v 8.5.1 --domain chat.example.com --email me@example.com
+```
+
+The email is remembered, so later runs need only the domain:
+
+```bash
+rc-repro config set acme.email me@example.com     # once
+rc-repro up -v 8.5.1 --domain chat.example.com
+```
+
+TLS is terminated by a Traefik sidecar and Rocket.Chat's `ROOT_URL` becomes the
+https URL — which is what makes OAuth/SAML redirects, `Secure` cookies,
 mixed-content cases and the mobile app behave like a customer's workspace.
 
 It is a **flag, not a preset** — `--preset` takes one value, so a `tls` preset
 could never be combined with `oidc`, `saml`, `livechat` or `multi-instance`, which
 are exactly the ones that need HTTPS.
 
-Three ways to get the certificate. The domain itself is yours to manage at your DNS
-provider — rc-repro's job is only to obtain and serve the certificate.
+## What you provide, and what rc-repro provides
 
-| | Command | Trusted by browsers / mobile |
-|---|---|---|
-| **Local CA** | `--https` | after `rc-repro trust-ca` (browsers only) |
-| **Let's Encrypt** | `--domain rc1.example.com` | **yes, automatically** |
-| **Your own** | `--domain … --tls-cert … --tls-key …` | if your issuer is |
+**You:** a domain that already resolves to this host, with TCP/443 reachable from
+the internet. However you arrange that — an A record, a CNAME, a public IP, a
+port-forward — is yours to manage.
 
-```bash
-# Local: offline, no domain, no rate limits.
-rc-repro up -v 8.6.1 --https
-rc-repro trust-ca                       # once per machine, to silence warnings
-  -> https://rc8-6-1.rcrepro.localhost:8443
+**rc-repro:** the certificate, and serving on it. It does not check your DNS or
+your routing, because it cannot see a tunnel or a firewall from inside the
+process, and guessing was the biggest source of confusion in this path.
 
-# Let's Encrypt. Remember the contact email once:
-rc-repro config set acme.email you@example.com
-# ...then a domain is the only flag you need. Do the staging run FIRST.
-rc-repro up -v 8.6.1 --domain rc1.example.com --acme-staging --wait
-rc-repro tls-status -n rc8-6-1           # what is ACTUALLY being served
+Let's Encrypt validates with the **TLS-ALPN-01** challenge by connecting to your
+domain on 443 — exactly as `compose.traefik.yml` does with
+`certificatesresolvers.le.acme.tlschallenge`. So the routing has to work *before*
+the certificate can be issued.
 
-# A certificate you already have:
-rc-repro up -v 8.6.1 --domain rc1.example.com \
-    --tls-cert ./fullchain.pem --tls-key ./privkey.pem
-```
+## When Let's Encrypt cannot reach you
 
-`--domain` implies HTTPS — a hostname has no other meaning here. `up --wait` only
-proves Rocket.Chat booted (it polls the plain http port); Traefik obtains its
-certificate afterwards and falls back to a placeholder if that fails, so use
-**`rc-repro tls-status`** (or **Check TLS** in the GUI) to see the real issuer.
+Behind NAT, behind a tunnel, or behind a proxy that terminates TLS, the default
+challenge cannot work — nothing can connect in. **dns-01** proves control by
+writing a TXT record instead, so it needs no inbound access at all.
 
-## What is worked out for you
-
-You do not choose a challenge or name a DNS provider — both are derived, and the
-job log says which and why:
-
-| Derived | How |
-|---|---|
-| **Challenge** | `dns-01` when `~/.rc-repro/acme/dns.env` exists, otherwise `tlsalpn` (needs inbound TCP/443). Those two are the only ones — `http-01` needed port 80 *as well as* 443 and did nothing `tlsalpn` does not |
-| **DNS provider** | from the variable names in `dns.env` — `CF_DNS_API_TOKEN` → cloudflare, `AWS_*` → route53, `DO_AUTH_TOKEN` → digitalocean, … |
-| **Bind interface** | an inbound challenge needs `0.0.0.0` (and warns about the exposure); `dns-01` stays on loopback |
-| **http → https redirect** | a domain-backed repro also publishes `:80` and redirects permanently, as the official compose files do. Best-effort: if something else holds 80 it is skipped with a warning rather than refusing |
-
-So to use DNS-01 — required **behind Cloudflare's orange cloud**, since Cloudflare
-terminates TLS and an inbound challenge can never reach you — just drop the token in
-place:
+It is not a flag. Put your DNS provider's credentials in
+`~/.rc-repro/acme/dns.env` and rc-repro uses dns-01 automatically:
 
 ```bash
 mkdir -p ~/.rc-repro/acme && chmod 700 ~/.rc-repro/acme
 printf 'CF_DNS_API_TOKEN=%s\n' "$TOKEN" > ~/.rc-repro/acme/dns.env
 chmod 600 ~/.rc-repro/acme/dns.env
-# nothing else changes:
-rc-repro up -v 8.6.1 --domain rc1.example.com --acme-staging --wait
+
+rc-repro up -v 8.5.1 --domain chat.example.com --email me@example.com
 ```
 
-Credentials are read from that file, never from the command line. Each
-[lego provider](https://go-acme.github.io/lego/dns/) reads its own variables. A
-Cloudflare token needs **both** `Zone:Zone:Read` and `Zone:DNS:Edit`.
+The provider is inferred from the variable names — `CF_*` → cloudflare, `AWS_*` →
+route53, `DO_AUTH_TOKEN` → digitalocean, `HETZNER_*`, `AZURE_*`, and so on. Any of
+[lego's ~100 providers](https://go-acme.github.io/lego/dns/) works; name one
+explicitly with `rc-repro config set acme.dns_provider <name>` if the variables do
+not identify it.
 
-Override any of it with `--acme-challenge`, `--acme-dns-provider` or `--acme-email`
-(hidden from `--help`; see `rc-repro config list` for what is remembered).
+Credentials are read from that file and mounted into Traefik as an `env_file` —
+never passed on a command line, where `ps` would show them to every user on the
+box. The values are never printed.
+
+Because nothing connects in, a dns-01 repro **stays bound to loopback** rather
+than being published on `0.0.0.0`. Getting a certificate and being reachable at
+the name are then separate things: the certificate is valid, but you still have to
+arrange how traffic gets to the workspace.
+
+## Without a domain
+
+```bash
+rc-repro trust-ca                    # once, installs rc-repro's local CA
+rc-repro up -v 8.5.1 --https         # https://<name>.rcrepro.localhost:8443
+```
+
+Offline, no rate limits, no domain. Browsers trust it after `trust-ca`; phones
+cannot use it at all (the CA is not installed there, and `.localhost` resolves to
+the phone itself).
+
+## How it maps to the official compose
+
+| Docs `.env` | rc-repro |
+|---|---|
+| `DOMAIN=example.com` | `--domain example.com` |
+| `LETSENCRYPT_EMAIL=…` | `--email …` (remembered) |
+| `LETSENCRYPT_ENABLED=true` | implied by `--domain` |
+| `ROOT_URL=https://…` | derived |
+| `TRAEFIK_PROTOCOL=https` | implied |
+
+Same Traefik v3.4, same `tlschallenge`, same `acme.json` storage, same
+`Host(\`domain\`)` router rule, same port 80 → 443 redirect.
 
 ## Gotchas
 
-- **A valid certificate is not the same as a reachable workspace.** `dns-01` issues
-  with no DNS record and no public route at all, so `up` warns when the name has no
-  record or the workspace is bound to loopback. Locally:
-  `curl --resolve rc1.example.com:443:127.0.0.1 https://rc1.example.com/api/info`
-- **Staging is untrusted on purpose.** A browser warning on `--acme-staging` is the
-  success signal. Staging and production use separate storage, so switching really
-  re-issues.
+- **Check what is actually served.** `up --wait` only proves Rocket.Chat booted;
+  Traefik requests the certificate afterwards and falls back to a self-signed
+  placeholder if ACME fails. `rc-repro tls-status --name X` makes a real TLS
+  connection and reports the certificate.
+- **A TLS-terminating proxy in front will break the default challenge.** If your
+  DNS provider proxies HTTPS (Cloudflare's orange cloud; others do the same), the
+  challenge reaches the proxy rather than this host and Let's Encrypt validates
+  against the proxy's certificate. Point the record straight at the host — or use
+  dns-01, below.
+- **`--domain` publishes on `0.0.0.0`.** Let's Encrypt has to connect in, so the
+  workspace stops being loopback-only. rc-repro says so once, per create.
 - **Rate limits.** 5 certificates per identical hostname per 7 days, and 5 failed
-  validations per hostname per hour — hence staging first. ACME state lives in
-  `~/.rc-repro/acme/` **outside** the workspace, so `down --volumes` cannot force a
-  re-issue.
+  validations per hostname per hour. Rehearse with
+  `rc-repro config set acme.staging true` — a browser warning on a staging
+  certificate is the success signal, and staging uses separate storage so switching
+  back really re-issues. ACME state lives in `~/.rc-repro/acme/` **outside** the
+  workspace, so `down --volumes` cannot force a re-issue.
 - **Internal calls still use http.** `rc-repro api`, seeding and the load tests talk
   to the repro's plain port, so they need no CA. `rc-repro info` shows both URLs.
 - **⚠ Repros run fixed weak credentials (`admin`/`admin123`).** Do not leave a
   publicly reachable `--domain` repro running: the hostname appears in public
   certificate-transparency logs within minutes of issuance.
-- Not yet supported: `--https` together with the `multi-instance` preset (it runs
-  its own Traefik) — it refuses with a clear error rather than half-working.
+- Not yet supported: `--https`/`--domain` together with the `multi-instance` preset
+  (it runs its own Traefik) — it refuses with a clear error rather than
+  half-working.
 
 ---
 
@@ -888,7 +919,7 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `capacity` | double VUs until the SLO breaks, bisect the boundary — "handles ~N concurrent" + why it broke |
 | `monitor` | attach/detach Prometheus + Grafana on a running repro |
 | `trust-ca` | install rc-repro's local CA so `--https` repros are trusted (`--uninstall`, `--show`) |
-| `tls-status` | report the certificate a `--https` repro is actually serving — see [HTTPS](#https) |
+| `tls-status` | report the certificate a `--domain`/`--https` repro is actually serving — see [HTTPS](#https) |
 | `serve` | launch the local [web GUI](#web-gui) (needs `pip install 'rc-repro[gui]'`) |
 | `logs` | tail a repro's logs |
 | `presets` | list available presets |

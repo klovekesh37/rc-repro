@@ -5,21 +5,23 @@ Layered onto ANY repro via `up --https` rather than being its own preset --
 exclusive with oidc/saml/livechat/multi-instance, which are exactly the ones that
 need HTTPS. Same shape as the monitoring add-on: services(), files(), notes().
 
-Three ways to get the certificate, matching the three real situations:
+Two ways to get the certificate, and only two inputs for the common one:
 
-  local  `--https`                        a CA made here with openssl, once, then a
-                                          leaf per repro. Offline, no rate limits.
-  acme   `--https --domain X --acme-email` Let's Encrypt via Traefik's own ACME.
-  own    `--https --tls-cert/--tls-key`    a certificate you already have.
+  acme   `--domain X --email Y`  Let's Encrypt via Traefik's own ACME resolver,
+                                 the same DOMAIN + LETSENCRYPT_EMAIL pair the
+                                 official compose.traefik.yml takes.
+  local  `--https`               a CA made here with openssl (see tls_local.py).
+                                 Offline, no domain, no rate limits.
 
-Only `local` generates anything; `acme` hands the job to Traefik, and `own` just
-mounts the files. All three end up serving on a TLS entrypoint and setting the
-repro's ROOT_URL to https, which is what RC actually cares about.
+The ACME CHALLENGE is not a user-facing choice. TLS-ALPN-01 is the default and
+what the official compose uses; dns-01 is selected automatically when provider
+credentials exist in ~/.rc-repro/acme/dns.env, because that is the only way to
+issue when Let's Encrypt cannot connect inbound -- behind NAT, behind a tunnel, or
+behind a proxy that terminates TLS in front of you. Neither appears as a flag.
 """
 
 from __future__ import annotations
 
-import os
 import re
 import socket
 import subprocess
@@ -27,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rc_repro import config
-from rc_repro.errors import ReproError, ValidationError
+from rc_repro.errors import ValidationError
 
 # Pinned to match the multi-instance preset, so a repro that uses both runs one
 # Traefik version rather than two.
@@ -57,12 +59,17 @@ ACME_DIR_NAME = "acme"
 # into a production run.
 ACME_FILE = "acme.json"
 ACME_FILE_STAGING = "acme-staging.json"
-# Credentials for a dns-01 provider. A file, never argv: `ps` shows command lines
-# to every user on the box.
+#: Credentials for a dns-01 provider. A file, never argv: `ps` shows command lines
+#: to every user on the box.
 DNS_ENV_FILE = "dns.env"
 LEGO_PROVIDER_DOCS = "https://go-acme.github.io/lego/dns/"
 
-MODE_LOCAL, MODE_ACME, MODE_OWN = "local", "acme", "own"
+MODE_LOCAL, MODE_ACME = "local", "acme"
+
+#: Subject Traefik puts on the self-signed certificate it serves when a
+#: resolver has produced nothing yet -- how `tls-status` tells "ACME has not
+#: issued" apart from "ACME issued something wrong".
+_TRAEFIK_FALLBACK = "TRAEFIK DEFAULT CERT"
 
 
 @dataclass
@@ -73,10 +80,10 @@ class TlsSpec:
     port: int = 0                # published host port for the TLS entrypoint
     acme_email: str = ""
     acme_staging: bool = False
-    acme_challenge: str = "tlsalpn"      # tlsalpn (inbound :443) | dns (no inbound)
+    # tlsalpn (Let's Encrypt connects in on 443) | dns (a TXT record, no inbound).
+    # Derived from whether credentials exist, never asked for.
+    acme_challenge: str = "tlsalpn"
     acme_dns_provider: str = ""
-    cert_path: str = ""          # mode=own: source paths on the host
-    key_path: str = ""
     # Publish :80 and redirect it to https, as the official compose files do.
     # Decided by the caller, which is the only place that can probe port 80 --
     # this is a pure builder.
@@ -151,8 +158,7 @@ def normalize_domain(value: str) -> tuple[str, str]:
     if raw.startswith("*."):
         raise ValidationError(
             f"--domain {value!r} is a wildcard. --domain has to be the concrete host "
-            "the workspace is reached at, because it becomes ROOT_URL. (A wildcard "
-            "certificate is a separate thing and needs the dns challenge.)")
+            "the workspace is reached at, because it becomes ROOT_URL.")
     if any(not _LABEL_RE.match(lbl) for lbl in raw.split(".")):
         raise ValidationError(
             f"--domain {value!r} is not a valid hostname (letters, digits and "
@@ -162,128 +168,6 @@ def normalize_domain(value: str) -> tuple[str, str]:
 
 # --- openssl -----------------------------------------------------------------
 
-def _openssl(*args: str, stdin: str | None = None) -> None:
-    """Run openssl, turning any failure into a user-facing error.
-
-    openssl writes its real diagnosis to stderr and exits non-zero; surfacing
-    that beats "command failed", which is all the exit code says.
-    """
-    try:
-        proc = subprocess.run(("openssl",) + args, capture_output=True, text=True,
-                              input=stdin, timeout=60)
-    except FileNotFoundError as exc:
-        raise ReproError(
-            "openssl not found - it generates the local CA for --https. Install it, "
-            "or supply a certificate with --tls-cert/--tls-key.") from exc
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ReproError(f"openssl failed: {exc}") from exc
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        raise ReproError("openssl " + args[0] + " failed: "
-                         + (detail[-1] if detail else f"exit {proc.returncode}"))
-
-
-def ensure_ca() -> tuple[Path, Path]:
-    """Create the local CA if absent; return (key, cert). Idempotent.
-
-    One CA per machine, shared by every repro and never regenerated: it is what
-    `trust-ca` installs, so replacing it would silently invalidate that trust.
-    """
-    d = ca_dir()
-    key, crt = d / CA_KEY, d / CA_CRT
-    if key.exists() and crt.exists():
-        return key, crt
-    d.mkdir(parents=True, exist_ok=True)
-    _openssl("genrsa", "-out", str(key), "4096")
-    # 0600: this key can mint a certificate for any name the browser will trust.
-    os.chmod(key, 0o600)
-    _openssl("req", "-x509", "-new", "-nodes", "-key", str(key), "-sha256",
-             "-days", str(_CA_DAYS), "-out", str(crt),
-             "-subj", "/CN=rc-repro local CA/O=rc-repro")
-    return key, crt
-
-
-def _leaf_ext(host: str, extra_sans: list[str]) -> str:
-    """The x509 extension block for a leaf cert.
-
-    SANs, not CN: browsers have ignored commonName since Chrome 58, so a cert
-    with only a CN is rejected with ERR_CERT_COMMON_NAME_INVALID.
-    """
-    dns = [host]
-    ips: list[str] = []
-    for s in extra_sans:
-        s = s.strip()
-        if not s:
-            continue
-        (ips if _is_ip(s) else dns).append(s)
-    # localhost/127.0.0.1 too, so the existing http:// habits and any in-container
-    # health check keep working against the same cert.
-    for d in ("localhost",):
-        if d not in dns:
-            dns.append(d)
-    if "127.0.0.1" not in ips:
-        ips.append("127.0.0.1")
-    lines = ["basicConstraints=CA:FALSE",
-             "keyUsage=digitalSignature,keyEncipherment",
-             "extendedKeyUsage=serverAuth",
-             "subjectAltName=@alt",
-             "",
-             "[alt]"]
-    lines += [f"DNS.{i} = {d}" for i, d in enumerate(dns, 1)]
-    lines += [f"IP.{i} = {p}" for i, p in enumerate(ips, 1)]
-    return "\n".join(lines) + "\n"
-
-
-def _is_ip(value: str) -> bool:
-    import ipaddress
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except ValueError:
-        return False
-
-
-def issue_leaf(host: str, extra_sans: list[str] | None = None) -> tuple[str, str]:
-    """Mint a leaf cert for `host`, signed by the local CA. Returns (cert, key) PEM.
-
-    Written into the repro workspace by the caller, so it is disposable: `up`
-    regenerates it and `down --volumes` deleting it costs nothing. That is the
-    opposite of the ACME case, where losing state costs rate-limit budget.
-    """
-    import tempfile
-    ca_key, ca_crt = ensure_ca()
-    with tempfile.TemporaryDirectory() as tmp:
-        t = Path(tmp)
-        key, csr, crt, ext = t / "tls.key", t / "tls.csr", t / "tls.crt", t / "ext.cnf"
-        ext.write_text(_leaf_ext(host, extra_sans or []), encoding="utf-8")
-        _openssl("genrsa", "-out", str(key), "2048")
-        _openssl("req", "-new", "-key", str(key), "-out", str(csr), "-subj", f"/CN={host}")
-        _openssl("x509", "-req", "-in", str(csr), "-CA", str(ca_crt), "-CAkey", str(ca_key),
-                 "-CAcreateserial", "-out", str(crt), "-days", str(_LEAF_DAYS),
-                 "-sha256", "-extfile", str(ext))
-        return crt.read_text(encoding="utf-8"), key.read_text(encoding="utf-8")
-
-
-def read_own_cert(cert_path: str, key_path: str) -> tuple[str, str]:
-    """Read a user-supplied cert/key, checking what Traefik would only fail on later.
-
-    Traefik's failure for a mismatched pair is a startup log line nobody sees --
-    the repro just doesn't serve. Checking here turns it into an error at `up`.
-    """
-    cert, key = Path(cert_path).expanduser(), Path(key_path).expanduser()
-    for label, p in (("--tls-cert", cert), ("--tls-key", key)):
-        if not p.is_file():
-            raise ValidationError(f"{label}: no such file: {p}")
-    pem, keypem = cert.read_text(encoding="utf-8"), key.read_text(encoding="utf-8")
-    if "BEGIN CERTIFICATE" not in pem:
-        raise ValidationError(f"--tls-cert: {cert} is not a PEM certificate")
-    if "PRIVATE KEY" not in keypem:
-        raise ValidationError(f"--tls-key: {key} is not a PEM private key")
-    return pem, keypem
-
-
-# --- compose ------------------------------------------------------------------
-
 def _dynamic_yml(backends: list[str], mode: str, host: str = "") -> str:
     """Traefik file-provider config: route everything to the RC backend(s) over TLS.
 
@@ -292,17 +176,21 @@ def _dynamic_yml(backends: list[str], mode: str, host: str = "") -> str:
     """
     servers = "\n".join(f'          - url: "http://{b}:{config.RC_CONTAINER_PORT}"'
                         for b in backends)
-    # mode=acme leaves cert selection to the resolver; local/own load a static pair.
+    # The rule differs by mode, and that is what decides whether ACME works.
+    #
+    # acme: Host(`domain`), exactly as the official compose.traefik.yml does it.
+    #   Traefik derives what to REQUEST from this matcher, so with a Host() rule no
+    #   `tls.domains` block is needed. The previous PathPrefix(`/`) rule named no
+    #   host, which made Traefik log "no domain found" and silently serve its
+    #   default certificate without ever making an ACME request -- indistinguishable
+    #   from a failed issuance. Matching the docs removes that failure mode.
+    # local: PathPrefix(`/`), because a local certificate is loaded from disk rather
+    #   than requested, and the workspace should also answer on localhost.
     if mode == MODE_ACME:
-        # `domains` is REQUIRED here. Traefik derives what to request from the
-        # router's Host() matcher, and this rule is PathPrefix(`/`) on purpose (so
-        # the workspace also answers on localhost and the container name). Without
-        # an explicit domain, Traefik has nothing to ask for: it logs
-        # "no domain found" and silently serves its default certificate — which
-        # looks exactly like an ACME failure, with no ACME request ever made.
-        tls_block = ("      tls:\n        certResolver: le\n        domains:\n"
-                     f'          - main: "{host}"\n')
+        rule = f'Host(`{host}`)'
+        tls_block = "      tls:\n        certResolver: le\n"
     else:
+        rule = "PathPrefix(`/`)"
         tls_block = "      tls: {}\n"
     static_certs = "" if mode == MODE_ACME else (
         "tls:\n"
@@ -315,7 +203,7 @@ def _dynamic_yml(backends: list[str], mode: str, host: str = "") -> str:
         "http:\n"
         "  routers:\n"
         "    rocketchat:\n"
-        '      rule: "PathPrefix(`/`)"\n'
+        f'      rule: "{rule}"\n'
         "      entryPoints: [websecure]\n"
         "      service: rocketchat\n"
         + tls_block
@@ -436,6 +324,7 @@ def dns_credentials(provider: str) -> tuple[bool, str]:
     return True, f"{path.name}: {', '.join(names)}"
 
 
+
 def _acme_args(spec: TlsSpec) -> list[str]:
     """Traefik's ACME flags."""
     args = [
@@ -447,14 +336,17 @@ def _acme_args(spec: TlsSpec) -> list[str]:
         args.append("--certificatesresolvers.le.acme.caserver="
                     "https://acme-staging-v02.api.letsencrypt.org/directory")
     if spec.acme_challenge == "dns":
+        # dns-01: validated by a TXT record the provider API writes, so Let's
+        # Encrypt never connects here. The only option behind NAT, a tunnel, or a
+        # proxy that terminates TLS in front of the origin.
         args.append("--certificatesresolvers.le.acme.dnschallenge=true")
         if spec.acme_dns_provider:
             args.append("--certificatesresolvers.le.acme.dnschallenge.provider="
                         + spec.acme_dns_provider)
     else:
-        # TLS-ALPN-01: only needs the one port we already publish. The only inbound
-        # challenge offered -- http-01 needs port 80 as WELL as 443 and buys nothing
-        # tlsalpn does not already do, so it was removed rather than maintained.
+        # TLS-ALPN-01, the same challenge the official compose.traefik.yml uses
+        # (`certificatesresolvers.le.acme.tlschallenge`). It validates on 443, which
+        # is already published, so no second port has to be opened for it.
         args.append("--certificatesresolvers.le.acme.tlschallenge=true")
     return args
 
@@ -465,7 +357,7 @@ def can_redirect_http(mode: str, port: int) -> bool:
     Local mode runs on an allocated port, where claiming a second one per repro
     just to redirect to the first costs more than it gives.
     """
-    return mode in (MODE_ACME, MODE_OWN) and port == 443
+    return mode == MODE_ACME and port == 443
 
 
 def service(spec: TlsSpec) -> dict:
@@ -529,87 +421,6 @@ def files(spec: TlsSpec, backends: list[str],
 # Deliberately narrow: macOS and Debian/Ubuntu/Fedora are handled, anything else
 # gets printed instructions. Guessing wrong here means either a silent no-op or
 # writing into a system trust store the user did not expect.
-
-_LINUX_ANCHORS = (
-    # (directory, refresh command) — first one whose directory exists wins.
-    ("/usr/local/share/ca-certificates", ["update-ca-certificates"]),      # Debian/Ubuntu
-    ("/etc/pki/ca-trust/source/anchors", ["update-ca-trust", "extract"]),  # Fedora/RHEL
-)
-_ANCHOR_NAME = "rc-repro-local-ca.crt"
-
-
-def _sudo(cmd: list[str]) -> subprocess.CompletedProcess:
-    """Run a trust-store command, with sudo when not already root.
-
-    Non-interactive (`sudo -n`): a CLI that silently blocks on a hidden password
-    prompt looks like a hang, so a missing sudo becomes the manual-instructions path.
-    """
-    full = cmd if os.geteuid() == 0 else ["sudo", "-n"] + cmd
-    return subprocess.run(full, capture_output=True, text=True, timeout=120)
-
-
-def trust(ca_crt: Path, uninstall: bool = False) -> tuple[bool, str]:
-    """Install/remove the CA in the OS trust store. Returns (done, description)."""
-    import platform
-    system = platform.system()
-    if system == "Darwin":
-        if uninstall:
-            cmd = ["security", "remove-trusted-cert", "-d", str(ca_crt)]
-        else:
-            cmd = ["security", "add-trusted-cert", "-d", "-r", "trustRoot",
-                   "-k", "/Library/Keychains/System.keychain", str(ca_crt)]
-        try:
-            r = _sudo(cmd)
-        except (OSError, subprocess.SubprocessError) as exc:
-            return False, f"macOS System keychain ({exc})"
-        return (r.returncode == 0), "the macOS System keychain"
-    if system == "Linux":
-        for anchor_dir, refresh in _LINUX_ANCHORS:
-            d = Path(anchor_dir)
-            if not d.is_dir():
-                continue
-            target = d / _ANCHOR_NAME
-            try:
-                if uninstall:
-                    r = _sudo(["rm", "-f", str(target)])
-                else:
-                    r = _sudo(["cp", str(ca_crt), str(target)])
-                if r.returncode != 0:
-                    return False, f"{anchor_dir} (need sudo: {(r.stderr or '').strip()[:60]})"
-                r = _sudo(refresh)
-            except (OSError, subprocess.SubprocessError) as exc:
-                return False, f"{anchor_dir} ({exc})"
-            return (r.returncode == 0), f"the system trust store ({anchor_dir})"
-        return False, "no known trust-store directory on this Linux"
-    return False, system or "unknown platform"
-
-
-def manual_trust_instructions(ca_crt: Path, uninstall: bool = False) -> str:
-    verb = "Remove" if uninstall else "Install"
-    return (
-        f"\n  {verb} this file by hand:\n"
-        f"    {ca_crt}\n\n"
-        "  macOS:          Keychain Access -> System -> drag it in -> set to Always Trust\n"
-        "  Debian/Ubuntu:  sudo cp it into /usr/local/share/ca-certificates/ "
-        "&& sudo update-ca-certificates\n"
-        "  Fedora/RHEL:    sudo cp it into /etc/pki/ca-trust/source/anchors/ "
-        "&& sudo update-ca-trust extract\n"
-        "  Windows:        certutil -addstore -f Root <path>\n"
-        "  Firefox:        Settings -> Privacy & Security -> Certificates -> "
-        "View Certificates -> Authorities -> Import\n\n"
-        "  Or skip it: the browser warning is safe to click through for a local repro.\n"
-    )
-
-
-# --- verification -------------------------------------------------------------
-# Traefik obtains certificates in the BACKGROUND after it starts, and falls back to
-# a self-signed "TRAEFIK DEFAULT CERT" when ACME fails. So a repro can be "ready"
-# (RC answers on its internal http port) while HTTPS is serving a dummy cert, or
-# nothing at all. Nothing but an actual TLS connection can tell the difference.
-
-# What Traefik serves when it has no real certificate — the signature of a failure.
-_TRAEFIK_FALLBACK = "TRAEFIK DEFAULT CERT"
-
 
 def _cert_field(pem: str, *args: str) -> str:
     try:
@@ -681,7 +492,6 @@ def verify(host: str, port: int = 443, timeout: float = 10.0,
 # its OWN resolvers, so the system resolver is not authoritative for this question
 # -- a split-horizon or stale-negative-cache resolver (common in labs and
 # corporate networks) made a perfectly good record look absent.
-_PUBLIC_RESOLVERS = ("1.1.1.1", "8.8.8.8")
 
 # A few of Cloudflare's published edge ranges. Used ONLY to explain a failure more
 # precisely, never to block: the list drifts, and being wrong here must not stop a
@@ -693,180 +503,33 @@ _CLOUDFLARE_HINT_NETS = ("104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13",
                          "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22")
 
 
-def _dig(host: str, resolver: str) -> list[str]:
-    try:
-        proc = subprocess.run(["dig", "+short", "+time=3", "+tries=1",
-                               f"@{resolver}", host, "A"],
-                              capture_output=True, text=True, timeout=12)
-    except (OSError, subprocess.SubprocessError):
-        return []
-    out = []
-    for line in (proc.stdout or "").splitlines():
-        line = line.strip()
-        # +short prints CNAME targets too; keep only addresses.
-        if line and not line.endswith("."):
-            out.append(line)
-    return out
-
-
-def resolves_to(host: str, public: bool = True) -> list[str]:
-    """Addresses `host` resolves to, [] if nothing answers.
-
-    Falls back to public resolvers because the caller is really asking "what will
-    Let's Encrypt see?", and the local resolver may not agree with the internet.
-    """
-    try:
-        infos = socket.getaddrinfo(host, None)
-        addrs = sorted({i[4][0] for i in infos})
-    except OSError:
-        addrs = []
-    if addrs or not public:
-        return addrs
-    for resolver in _PUBLIC_RESOLVERS:
-        found = _dig(host, resolver)
-        if found:
-            return sorted(set(found))
-    return []
-
-
-def _is_proxy_fronted(addrs: list[str]) -> bool:
-    import ipaddress
-    nets = [ipaddress.ip_network(n) for n in _CLOUDFLARE_HINT_NETS]
-    for a in addrs:
-        try:
-            ip = ipaddress.ip_address(a)
-        except ValueError:
-            continue
-        if ip.version == 4 and any(ip in n for n in nets):
-            return True
-    return False
-
-
-def dns_preflight(host: str, challenge: str = "tlsalpn") -> tuple[bool, str]:
-    """Rule out ACME setups that are certain to fail, before one costs quota.
-
-    Cannot prove inbound reachability — NAT and firewalls are invisible from here
-    — so a pass is necessary, not sufficient. What it can catch: a name nothing
-    resolves, a name pointing only somewhere unroutable, and a name fronted by a
-    TLS-terminating proxy while using a challenge that requires reaching the origin.
-    """
-    import ipaddress
-    addrs = resolves_to(host)
-
-    if challenge == "dns":
-        # dns-01 validates by reading a TXT record at _acme-challenge.<host>, which
-        # the provider API creates. Let's Encrypt never connects to the origin, so
-        # the hostname does not need an A/AAAA record AT ALL -- requiring one here
-        # refused a setup that would have issued fine.
-        where = ", ".join(addrs) if addrs else "no A/AAAA record (fine for dns-01)"
-        return True, f"{host} -> {where} (dns-01 needs no inbound access)"
-
-    if not addrs:
-        return False, (
-            f"{host} does not resolve, on this machine or via {' / '.join(_PUBLIC_RESOLVERS)}. "
-            f"Add a record for it, then check with `dig +short {host}` — or use "
-            "--acme-challenge dns, which needs no record for the host itself.")
-
-    private = []
-    for a in addrs:
-        try:
-            ip = ipaddress.ip_address(a)
-        except ValueError:
-            continue
-        if ip.is_loopback or ip.is_private or ip.is_link_local:
-            private.append(a)
-    if private and len(private) == len(addrs):
-        return False, (f"{host} resolves only to {', '.join(private)}, which Let's "
-                       "Encrypt cannot reach. It must resolve to a public address, "
-                       "or use --acme-challenge dns.")
-
-    if _is_proxy_fronted(addrs):
-        return False, (
-            f"{host} resolves to {', '.join(addrs)}, which looks like Cloudflare's "
-            f"proxy (an orange-clouded record). Cloudflare terminates TLS there, so "
-            f"the {challenge} challenge can never reach this host and Let's Encrypt "
-            f"would validate against Cloudflare's certificate instead.\n"
-            "  Either grey-cloud the record (DNS only), or keep the proxy and use:\n"
-            "    --acme-challenge dns --acme-dns-provider cloudflare\n"
-            "  (dns-01 needs no inbound access at all — put a zone-scoped token in "
-            "~/.rc-repro/acme/dns.env as CF_DNS_API_TOKEN=...)")
-    return True, f"{host} -> {', '.join(addrs)}"
-
-
-def reachability_gaps(spec: TlsSpec, bind_host: str) -> list[str]:
-    """Why the workspace will NOT be reachable at spec.root_url, or [] if it should be.
-
-    Getting a certificate and being reachable at the name are separate things, and
-    dns-01 makes the gap easy to miss: it issues with no DNS record and no public
-    route, after which the summary advertises an https URL nothing outside this
-    machine can open.
-    """
-    gaps = []
-    if not resolves_to(spec.host):
-        gaps.append(f"{spec.host} has no DNS record")
-    if bind_host not in ("", "0.0.0.0", "::"):
-        gaps.append(f"the workspace is bound to {bind_host}")
-    elif not host_has_public_address():
-        gaps.append("this host has no public address")
-    return gaps
-
-
-def host_has_public_address() -> bool:
-    """Whether any local interface has a routable address.
-
-    Behind NAT (a lab container, a laptop) an inbound challenge cannot reach us
-    even with correct DNS. Only a hint: a port-forward can make it work anyway.
-    """
-    import ipaddress
-    try:
-        infos = socket.getaddrinfo(socket.gethostname(), None)
-    except OSError:
-        return False
-    for i in infos:
-        try:
-            ip = ipaddress.ip_address(i[4][0])
-        except ValueError:
-            continue
-        if not (ip.is_loopback or ip.is_private or ip.is_link_local):
-            return True
-    return False
-
-
 def notes(spec: TlsSpec, name: str = "<name>") -> list[str]:
     if spec.mode == MODE_LOCAL:
         return [
-            f"HTTPS (local CA): {spec.root_url}",
-            "The certificate is signed by rc-repro's own CA, so a browser warns until"
-            " you run `rc-repro trust-ca` once (then no warnings, and curl needs no -k).",
+            f"HTTPS (local certificate): {spec.root_url}",
+            "Signed by rc-repro's own CA, so a browser warns until you run"
+            " `rc-repro trust-ca` once (then no warnings, and curl needs no -k).",
             "A phone cannot use this: the cert is untrusted there and .localhost"
             " resolves to the phone itself. Use --domain for mobile.",
         ]
-    if spec.mode == MODE_ACME:
-        if spec.acme_staging:
-            # Staging roots are NOT in any trust store -- that is the whole point of
-            # staging. Claiming otherwise sent people looking for a broken workspace
-            # when the browser warning was the expected, correct outcome.
-            return [
-                f"HTTPS (Let's Encrypt STAGING): {spec.root_url}",
-                "A staging certificate is deliberately NOT trusted by browsers or the"
-                " mobile app - a warning here is the SUCCESS signal: TLS terminated"
-                " with a real Let's Encrypt-issued cert, so DNS, port 443 and the"
-                " challenge all work.",
-                "Confirm what is being served:  rc-repro tls-status --name " + name,
-                "Then switch to a trusted certificate by re-running WITHOUT"
-                " --acme-staging and with --force.",
-            ]
+    if spec.acme_staging:
+        # Staging roots are NOT in any trust store -- that is the whole point of
+        # staging. Claiming otherwise sent people looking for a broken workspace
+        # when the browser warning was the expected, correct outcome.
         return [
-            f"HTTPS (Let's Encrypt): {spec.root_url}",
-            "Publicly trusted, so the Rocket.Chat mobile app accepts it with nothing"
-            f" to install - just add {spec.root_url} in the app.",
-            "Confirm it really issued:  rc-repro tls-status --name " + name,
-            "Certificate state is kept in ~/.rc-repro/acme/ and survives `down`, so"
-            " re-creating this repro reuses the cert instead of re-issuing it.",
+            f"HTTPS (Let's Encrypt STAGING): {spec.root_url}",
+            "A staging certificate is deliberately NOT trusted - a browser warning"
+            " here is the SUCCESS signal, because TLS terminated with a real"
+            " Let's Encrypt-issued cert.",
+            "Confirm what is served:  rc-repro tls-status --name " + name,
+            "Then `rc-repro config unset acme.staging` and re-run with --force.",
         ]
     return [
-        f"HTTPS (supplied certificate): {spec.root_url}",
-        "Trusted wherever your certificate's issuer is trusted.",
-        "Confirm what is being served:  rc-repro tls-status --name " + name,
+        f"HTTPS (Let's Encrypt): {spec.root_url}",
+        "Publicly trusted, so the Rocket.Chat mobile app accepts it with nothing"
+        f" to install - just add {spec.root_url} in the app.",
+        "Traefik requests the certificate in the background. Confirm it issued:"
+        "  rc-repro tls-status --name " + name,
+        "Certificate state lives in ~/.rc-repro/acme/ and survives `down`, so"
+        " re-creating this repro reuses the cert instead of re-issuing it.",
     ]
-
