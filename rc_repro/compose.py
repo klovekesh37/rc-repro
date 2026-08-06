@@ -126,6 +126,16 @@ def _rc_environment(spec: Spec) -> dict:
     return env
 
 
+# mongod asks for 64000 open files and warns on every boot that 1024 is too low
+# ("Soft rlimits for open file descriptors too low"). Docker's default soft limit
+# IS 1024, and normal Rocket.Chat traffic survives it -- but building many
+# collections and indexes at once does not: a `rc-repro restore` hit EMFILE inside
+# WiredTiger, which panics and aborts the whole mongod rather than failing the one
+# operation. The container's hard limit is far higher, so raising the soft limit
+# costs nothing.
+_MONGO_ULIMITS = {"nofile": {"soft": 64000, "hard": 64000}}
+
+
 def _mongo_service_bitnami(spec: Spec) -> dict:
     # Bitnami auto-initiates the replica set via REPLICA_SET_MODE=primary,
     # so no separate init container is needed.
@@ -133,6 +143,7 @@ def _mongo_service_bitnami(spec: Spec) -> dict:
         "mongodb": {
             "image": f"docker.io/bitnamilegacy/mongodb:{spec.mongo_tag}",
             "restart": "always",
+            "ulimits": dict(_MONGO_ULIMITS),
             # Bitnami MongoDB images are published for amd64 only; pin the
             # platform so they run (under emulation) on Apple Silicon too.
             "platform": "linux/amd64",
@@ -175,6 +186,7 @@ def _mongo_service_official(spec: Spec) -> dict:
             "image": image,
             "user": "1001",
             "restart": "always",
+            "ulimits": dict(_MONGO_ULIMITS),
             "depends_on": {"mongodb-fix-permission": {"condition": "service_completed_successfully"}},
             "volumes": ["mongodb_data:/data/db:rw"],
             "entrypoint": ["mongod", "--replSet", "rs0", "--bind_ip_all"],

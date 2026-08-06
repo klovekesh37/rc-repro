@@ -6,12 +6,15 @@ generated docker-compose.yml and a repro.json metadata file.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -326,6 +329,168 @@ def compose_exec_capture(name: str, service: str, args: list[str],
     except (OSError, subprocess.SubprocessError):
         return 1, ""
     return r.returncode, r.stdout or ""
+
+
+def compose_exec_to_file(name: str, service: str, args: list[str], dest: "Path",
+                         timeout: float | None = None) -> tuple[int, str]:
+    """Run a command in a service, writing its RAW stdout to `dest`.
+
+    Binary-safe on purpose: `mongodump --archive` emits BSON, and the text-mode
+    decode/newline translation that compose_exec_capture applies would corrupt it
+    silently -- the dump would restore with errors nobody could trace back here.
+    Returns (returncode, stderr-as-text).
+    """
+    with open(dest, "wb") as fh:
+        try:
+            proc = subprocess.run(
+                ["docker", "compose", "exec", "-T", service, *args],
+                cwd=workspace(name), stdout=fh, stderr=subprocess.PIPE,
+                timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return 1, str(exc)
+    return proc.returncode, (proc.stderr or b"").decode("utf-8", "replace")
+
+
+def compose_exec_from_file(name: str, service: str, args: list[str], src: "Path",
+                           timeout: float | None = None) -> tuple[int, str]:
+    """Run a command in a service with `src` piped to its stdin.
+
+    The counterpart of compose_exec_to_file, for `mongorestore --archive`. Output
+    is merged so a caller has one blob to show when a restore fails.
+    """
+    with open(src, "rb") as fh:
+        try:
+            proc = subprocess.run(
+                ["docker", "compose", "exec", "-T", service, *args],
+                cwd=workspace(name), stdin=fh, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return 1, str(exc)
+    return proc.returncode, (proc.stdout or b"").decode("utf-8", "replace")
+
+
+def stop_services(name: str, services: list[str]) -> int:
+    """Stop specific services, leaving the rest of the project running.
+
+    `stop()` stops everything including Mongo -- useless for a dump, which needs
+    Mongo up and only the writers quiesced.
+    """
+    return _compose(name, "stop", *services).returncode
+
+
+def start_services(name: str, services: list[str]) -> int:
+    return _compose(name, "start", *services).returncode
+
+
+def rc_services(name: str) -> list[str]:
+    """The repro's Rocket.Chat service names, read from its compose file.
+
+    A multi-instance repro has rocketchat-1..N rather than one `rocketchat`, and
+    quiescing only the first would leave the others writing during a dump.
+    """
+    try:
+        doc = read_compose(name)
+    except (OSError, ValueError):
+        return []
+    return sorted(s for s in (doc.get("services") or {})
+                  if s == "rocketchat" or s.startswith("rocketchat-"))
+
+
+#: Per-repro reentrant thread locks. `serve` runs every job on its own thread, so
+#: thread-level exclusion is needed as well as the cross-process file lock -- flock
+#: is held per file DESCRIPTION, and two threads opening the lock file separately
+#: would each be granted it.
+_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+#: name -> reentrancy depth, per thread.
+_HELD = threading.local()
+
+
+def _held_names() -> dict[str, int]:
+    names = getattr(_HELD, "names", None)
+    if names is None:
+        names = _HELD.names = {}
+    return names
+
+
+def _thread_lock_for(name: str) -> threading.RLock:
+    with _THREAD_LOCKS_GUARD:
+        lock = _THREAD_LOCKS.get(name)
+        if lock is None:
+            lock = _THREAD_LOCKS[name] = threading.RLock()
+        return lock
+
+
+@contextlib.contextmanager
+def repro_lock(name: str, *, timeout: float = 900.0, poll: float = 0.2):
+    """Exclusive lock for mutating one repro, across threads AND processes.
+
+    Every mutating operation does read-compose -> write-compose -> `docker compose
+    up`. Two interleaving on one repro corrupts it: compose races itself and leaves
+    an orphaned container behind, which is how a repro ends up with Rocket.Chat gone
+    and a stray `<hash>_rcrepro-...` container in its place.
+
+    Two layers, because one is not enough:
+      * threading.RLock  -- `serve` runs jobs on separate threads, and flock is per
+        open file description, so two threads that each open the file would both be
+        granted it. RLock is also what makes the lock REENTRANT, which
+        `restore --new` needs: it holds the lock and then calls create_repro, which
+        takes it again on the same thread.
+      * flock            -- the CLI and `serve` are different processes acting on
+        the same repros, and a thread lock says nothing about that.
+
+    Degrades to thread-only where flock is unavailable (Windows): a hard dependency
+    would be worse than the race it prevents.
+    """
+    tlock = _thread_lock_for(name)
+    if not tlock.acquire(timeout=timeout):
+        raise TimeoutError(
+            f"another rc-repro operation has been holding {name!r} for "
+            f"over {int(timeout)}s")
+    # Reentrancy depth is tracked per THREAD, in step with the RLock's own
+    # semantics. It cannot live on the lock object: threading.RLock is a C type
+    # with no __dict__, so assigning an attribute to it raises.
+    held = _held_names()
+    reentrant = held.get(name, 0)
+    held[name] = reentrant + 1
+    try:
+        # The outermost frame on this thread already owns the file lock, and
+        # re-flocking the same path from a second descriptor would deadlock
+        # against ourselves -- which is what `restore --new` would do when it
+        # calls create_repro from inside its own lock.
+        if reentrant:
+            yield
+            return
+        try:
+            import fcntl
+        except ImportError:                              # pragma: no cover - Windows
+            yield
+            return
+        lock_dir = config.home() / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        path = lock_dir / f"{name}.lock"
+        deadline = time.monotonic() + timeout
+        with open(path, "w", encoding="utf-8") as fh:
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"another rc-repro process has been holding {name!r} for "
+                            f"over {int(timeout)}s") from None
+                    time.sleep(poll)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        if held.get(name, 0) <= 1:
+            held.pop(name, None)
+        else:
+            held[name] -= 1
+        tlock.release()
 
 
 def rm_services(name: str, services: list[str]) -> int:

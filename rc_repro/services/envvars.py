@@ -146,6 +146,15 @@ def set_env(name: str, sets: dict | None = None, unset: list[str] | None = None,
     """
     lifecycle.require_docker()
     target = lifecycle.resolve_name(name)
+    # Serialised against every other mutating operation on this repro: this does
+    # read-compose -> write-compose -> `docker compose up`, and interleaving that
+    # with a backup, an upgrade or another env change races compose against itself.
+    with runner.repro_lock(target):
+        return _set_env_locked(target, sets, unset, restart=restart, emit=emit)
+
+
+def _set_env_locked(target: str, sets: dict | None, unset: list[str] | None,
+                    *, restart: bool = True, emit: Emit = null_emit) -> dict:
     sets = dict(sets or {})
     unset = list(unset or [])
     check_names(list(sets) + unset)

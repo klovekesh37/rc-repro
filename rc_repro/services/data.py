@@ -44,6 +44,13 @@ def _scale_ok(rc: int, out: str, what: str, *, hint: str = "") -> dict:
 def run_scale(name: str, spec_str: str, emit: Emit = null_emit) -> dict:
     """Bulk-insert users/messages per a `--scale` spec (users=N,messages=N@room)."""
     target = lifecycle.resolve_name(name)
+    # Bulk prefill writes straight into Mongo; running it while a backup is dumping
+    # would put half of it in the archive.
+    with runner.repro_lock(target):
+        return _run_scale_locked(target, spec_str, emit)
+
+
+def _run_scale_locked(target: str, spec_str: str, emit: Emit = null_emit) -> dict:
     try:
         spec = scaleseed.parse_scale(spec_str)
     except ValueError as exc:

@@ -929,6 +929,174 @@ def config_import(
             f"rc-repro restart --name {m.name}")
 
 
+# --- backup / restore / upgrade -------------------------------------------------
+
+def _human_bytes(n: int) -> str:
+    from rc_repro.services.backup import _human
+    return _human(n)
+
+
+@app.command(name="backup")
+def backup_cmd(
+    name: str = typer.Option("", "--name", "-n"),
+    out: str = typer.Option("", "--out", help="write the bundle here instead of ~/.rc-repro/backups/"),
+    label: str = typer.Option("", "--label", help="a note stored in the bundle, e.g. 'before upgrade'"),
+    live: bool = typer.Option(False, "--live", help="don't stop Rocket.Chat first (faster, but the dump may be inconsistent)"),
+) -> None:
+    """Back up a repro's Rocket.Chat database into a restorable bundle.
+
+    Rocket.Chat is stopped for the dump so it is consistent, then started again;
+    MongoDB keeps running throughout and its data volume is untouched.
+
+    The bundle carries the database alongside the repro's version, preset and
+    parameters, so `rc-repro restore --new` can rebuild the whole workspace from
+    it — on this machine or somebody else's.
+    """
+    from rc_repro.services import backup as backupsvc
+    try:
+        # `note=`, not `label=`: JobManager.submit() owns the `label` keyword, so the
+        # service takes the note under a different name (see backup.create).
+        res = backupsvc.create(name, out=out, note=label, live=live, emit=_cli_emit)
+    except errors.ReproError as exc:
+        _err(str(exc))
+    m = res["manifest"]
+    ui.ok(f"✓ backed up {res['name']!r} ({m['rc_version']}) — {_human_bytes(res['bytes'])}")
+    typer.echo(f"    {res['path']}")
+    if m.get("sidecar_volumes"):
+        ui.warn("  sidecar data is NOT included: " + ", ".join(m["sidecar_volumes"]))
+    ui.hint(f"  restore it:  rc-repro restore {res['path']}")
+
+
+@app.command(name="backups")
+def backups_cmd(
+    name: str = typer.Option("", "--name", "-n", help="only bundles from this repro"),
+) -> None:
+    """List backup bundles in ~/.rc-repro/backups/, newest first."""
+    from rc_repro.services import backup as backupsvc
+    rows = backupsvc.list_backups(name)
+    if not rows:
+        ui.note("no backups yet — make one with `rc-repro backup`")
+        return
+    for r in rows:
+        if r["error"]:
+            ui.warn(f"  {Path(r['path']).name}  UNREADABLE: {r['error']}")
+            continue
+        label = f"  ({r['label']})" if r["label"] else ""
+        typer.echo(f"  {Path(r['path']).name}")
+        typer.echo(f"      {r['repro']}  RC {r['rc_version']}  "
+                   f"{_human_bytes(r['bytes'])}  {r['created_at']}{label}")
+
+
+@app.command(name="restore")
+def restore_cmd(
+    bundle: str = typer.Argument(..., help="path to a .rcbak bundle"),
+    name: str = typer.Option("", "--name", "-n", help="restore into this repro (default: the one it came from)"),
+    new: bool = typer.Option(False, "--new", help="create a fresh repro from the bundle instead of restoring into an existing one"),
+    allow_upgrade: bool = typer.Option(False, "--allow-upgrade", help="permit restoring older data into a newer workspace (Rocket.Chat will migrate it)"),
+    force: bool = typer.Option(False, "--force", help="ignore compatibility refusals"),
+) -> None:
+    """Restore a backup bundle into a repro.
+
+    Three targets:
+
+      rc-repro restore B                  in place — the repro it came from
+      rc-repro restore B --new            a fresh repro built from the bundle
+      rc-repro restore B --name other     an existing, different repro
+
+    Existing collections are DROPPED, so the result is the backup's data and not a
+    merge of the two. Downgrading (newer data into an older workspace) is refused:
+    Rocket.Chat does not migrate a database backwards.
+    """
+    from rc_repro.services import backup as backupsvc
+    try:
+        res = backupsvc.restore(bundle, name=name, new=new,
+                                allow_upgrade=allow_upgrade, force=force,
+                                emit=_cli_emit)
+    except errors.ReproError as exc:
+        _err(str(exc))
+    what = "created and restored" if res["created"] else "restored"
+    ui.ok(f"✓ {what} {res['name']!r} from {Path(res['bundle']).name} "
+          f"in {res['restore_seconds']}s")
+    if res["direction"] == "upgrade":
+        ui.warn(f"  {res['from_version']} data now runs on {res['to_version']} — "
+                "Rocket.Chat has migrated it")
+    if res.get("url"):
+        ui.hint(f"  {res['url']}")
+
+
+@app.command(name="upgrade")
+def upgrade_cmd(
+    to: str = typer.Option("", "--to", help="target Rocket.Chat version, e.g. 8.6.1"),
+    name: str = typer.Option("", "--name", "-n"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="show what would happen and stop"),
+    no_backup: bool = typer.Option(False, "--no-backup", help="skip the automatic pre-upgrade backup (no rollback will be possible)"),
+    no_rollback: bool = typer.Option(False, "--no-rollback", help="leave a failed upgrade in place instead of rolling it back"),
+    rollback: bool = typer.Option(False, "--rollback", help="undo the last upgrade from its pre-upgrade backup"),
+    bundle: str = typer.Option("", "--bundle", help="with --rollback: restore this bundle instead of the recorded one"),
+    offline: bool = typer.Option(False, "--offline", help="resolve the version from the built-in map, no network"),
+    force: bool = typer.Option(False, "--force", help="ignore refusals (downgrades, MongoDB major changes)"),
+) -> None:
+    """Upgrade a RUNNING repro to another Rocket.Chat version.
+
+    Rocket.Chat runs its database migrations on boot, so this is the honest way to
+    reproduce "it broke after we upgraded": real data, real migrations. A
+    pre-upgrade backup is taken automatically and `--rollback` restores it.
+
+    The repro has to be running — the backup needs MongoDB up, and the migrations
+    only happen when Rocket.Chat boots.
+    """
+    from rc_repro.services import upgrade as upgradesvc
+    if rollback:
+        try:
+            res = upgradesvc.rollback(name, bundle=bundle, emit=_cli_emit)
+        except errors.ReproError as exc:
+            _err(str(exc))
+        ui.ok(f"✓ {res['name']!r} rolled back to {res['rolled_back_to']}")
+        return
+
+    if not to:
+        _err("no target version given — use `--to 8.6.1` (or `--rollback` to undo)")
+    try:
+        p = upgradesvc.plan(name, to, offline=offline)
+    except errors.ReproError as exc:
+        _err(str(exc))
+
+    ui.panel(f"upgrade: {p['name']}", [
+        ("Rocket.Chat", f"{p['from_version']}  ->  {p['to_version']}"),
+        ("MongoDB", f"{p['from_mongo']}" + ("" if p["from_mongo"] == p["to_mongo"]
+                                            else f"  ->  {p['to_mongo']}")),
+        ("image", f"{p['rc_image']}:{p['to_version']}"),
+        ("source", p["source"]),
+    ])
+    for line in p["warnings"]:
+        ui.warn("  " + line)
+    if not p["allowed"]:
+        (ui.warn if force else ui.fail)("  " + p["blocked_reason"])
+        if not force:
+            ui.hint("  --force overrides this, but expect it to fail")
+            raise typer.Exit(1)
+    if dry_run:
+        ui.note("  --dry-run: nothing changed")
+        return
+
+    try:
+        res = upgradesvc.run(name, to, offline=offline, force=force,
+                             no_backup=no_backup,
+                             rollback_on_failure=not no_rollback, emit=_cli_emit)
+    except errors.ReproError as exc:
+        _err(str(exc))
+    ui.ok(f"✓ {res['name']!r} upgraded {res['from_version']} -> {res['to_version']} "
+          f"in {res['boot_seconds']}s")
+    if res["running_version"]:
+        typer.echo(f"    Rocket.Chat reports {res['running_version']}")
+    if res["migration_errors"]:
+        ui.warn(f"  {len(res['migration_errors'])} migration error(s) in the boot log:")
+        for line in res["migration_errors"]:
+            typer.echo(f"      {line}")
+    if res["backup"]:
+        ui.hint(f"  roll back:  rc-repro upgrade --rollback --name {res['name']}")
+
+
 @app.command()
 def stats(
     name: str = typer.Option("", "--name", "-n"),

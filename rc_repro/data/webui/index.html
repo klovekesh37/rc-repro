@@ -177,6 +177,29 @@
     </form>
   </dialog>
 
+  <!-- Upgrade dialog. Reachable only from a RUNNING workspace: the pre-upgrade
+       backup needs MongoDB up, and Rocket.Chat runs its migrations on boot. -->
+  <dialog id="upgrade-dialog">
+    <form id="upgrade-form" method="dialog">
+      <h2 id="upgrade-title">Upgrade</h2>
+      <p class="hint">Currently running <b id="upgrade-current">?</b>. Rocket.Chat
+        migrates its database on boot, so this is a one-way change — which is why a
+        backup is taken first.</p>
+      <label>Target version
+        <input name="to" id="upgrade-to" placeholder="8.6.1" autocomplete="off">
+      </label>
+      <p class="hint" id="upgrade-plan"></p>
+      <div class="checks">
+        <label><input type="checkbox" id="upgrade-nobackup"> Skip the pre-upgrade
+          backup (nothing to roll back to)</label>
+      </div>
+      <menu>
+        <button type="button" id="upgrade-cancel" class="btn">Cancel</button>
+        <button type="button" class="btn primary" id="upgrade-go" disabled>Upgrade</button>
+      </menu>
+    </form>
+  </dialog>
+
   <!-- Config-import dialog -->
   <dialog id="import-dialog">
     <form id="import-form" method="dialog">

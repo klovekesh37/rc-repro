@@ -28,7 +28,15 @@ def _rc_services_in(doc: dict) -> list[str]:
 
 def attach(name: str, emit: Emit = null_emit) -> dict:
     lifecycle.require_docker()
-    m = runner.read_meta(lifecycle.resolve_name(name))
+    target = lifecycle.resolve_name(name)
+    # Same read-compose -> write-compose -> `docker compose up` shape as env and
+    # backup, so it takes the same per-repro lock.
+    with runner.repro_lock(target):
+        return _attach_locked(target, emit)
+
+
+def _attach_locked(target: str, emit: Emit = null_emit) -> dict:
+    m = runner.read_meta(target)
     doc = runner.read_compose(m.name)
     lifecycle.check_monitor_ports(exclude=m.name)   # raises ConflictError on a taken port
     try:
@@ -58,7 +66,15 @@ def attach(name: str, emit: Emit = null_emit) -> dict:
 
 def detach(name: str, emit: Emit = null_emit) -> dict:
     lifecycle.require_docker()
-    m = runner.read_meta(lifecycle.resolve_name(name))
+    target = lifecycle.resolve_name(name)
+    # Same read-compose -> write-compose -> `docker compose up` shape as env and
+    # backup, so it takes the same per-repro lock.
+    with runner.repro_lock(target):
+        return _detach_locked(target, emit)
+
+
+def _detach_locked(target: str, emit: Emit = null_emit) -> dict:
+    m = runner.read_meta(target)
     doc = runner.read_compose(m.name)
     rc_ok = False
     try:

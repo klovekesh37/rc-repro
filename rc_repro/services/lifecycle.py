@@ -22,12 +22,22 @@ from rc_repro.services.events import Emit, info, null_emit, warn
 _NAME_RE = re.compile(r"[^a-z0-9-]+")
 # What sanitize() can produce, and therefore the only shape a real repro has.
 _VALID_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# The name becomes a directory entry (255 bytes on ext4/APFS) and a compose project
+# name, and the generated container names add `rcrepro-<name>-<service>-1` on top.
+# Unbounded, it passed validation and then raised ENAMETOOLONG from the filesystem
+# -- a 500 from the web API and a raw traceback from the CLI. 64 leaves ample room
+# for every suffix rc-repro appends and is longer than any real repro name.
+NAME_MAX = 64
 
 
 def _require_valid_name(name: str) -> None:
     if not _VALID_NAME_RE.match(name):
         raise ValidationError(
             f"invalid repro name {name!r} (lowercase letters, digits and '-' only)")
+    if len(name) > NAME_MAX:
+        raise ValidationError(
+            f"repro name is {len(name)} characters; the limit is {NAME_MAX} "
+            "(it becomes a directory and a set of container names)")
 
 
 # --- naming (pure) ------------------------------------------------------------
@@ -391,7 +401,23 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
 
     `stream_output=True` streams docker's line output through `emit` (for the web
     job log); False leaves docker's own progress on the terminal (CLI default).
+
+    Serialised per repro, like every other mutating operation: `up --force` racing
+    a backup or an env change makes compose reconcile against itself. The name is
+    derived here rather than inside, because the lock needs it before any work
+    starts -- it depends only on the request, so it is cheap to compute twice.
     """
+    name = sanitize(req.name) if req.name else derive_name(req.version, req.preset)
+    if not name:
+        raise ValidationError(
+            f"name {req.name!r} contains no usable characters (want a-z, 0-9, '-')")
+    _require_valid_name(name)
+    with runner.repro_lock(name):
+        return _create_repro_locked(req, emit, stream_output=stream_output)
+
+
+def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
+                         stream_output: bool = False) -> dict:
     require_docker()
     cfg = config.load_config()
 
@@ -418,6 +444,10 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
     repro_name = sanitize(req.name) if req.name else derive_name(req.version, req.preset)
     if not repro_name:
         raise ValidationError(f"name {req.name!r} contains no usable characters (want a-z, 0-9, '-')")
+    # sanitize() fixes the CHARACTERS but not the length, and the first thing below
+    # is a stat on the derived path -- which raises ENAMETOOLONG rather than
+    # returning False for an over-long name.
+    _require_valid_name(repro_name)
     if req.port and not (1024 <= req.port <= 65535):
         raise ValidationError(f"--port {req.port} is out of range (want 1024-65535)")
 
@@ -489,6 +519,11 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         meta.extra["sidecar_ports"] = pre.ports
     if env_overrides:
         meta.extra["env"] = env_overrides
+    if req.params:
+        # Recorded so a repro can be rebuilt exactly: `backup` copies these into its
+        # manifest, and `restore --new` would otherwise recreate an s3_minio repro
+        # with the DEFAULT bucket rather than the one whose data it is loading.
+        meta.extra["params"] = dict(req.params)
     files = list(pre.files)
     if tlsspec:
         from rc_repro import tls as tlsmod

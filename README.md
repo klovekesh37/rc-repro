@@ -22,7 +22,7 @@ Prefer a UI? `rc-repro serve` opens a local web dashboard for everything below
 - [Scenarios](#scenarios) — presets (LDAP, SAML, email, …) & monitoring
 - [HTTPS](#https) — local CA, Let's Encrypt, or your own certificate
 - [Environment variables](#environment-variables) — `rc-repro env`, change settings on a running repro
-- [Data & performance](#data--performance) — sample data, data-scale prefill, config import, benchmarking, load testing
+- [Data & performance](#data--performance) — sample data, data-scale prefill, config import, backup/restore, upgrade testing, benchmarking, load testing
 - [API testing](#api-testing)
 - [Reference](#reference) — command list, version resolution, state, development
 
@@ -623,6 +623,66 @@ anything. Some settings need `rc-repro restart` to fully take effect; a few
 Enterprise/module-gated settings will be reported as rejected on an unlicensed
 repro (they apply once a license is present).
 
+## Backup & restore (`backup`, `restore`)
+
+A backup is a **bundle**, not a bare dump: the Rocket.Chat database plus the
+version, preset and parameters that produced it. That is what lets a single file
+rebuild a whole workspace — on your machine or a colleague's.
+
+```bash
+rc-repro backup --label "before upgrade"     # -> ~/.rc-repro/backups/<name>-<stamp>.rcbak
+rc-repro backups                             # what you have, newest first
+rc-repro restore <bundle>                    # in place — same repro
+rc-repro restore <bundle> --new              # build a fresh workspace from it
+rc-repro restore <bundle> --name other       # into a different existing repro
+```
+
+Built on `mongodump --archive` / `mongorestore --archive` — the procedure the
+[official docs](https://docs.rocket.chat/docs/deploy-with-docker-docker-compose#back-up-and-restore-mongodb-data-on-docker)
+describe — with some deliberate differences:
+
+- **Rocket.Chat is stopped** for both operations (MongoDB keeps running).
+  `mongodump` is not point-in-time consistent across collections, so a dump taken
+  while RC writes can catch a half-finished state. `--live` skips this.
+- **The target database is dropped first.** `mongorestore --drop` alone only drops
+  the collections it is about to restore, so anything present in the target but
+  absent from the bundle would survive and leave you with a hybrid.
+- **`--db` and `--gzip`**, so `admin`/`local` never travel and bundles stay small.
+
+Compatibility is checked before anything is touched: restoring **newer data into
+an older workspace is refused** (Rocket.Chat does not migrate a database
+backwards), and older-into-newer needs `--allow-upgrade` because RC will migrate
+it on boot.
+
+**Not included:** sidecar data — MinIO objects, Keycloak realms, LDAP entries,
+Mailpit mail. Restoring an `s3_minio` bundle gives you a database that references
+uploads whose objects are gone; the restore says so.
+
+## Upgrade testing (`upgrade`)
+
+Rocket.Chat runs its database migrations on boot, so "it broke after we upgraded"
+is only reproducible with real data going to a real new version:
+
+```bash
+rc-repro upgrade --to 8.6.1 --dry-run    # what would happen
+rc-repro upgrade --to 8.6.1              # backs up first, then upgrades
+rc-repro upgrade --rollback              # undo, from that automatic backup
+```
+
+The repro has to be **running** — the pre-upgrade backup needs MongoDB up, and the
+migrations only happen when Rocket.Chat boots. A stopped repro is refused with the
+command to start it. The GUI applies the same rule: Upgrade only appears on a
+running workspace.
+
+A pre-upgrade backup is taken automatically (`--no-backup` opts out, and then
+there is nothing to roll back to). If the upgrade fails, it is rolled back to the
+previous version and data unless you pass `--no-rollback`.
+
+**Refused rather than attempted:** an upgrade that also needs a new MongoDB
+*major* (e.g. RC 8.2+ moving you to MongoDB 8.0). Majors have to be stepped one at
+a time with a `featureCompatibilityVersion` bump between each; doing that in one
+move is how data is lost, so rc-repro names the path and stops.
+
 ## Version comparison (`benchmark`)
 
 Boot several versions, run the **identical** seed workload against each, and
@@ -819,6 +879,9 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `token` / `api` / `pat` | REST auth + calls |
 | `seed` | populate a repro with sample users/channels/messages (`--stats` for CPU/RAM cost; `--scale` for bulk Mongo data-scale prefill) |
 | `config-import` | apply a customer's exported settings (support-dump `*-settings.json`) to a repro; `--dry-run`, `--only` |
+| `backup` / `backups` | dump a repro's database into a restorable bundle; list the bundles you have |
+| `restore` | load a bundle back — in place, into another repro, or `--new` to rebuild the whole workspace |
+| `upgrade` | move a **running** repro to another RC version and let it migrate; `--rollback` undoes it |
 | `stats` | sample a repro's container CPU/RAM (`--for N`, or `--watch` live) |
 | `benchmark` | boot several versions, run identical seed workload, compare (regression check) |
 | `loadtest` | drive concurrent HTTP load with k6 as real seeded users; per-step latency, SLO gate, `--save`/`--compare` baselines, `--spike`, `--live` |

@@ -278,7 +278,7 @@ function renderDetail() {
       : el("span", { class: "pill " + stateClass(d.state) }, d.state),
     el("button", { class: "close", onclick: closeDetail }, "×"));
   const tabs = el("div", { class: "tabs" });
-  for (const t of ["overview", "logs", "containers", "env vars"]) {
+  for (const t of ["overview", "logs", "containers", "env vars", "backups"]) {
     const key = t === "env vars" ? "env" : t;
     tabs.append(el("button", { class: "tab" + (dstate.tab === key ? " active" : ""), onclick: () => switchTab(key) },
       t.charAt(0).toUpperCase() + t.slice(1)));
@@ -307,6 +307,16 @@ function renderDetail() {
     actions.append(dBtn("API call", () => openCall(d.name), "",
       "Send an authenticated REST call to this workspace and see the response "
       + "— the same request `rc-repro api` makes."));
+    actions.append(dBtn("Back up", () => doBackup(d.name), "",
+      "Dump this workspace's database into a restorable bundle. Rocket.Chat is "
+      + "stopped for the dump and started again; MongoDB keeps its data."));
+    // Only on a RUNNING workspace: the pre-upgrade backup needs MongoDB up, and
+    // Rocket.Chat's migrations only run when it boots. Offering this on a stopped
+    // repro would be offering an action that cannot work. The server agrees --
+    // upgrade.require_running() refuses it there too.
+    actions.append(dBtn("Upgrade", () => openUpgrade(d.name, d.rc_version), "",
+      "Move this workspace to another Rocket.Chat version and let it run its "
+      + "migrations. A pre-upgrade backup is taken automatically."));
     // `up --wait` only proves RC booted (it polls the internal http port). Traefik
     // gets its certificate in the background afterwards and falls back to a dummy
     // when ACME fails, so HTTPS needs its own check.
@@ -471,7 +481,179 @@ function renderTab() {
                   kind.value === "setting" ? payload : {}, []);
     } }, "Set + restart");
     body.append(el("div", { class: "row2" }, kind, key, val, add), why);
+  } else if (dstate.tab === "backups") {
+    renderBackups(body, d);
   }
+}
+
+// ---- backup / restore / upgrade ------------------------------------------------
+// A backup is a bundle: the database PLUS the version, preset and parameters that
+// produced it. That is what lets "Restore as new" rebuild a whole workspace from
+// one file rather than needing a matching repro to already exist.
+
+const fmtBytes = (n) => {
+  if (!n) return "—";
+  const u = ["B", "KB", "MB", "GB"];
+  let i = 0, v = Number(n);
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v.toFixed(0) : v.toFixed(1)) + " " + u[i];
+};
+const shortName = (p) => String(p || "").split("/").pop();
+
+async function renderBackups(body, d) {
+  body.append(el("p", { class: "hint" },
+    "Backups hold this workspace's Rocket.Chat database plus the version and preset "
+    + "that produced it. Sidecar data (uploads, IdP state) is not included."));
+  const bar = el("div", { class: "row2" },
+    el("button", { class: "btn primary", onclick: () => doBackup(d.name) }, "Back up now"));
+  body.append(bar);
+  const list = el("div", {}, el("p", { class: "empty" }, "loading…"));
+  body.append(list);
+
+  let rows = [];
+  try {
+    rows = (await api(`/api/backups?name=${encodeURIComponent(d.name)}`)).backups || [];
+  } catch (e) {
+    list.innerHTML = ""; list.append(el("p", { class: "empty" }, String(e.message || e)));
+    return;
+  }
+  list.innerHTML = "";
+  if (!rows.length) {
+    list.append(el("p", { class: "empty" }, "No backups yet for this workspace."));
+    return;
+  }
+  const t = el("table", { class: "dtable" }, el("tr", {},
+    el("th", {}, "bundle"), el("th", {}, "from"), el("th", {}, "size"), el("th", {}, "")));
+  for (const b of rows) {
+    if (b.error) {
+      t.append(el("tr", {}, el("td", {}, shortName(b.path)),
+        el("td", { class: "v bad", colspan: "3" }, "unreadable: " + b.error)));
+      continue;
+    }
+    const label = el("td", {}, shortName(b.path));
+    if (b.label) label.append(el("span", { class: "pill small" }, b.label));
+    t.append(el("tr", {}, label,
+      el("td", { class: "v" }, `RC ${b.rc_version}`),
+      el("td", { class: "v" }, fmtBytes(b.bytes)),
+      el("td", {},
+        el("button", { class: "btn small primary", onclick: () => doRestore(b, d.name) }, "restore"),
+        el("button", { class: "btn small", onclick: () => doRestore(b, "", true) }, "as new"),
+        el("button", { class: "btn small danger", onclick: () => doDeleteBackup(b) }, "delete"))));
+  }
+  t.append();
+  list.append(t);
+}
+
+async function doBackup(name) {
+  const note = prompt(`Back up ${name}\n\nOptional note stored in the bundle:`, "");
+  if (note === null) return;
+  try {
+    const { job_id } = await api(`/api/repros/${encodeURIComponent(name)}/backup`,
+      { method: "POST", body: JSON.stringify({ label: note }) });
+    streamJob(job_id, `Backing up ${name}`, (res) => {
+      toast(`backed up to ${shortName(res && res.path)}`, "ok");
+    });
+  } catch (e) { toast(e.message); }
+}
+
+async function doRestore(b, into, asNew = false) {
+  // Ask the SERVER whether this is allowed before offering the button's action:
+  // a downgrade is refused, and an older-into-newer restore is a migration the
+  // user has to opt into. Learning that after a job started is too late.
+  let verdict = null;
+  if (!asNew && into) {
+    try {
+      verdict = (await api("/api/backups/compatibility", {
+        method: "POST", body: JSON.stringify({ bundle: b.path, name: into }),
+      })).compatibility;
+    } catch (e) { toast(String(e.message || e), "bad"); return; }
+    if (verdict && !verdict.allowed) { toast(verdict.blocked_reason, "bad"); return; }
+  }
+  const lines = [];
+  if (asNew) {
+    lines.push(`Create a NEW workspace from ${shortName(b.path)} (RC ${b.rc_version}).`);
+  } else {
+    lines.push(`Restore ${shortName(b.path)} into ${into}.`,
+      "", "Existing collections are DROPPED — this replaces the data, it does not merge.");
+  }
+  for (const w of ((verdict && verdict.warnings) || [])) lines.push("", "⚠ " + w);
+  if (!confirm(lines.join("\n"))) return;
+  try {
+    const { job_id } = await api("/api/restore", {
+      method: "POST",
+      body: JSON.stringify({
+        bundle: b.path, name: asNew ? "" : into, new: asNew,
+        allow_upgrade: !!(verdict && verdict.requires_flag === "allow_upgrade"),
+      }),
+    });
+    streamJob(job_id, asNew ? `Restoring ${shortName(b.path)} as a new workspace`
+                            : `Restoring ${shortName(b.path)} into ${into}`,
+      (res) => { toast(`restored ${(res && res.name) || ""}`, "ok"); refresh(); });
+  } catch (e) { toast(e.message); }
+}
+
+async function doDeleteBackup(b) {
+  if (!confirm(`Delete ${shortName(b.path)}?\n\nThis cannot be undone.`)) return;
+  try {
+    await api(`/api/backups?path=${encodeURIComponent(b.path)}`, { method: "DELETE" });
+    toast("backup deleted", "ok");
+    renderTab();
+  } catch (e) { toast(String(e.message || e), "bad"); }
+}
+
+let UPGRADE_TARGET = "";
+function openUpgrade(name, current) {
+  UPGRADE_TARGET = name;
+  $("#upgrade-title").textContent = `Upgrade: ${name}`;
+  $("#upgrade-current").textContent = current || "?";
+  $("#upgrade-to").value = "";
+  $("#upgrade-plan").textContent = "";
+  $("#upgrade-plan").className = "hint";
+  $("#upgrade-go").disabled = true;
+  $("#upgrade-dialog").showModal();
+}
+
+async function checkUpgradePlan() {
+  const to = $("#upgrade-to").value.trim();
+  const out = $("#upgrade-plan"), go = $("#upgrade-go");
+  go.disabled = true;
+  if (!to) { out.textContent = ""; out.className = "hint"; return; }
+  out.textContent = "checking…"; out.className = "hint";
+  try {
+    const s = await api(`/api/repros/${encodeURIComponent(UPGRADE_TARGET)}/upgrade`
+      + `?to=${encodeURIComponent(to)}`);
+    if (!s.can_upgrade) { out.textContent = s.reason; out.className = "hint bad"; return; }
+    const p = s.plan || {};
+    if (!p.allowed) { out.textContent = p.blocked_reason; out.className = "hint bad"; return; }
+    const bits = [`${p.from_version} → ${p.to_version}`,
+                  `MongoDB ${p.from_mongo}` + (p.from_mongo === p.to_mongo ? "" : ` → ${p.to_mongo}`)];
+    out.textContent = bits.join(" · ") + (p.warnings || []).map((w) => "\n⚠ " + w).join("");
+    out.className = (p.warnings || []).length ? "hint warn" : "hint ok";
+    go.disabled = false;
+  } catch (e) {
+    out.textContent = String(e.message || e); out.className = "hint bad";
+  }
+}
+
+async function submitUpgrade() {
+  const to = $("#upgrade-to").value.trim();
+  const noBackup = $("#upgrade-nobackup").checked;
+  const name = UPGRADE_TARGET;
+  $("#upgrade-dialog").close();
+  if (noBackup && !confirm(
+    "Without a pre-upgrade backup there is nothing to roll back to if the "
+    + "migrations fail.\n\nContinue?")) return;
+  try {
+    const { job_id } = await api(`/api/repros/${encodeURIComponent(name)}/upgrade`,
+      { method: "POST", body: JSON.stringify({ to, no_backup: noBackup }) });
+    streamJob(job_id, `Upgrading ${name} to ${to}`, (res) => {
+      const errs = (res && res.migration_errors) || [];
+      toast(errs.length
+        ? `upgraded to ${res.to_version} with ${errs.length} migration error(s)`
+        : `upgraded to ${(res && res.to_version) || to}`, errs.length ? "warn" : "ok");
+      refresh();
+    });
+  } catch (e) { toast(e.message); }
 }
 
 // ---- env vars ---------------------------------------------------------------
@@ -1551,6 +1733,13 @@ $("#seed-mode").addEventListener("change", syncSeedMode);
 $("#seed-cancel").addEventListener("click", () => $("#seed-dialog").close());
 $("#seed-clear").addEventListener("click", clearScale);
 $("#seed-submit").addEventListener("click", (e) => { e.preventDefault(); submitSeed(); });
+$("#upgrade-cancel").addEventListener("click", () => $("#upgrade-dialog").close());
+// Resolved server-side as you type: the version -> MongoDB pairing and the
+// downgrade/major refusals are the backend's to decide, and finding out after a
+// job started is too late. `change` too, so paste-and-blur is not missed.
+$("#upgrade-to").addEventListener("change", checkUpgradePlan);
+$("#upgrade-to").addEventListener("blur", checkUpgradePlan);
+$("#upgrade-go").addEventListener("click", (e) => { e.preventDefault(); submitUpgrade(); });
 $("#import-cancel").addEventListener("click", () => $("#import-dialog").close());
 $("#import-preview").addEventListener("click", (e) => { e.preventDefault(); previewImport(); });
 $("#import-apply").addEventListener("click", applyImport);

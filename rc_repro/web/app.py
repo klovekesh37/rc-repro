@@ -566,6 +566,98 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
                           restart=bool(body.get("restart", True)), label=target)
         return {"job_id": job.id}
 
+    # --- backup / restore / upgrade -------------------------------------------
+    @app.post("/api/repros/{name}/backup")
+    def backup_create(name: str, body: dict = Body(default={})):
+        """Dump the repro's database into a bundle. A job: minutes on a seeded repro."""
+        from rc_repro.services import backup as backupsvc
+        target = lc.resolve_name(name)
+        job = jobs.submit("backup", backupsvc.create, target, label=target,
+                          out=str(body.get("out") or ""),
+                          note=str(body.get("label") or ""),
+                          live=bool(body.get("live", False)))
+        return {"job_id": job.id}
+
+    @app.get("/api/backups")
+    def backups_list(name: str = ""):
+        from rc_repro.services import backup as backupsvc
+        return {"backups": backupsvc.list_backups(name)}
+
+    @app.delete("/api/backups")
+    def backup_delete(path: str):
+        from rc_repro.services import backup as backupsvc
+        return backupsvc.delete(path)
+
+    @app.post("/api/backups/compatibility")
+    def backup_compatibility(body: dict = Body(...)):
+        """Whether a bundle may be restored into a repro — asked BEFORE committing.
+
+        The restore dialog enables its button from this, so a user learns that a
+        downgrade is refused while choosing, not after starting a job.
+        """
+        from rc_repro.services import backup as backupsvc
+        bundle = str(body.get("bundle") or "")
+        if not bundle:
+            raise ValidationError("no bundle given")
+        manifest = backupsvc.read_manifest(bundle)
+        target = str(body.get("name") or "")
+        if not target:
+            return {"manifest": manifest, "compatibility": None}
+        meta = runner.read_meta(lc.resolve_name(target))
+        return {"manifest": manifest,
+                "compatibility": backupsvc.compatibility(manifest, meta)}
+
+    @app.post("/api/restore")
+    def restore(body: dict = Body(...)):
+        from rc_repro.services import backup as backupsvc
+        bundle = str(body.get("bundle") or "")
+        if not bundle:
+            raise ValidationError("no bundle given")
+        job = jobs.submit("restore", backupsvc.restore, bundle,
+                          name=str(body.get("name") or ""),
+                          new=bool(body.get("new", False)),
+                          allow_upgrade=bool(body.get("allow_upgrade", False)),
+                          force=bool(body.get("force", False)),
+                          label=str(body.get("name") or Path(bundle).name))
+        return {"job_id": job.id}
+
+    @app.get("/api/repros/{name}/upgrade")
+    def upgrade_state(name: str, to: str = "", offline: bool = False):
+        """Whether Upgrade may be offered, and what a given target would do.
+
+        Without `to` this is just the gate: the GUI renders the action only for a
+        RUNNING workspace, because the pre-upgrade backup needs MongoDB up and the
+        migrations only run when Rocket.Chat boots.
+        """
+        from rc_repro.services import upgrade as upgradesvc
+        state = upgradesvc.can_upgrade(name)
+        if to and state["can_upgrade"]:
+            state["plan"] = upgradesvc.plan(name, to, offline=offline)
+        return state
+
+    @app.post("/api/repros/{name}/upgrade")
+    def upgrade_run(name: str, body: dict = Body(...)):
+        from rc_repro.services import upgrade as upgradesvc
+        target = lc.resolve_name(name)
+        to = str(body.get("to") or "")
+        if not to:
+            raise ValidationError("no target version given, e.g. {\"to\": \"8.6.1\"}")
+        job = jobs.submit("upgrade", upgradesvc.run, target, to,
+                          offline=bool(body.get("offline", False)),
+                          force=bool(body.get("force", False)),
+                          no_backup=bool(body.get("no_backup", False)),
+                          rollback_on_failure=bool(body.get("rollback_on_failure", True)),
+                          label=target)
+        return {"job_id": job.id}
+
+    @app.post("/api/repros/{name}/upgrade/rollback")
+    def upgrade_rollback(name: str, body: dict = Body(default={})):
+        from rc_repro.services import upgrade as upgradesvc
+        target = lc.resolve_name(name)
+        job = jobs.submit("rollback", upgradesvc.rollback, target,
+                          bundle=str(body.get("bundle") or ""), label=target)
+        return {"job_id": job.id}
+
     @app.get("/api/repros/{name}/tls")
     def tls_state(name: str):
         """What the repro is ACTUALLY serving over TLS — the GUI's `tls-status`.
