@@ -1531,8 +1531,16 @@ function reopenJob(j) { streamJob(j.id, jobTitle(j), JOB_RESULT_RENDERER[j.kind]
 
 // ---- create dialog ----------------------------------------------------------
 let PRESETS = [];
+let ACME_EMAIL_REMEMBERED = false;
+
 async function openCreate() {
   try { PRESETS = (await api("/api/presets")).presets; } catch (e) { toast(e.message); return; }
+  // Whether `config set acme.email` has been run. The email field is optional only
+  // if it has -- and the GUI cannot set it, so a first-time user must be told to
+  // type one rather than discovering it from a failed job.
+  try { ACME_EMAIL_REMEMBERED = (await api("/api/settings")).acme_email_remembered; }
+  catch (_) { ACME_EMAIL_REMEMBERED = false; }
+  syncHttpsFields();
   const sel = $("#preset-select");
   sel.innerHTML = "";
   for (const p of PRESETS) sel.append(el("option", { value: p.name }, p.name + (p.requires_license ? " (license)" : "")));
@@ -1613,6 +1621,13 @@ function syncHttpsFields() {
   const mode = $("#https-mode").value;
   $("#https-mode-hint").textContent = HTTPS_MODE_HINT[mode] || "";
   for (const el of document.querySelectorAll(".https-acme")) el.hidden = mode !== "acme";
+  const email = $("#create-form") && $("#create-form").acme_email;
+  if (email) {
+    email.required = mode === "acme" && !ACME_EMAIL_REMEMBERED;
+    email.placeholder = ACME_EMAIL_REMEMBERED
+      ? "remembered — leave blank to reuse it"
+      : "you@example.com";
+  }
 }
 
 function applyHttpsToRequest(f, req) {
@@ -1621,6 +1636,10 @@ function applyHttpsToRequest(f, req) {
   const val = (k) => (f[k] && f[k].value.trim()) || "";
   if (mode === "local") { req.https = true; return true; }
   if (!val("domain")) { toast("HTTPS: a domain is required for Let's Encrypt"); return false; }
+  if (!val("acme_email") && !ACME_EMAIL_REMEMBERED) {
+    toast("HTTPS: a contact email is required for Let's Encrypt");
+    return false;
+  }
   req.domain = val("domain");
   // The email may be blank when it is remembered in config. Everything else --
   // the challenge, the port, whether to publish publicly -- is derived server-side,

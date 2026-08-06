@@ -181,6 +181,18 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
     def describe(name: str):
         return lc.describe(name)
 
+    @app.get("/api/settings")
+    def settings():
+        """Remembered settings the create dialog needs to behave correctly.
+
+        Only whether a Let's Encrypt contact email exists, never the address: the
+        form's email field said "leave blank, it is remembered", which is true for
+        someone who ran `rc-repro config set acme.email` and false for everyone
+        else -- and the GUI has no way to set it. A blank field then produced a job
+        that failed on a required value the form had called optional.
+        """
+        return {"acme_email_remembered": bool(config.load_config().get("acme_email"))}
+
     @app.get("/api/presets")
     def list_presets():
         return {"presets": [

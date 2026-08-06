@@ -870,3 +870,27 @@ def test_state_rejects_a_non_string_action(monkeypatch):
     for bad in ({}, [], 5, None):
         r = client().post("/api/repros/x/state", headers=H, json={"action": bad})
         assert r.status_code == 400, f"{bad!r} gave {r.status_code}"
+
+
+def test_settings_says_whether_an_email_is_remembered_without_leaking_it(monkeypatch,
+                                                                        tmp_path):
+    """The create dialog's email field is optional only if one is remembered.
+
+    The placeholder used to say "leave blank, it is remembered" -- true for someone
+    who ran `rc-repro config set acme.email`, false for everyone else, and the GUI
+    has no way to set it. A blank field then produced a job that failed on a value
+    the form had called optional.
+    """
+    from rc_repro import config as cfgmod
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    c = client()
+    assert c.get("/api/settings", headers=H).json() == {"acme_email_remembered": False}
+
+    cfgmod.update_config(lambda cfg: cfg.__setitem__("acme_email", "ops@rocket.chat"))
+    r = c.get("/api/settings", headers=H)
+    assert r.json() == {"acme_email_remembered": True}
+    assert "ops@rocket.chat" not in r.text, "the address itself must never be returned"
+
+
+def test_settings_needs_a_token():
+    assert client().get("/api/settings").status_code == 401
