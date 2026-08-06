@@ -533,26 +533,38 @@ function logRow(e) {
     el("span", { class: "ls" }, e.service || ""),
     el("span", { class: "lm" }, e.msg));
 }
+// The service filter's options, rebuilt from whatever services the buffer has seen.
+// Its own function because it has TWO callers: a full re-render, and each arriving
+// log line. It used to live only inside renderLogList(), which the WebSocket handler
+// never calls -- it appends rows straight to the DOM to avoid re-rendering the whole
+// list per line. So the dropdown stayed on "all services" no matter how many
+// services were streaming, and only filled in once something ELSE forced a
+// re-render: changing the level, typing in search, or toggling follow.
+function refreshServiceOptions() {
+  const sel = $("#log-svc"); if (!sel) return;
+  const svcs = [...new Set(logv.buf.map((e) => e.service).filter(Boolean))].sort();
+  // Nothing to do when the options already match; this runs per log line.
+  const shown = [...sel.options].map((o) => o.value).filter(Boolean);
+  if (shown.length === svcs.length && shown.every((s, i) => s === svcs[i])) return;
+  const cur = logv.svc;
+  // Built with el() rather than an innerHTML template: a "service" is just the
+  // text before the first `|` of a container log line (parseLogLine), so it is
+  // attacker-influenced content and must never be parsed as markup.
+  sel.innerHTML = "";
+  sel.append(el("option", { value: "" }, "all services"));
+  for (const s of svcs) sel.append(el("option", { value: s }, s));
+  // A service that has aged out of the buffer shows "all services", as the
+  // previous `selected`-attribute build did (setting .value to a missing
+  // option would instead blank the select).
+  if (!svcs.includes(cur)) logv.svc = "";   // else passes() filters to permanent empty
+  sel.value = logv.svc;
+}
+
 function renderLogList() {
   const box = $("#logview"); if (!box) return;
   box.innerHTML = "";
   for (const e of logv.buf) if (passes(e)) box.append(logRow(e));
-  // refresh service dropdown options
-  const sel = $("#log-svc"); if (sel) {
-    const svcs = [...new Set(logv.buf.map((e) => e.service).filter(Boolean))].sort();
-    const cur = logv.svc;
-    // Built with el() rather than an innerHTML template: a "service" is just the
-    // text before the first `|` of a container log line (parseLogLine), so it is
-    // attacker-influenced content and must never be parsed as markup.
-    sel.innerHTML = "";
-    sel.append(el("option", { value: "" }, "all services"));
-    for (const s of svcs) sel.append(el("option", { value: s }, s));
-    // A service that has aged out of the buffer shows "all services", as the
-    // previous `selected`-attribute build did (setting .value to a missing
-    // option would instead blank the select).
-    if (!svcs.includes(cur)) logv.svc = "";   // else passes() filters to permanent empty
-    sel.value = logv.svc;
-  }
+  refreshServiceOptions();
   if (logv.follow) box.scrollTop = box.scrollHeight;
 }
 function renderLogs(body, d) {
@@ -583,6 +595,10 @@ function renderLogs(body, d) {
     const e = parseLogLine(m.data);
     logv.buf.push(e);
     if (logv.buf.length > LOG_MAX) logv.buf.shift();
+    // OUTSIDE the passes() check below, deliberately: a service that only logs at
+    // info still has to appear in the filter while the level is set to error, or
+    // you cannot select the service whose errors you are looking for.
+    refreshServiceOptions();
     if (passes(e)) {
       const b = $("#logview");
       b.append(logRow(e));

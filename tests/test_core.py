@@ -1687,6 +1687,40 @@ def test_webui_hidden_toggles_actually_hide():
     assert not missing, f"app.js toggles .hidden on id(s) not in index.html: {missing}"
 
 
+def test_webui_log_service_filter_is_refreshed_by_the_stream():
+    """The service dropdown must fill as log lines arrive.
+
+    It is populated only by refreshServiceOptions(). The WebSocket handler appends
+    rows straight to the DOM rather than re-rendering the list per line, so if it
+    does not call that itself the dropdown stays on "all services" until something
+    ELSE forces a full re-render -- changing the level, searching, toggling follow.
+    That was the bug: the filter appeared empty until you touched another control.
+
+    The call must also sit OUTSIDE the passes() check, or a service that only logs
+    below the current level never becomes selectable -- exactly the service whose
+    errors you are hunting when you set the filter to error+.
+    """
+    from importlib import resources
+    js = resources.files("rc_repro").joinpath("data", "webui", "app.js").read_text(
+        encoding="utf-8")
+
+    assert "function refreshServiceOptions(" in js, \
+        "expected the service-option builder to be callable on its own"
+
+    handler = js[js.index("ws.onmessage"):]
+    handler = handler[:handler.index("ws.onclose")]
+    assert "refreshServiceOptions()" in handler, \
+        "the log stream handler never refreshes the service filter"
+    # Before the `if (passes(e))` guard, so a below-threshold line still registers
+    # its service.
+    assert handler.index("refreshServiceOptions()") < handler.index("if (passes(e))"), \
+        "refreshServiceOptions() must run for every line, not only displayed ones"
+    # And the full re-render path keeps using it, so the two cannot drift apart.
+    render = js[js.index("function renderLogList("):]
+    render = render[:render.index("\n}")]
+    assert "refreshServiceOptions()" in render
+
+
 def test_webui_busy_state_is_styled_and_labelled():
     """Every action that shows a spinner must have a verb, and the classes app.js
     emits for it must exist in app.css.
