@@ -2240,6 +2240,7 @@ def serve(
     port: int = typer.Option(7070, "--port", help="host port for the web GUI"),
     domain: str = typer.Option("", "--domain", help="serve the GUI over HTTPS on this hostname, via rc-repro's shared front door"),
     email: str = typer.Option("", "--email", help="contact address for the Let's Encrypt certificate (remembered after the first use)"),
+    no_domain: bool = typer.Option(False, "--no-domain", help="ignore the domain this box was set up with and serve locally"),
     # Default resolved below, not here: with --domain the GUI should bind the
     # Docker bridge, and an empty default is the only way to tell "the user chose
     # 127.0.0.1" from "the user chose nothing".
@@ -2285,6 +2286,16 @@ def serve(
     basic = usersvc.any_users()
 
     door: "edgesvc.Edge | None" = None
+    # Reuse the name this box was already set up with. `serve --domain X --email Y`
+    # records both, and without this you had to retype them on every restart --
+    # and a plain `serve` did not merely forget, it went back to loopback while
+    # the edge's GUI route still pointed at a process it could no longer reach,
+    # so the name 502'd. Pass --no-domain for a deliberately local session.
+    if not domain and not no_domain:
+        domain = edgesvc.served_domain()
+        if domain:
+            ui.note(f"  serving {domain} (set up earlier; --no-domain for a local "
+                    "session)")
     if domain:
         # Normalized before anything reads it: it becomes the Host() rule, a TLS
         # SNI name and the printed URL, so a surviving scheme corrupts all three.
@@ -2292,12 +2303,17 @@ def serve(
         if fixed:
             ui.note(f"  using --domain {domain} ({fixed})")
         cfg = config.load_config()
+        given_email = email
         email = email or str(cfg.get("acme_email") or "")
         if not email:
             _err("a Let's Encrypt certificate needs a contact email:\n"
                  f"  rc-repro serve --domain {domain} --email you@example.com\n"
                  "It is remembered after the first use, or set it once with:\n"
                  "  rc-repro config set acme.email you@example.com")
+        if given_email and given_email != str(cfg.get("acme_email") or ""):
+            # `up` documents the email as remembered after first use; it was not
+            # true here, so every restart needed it retyped.
+            config.save_config({**cfg, "acme_email": email})
         if not basic:
             ui.warn("  ⚠ this publishes the GUI on the internet with no login — "
                     "anyone who finds the name can create and delete repros.")

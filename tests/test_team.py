@@ -232,11 +232,14 @@ def fronted(served, monkeypatch):
     calls: dict = {}
     monkeypatch.setattr(fdsvc, "bridge_address", lambda: "172.17.0.1")
     def fake_write(door):
-        # Touch the file too: the real write() does, and ensure_running() keys off
-        # installed() to decide whether it must configure one itself.
+        # Write the same files the real one does. A fake that skips the side
+        # effects its callers key off is not a fake of that function: without the
+        # compose file, ensure_running() thinks nothing is installed; without the
+        # `domain` file, serve() cannot reuse the name the box was set up with.
         calls.setdefault("door", door)
         fdsvc.compose_path().parent.mkdir(parents=True, exist_ok=True)
         fdsvc.compose_path().write_text("services: {edge: {}}\n")
+        (fdsvc.edge_dir() / "domain").write_text(door.domain + "\n")
 
     monkeypatch.setattr(fdsvc, "write", fake_write)
     monkeypatch.setattr(fdsvc, "has_acme", lambda: True)
@@ -440,3 +443,41 @@ def test_with_accounts_the_url_carries_no_token(fronted):
         "serve", "--domain", "rc.example.com", "--email", "ops@example.com"])
     line = next(ln for ln in r.output.splitlines() if "rc-repro GUI:" in ln)
     assert "?t=" not in line and line.strip().endswith("rc.example.com/")
+
+
+def test_serve_reuses_the_domain_the_box_was_set_up_with(fronted):
+    """Asked directly: "do I need to run this every time with the same
+    parameters?" It was yes -- and a plain `serve` did not merely forget, it went
+    back to loopback while the edge's GUI route still pointed at a process it
+    could no longer reach, so the name 502'd."""
+    # Set it up the way somebody actually would, once.
+    first = cli_runner.invoke(cli.app, [
+        "serve", "--domain", "rc.example.com", "--email", "ops@example.com"])
+    assert first.exit_code == 0, first.output
+
+    r = cli_runner.invoke(cli.app, ["serve"])          # no flags at all
+    assert r.exit_code == 0, r.output
+    assert "rc.example.com" in fronted["allow_hosts"]
+    assert fronted["host"] == "172.17.0.1", "and it binds the bridge, as before"
+
+
+def test_no_domain_gives_a_deliberately_local_session(fronted):
+    from rc_repro.services import edge as edgesvc
+
+    edgesvc.write(edgesvc.Edge(domain="rc.example.com", acme_email="o@e.com"))
+    r = cli_runner.invoke(cli.app, ["serve", "--no-domain", "--no-open"])
+    assert r.exit_code == 0, r.output
+    assert fronted["host"] == "127.0.0.1"
+
+
+def test_the_email_is_remembered_after_the_first_use(fronted, tmp_path):
+    """`up` documents it as remembered; for serve it was not, so every restart
+    needed it retyped."""
+    from rc_repro import config
+
+    cli_runner.invoke(cli.app, [
+        "serve", "--domain", "rc.example.com", "--email", "ops@example.com"])
+    assert config.load_config().get("acme_email") == "ops@example.com"
+
+    r = cli_runner.invoke(cli.app, ["serve", "--domain", "rc.example.com"])
+    assert r.exit_code == 0, r.output      # no --email needed the second time
