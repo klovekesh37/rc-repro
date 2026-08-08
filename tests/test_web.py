@@ -894,3 +894,380 @@ def test_settings_says_whether_an_email_is_remembered_without_leaking_it(monkeyp
 
 def test_settings_needs_a_token():
     assert client().get("/api/settings").status_code == 401
+
+
+# --- named-user login (#team-auth) ------------------------------------------------
+#
+# With accounts present the GUI is behind a login, and every request carries it.
+# Without accounts nothing changes: the session token still works exactly as before.
+
+import base64 as _b64  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+
+def _auth(user, password):
+    raw = _b64.b64encode(f"{user}:{password}".encode()).decode()
+    return {"Authorization": f"Basic {raw}", "Host": "localhost"}
+
+
+@pytest.fixture
+def basic_client(tmp_path, monkeypatch):
+    from rc_repro.services import users as usersvc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    usersvc.forget()
+    usersvc._failures.clear()
+    usersvc.add("alice", "correct-horse-battery")
+    app = create_app(basic_auth=True)
+    yield TestClient(app, base_url="http://localhost")
+    usersvc.forget()
+    usersvc._failures.clear()
+
+
+def test_basic_auth_challenges_an_anonymous_request(basic_client):
+    """The WWW-Authenticate header is what makes the browser show a login box."""
+    r = basic_client.get("/api/repros", headers={"Host": "localhost"})
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"].startswith("Basic ")
+
+
+def test_the_spa_itself_is_behind_the_login(basic_client):
+    """Not just /api/ — rendering a dashboard for someone who cannot use it is
+    a worse experience than asking them to sign in first."""
+    assert basic_client.get("/", headers={"Host": "localhost"}).status_code == 401
+
+
+def test_correct_credentials_are_accepted(basic_client, monkeypatch):
+    monkeypatch.setattr(lc, "list_repros", lambda: [])
+    r = basic_client.get("/api/repros", headers=_auth("alice", "correct-horse-battery"))
+    assert r.status_code == 200
+
+
+def test_a_wrong_password_or_unknown_user_is_refused(basic_client):
+    assert basic_client.get("/api/repros",
+                            headers=_auth("alice", "wrong-x-x-x-x")).status_code == 401
+    assert basic_client.get("/api/repros",
+                            headers=_auth("ghost", "correct-horse-battery")).status_code == 401
+
+
+def test_health_stays_open_for_uptime_checks(basic_client):
+    assert basic_client.get("/api/health",
+                            headers={"Host": "localhost"}).status_code == 200
+
+
+def test_a_malformed_authorization_header_does_not_crash(basic_client):
+    for bad in ("", "Basic", "Basic !!!notbase64", "Bearer abc", "Basic " + _b64.b64encode(b"\xff\xfe").decode()):
+        r = basic_client.get("/api/repros", headers={"Authorization": bad, "Host": "localhost"})
+        assert r.status_code == 401, bad
+
+
+def test_repeated_failures_report_a_lockout(basic_client):
+    from rc_repro.services import users as usersvc
+    for _ in range(usersvc._LOCKOUT_AFTER):
+        basic_client.get("/api/repros", headers=_auth("alice", "wrong-x-x-x-x"))
+    r = basic_client.get("/api/repros", headers=_auth("alice", "correct-horse-battery"))
+    assert r.status_code == 401
+    assert "too many failed attempts" in r.json()["error"]
+
+
+def test_the_token_path_is_untouched_when_there_are_no_users(monkeypatch):
+    """An existing single-user install must behave exactly as before."""
+    c = client()
+    assert c.get("/api/repros").status_code == 401          # token missing
+    monkeypatch.setattr(lc, "list_repros", lambda: [])
+    assert c.get("/api/repros", headers=H).status_code == 200
+    assert c.get("/").status_code == 200, "the SPA is not gated in token mode"
+
+
+def test_a_job_records_who_ran_it(basic_client, monkeypatch, tmp_path):
+    """Attribution is the point of named accounts — without it they are just a
+    shared password with extra steps."""
+    monkeypatch.setattr(lc, "create_repro",
+                        lambda req, emit, stream_output=False: {"name": "x"})
+    hdr = _auth("alice", "correct-horse-battery")
+    assert basic_client.post("/api/repros", headers=hdr,
+                             json={"version": "8.5.1"}).status_code == 200
+    rows = basic_client.get("/api/jobs", headers=hdr).json()["jobs"]
+    assert rows[0]["actor"] == "alice"
+
+
+def test_the_audit_log_survives_a_restart(basic_client, monkeypatch, tmp_path):
+    """journald is not always where somebody will look, and an in-memory job list
+    is gone the moment the service restarts."""
+    monkeypatch.setattr(lc, "create_repro",
+                        lambda req, emit, stream_output=False: {"name": "x"})
+    basic_client.post("/api/repros", headers=_auth("alice", "correct-horse-battery"),
+                      json={"version": "8.5.1"})
+    from rc_repro.web.jobs import AUDIT_FILE
+    line = (tmp_path / AUDIT_FILE).read_text().strip()
+    when, who, kind, label = line.split("\t")
+    assert who == "alice" and kind == "create" and label == "8.5.1"
+    assert when.startswith("20")
+
+
+def test_token_mode_records_no_actor(monkeypatch):
+    """A shared secret genuinely cannot say who acted; claiming otherwise would be
+    worse than an empty column."""
+    monkeypatch.setattr(lc, "create_repro",
+                        lambda req, emit, stream_output=False: {"name": "x"})
+    c = client()
+    c.post("/api/repros", headers=H, json={"version": "8.5.1"})
+    assert c.get("/api/jobs", headers=H).json()["jobs"][0]["actor"] == ""
+
+
+def test_an_unwritable_audit_log_does_not_break_the_job(monkeypatch):
+    from rc_repro import config as cfgmod
+    from rc_repro.web import jobs as jobs_mod
+    # audit() imports config lazily, so patch the source module, not jobs.
+    monkeypatch.setattr(cfgmod, "home",
+                        lambda: Path("/proc/definitely-not-writable"))
+    jobs_mod.audit("alice", "create", "8.5.1")     # must not raise
+
+
+def test_the_actor_comes_from_the_session_not_the_body(basic_client, monkeypatch):
+    """Otherwise anyone could create a workspace in a colleague's namespace."""
+    seen = {}
+    monkeypatch.setattr(lc, "create_repro",
+                        lambda req, emit, stream_output=False:
+                        seen.update(actor=req.actor) or {"name": "x"})
+    basic_client.post("/api/repros", headers=_auth("alice", "correct-horse-battery"),
+                      json={"version": "8.5.1", "actor": "bob"})
+    assert seen["actor"] == "alice", "the body's actor must be ignored"
+
+
+def test_health_reports_who_is_signed_in(basic_client):
+    """Caught live: /api/health is exempt from the login, and the exemption also
+    skipped reading the header -- so the dashboard could never learn its own
+    identity and every card rendered as unowned.
+
+    It reads the header but never DERIVES from it (see the test below), so the
+    name appears once the session is established. A browser always gets there:
+    the SPA itself is behind the login, so loading the page authenticates before
+    app.js polls anything.
+    """
+    anon = basic_client.get("/api/health").json()
+    assert anon["ok"] is True and anon["actor"] == ""
+
+    creds = _auth("alice", "correct-horse-battery")
+    basic_client.get("/", headers=creds)          # what the browser does first
+    assert basic_client.get("/api/health", headers=creds).json()["actor"] == "alice"
+
+
+def test_health_never_derives_a_password_for_an_anonymous_caller(basic_client, monkeypatch):
+    """The open endpoint must not be a CPU amplifier: deriving there let anyone
+    who can reach the port spend ~50ms of scrypt (and 34MB) per request just by
+    attaching an Authorization header, and varying the name dodged the lockout."""
+    from rc_repro.services import users as usersvc
+
+    monkeypatch.setattr(usersvc, "verify", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("scrypt derivation on the open endpoint")))
+    for i in range(5):
+        r = basic_client.get("/api/health", headers=_auth(f"nobody{i}", "guess"))
+        assert r.status_code == 200, "and it must stay open for uptime checks"
+
+
+def test_the_failure_map_cannot_grow_without_limit():
+    """Keyed by name, so a name-varying flood both dodges the lockout and leaks
+    memory for as long as the server runs."""
+    from rc_repro.services import users as usersvc
+
+    usersvc._failures.clear()
+    try:
+        for i in range(usersvc._FAILURES_MAX + 500):
+            usersvc._record_failure(f"nobody{i}")
+        assert len(usersvc._failures) <= usersvc._FAILURES_MAX
+    finally:
+        usersvc._failures.clear()
+
+
+def test_health_stays_open_with_bad_credentials(basic_client):
+    """An uptime check must not start failing because somebody typo'd a password."""
+    r = basic_client.get("/api/health", headers=_auth("alice", "wrong-wrong-wrong"))
+    assert r.status_code == 200
+    assert r.json()["actor"] == "", "and it must not claim they are signed in"
+
+
+# --- CSRF (F2) ------------------------------------------------------------------
+# In token mode the unguessable ?t= doubles as a CSRF token. A Basic credential
+# does not: the browser attaches it automatically, `Host:` is whatever this server
+# answers to, and Basic is not a cookie so SameSite never applies. Confirmed
+# reachable before the fix -- a body-less POST to /upgrade/rollback, which drops
+# the workspace database.
+
+_CROSS = {"Host": "localhost", "Sec-Fetch-Site": "cross-site",
+          "Origin": "https://evil.example"}
+
+
+def test_a_cross_site_state_change_is_refused(basic_client):
+    creds = _auth("alice", "correct-horse-battery")
+    for path in ("/api/repros/x/upgrade/rollback", "/api/repros/x/pat",
+                 "/api/repros/x/default", "/api/repros/x/monitor"):
+        r = basic_client.post(path, headers={**creds, **_CROSS})
+        assert r.status_code == 403, f"{path} -> {r.status_code}"
+
+
+def test_a_cross_site_delete_is_refused(basic_client):
+    r = basic_client.delete("/api/repros/x?volumes=true&confirm=true",
+                            headers={**_auth("alice", "correct-horse-battery"), **_CROSS})
+    assert r.status_code == 403
+
+
+def test_the_apps_own_requests_still_work(basic_client):
+    """Sec-Fetch-Site: same-origin is what the SPA's own fetch() sends."""
+    creds = _auth("alice", "correct-horse-battery")
+    r = basic_client.post("/api/repros/x/default",
+                          headers={**creds, "Host": "localhost",
+                                   "Sec-Fetch-Site": "same-origin",
+                                   "Origin": "http://localhost"})
+    assert r.status_code != 403
+
+
+def test_non_browser_clients_are_unaffected(basic_client):
+    """curl and CI send neither header; refusing them would break every script."""
+    r = basic_client.post("/api/repros/x/default",
+                          headers={**_auth("alice", "correct-horse-battery"),
+                                   "Host": "localhost"})
+    assert r.status_code != 403
+
+
+def test_reads_are_never_refused_as_cross_site(basic_client):
+    r = basic_client.get("/api/repros",
+                         headers={**_auth("alice", "correct-horse-battery"), **_CROSS})
+    assert r.status_code == 200
+
+
+# --- backup `out` is confined over HTTP (F9) ------------------------------------
+
+def test_a_backup_cannot_be_written_outside_the_managed_directory(basic_client, monkeypatch):
+    """`out` chose a path on the SERVER. Unconfined it wrote a tar.gz anywhere the
+    server user could -- a systemd drop-in, a webroot -- and with a forged
+    cross-site request the attacker chose the path too."""
+    creds = _auth("alice", "correct-horse-battery")
+    monkeypatch.setattr(lc, "resolve_name", lambda n, actor="": n)
+    for bad in ("/etc/cron.d/pwn", "../../../../tmp/pwn.tar.gz", "~/../../tmp/x"):
+        r = basic_client.post("/api/repros/x/backup",
+                              headers={**creds, "Host": "localhost"},
+                              json={"out": bad})
+        assert r.status_code == 400, f"{bad} -> {r.status_code}"
+        assert "must be inside" in r.json()["error"]
+
+
+def test_a_backup_inside_the_managed_directory_is_allowed(basic_client, monkeypatch, tmp_path):
+    from rc_repro.services import backup as backupsvc
+
+    creds = _auth("alice", "correct-horse-battery")
+    monkeypatch.setattr(lc, "resolve_name", lambda n, actor="": n)
+    seen = {}
+    monkeypatch.setattr(backupsvc, "create",
+                        lambda t, out="", note="", live=False, emit=None:
+                        seen.update(out=out) or {"ok": True})
+    dest = backupsvc.backups_dir() / "mine.tar.gz"
+    r = basic_client.post("/api/repros/x/backup", headers={**creds, "Host": "localhost"},
+                          json={"out": str(dest)})
+    assert r.status_code == 200, r.text
+    assert seen["out"] == str(dest.resolve())
+
+
+# --- graceful shutdown (F15) ----------------------------------------------------
+
+def test_shutdown_waits_for_a_running_job():
+    """A backup killed inside _Quiesced leaves Rocket.Chat STOPPED with nothing to
+    restart it; a load test killed mid-run leaves CPU caps applied. Daemon threads
+    skip every `finally`, and `Restart=always` makes that routine."""
+    import time as _t
+
+    from rc_repro.web.jobs import JobManager
+
+    jobs = JobManager()
+    cleaned = []
+
+    def slow(emit=None):
+        try:
+            _t.sleep(0.4)
+            return {"ok": True}
+        finally:
+            cleaned.append("restored")
+
+    jobs.submit("seed", slow, label="x")
+    _t.sleep(0.05)
+    left = jobs.drain(timeout=5)
+    assert left == [], "the job should have finished before the deadline"
+    assert cleaned == ["restored"], "its cleanup must have run"
+
+
+def test_shutdown_is_bounded_and_names_what_it_abandoned():
+    """A capacity search can run for an hour; a shutdown that never completes is
+    its own failure, and systemd would SIGKILL us anyway."""
+    import threading
+    import time as _t
+
+    from rc_repro.web.jobs import JobManager
+
+    jobs = JobManager()
+    release = threading.Event()
+    job = jobs.submit("seed", lambda emit=None: release.wait(timeout=10), label="x")
+    _t.sleep(0.05)
+    left = jobs.drain(timeout=0.3)
+    assert left == [job.id], "an abandoned job must be named"
+    release.set()
+
+
+def test_new_work_is_refused_once_shutting_down():
+    from rc_repro.errors import ConflictError
+    from rc_repro.web.jobs import JobManager
+
+    jobs = JobManager()
+    jobs.drain(timeout=0)
+    with pytest.raises(ConflictError):
+        jobs.submit("seed", lambda emit=None: None, label="x")
+
+
+def test_the_app_drains_on_shutdown(monkeypatch):
+    """The hook has to be wired to the app, not just exist."""
+    drained = []
+    app = create_app(token=TOKEN)
+    monkeypatch.setattr(type(app.state.jobs), "drain",
+                        lambda self, timeout=25.0: drained.append(True) or [])
+    with TestClient(app, base_url="http://localhost") as c:
+        c.get("/api/health")
+    assert drained == [True], "lifespan shutdown never ran drain()"
+
+
+# --- the edge, in the GUI (its own endpoint) ------------------------------------
+
+def test_edge_status_is_not_on_the_health_endpoint(basic_client):
+    """/api/health is the cheap, unauthenticated one that every tab polls every
+    four seconds; the edge status shells out to docker twice."""
+    body = basic_client.get("/api/health",
+                            headers=_auth("alice", "correct-horse-battery")).json()
+    assert "routes" not in body and "edge" not in body
+
+
+def test_edge_endpoint_reports_each_route_and_whether_it_is_reachable(
+        basic_client, monkeypatch):
+    """A route the edge cannot reach answers 502 rather than erroring -- the one
+    failure nothing else in the UI would surface."""
+    from rc_repro.services import edge as edgesvc
+
+    edgesvc.write(edgesvc.Edge(domain="gui.example.com", acme_email="o@e.com"))
+    monkeypatch.setattr(edgesvc, "_docker", lambda *a, **k: type(
+        "P", (), {"returncode": 0, "stdout": ""})())
+    edgesvc.register("alice-rc8-5-1", "t1.example.com")
+    edgesvc.register("bob-rc8-5-1", "t2.example.com")
+    monkeypatch.setattr(edgesvc, "running", lambda: True)
+    monkeypatch.setattr(edgesvc, "attached_networks",
+                        lambda: {edgesvc.workspace_network("alice-rc8-5-1")})
+
+    body = basic_client.get("/api/edge",
+                            headers=_auth("alice", "correct-horse-battery")).json()
+    assert body["installed"] is True and body["running"] is True
+    assert body["domain"] == "gui.example.com"
+    by_name = {r["name"]: r for r in body["routes"]}
+    assert by_name["alice-rc8-5-1"]["host"] == "t1.example.com"
+    assert by_name["alice-rc8-5-1"]["reachable"] is True
+    assert by_name["bob-rc8-5-1"]["reachable"] is False, "attached to neither"
+
+
+def test_edge_endpoint_says_so_when_there_is_none(basic_client):
+    body = basic_client.get("/api/edge",
+                            headers=_auth("alice", "correct-horse-battery")).json()
+    assert body["installed"] is False and body["routes"] == []

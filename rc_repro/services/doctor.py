@@ -50,7 +50,10 @@ def run_checks() -> dict:
         rows.append({"status": status, "message": msg})
 
     # Docker daemon (everything else that needs Docker degrades gracefully).
-    docker_up = runner.docker_available()
+    # max_age=0: the dashboard poll memoises this, but somebody running `doctor`
+    # has explicitly asked whether Docker is up RIGHT NOW -- answering that from a
+    # cache is how a diagnostic tells you the opposite of the truth.
+    docker_up = runner.docker_available(max_age=0)
     if docker_up:
         line("ok", f"Docker daemon running ({runner.docker_server_version() or '?'})")
     else:
@@ -97,6 +100,27 @@ def run_checks() -> dict:
     except OSError:
         line("warn", "couldn't check disk space")
 
+    # Memory headroom, in workspaces rather than megabytes -- "3.2 GB available"
+    # does not tell you whether you can start another one, and that is the only
+    # question anybody is actually asking. Added after seven concurrent stacks
+    # OOM-killed a 10 GB host: every `up` had succeeded, and nothing anywhere
+    # reported that the machine was nearly full.
+    mem = runner.host_memory()
+    if mem:
+        total_mb, avail_mb, swap_mb = mem
+        room = max(0, avail_mb - lc.host_reserve_mb(total_mb)) // lc.WORKSPACE_MB
+        detail = f"{avail_mb} MB available of {total_mb} MB"
+        if room >= 2:
+            line("ok", f"Memory: {detail} — room for about {room} more workspace(s)")
+        elif room == 1:
+            line("warn", f"Memory: {detail} — room for about 1 more workspace")
+        else:
+            line("warn", f"Memory: {detail} — NOT enough for another workspace. "
+                         "`rc-repro stop --name <it>` frees memory and keeps the data")
+        if swap_mb == 0:
+            line("warn", "No swap: memory pressure becomes an OOM kill rather than "
+                         "slowdown, and the kernel picks its own victim")
+
     # Live version lookup reachability.
     try:
         r = requests.get("https://releases.rocket.chat/8.5.1/info", timeout=5)
@@ -116,6 +140,58 @@ def run_checks() -> dict:
             line("warn", f"Port 3000 in use — `up` will auto-pick the next free port ({free})")
     except RuntimeError as exc:   # bounded scan found nothing bindable
         line("fail", str(exc))
+
+    # The shared edge. Silent unless one is set up, so a single-user install
+    # sees no rows about a thing it does not have -- but once one exists it is
+    # reported, because everything on the box depends on it (§8, shared fate):
+    # while it is down the GUI and EVERY registered workspace are unreachable,
+    # and nothing else in this report would say so.
+    try:
+        from rc_repro.services import edge as edgesvc
+
+        if edgesvc.installed():
+            served = edgesvc.served_domain()
+            where = f" ({served})" if served else ""
+            routes = edgesvc.registered()
+            if not docker_up:
+                line("warn", f"Edge{where} installed — cannot check it, Docker is down")
+            elif edgesvc.running():
+                line("ok", f"Edge running{where} — holds :80/:443, "
+                           f"{len(routes)} workspace route(s)")
+            else:
+                # Name what is holding the port. "the edge is not running" sends
+                # you looking at the edge, when the cause is usually something
+                # else on :443 -- a Traefik left by an older rc-repro, or an
+                # unrelated web server.
+                holder = edgesvc.port_holder(443) if docker_up else ""
+                because = f" — {holder} is holding :443" if holder else ""
+                line("fail", f"Edge{where} is NOT running{because}. Every https "
+                             f"name on this box ({len(routes)} route(s)) is "
+                             "unreachable. `rc-repro edge start`")
+            if docker_up:
+                # A route whose workspace is gone points the edge at nothing, so
+                # that hostname 502s instead of 404ing and the name cannot be
+                # reused.
+                known = {m.name for m in runner.list_meta()}
+                stale = [r for r in routes if r not in known]
+                if stale:
+                    line("warn", f"{len(stale)} edge route(s) with no workspace: "
+                                 f"{', '.join(sorted(stale)[:5])} — remove with "
+                                 f"`rc-repro down --name <it>`")
+                # A route the edge cannot REACH is a 502 rather than an error, and
+                # nothing else in the tool would ever say so. Happens after the
+                # edge is recreated, since attachments are runtime state.
+                if edgesvc.running():
+                    attached = set(edgesvc.attached_networks())
+                    orphan = [r for r in routes if r in known
+                              and edgesvc.workspace_network(r) not in attached]
+                    if orphan:
+                        line("warn",
+                             f"{len(orphan)} route(s) the edge cannot reach: "
+                             f"{', '.join(sorted(orphan)[:5])} — they answer 502. "
+                             "`rc-repro edge restart` re-attaches them")
+    except Exception:  # noqa: BLE001 - a check must never break the report
+        line("warn", "Edge status could not be determined")
 
     counts = {s: sum(1 for r in rows if r["status"] == s) for s in ("ok", "warn", "fail")}
     verdict = "fail" if counts["fail"] else ("warn" if counts["warn"] else "ok")

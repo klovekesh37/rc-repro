@@ -591,11 +591,13 @@ def test_repro_lock_excludes_another_thread():
     import threading
     started, blocked = threading.Event(), []
 
+    from rc_repro.errors import ConflictError, ReproError
+
     def contender():
         try:
             with runner.repro_lock("rc8-5-1", timeout=0.4):
                 blocked.append(False)
-        except TimeoutError:
+        except ConflictError:
             blocked.append(True)
 
     with runner.repro_lock("rc8-5-1"):
@@ -604,6 +606,11 @@ def test_repro_lock_excludes_another_thread():
         t.join(timeout=5)
     started.set()
     assert blocked == [True], "a second thread got the lock while it was held"
+    # A builtin TimeoutError escaped both front ends: the CLI printed a traceback
+    # and the API turned it into "internal error". ReproError is the contract they
+    # both understand -- red line + exit 1, or a 409.
+    assert issubclass(ConflictError, ReproError)
+    assert ConflictError("x").http_status == 409
 
 
 def test_repro_lock_is_released_after_an_exception():

@@ -8,7 +8,10 @@ jobs.py) streamed to the browser over SSE.
 
 from __future__ import annotations
 
+import base64
 import asyncio
+import sys
+from contextlib import asynccontextmanager
 import json
 import re
 import time
@@ -30,6 +33,7 @@ from rc_repro import runner
 from rc_repro.errors import NotReadyError, ReproError, ValidationError
 from rc_repro.services import data as datasvc
 from rc_repro.services import lifecycle as lc
+from rc_repro.web import jobs as jobs_mod
 from rc_repro.web.jobs import JobManager
 
 # `docker compose logs --tail N` is buffered in memory server-side, so a
@@ -70,6 +74,37 @@ def _prune_uploads(dest: Path, keep: int = 5) -> None:
         stale.with_suffix(".only").unlink(missing_ok=True)
 
 
+def _route_host(edgesvc, name: str) -> str:
+    """The hostname a route file serves, for display."""
+    try:
+        for line in edgesvc.route_path(name).read_text().splitlines():
+            if "rule:" in line and "Host(" in line:
+                return line.split("Host(`", 1)[1].split("`", 1)[0]
+    except (OSError, IndexError):
+        pass
+    return ""
+
+
+def _confined_backup_out(out: str, backupsvc) -> str:
+    """A caller-supplied backup destination, restricted to the managed directory.
+
+    resolve() before comparing, so `..` and a symlink pointing out are both caught
+    rather than only literal prefixes.
+    """
+    if not out:
+        return ""
+    root = backupsvc.backups_dir().resolve()
+    dest = Path(out).expanduser()
+    if not dest.is_absolute():
+        dest = root / dest
+    dest = dest.resolve()
+    if dest != root and root not in dest.parents:
+        raise ValidationError(
+            f"`out` must be inside {root} — the HTTP API cannot choose arbitrary "
+            "paths on the server (the CLI's --out still can)")
+    return str(dest)
+
+
 def _read_upload(file: UploadFile) -> bytes:
     """Read an upload with a hard cap (it used to be an unbounded .read())."""
     data = file.file.read(MAX_UPLOAD_BYTES + 1)
@@ -79,12 +114,36 @@ def _read_upload(file: UploadFile) -> bytes:
     return data
 
 
-def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI:
+def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
+               basic_auth: bool = False) -> FastAPI:
     # openapi_url=None as well as the doc UIs: the schema path does not start
     # with /api/, so `guard` below would hand it out without a token.
-    app = FastAPI(title="rc-repro", docs_url=None, redoc_url=None, openapi_url=None)
     jobs = JobManager()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        # Shutdown. Job threads are daemons, so without this a `systemctl restart`
+        # kills them mid-operation and skips every `finally` -- leaving Rocket.Chat
+        # stopped after an interrupted backup, or the rate limiter off and CPU caps
+        # applied after an interrupted load test. Run in a thread because drain()
+        # blocks on join() and this is the event loop.
+        left = await asyncio.to_thread(jobs.drain)
+        if left:
+            # Named, so the operator knows which repro to look at rather than
+            # finding it in a strange state days later.
+            print(f"rc-repro: shut down with {len(left)} job(s) still running: "
+                  f"{', '.join(left)}", file=sys.stderr)
+
+    app = FastAPI(title="rc-repro", docs_url=None, redoc_url=None, openapi_url=None,
+                  lifespan=lifespan)
     app.state.token = token
+    app.state.jobs = jobs
+    # Whether the login is enforced. Whether the TRANSPORT is safe is not decided
+    # here and cannot be: behind a TLS-terminating proxy every request arrives as
+    # plain http regardless. `serve` weighs that at bind time, where the interface
+    # is known. (An `insecure` flag was carried in here and never read.)
+    app.state.basic_auth = basic_auth
 
     # Host allow-list (DNS-rebind/CSRF guard). Loopback always allowed; extra
     # hosts (e.g. a reverse-proxy domain like *.iximiuz.com) opt in via
@@ -124,16 +183,95 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
            f"frame-src 'self' http://localhost:{config.MONITOR_PORTS[1]}; "
            "base-uri 'none'; form-action 'none'; object-src 'none'")
 
-    # --- security: Host allow-list + token on the API
+    def _basic_actor(header: str | None, *, derive: bool = True) -> tuple[str, str]:
+        """(authenticated_user, attempted_name) from an Authorization header.
+
+        The attempted name comes back even on failure, so the caller can report a
+        lockout without decoding the header a second time.
+
+        Verification is off-loaded to services.users, which caches successes: the
+        browser attaches this header to EVERY request, and re-deriving scrypt each
+        time would saturate the threadpool.
+
+        `derive=False` consults ONLY that cache. It exists for the open endpoint:
+        anything reachable without credentials must not be able to spend ~50 ms of
+        scrypt (and 34 MB) per request on behalf of an anonymous caller, which is
+        what happens the moment it decodes an attacker-supplied header.
+        """
+        from rc_repro.services import users as usersvc
+
+        scheme, _, encoded = (header or "").partition(" ")
+        if scheme.lower() != "basic" or not encoded:
+            return "", ""
+        try:
+            name, _, password = base64.b64decode(encoded).decode("utf-8").partition(":")
+        except (ValueError, UnicodeDecodeError):
+            return "", ""
+        check = usersvc.verify if derive else usersvc.verify_cached
+        return (name if check(name, password) else ""), name
+
+    def _challenge(detail: str = "") -> JSONResponse:
+        return JSONResponse(
+            {"error": detail or "sign in to use rc-repro", "kind": "Unauthorized"},
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="rc-repro", charset="UTF-8"'})
+
+    # --- security: Host allow-list, then Basic Auth or the session token
     @app.middleware("http")
     async def guard(request: Request, call_next):
         if not host_ok(request.headers.get("host")):
             return JSONResponse({"error": "host not allowed (use serve --allow-host)"}, status_code=403)
         path = request.url.path
-        if token and path.startswith("/api/") and path != "/api/health":
+        # Cross-site state change. In TOKEN mode the unguessable ?t= doubles as a
+        # CSRF token, but a Basic credential is attached by the BROWSER on every
+        # request and `Host:` is whatever this server answers to -- so the host
+        # allow-list waves a forged request straight through, and Basic is not a
+        # cookie so SameSite never applies. Confirmed reachable: a body-less POST
+        # to /upgrade/rollback (which drops the database) from any origin.
+        # Sec-Fetch-Site is sent by every current browser; Origin backstops the
+        # rest. Non-browser clients (curl, CI) send neither and are unaffected.
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            site = request.headers.get("sec-fetch-site", "")
+            origin = request.headers.get("origin", "")
+            cross = site not in ("", "same-origin", "none")
+            if not cross and origin:
+                cross = not host_ok(origin.split("://", 1)[-1])
+            if cross:
+                return JSONResponse(
+                    {"error": "cross-site request refused", "kind": "Forbidden"},
+                    status_code=403)
+        actor = ""
+        if app.state.basic_auth:
+            # Everything is behind the login, not just /api/ -- the SPA itself
+            # should not render for someone who cannot use it. /api/health stays
+            # open so an uptime check needs no credential -- but its credentials
+            # are still READ, so it can tell the dashboard who is signed in.
+            #
+            # On that open path the read is CACHE-ONLY: deriving there let any
+            # anonymous caller spend ~50 ms of scrypt per request just by sending
+            # an Authorization header, on the one route that must stay cheap. A
+            # miss costs the dashboard nothing -- its very next authenticated
+            # request populates the cache.
+            open_path = path == "/api/health"
+            actor, attempted = _basic_actor(request.headers.get("authorization"),
+                                            derive=not open_path)
+            if not open_path and not actor:
+                from rc_repro.services import users as usersvc
+                wait = usersvc.locked_out(attempted) if attempted else 0.0
+                if wait:
+                    return _challenge(
+                        f"too many failed attempts; try again in {int(wait) + 1}s")
+                return _challenge()
+        elif token and path.startswith("/api/") and path != "/api/health":
             given = request.headers.get("x-rc-repro-token") or request.query_params.get("t")
             if given != token:
                 return JSONResponse({"error": "bad or missing token"}, status_code=401)
+        # Who did this, for job attribution. "" when the token is in use, because a
+        # shared secret genuinely cannot say. A contextvar rather than fifteen
+        # extra handler parameters; it propagates into the threadpool where every
+        # `def` handler runs.
+        request.state.actor = actor
+        jobs_mod.CURRENT_ACTOR.set(actor)
         response = await call_next(request)
         response.headers.setdefault("Content-Security-Policy", csp)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -159,12 +297,40 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
 
     # --- read (blocking -> def -> threadpool) ---------------------------------
     @app.get("/api/health")
-    def health():
-        return {"ok": True, "docker": runner.docker_available()}
+    def health(request: Request):
+        # `actor` echoes back the caller's OWN credentials, so an open /api/health
+        # gives away nothing: unauthenticated callers get "". The dashboard polls
+        # this anyway, which keeps the name fresh without a second endpoint.
+        return {"ok": True, "docker": runner.docker_available(),
+                "actor": getattr(request.state, "actor", "") or ""}
 
     @app.get("/api/repros")
     def list_repros():
         return {"repros": lc.list_repros()}
+
+    @app.get("/api/edge")
+    def edge_status():
+        """The shared Traefik, and whether each name it serves is actually
+        reachable.
+
+        Its own endpoint rather than a field on /api/health: this shells out to
+        docker twice and health is the cheap, unauthenticated one that every tab
+        polls every four seconds.
+        """
+        from rc_repro.services import edge as edgesvc
+
+        st = edgesvc.status()
+        attached = set(st.pop("attached", []))
+        st["domain"] = edgesvc.served_domain()
+        st["routes"] = [
+            {"name": n,
+             "host": _route_host(edgesvc, n),
+             # A route the edge cannot reach answers 502 rather than erroring,
+             # which is the one failure nothing else in the UI would surface.
+             "reachable": edgesvc.workspace_network(n) in attached}
+            for n in st.get("routes", [])
+        ]
+        return st
 
     @app.get("/api/doctor")
     def doctor():
@@ -257,10 +423,16 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
 
     @app.websocket("/api/repros/{name}/logs/stream")
     async def logs_stream(ws: WebSocket, name: str, tail: int = 300):
-        # WS bypasses the http middleware, so enforce host + token here.
+        # WS bypasses the http middleware, so the same checks run here.
         if not app.state.host_ok(ws.headers.get("host")):
             await ws.close(code=1008); return
-        if token and ws.query_params.get("t") != token:
+        if app.state.basic_auth:
+            # A browser cannot set headers on a WebSocket from JS -- which is why
+            # the token rides in ?t=. It DOES attach cached Basic credentials to
+            # the upgrade request automatically, so the same header is here.
+            if not _basic_actor(ws.headers.get("authorization"))[0]:
+                await ws.close(code=1008); return
+        elif token and ws.query_params.get("t") != token:
             await ws.close(code=1008); return
         await ws.accept()
         try:
@@ -350,9 +522,12 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
 
     # --- mutating ------------------------------------------------------------
     @app.post("/api/repros")
-    def create(req: dict = Body(...)):
-        allowed = set(lc.CreateReq.__dataclass_fields__)
+    def create(request: Request, req: dict = Body(...)):
+        allowed = set(lc.CreateReq.__dataclass_fields__) - {"actor"}
         fields = {k: v for k, v in req.items() if k in allowed}
+        # From the session, never the body: a caller must not be able to create a
+        # workspace in somebody else's namespace by asking.
+        fields["actor"] = getattr(request.state, "actor", "") or ""
         # `version` is CreateReq's only required field, so omitting it raised a
         # TypeError from the constructor -- an opaque 500 for any caller using the
         # documented HTTP API rather than the GUI (which always sends the key).
@@ -584,8 +759,15 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None) -> FastAPI
         """Dump the repro's database into a bundle. A job: minutes on a seeded repro."""
         from rc_repro.services import backup as backupsvc
         target = lc.resolve_name(name)
+        # `out` chooses a path on the SERVER. Over HTTP the caller is remote, so it
+        # is confined to the managed backup directory: unconfined, this wrote a
+        # tar.gz anywhere the server user could -- a systemd drop-in directory, a
+        # webroot -- and combined with a forged cross-site request the attacker
+        # chose the path too. The CLI keeps an unconfined --out on purpose: there
+        # the caller IS the user, at their own shell.
+        out = _confined_backup_out(str(body.get("out") or ""), backupsvc)
         job = jobs.submit("backup", backupsvc.create, target, label=target,
-                          out=str(body.get("out") or ""),
+                          out=out,
                           note=str(body.get("label") or ""),
                           live=bool(body.get("live", False)))
         return {"job_id": job.id}

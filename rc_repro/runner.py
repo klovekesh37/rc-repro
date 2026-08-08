@@ -20,9 +20,14 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from rc_repro import config
+# ConflictError, not the builtin TimeoutError, for a lock that could not be taken:
+# it is the FAILURE contract both front ends understand (errors.py) -- the CLI
+# prints it and exits 1, the API returns 409. A builtin escaped both, so waiting
+# out the timeout ended in a raw traceback or an opaque "internal error".
+from rc_repro.errors import ConflictError
 
 
-def _atomic_write(path: Path, content: str) -> None:
+def atomic_write(path: Path, content: str) -> None:
     """Write via a temp file in the same dir + os.replace, so readers never see a
     partially written file (rename is atomic on the same filesystem).
 
@@ -78,15 +83,63 @@ def exists(name: str) -> bool:
     return (workspace(name) / "docker-compose.yml").exists()
 
 
+def _restrict(root: Path) -> None:
+    """Keep a workspace's contents away from other local users. Best-effort.
+
+    The DIRECTORY is what does the work: 0700 means no other user can traverse
+    into the workspace, so nothing inside it is reachable whatever its own mode.
+    Files are left group/other readable, and that is not a compromise -- it is
+    required. Half of what lives here is bind-mounted INTO a container, and those
+    run as non-root (Prometheus as 65534, Grafana, Loki, the OTel collector), so
+    0600 made them unreadable and Prometheus crash-looped on
+    "open /etc/prometheus/prometheus.yml: permission denied".
+
+    Only the ROOT is 0700. Nested directories are 0755, because some volumes
+    mount a DIRECTORY rather than a file and the container then has to list it --
+    Prometheus globs `/etc/prometheus/file_sd_configs/*.yml`, and with that
+    directory at 0700 it started cleanly and scraped nothing at all, which is
+    worse than crashing.
+
+    Both rules verified rather than reasoned about:
+
+      mounted FILE       0644 inside a 0700 dir  -> readable  (the host path's
+                         0600 inside a 0700 dir  -> refused    directories never
+                                                                apply)
+      mounted DIRECTORY  0700                    -> cannot list
+                         0755 under a 0700 root  -> lists and reads
+
+    The 0700 root is what keeps other local users out, and it keeps them out of
+    every subdirectory too, whatever those are set to -- so the privacy goal and
+    the containers do not actually conflict.
+
+    Never fatal: a workspace on a filesystem that cannot represent these modes
+    (some network shares) must still be usable -- refusing to create a repro over
+    a permission bit would trade a small exposure for a broken tool.
+    """
+    try:
+        root.chmod(0o700)
+        for path in root.rglob("*"):
+            path.chmod(0o755 if path.is_dir() else 0o644)
+    except OSError:
+        pass
+
+
 def write(name: str, compose_yaml: str, meta: Metadata,
           files: list[tuple[str, str]] | None = None) -> None:
     ws = workspace(name)
     ws.mkdir(parents=True, exist_ok=True)
+    # The generated compose file carries ADMIN_PASS and, when set, REG_TOKEN, and
+    # preset files carry LDAP and MinIO credentials -- all of it written at the
+    # process umask, which on a normal box leaves them readable by every local
+    # user. That is tolerable on a laptop and not on the shared server this branch
+    # is for, where "your own workspace" is the whole point. Applied on every
+    # write, so workspaces created before this are tightened when next touched.
+    _restrict(ws)
     # Write atomically (temp + rename): an interruption mid-write must not leave a
     # half-written repro.json that read_meta would choke on, nor a compose file
     # out of sync with its metadata.
-    _atomic_write(ws / "docker-compose.yml", compose_yaml)
-    _atomic_write(ws / "repro.json", json.dumps(asdict(meta), indent=2))
+    atomic_write(ws / "docker-compose.yml", compose_yaml)
+    atomic_write(ws / "repro.json", json.dumps(asdict(meta), indent=2))
     # Preset-generated files (e.g. a seeded LDIF that a service mounts).
     # `{{ROOT_URL}}` is substituted with the repro's URL — presets are built
     # before the host port is known, so a generated file that must reference the
@@ -95,6 +148,7 @@ def write(name: str, compose_yaml: str, meta: Metadata,
         fp = ws / relpath
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content.replace("{{ROOT_URL}}", meta.root_url), encoding="utf-8")
+    _restrict(ws)          # again: covers the files just written, and their dirs
 
 
 _META_FIELDS = frozenset(f.name for f in fields(Metadata))
@@ -157,15 +211,25 @@ def used_ports() -> set[int]:
 PORT_MAX = 65535
 
 
-def port_free(port: int) -> bool:
-    """True if `port` is free to publish on the host right now."""
-    # First: is something already LISTENING on loopback? A wildcard bind with
+def port_free(port: int, host: str = "") -> bool:
+    """True if `port` is free to publish on the host right now.
+
+    `host` narrows the question to one interface. It matters because the wildcard
+    bind below reports busy for EVERY address as soon as anything holds the port
+    on 0.0.0.0 — correct for "can I publish this everywhere", wrong for "is
+    203.0.113.10:443 free", which is the dedicated-IP escape hatch: two processes
+    CAN hold the same port on different IPs (verified on 172.16.0.2 and .3 at
+    once). Without this the front door holding 443 on 0.0.0.0 made every other
+    address look taken.
+    """
+    probe_host = host or "127.0.0.1"
+    # First: is something already LISTENING there? A wildcard bind with
     # SO_REUSEADDR (below) can miss a docker publish on 127.0.0.1:<port> (repros
     # bind loopback), so probe it directly — connect success == in use.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.settimeout(0.2)
         try:
-            if probe.connect_ex(("127.0.0.1", port)) == 0:
+            if probe.connect_ex((probe_host, port)) == 0:
                 return False
         except OSError:
             return False
@@ -177,7 +241,7 @@ def port_free(port: int) -> bool:
         if sys.platform != "win32":
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            s.bind(("0.0.0.0", port))
+            s.bind((host or "0.0.0.0", port))
             return True
         except PermissionError:
             # A privileged port (<1024) cannot be bound by an unprivileged user,
@@ -281,26 +345,39 @@ def up(name: str, *, pull: bool = True) -> int:
         _compose(name, "pull")
     # --remove-orphans: if the compose file changed shape (e.g. a different
     # preset after --force), containers of dropped services are cleaned up.
-    return _compose(name, "up", "-d", "--remove-orphans").returncode
+    return _mutating(name, "up", "-d", "--remove-orphans")
 
 
 def down(name: str, *, volumes: bool = False) -> int:
     args = ["down", "--remove-orphans"]
     if volumes:
         args.append("-v")
-    return _compose(name, *args).returncode
+    return _mutating(name, *args)
 
 
 def start(name: str) -> int:
-    return _compose(name, "start").returncode
+    return _mutating(name, "start")
 
 
 def stop(name: str) -> int:
-    return _compose(name, "stop").returncode
+    return _mutating(name, "stop")
 
 
 def restart(name: str) -> int:
-    return _compose(name, "restart").returncode
+    return _mutating(name, "restart")
+
+
+def _mutating(name: str, *args: str) -> int:
+    """A compose command that CHANGES container state.
+
+    Drops the memoised query results afterwards: a dashboard that still showed
+    "running" for two seconds after a Stop would be a cache the user can notice,
+    which is worse than the process spawns the memo saves.
+    """
+    try:
+        return _compose(name, *args).returncode
+    finally:
+        invalidate_docker_queries()
 
 
 def logs(name: str, *, follow: bool = False, tail: int | None = None) -> int:
@@ -444,9 +521,10 @@ def repro_lock(name: str, *, timeout: float = 900.0, poll: float = 0.2):
     """
     tlock = _thread_lock_for(name)
     if not tlock.acquire(timeout=timeout):
-        raise TimeoutError(
-            f"another rc-repro operation has been holding {name!r} for "
-            f"over {int(timeout)}s")
+        raise ConflictError(
+            f"another rc-repro operation is still working on {name!r} "
+            f"(waited {int(timeout)}s). Check `rc-repro list` and the Activity "
+            "list, then retry.")
     # Reentrancy depth is tracked per THREAD, in step with the RLock's own
     # semantics. It cannot live on the lock object: threading.RLock is a C type
     # with no __dict__, so assigning an attribute to it raises.
@@ -477,9 +555,10 @@ def repro_lock(name: str, *, timeout: float = 900.0, poll: float = 0.2):
                     break
                 except OSError:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            f"another rc-repro process has been holding {name!r} for "
-                            f"over {int(timeout)}s") from None
+                        raise ConflictError(
+                            f"another rc-repro process is still working on {name!r} "
+                            f"(waited {int(timeout)}s). Check `rc-repro list` and "
+                            "the Activity list, then retry.") from None
                     time.sleep(poll)
             try:
                 yield
@@ -528,6 +607,31 @@ def service_container_ids(name: str, service: str) -> list[str]:
     if r.returncode != 0:
         return []
     return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+
+
+def host_memory() -> tuple[int, int, int] | None:
+    """(total_mb, available_mb, swap_total_mb) for the machine, or None.
+
+    MemAvailable, not MemFree: free memory excludes the page cache, which the
+    kernel reclaims on demand, so `free` looks alarming on a healthy box and
+    reassuring on a doomed one. MemAvailable is the kernel's own estimate of what
+    a new workload can actually get, which is exactly the question here.
+
+    Linux only. Everywhere else this returns None and the caller skips the check
+    rather than guessing -- a wrong refusal is worse than no refusal.
+    """
+    try:
+        fields = {}
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                fields[key] = int(rest.strip().split()[0])   # kB
+    except (OSError, ValueError, IndexError):
+        return None
+    if "MemTotal" not in fields or "MemAvailable" not in fields:
+        return None
+    return (fields["MemTotal"] // 1024, fields["MemAvailable"] // 1024,
+            fields.get("SwapTotal", 0) // 1024)
 
 
 def docker_capacity() -> tuple[float, int] | None:
@@ -644,10 +748,12 @@ def project_states() -> dict[str, str] | None:
     failed — callers that DELETE based on absence (prune) must not confuse
     "no projects" with "couldn't ask docker".
     """
-    data = _compose_ls()
-    if data is None:
-        return None
-    return {item.get("Name", ""): item.get("Status", "") for item in data}
+    def query():
+        data = _compose_ls()
+        if data is None:
+            return None
+        return {item.get("Name", ""): item.get("Status", "") for item in data}
+    return _cached_query("project_states", query)
 
 
 def project_config_files() -> dict[str, str] | None:
@@ -688,6 +794,10 @@ def rc_status_by_project() -> dict[str, str]:
     """Map compose project -> its rocketchat container `Status` string
     ("Up 2 hours (healthy)"), in ONE `docker ps` call (cheap enough for the whole
     dashboard). Used to show uptime/health per repro without an N-call fan-out."""
+    return _cached_query("rc_status_by_project", _rc_status_by_project_uncached)
+
+
+def _rc_status_by_project_uncached() -> dict[str, str]:
     try:
         proc = subprocess.run(
             ["docker", "ps", "--all", "--format",
@@ -731,14 +841,65 @@ def container_details(name: str) -> list[dict]:
             for it in data]
 
 
-def docker_available() -> bool:
+#: `docker info` forks a client that talks to the daemon: ~35 ms, and /api/health
+#: calls it on every poll. One open dashboard is 4 per 4 s; a ten-person team with
+#: a few tabs each turns the health check -- the cheap, unauthenticated one -- into
+#: the most expensive thing the server does. Short enough that `doctor` and the
+#: badge still react to Docker stopping within a poll or two.
+_DOCKER_TTL = 3.0
+_docker_seen: tuple[float, bool] | None = None
+_docker_lock = threading.Lock()
+
+
+#: Read-only docker QUERIES that the dashboard poll repeats. Each open tab asks
+#: for /api/repros every 4s, which is `docker compose ls` + `docker ps` + `docker
+#: info`; ten teammates with a tab open is ~40 process spawns every 4 seconds on
+#: the shared box. Memoised just long enough to collapse concurrent tabs into one
+#: call, and INVALIDATED by every mutation so the UI never shows a stale state
+#: after an action -- a cache the user can notice would be worse than the spawns.
+_QUERY_TTL = 2.5
+_query_cache: dict[str, tuple[float, object]] = {}
+_query_lock = threading.Lock()
+
+
+def invalidate_docker_queries() -> None:
+    """Drop memoised docker state. Called after anything that changes it."""
+    with _query_lock:
+        _query_cache.clear()
+    global _docker_seen
+    _docker_seen = None
+
+
+def _cached_query(key: str, fn):
+    now = time.monotonic()
+    with _query_lock:
+        hit = _query_cache.get(key)
+        if hit is not None and now - hit[0] < _QUERY_TTL:
+            return hit[1]
+    value = fn()
+    with _query_lock:
+        _query_cache[key] = (now, value)
+    return value
+
+
+def docker_available(*, max_age: float = _DOCKER_TTL) -> bool:
+    """Whether the daemon answers. Cached briefly; `max_age=0` forces a probe."""
+    global _docker_seen
+    now = time.monotonic()
+    if max_age > 0:
+        seen = _docker_seen
+        if seen is not None and now - seen[0] < max_age:
+            return seen[1]
     try:
         proc = subprocess.run(
             ["docker", "info"], capture_output=True, text=True, timeout=10
         )
-        return proc.returncode == 0
+        ok = proc.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
-        return False
+        ok = False
+    with _docker_lock:
+        _docker_seen = (now, ok)
+    return ok
 
 
 def _first_line(cmd: list[str]) -> str | None:

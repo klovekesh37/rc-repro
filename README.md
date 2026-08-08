@@ -23,6 +23,10 @@ Prefer a UI? `rc-repro serve` opens a local web dashboard for everything below
 - [HTTPS](#https) — a domain and an email, or a local certificate
 - [Environment variables](#environment-variables) — `rc-repro env`, change settings on a running repro
 - [Data & performance](#data--performance) — sample data, data-scale prefill, config import, backup/restore, upgrade testing, benchmarking, load testing
+
+Then, when you need them:
+
+- [Shared server](#shared-server) — accounts, who did what, one Traefik for every HTTPS name
 - [API testing](#api-testing)
 - [Reference](#reference) — command list, version resolution, state, development
 
@@ -179,6 +183,10 @@ It binds **loopback only** by default and prints a one-time session token in the
 URL (repros run weak fixed credentials, so the control plane must not be exposed
 to your network — `--bind 0.0.0.0` requires an explicit opt-in and warns).
 
+Sharing one `serve` with a team? Add accounts and it asks for a login instead of
+handing everyone the same token, records who ran what, and can serve itself and
+every workspace over HTTPS on one port — see [Shared server](#shared-server).
+
 What you can do from it:
 
 - **Dashboard** — every repro as a card (version, port, state, uptime/health),
@@ -197,7 +205,8 @@ What you can do from it:
   (`rc-repro api` with the response pretty-printed), **Check TLS**, and a
   **doctor** preflight behind the Docker badge.
 - **Activity** — long jobs keep running if you close the dialog, and are
-  reachable again from the jobs list; a crash-looping repro is called out.
+  reachable again from the jobs list; a crash-looping repro is called out. With
+  [accounts](#shared-server), each job also shows **who** ran it.
 
 Long operations stream live progress in the browser. Everything the GUI does is
 also a CLI command — same code underneath.
@@ -377,12 +386,17 @@ monitoring stack (file-SD Prometheus + provisioned Grafana).
 
 # HTTPS
 
-`up --domain` — serve a repro over TLS with a Let's Encrypt certificate, the same
-two inputs the [official Rocket.Chat compose](https://docs.rocket.chat/docs/deploy-with-docker-docker-compose#3c-configure-domain-and-reverse-proxy)
-takes as `DOMAIN` and `LETSENCRYPT_EMAIL`:
+**Two ways, one command each.** Both are served by the shared
+[edge](#https-for-the-whole-box-the-edge) — one Traefik for the machine, started
+automatically — so you can run as many as you like at once.
 
 ```bash
+# A real name, with a Let's Encrypt certificate
 rc-repro up -v 8.5.1 --domain chat.example.com --email me@example.com
+
+# No domain, no internet: rc-repro's own CA
+rc-repro trust-ca                       # once
+rc-repro up -v 8.5.1 --https            # https://<name>.rcrepro.localhost
 ```
 
 The email is remembered, so later runs need only the domain:
@@ -392,37 +406,42 @@ rc-repro config set acme.email me@example.com     # once
 rc-repro up -v 8.5.1 --domain chat.example.com
 ```
 
-TLS is terminated by a Traefik sidecar and Rocket.Chat's `ROOT_URL` becomes the
-https URL — which is what makes OAuth/SAML redirects, `Secure` cookies,
-mixed-content cases and the mobile app behave like a customer's workspace.
+Rocket.Chat's `ROOT_URL` becomes the https URL — which is what makes OAuth/SAML
+redirects, `Secure` cookies, mixed-content cases and the mobile app behave like a
+customer's workspace.
 
-It is a **flag, not a preset** — `--preset` takes one value, so a `tls` preset
-could never be combined with `oidc`, `saml`, `livechat` or `multi-instance`, which
-are exactly the ones that need HTTPS.
+`--domain` takes the same two inputs the [official Rocket.Chat
+compose](https://docs.rocket.chat/docs/deploy-with-docker-docker-compose#3c-configure-domain-and-reverse-proxy)
+calls `DOMAIN` and `LETSENCRYPT_EMAIL`, and `--https` is a flag rather than a
+preset — `--preset` takes one value, so a `tls` preset could never combine with
+`oidc`, `saml`, `livechat` or `multi-instance`, which are exactly the ones that
+need HTTPS.
 
-## What you provide, and what rc-repro provides
+## Before it can work
 
-**You:** a domain that already resolves to this host, with TCP/443 reachable from
-the internet. However you arrange that — an A record, a CNAME, a public IP, a
-port-forward — is yours to manage.
+**You provide** a domain that already resolves to this host, with **TCP/443
+reachable from the internet**. An A record, a CNAME, a public IP, a port-forward —
+however you arrange it is yours to manage.
 
-**rc-repro:** the certificate, and serving on it. It does not check your DNS or
-your routing, because it cannot see a tunnel or a firewall from inside the
-process, and guessing was the biggest source of confusion in this path.
+**rc-repro provides** the certificate and serves on it. It does not check your DNS
+or your routing: it cannot see a tunnel or a firewall from inside the process, and
+guessing was the biggest source of confusion in this path.
 
-Let's Encrypt validates with the **TLS-ALPN-01** challenge by connecting to your
-domain on 443 — exactly as `compose.traefik.yml` does with
-`certificatesresolvers.le.acme.tlschallenge`. So the routing has to work *before*
-the certificate can be issued.
+Let's Encrypt validates by **connecting to your domain on 443**. So the routing has
+to work *before* a certificate can be issued — and if something else on the path
+terminates 443 (a proxying DNS provider like Cloudflare's orange cloud, or a
+managed lab or PaaS front end), the challenge never reaches this host and Traefik
+keeps serving its own self-signed certificate. `rc-repro tls-status --name X`
+makes a real TLS connection and tells you what is actually being served.
 
-## When Let's Encrypt cannot reach you
+**dns-01 is the way round all of that**, because it proves control with a TXT
+record and needs no inbound access at all.
 
-Behind NAT, behind a tunnel, or behind a proxy that terminates TLS, the default
-challenge cannot work — nothing can connect in. **dns-01** proves control by
-writing a TXT record instead, so it needs no inbound access at all.
+<details>
+<summary><b>Using dns-01 (also what unlocks a wildcard certificate)</b></summary>
 
-It is not a flag. Put your DNS provider's credentials in
-`~/.rc-repro/acme/dns.env` and rc-repro uses dns-01 automatically:
+Not a flag — put your provider's credentials in `~/.rc-repro/acme/dns.env` and
+rc-repro uses dns-01 automatically:
 
 ```bash
 mkdir -p ~/.rc-repro/acme && chmod 700 ~/.rc-repro/acme
@@ -438,66 +457,45 @@ route53, `DO_AUTH_TOKEN` → digitalocean, `HETZNER_*`, `AZURE_*`, and so on. An
 explicitly with `rc-repro config set acme.dns_provider <name>` if the variables do
 not identify it.
 
-Credentials are read from that file and mounted into Traefik as an `env_file` —
-never passed on a command line, where `ps` would show them to every user on the
-box. The values are never printed.
+Credentials are read from that file and mounted as an `env_file` — never passed on
+a command line, where `ps` would show them to every user on the box. The values are
+never printed.
 
-Because nothing connects in, a dns-01 repro **stays bound to loopback** rather
-than being published on `0.0.0.0`. Getting a certificate and being reachable at
-the name are then separate things: the certificate is valid, but you still have to
-arrange how traffic gets to the workspace.
+The same token is what lets the edge obtain **one `*.example.com` certificate**
+instead of one per workspace name — see
+[Certificates](#certificates).
 
-## Without a domain
+</details>
+
+## Rehearse against staging first
+
+Let's Encrypt allows **5 certificates per identical hostname per 7 days** and **5
+failed validations per hostname per hour**, which is easy to burn while getting
+DNS right:
 
 ```bash
-rc-repro trust-ca                    # once, installs rc-repro's local CA
-rc-repro up -v 8.5.1 --https         # https://<name>.rcrepro.localhost:8443
+rc-repro config set acme.staging true
 ```
 
-Offline, no rate limits, no domain. Browsers trust it after `trust-ca`; phones
-cannot use it at all (the CA is not installed there, and `.localhost` resolves to
-the phone itself).
+A browser warning on a staging certificate **is** the success signal. Staging uses
+separate storage, so switching back really re-issues. ACME state lives in
+`~/.rc-repro/acme/` **outside** the workspace, so `down --volumes` can never force
+a re-issue.
 
-## How it maps to the official compose
+## Good to know
 
-| Docs `.env` | rc-repro |
-|---|---|
-| `DOMAIN=example.com` | `--domain example.com` |
-| `LETSENCRYPT_EMAIL=…` | `--email …` (remembered) |
-| `LETSENCRYPT_ENABLED=true` | implied by `--domain` |
-| `ROOT_URL=https://…` | derived |
-| `TRAEFIK_PROTOCOL=https` | implied |
-
-Same Traefik v3.4, same `tlschallenge`, same `acme.json` storage, same
-`Host(\`domain\`)` router rule, same port 80 → 443 redirect.
-
-## Gotchas
-
-- **Check what is actually served.** `up --wait` only proves Rocket.Chat booted;
-  Traefik requests the certificate afterwards and falls back to a self-signed
-  placeholder if ACME fails. `rc-repro tls-status --name X` makes a real TLS
-  connection and reports the certificate.
-- **A TLS-terminating proxy in front will break the default challenge.** If your
-  DNS provider proxies HTTPS (Cloudflare's orange cloud; others do the same), the
-  challenge reaches the proxy rather than this host and Let's Encrypt validates
-  against the proxy's certificate. Point the record straight at the host — or use
-  dns-01, below.
-- **`--domain` publishes on `0.0.0.0`.** Let's Encrypt has to connect in, so the
-  workspace stops being loopback-only. rc-repro says so once, per create.
-- **Rate limits.** 5 certificates per identical hostname per 7 days, and 5 failed
-  validations per hostname per hour. Rehearse with
-  `rc-repro config set acme.staging true` — a browser warning on a staging
-  certificate is the success signal, and staging uses separate storage so switching
-  back really re-issues. ACME state lives in `~/.rc-repro/acme/` **outside** the
-  workspace, so `down --volumes` cannot force a re-issue.
-- **Internal calls still use http.** `rc-repro api`, seeding and the load tests talk
-  to the repro's plain port, so they need no CA. `rc-repro info` shows both URLs.
+- **`up --wait` only proves Rocket.Chat booted.** The certificate is requested
+  afterwards, in the background. `rc-repro tls-status --name X` is the check.
+- **Internal calls still use http.** `rc-repro api`, seeding and the load tests
+  talk to the workspace's plain port, so they need no CA. `rc-repro info` shows
+  both URLs.
+- **Workspaces stay bound to loopback**, including `--domain` ones. Only the edge
+  is published, and it is the only thing that needs to reach them.
+- **`--https` phones don't work.** Browsers trust the local CA after `trust-ca`;
+  a phone has neither the CA nor a way to resolve `.localhost`.
 - **⚠ Repros run fixed weak credentials (`admin`/`admin123`).** Do not leave a
-  publicly reachable `--domain` repro running: the hostname appears in public
+  publicly reachable `--domain` workspace running: the hostname appears in public
   certificate-transparency logs within minutes of issuance.
-- Not yet supported: `--https`/`--domain` together with the `multi-instance` preset
-  (it runs its own Traefik) — it refuses with a clear error rather than
-  half-working.
 
 ---
 
@@ -875,6 +873,193 @@ if any rule fails, so it drops straight into CI. `--stats` adds the CPU/RAM cost
 
 ---
 
+# Shared server
+
+Everything above assumes one person on a laptop. Put `rc-repro serve` on a box the
+team shares and three things break at once:
+
+- the session token is **one secret handed to everybody**, and it changes on every
+  restart, so a shared URL dies whenever the service does;
+- nothing can answer **"who tore down TICKET-1234?"**;
+- two people running `up -v 8.5.1` both get `rc8-5-1`, and **the second silently
+  reuses the first one's data**.
+
+Accounts fix all three. Everything here is opt-in: until someone runs `users add`,
+rc-repro behaves exactly as it always has.
+
+## Accounts
+
+```bash
+rc-repro users add alice        # prompts for the password twice, never on argv
+rc-repro users list             # names and dates — never hashes
+rc-repro users passwd alice
+rc-repro users remove alice
+```
+
+Stored in `~/.rc-repro/users`, mode `0600`, hashed with `hashlib.scrypt` from the
+standard library (no new dependency). Passwords are at least 12 characters.
+
+Once **any** account exists, `rc-repro serve` asks the browser to sign in instead
+of using a token. Five failed attempts start an exponential backoff, and an
+unknown username still performs a full hash derivation so response time cannot be
+used to enumerate who exists.
+
+> **Basic Auth sends the password on every request**, so `serve` refuses to do it
+> over plain http on a network-reachable interface. Three ways forward, and it
+> prints all three: give it a real name with `--domain` (below), keep it on
+> loopback behind a TLS proxy on the same box, or — if TLS terminates upstream at
+> a proxy, lab or load balancer — pass `--insecure`, which means "plain http is
+> fine on this hop", not "no login".
+
+## Who did what
+
+Every job records the account that ran it — shown in the GUI's **Activity** list,
+and appended to `~/.rc-repro/audit.log`:
+
+```
+2026-08-07T09:12:44+00:00<TAB>alice<TAB>up<TAB>alice-rc8-5-1
+```
+
+A file rather than only stdout, because on a shared box "who did this" has to
+survive a restart. In token mode the actor is empty and the GUI hides the column
+entirely — a shared secret genuinely cannot say who acted, and *"unknown"* would
+be worse than nothing.
+
+**The CLI's idea of who you are is not authenticated.** It uses your login name if
+it matches an account, or `RC_REPRO_USER`. That is enough for attribution among
+colleagues; it is not a security boundary, and the audit log mixes a verified GUI
+identity with an asserted CLI one.
+
+## Your own workspaces
+
+With accounts, derived names are namespaced by owner, so two people can run the
+same version:
+
+```
+$ rc-repro list
+NAME                 OWNER        RC        MONGO   PORT   STATE      URL
+*alice-rc8-5-1       alice        8.5.1     8.0     3000   running    …
+ bob-rc8-5-1         bob          8.5.1     8.0     3001   running    …
+```
+
+The OWNER column appears only when a workspace has one, so single-user output —
+and anything parsing it — is unchanged.
+
+**Everyone can see and act on everything.** Support engineers hand tickets over
+and cover for each other; hiding a colleague's workspace would make the tool worse
+at its job. The guardrail is that destroying someone else's data names them first,
+in the CLI prompt and the GUI confirm — and still says so under `--yes`, where
+there is no prompt to read but there is a log to read afterwards.
+
+## HTTPS for the whole box: the edge
+
+**A workspace never terminates TLS.** One Traefik — the **edge** — holds `:80`
+and `:443` and serves every name on the machine. Nothing to set up:
+
+```bash
+rc-repro up -v 8.5.1 --domain t1234.support.example.com --email ops@example.com
+rc-repro up -v 8.6.1 --domain t5678.support.example.com     # and another, and another
+```
+
+The edge starts by itself with the first workspace that needs a name. There is no
+`--edge` flag, no ordering to get right, and `--domain` means exactly what it
+always did.
+
+Add **one wildcard DNS record** (`*.support.example.com` → the box) and no
+workspace ever needs a DNS record again.
+
+**`--https` works the same way**, with rc-repro's own CA instead of Let's
+Encrypt, so it needs no domain at all:
+
+```bash
+rc-repro trust-ca                                  # once
+rc-repro up -v 8.5.1 --https --name TICKET-1234    # https://ticket-1234.rcrepro.localhost
+```
+
+Ten of those used to consume ten ports and give ten different URLs. Now every
+name answers on 443.
+
+### What that buys, and what it costs
+
+- **HTTPS is a runtime property.** A workspace's compose file is identical
+  whether it serves https or not, so gaining or losing a name writes or deletes a
+  route file — **no container is ever rebuilt for it.** Workspaces from an older
+  rc-repro are moved across the same way: their Traefik container is removed and
+  the edge attaches to them live, with Rocket.Chat and MongoDB never stopping.
+- **Workspaces still cannot reach each other.** Each keeps the private network
+  compose gives it and the edge joins *those*, rather than everything sharing one.
+- **The GUI is just another name.** `serve --domain support.example.com` adds a
+  route for it; whether the GUI has a public name and whether a workspace can
+  serve HTTPS are unrelated questions.
+- **Shared fate**, and it is real: while the edge is down, every https name on the
+  box is unreachable. It only routes, it restarts unless stopped, and `doctor`
+  calls it a failure rather than a warning.
+
+### Seeing it
+
+It is **not a workspace** — never in `list`, and `prune`/`down` cannot touch it.
+It answers for itself instead:
+
+```bash
+rc-repro edge status      # running? which names? can it reach each one?
+rc-repro edge stop        # frees :80 and :443 for something else
+rc-repro edge start
+```
+
+`status` prints each route beside whether the edge is actually attached to that
+workspace, because a route it cannot reach answers **502** rather than erroring —
+the one failure nothing else would tell you about.
+
+### Certificates
+
+Each name gets its own by default, against Let's Encrypt's limit of 50 per
+registered domain per 7 days; rc-repro counts the names it caused and warns as you
+approach it. Put a DNS API token in `~/.rc-repro/acme/dns.env` and the edge
+obtains a single `*.support.example.com` instead, and no workspace ever costs a
+certificate again. No flag — a wildcard can only be issued over dns-01, so the
+token *is* the choice.
+
+A wildcard covers exactly one label: `t1234.support.example.com` is covered,
+`a.b.support.example.com` is not and gets its own.
+
+> **Let's Encrypt has to reach this machine on :443.** Behind a platform that
+> terminates 443 itself — some managed labs and PaaS front ends do — the challenge
+> never arrives and Traefik keeps serving its own self-signed certificate.
+> `rc-repro edge status` and `tls-status` show what is really being served. dns-01
+> (the token above) is the way out, because it is validated by a DNS record rather
+> than an inbound connection.
+
+## Keeping it running
+
+`serve` runs in the foreground. To keep it up:
+
+```bash
+rc-repro serve --domain support.example.com --email ops@example.com --print-service
+```
+
+That prints a **systemd unit** and the commands to install it, plus the
+`nohup … &` fallback — and writes nothing, so you can read it before anything
+runs. systemd is the real answer: it restarts on crash, starts on boot, and gives
+you `systemctl status` and `journalctl -u rc-repro -f`. `nohup` survives logout
+and **nothing else** — no restart, no reboot, no log rotation, no status.
+
+Restart-on-crash is only useful *because* accounts exist. With the session token,
+every restart minted a new one and killed every bookmark.
+
+## What this is not
+
+- **No roles.** Everyone who can sign in can do everything. The users file leaves
+  room for a role column, so `readonly` can be added without a migration.
+- **No MFA, and no clean logout** — browsers cache Basic credentials until the tab
+  closes. Revoking is `users remove`. SSO in front is the upgrade if those matter.
+- **Every workspace still runs `admin`/`admin123`.** The GUI login is the only
+  boundary; the workspaces behind it are not individually protected.
+- **Shared fate.** The edge going down takes every https name with it. It only
+  routes, so it is small, it restarts unless stopped, and `doctor` calls it a
+  failure rather than a warning.
+
+---
+
 # API testing
 
 Auth is set up so you can hit the REST API immediately:
@@ -920,7 +1105,9 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `monitor` | attach/detach Prometheus + Grafana on a running repro |
 | `trust-ca` | install rc-repro's local CA so `--https` repros are trusted (`--uninstall`, `--show`) |
 | `tls-status` | report the certificate a `--domain`/`--https` repro is actually serving — see [HTTPS](#https) |
-| `serve` | launch the local [web GUI](#web-gui) (needs `pip install 'rc-repro[gui]'`) |
+| `users` | GUI accounts for a [shared server](#shared-server) (`list`/`add`/`passwd`/`remove`) |
+| `serve` | launch the [web GUI](#web-gui) (needs `pip install 'rc-repro[gui]'`); `--domain`/`--email` give it a public name on the [edge](#https-for-the-whole-box-the-edge), `--print-service` shows how to keep it running |
+| `edge` | the shared Traefik serving every HTTPS name (`status`/`start`/`stop`/`restart`) |
 | `logs` | tail a repro's logs |
 | `presets` | list available presets |
 | `versions <X.Y.Z>` | show the resolved MongoDB pairing (without launching) |
@@ -952,6 +1139,10 @@ only for RC < 8 (deprecated in 8.x).
 ├── presets/                  # your custom/team presets
 ├── reports/                  # benchmark & loadtest markdown reports
 ├── loadtests/                # saved loadtest baselines (--save / --compare)
+├── users                     # GUI accounts, 0600, scrypt — see Shared server
+├── audit.log                 # who ran what: timestamp, actor, kind, target
+├── acme/                     # ACME state; dns.env (DNS token), issued.json (cert tally)
+├── edge/                     # the shared edge's compose project + one file per route
 └── repros/<name>/
     ├── docker-compose.yml     # generated — don't hand-edit; re-run `up`
     ├── repro.json             # metadata

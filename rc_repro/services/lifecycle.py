@@ -16,6 +16,8 @@ from rc_repro import compose, config, presets, rcapi, runner, versions
 from rc_repro import seed as seeder
 from rc_repro.errors import (ConflictError, DockerError, NotFoundError,
                              NotReadyError, ValidationError)
+from rc_repro.services import audit as auditsvc
+from rc_repro.services import edge as edgesvc
 from rc_repro.services import diagnose, postready
 from rc_repro.services.events import Emit, info, null_emit, warn
 
@@ -28,6 +30,12 @@ _VALID_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # -- a 500 from the web API and a raw traceback from the CLI. 64 leaves ample room
 # for every suffix rc-repro appends and is longer than any real repro name.
 NAME_MAX = 64
+
+#: How long an INTERACTIVE mutator waits for the repro lock. repro_lock's own
+#: default is 900s, which is right for a create or a restore queued behind
+#: another -- and wrong for a button: nobody wants a Stop click to hang for
+#: fifteen minutes rather than say "something else is working on this".
+_INTERACTIVE_LOCK_WAIT = 60.0
 
 
 def _require_valid_name(name: str) -> None:
@@ -47,11 +55,34 @@ def sanitize(name: str) -> str:
     return _NAME_RE.sub("-", name).strip("-")
 
 
-def derive_name(version: str, preset: str) -> str:
+def derive_name(version: str, preset: str, actor: str = "") -> str:
+    """The workspace name for a version+preset, namespaced by who asked.
+
+    Without `actor` this returns the same name for everybody -- so on a shared
+    server the second person to run `up -v 8.5.1` silently REUSED the first
+    person's workspace, data and all, with no warning. Prefixing by the
+    authenticated user makes two people running the same version two workspaces.
+
+    Left off entirely on a single-user machine, where the prefix would be noise
+    and would break every existing name.
+    """
     base = "rc" + version
     if preset and preset != "default":
         base += "-" + preset
+    if actor:
+        base = f"{actor}-{base}"
     return sanitize(base)
+
+
+def owner_prefix(name: str, actor: str) -> str:
+    """`name` namespaced to `actor`, unless it already is.
+
+    An explicit --name still wins, but on a shared server it has to be somebody's
+    or two people typing `--name test` collide exactly as the derived names did.
+    """
+    if not actor:
+        return name
+    return name if name.startswith(f"{actor}-") else f"{actor}-{name}"
 
 
 # --- preconditions ------------------------------------------------------------
@@ -61,18 +92,154 @@ def require_docker() -> None:
         raise NotReadyError("Docker isn't running. Start Docker Desktop and try again.")
 
 
-def resolve_name(name: str | None) -> str:
+#: Rocket.Chat settled at 670-770 MB and MongoDB at 124-184 MB per workspace on
+#: the host that OOMed -- so ~950 MB at REST. Rounded UP to 1100, deliberately:
+#: those were idle figures, RC's Node heap reached 721 MB under a mild load test,
+#: and calibrating to the resting case would have permitted exactly the seven
+#: stacks that took the machine down. Matches design §8's "roughly 1.2 GB".
+WORKSPACE_MB = 1100
+#: Sidecars a preset adds. Keycloak (saml/oidc) is by far the largest.
+PRESET_MB = {"saml": 450, "oidc": 450, "s3_minio": 120, "ldap": 80,
+             "livechat": 60, "multi-instance": 400, "email": 40}
+#: Prometheus + Grafana + Loki + the OTel collector + two exporters.
+MONITORING_MB = 280
+#: Left unspent: for the OS, Docker, the page cache -- and, mostly, for GROWTH.
+#: A fifth of the host, never below 1 GB.
+#:
+#: The proportion is the lesson from the incident. That box OOMed while
+#: MemAvailable still read ~3.3 GB, because the danger is not the memory a
+#: workspace takes at admission but the memory seven already-admitted ones take
+#: an hour later: Rocket.Chat is Node, its heap grows with use, and a mild load
+#: test alone pushed one to 721 MB. A fixed 1 GB reserve waved the fatal
+#: configuration through when I tested it against the real numbers; a fifth
+#: refuses it.
+#:
+#: This is why the check cannot be the only defence -- see the growth caveat in
+#: check_capacity().
+def host_reserve_mb(total_mb: int) -> int:
+    return max(1024, total_mb // 5)
+
+
+def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_emit) -> None:
+    """Refuse to create a workspace the host cannot hold.
+
+    Written after seven concurrent stacks OOM-killed a 10 GB host with no swap:
+    the kernel killed a Rocket.Chat process, load average hit 165, and the box had
+    to be recovered. Every individual `up` had succeeded -- nothing anywhere asked
+    whether there was room for one more, which is exactly the gap
+    docs/design/team-server.md §8 recorded as "made visible, not solved".
+
+    It cannot be the only defence, and should not be presented as one: the memory
+    that kills a host is the memory workspaces take LATER, not at admission. This
+    stops the obviously-doomed create and keeps the ceiling visible; container
+    memory limits and enough RAM are what actually bound the total.
+
+    A REFUSAL rather than a warning, because the failure is not confined to the
+    workspace being created: the OOM killer picks its own victim, so on a shared
+    server this destroys a colleague's work. A warning would be advice nobody
+    reads until after the machine is down. Overridable with --force, and the
+    message says what to stop instead.
+    """
+    mem = runner.host_memory()
+    if mem is None:                     # not Linux: skip rather than guess
+        return
+    total_mb, available_mb, swap_mb = mem
+    need = WORKSPACE_MB + PRESET_MB.get(preset_name, 0)
+    if req.monitor:
+        need += MONITORING_MB
+
+    reserve = host_reserve_mb(total_mb)
+    headroom = available_mb - reserve
+    if need <= headroom:
+        # Say so while it is still comfortable, so the ceiling is visible before
+        # it is hit rather than only in the refusal.
+        if headroom - need < WORKSPACE_MB:
+            warn(emit, f"after this one, about {max(0, headroom - need)} MB is left "
+                       f"— roughly {max(0, (headroom - need)) // WORKSPACE_MB} more "
+                       "workspace(s). `rc-repro list` shows what is running.",
+                 phase="create")
+        return
+
+    running = [m.name for m in runner.list_meta()]
+    swap_note = ("\n  This host has NO SWAP, so there is no buffer at all: memory "
+                 "pressure becomes an OOM kill rather than slowdown."
+                 if swap_mb == 0 else "")
+    raise NotReadyError(
+        f"not enough memory: this workspace needs about {need} MB and only "
+        f"{max(0, headroom)} MB is free to use "
+        f"({available_mb} MB available, {reserve} MB kept for the OS, Docker and "
+        f"the page cache, {total_mb} MB total).{swap_note}\n"
+        f"  {len(running)} workspace(s) exist: {', '.join(running[:6]) or 'none'}"
+        f"{' …' if len(running) > 6 else ''}\n"
+        "  Free some memory first — `rc-repro stop --name <it>` keeps the data:\n"
+        "    rc-repro list\n"
+        "  Or override this check if you are sure:  --force")
+
+
+def name_candidates(name: str, actor: str = "") -> list[str]:
+    """The workspaces `name` could mean, best match first.
+
+    Creation TRANSFORMS what you type -- `sanitize()` always, and the owner prefix
+    when there are accounts -- so resolution has to apply the same transforms or
+    the name never round-trips. It did not, and in two separate ways:
+
+      up   --name TICKET-1234  ->  creates 'ticket-1234'   (sanitize)
+      down --name TICKET-1234  ->  ValidationError         (validate, no sanitize)
+
+    which broke the README's own first example on a plain single-user install,
+    and then:
+
+      up   --name test         ->  creates 'alice-test'    (owner prefix)
+      down --name test         ->  NotFoundError
+
+    once any account existed. The first is older than the team work; the prefix
+    only widened it. Both are the same bug -- create and resolve disagreeing about
+    what a name means -- so both are fixed by deriving the candidates the same way.
+
+    Order matters, and is: what you typed, then what creating it would have made,
+    then the bare sanitized form.
+
+      * exact first, so a full name always wins -- `alice-test` resolves to itself
+        rather than being prefixed again, and a colleague's `bob-rc8-5-1` is
+        reachable by typing it;
+      * the OWNER-PREFIXED form before the bare one, because that is what `up`
+        would target. With both `ticket-1234` (made before accounts) and
+        `alice-ticket-1234` present, `--name TICKET-1234` has to mean the same
+        workspace here as it does there, or the round trip is broken again in a
+        subtler way;
+      * the bare form last, so pre-accounts workspaces stay reachable.
+    """
+    out: list[str] = []
+    # Only if it is already a legal name: this one is used as a filesystem path,
+    # and the sanitized forms below are safe by construction while raw input is
+    # not ('../../x' must never be probed as a path).
+    if _VALID_NAME_RE.match(name or "") and len(name) <= NAME_MAX:
+        out.append(name)
+    clean = sanitize(name or "")
+    if actor and clean:
+        prefixed = owner_prefix(clean, actor)
+        if prefixed not in out:
+            out.append(prefixed)
+    if clean and clean not in out:
+        out.append(clean)
+    return out
+
+
+def resolve_name(name: str | None, actor: str = "") -> str:
     """Explicit name (must exist) else the configured default (must exist).
 
-    The name is shape-checked first: `sanitize()` runs only at creation, so every
-    real repro matches, while the value here goes on to become a filesystem path
-    (runner.workspace) and a compose project name. Validating beats trusting it.
+    `actor` lets a name typed without the owner prefix find the workspace it
+    created; without one this behaves exactly as it did before accounts existed.
     """
     if name:
-        _require_valid_name(name)
-        if not runner.exists(name):
-            raise NotFoundError(f"no repro named {name!r} (run `rc-repro list`)")
-        return name
+        for candidate in name_candidates(name, actor):
+            if runner.exists(candidate):
+                return candidate
+        # Nothing matched. Report the shape problem when there is one -- "invalid
+        # name" is more use than "not found" for `--name 'my repro!'` -- and
+        # otherwise say what was looked for, in the form it would have been made.
+        _require_valid_name(sanitize(name) or name)
+        raise NotFoundError(f"no repro named {name!r} (run `rc-repro list`)")
     default = config.load_config().get("default_repro")
     if not default:
         raise ValidationError("no name given and no default repro set (use `rc-repro use <name>`)")
@@ -162,6 +329,24 @@ def pick_host_port(port: int, pre: presets.Preset, exclude: str = "") -> int:
         raise ConflictError(str(exc)) from exc
 
 
+def owner_of(name: str) -> str:
+    """Who created `name`, or "" for a pre-team workspace or one that is gone."""
+    try:
+        meta = runner.read_meta(name)
+    except Exception:
+        return ""
+    return meta.extra.get("created_by", "") if isinstance(meta.extra, dict) else ""
+
+
+def _derive_for(req: "CreateReq") -> str:
+    """The workspace name for this request. Used twice -- by the lock wrapper and
+    by the body -- so they cannot drift apart and lock a different repro than the
+    one being written."""
+    if req.name:
+        return sanitize(owner_prefix(sanitize(req.name), req.actor))
+    return derive_name(req.version, req.preset, req.actor)
+
+
 # --- create -------------------------------------------------------------------
 
 @dataclass
@@ -202,10 +387,39 @@ class CreateReq:
     acme_dns_provider: str = ""
     # `up --env KEY=VALUE`. Merged over the preset's env; a None value removes a key.
     env: dict = field(default_factory=dict)
+    # Who asked for this, when the GUI has named accounts. Namespaces the derived
+    # workspace name so two people can run the same version, and is recorded on the
+    # workspace so `list` can show who owns what.
+    actor: str = ""
     # Set by _resolve_tls: TLS-ALPN is validated by Let's Encrypt CONNECTING here,
     # so --domain has to publish on a public interface. Derived, not asked for --
     # an explicit --bind always wins.
     bind_public: bool = False
+
+
+def _tls_from_record(name: str) -> "tuple[bool, str] | None":
+    """(https, domain) an EXISTING workspace was created with, or None.
+
+    Read from repro.json rather than remembered in the request, because the `up`
+    that brings a workspace back is a different invocation -- usually a different
+    day -- from the one that gave it a name.
+    """
+    if not name or not runner.exists(name):
+        return None
+    try:
+        meta = runner.read_meta(name)
+    except Exception:  # noqa: BLE001 - half-written record
+        return None
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    mode = extra.get("tls")
+    if not mode or not meta.public_url:
+        return None
+    from rc_repro import tls as tlsmod
+
+    if mode == tlsmod.MODE_LOCAL:
+        return (True, "")
+    host = meta.public_url.split("://", 1)[-1].split("/", 1)[0]
+    return (False, host) if host else None
 
 
 def _resolve_tls(req: CreateReq, repro_name: str, bind_host: str, exclude: str = "",
@@ -219,7 +433,20 @@ def _resolve_tls(req: CreateReq, repro_name: str, bind_host: str, exclude: str =
     # A domain means HTTPS; requiring --https alongside it was ceremony. --https on
     # its own selects the local-CA mode, which needs nothing else.
     if not (req.https or req.domain or req.acme_email):
-        return None
+        # ...unless this workspace ALREADY has an https name. `down` then `up` is
+        # the documented way to bring a workspace back ("data intact"), and it
+        # silently dropped TLS: the record went on claiming public_url while
+        # nothing served it. Harmless to re-derive, because the name and the
+        # certificate both live outside the workspace -- restoring it is writing a
+        # route file, where before it would have meant rebuilding a Traefik.
+        restored = _tls_from_record(exclude or repro_name)
+        if restored is None:
+            return None
+        req.https, req.domain = restored
+        if not (req.https or req.domain):
+            return None
+        info(emit, f"restoring the https name this workspace already had"
+                   f"{' (' + req.domain + ')' if req.domain else ''}", phase="tls")
 
     from rc_repro import tls as tlsmod
 
@@ -247,48 +474,26 @@ def _resolve_tls(req: CreateReq, repro_name: str, bind_host: str, exclude: str =
     else:
         mode = tlsmod.MODE_LOCAL
 
-    # TLS-ALPN-01 is validated by Let's Encrypt CONNECTING here, so it has to
-    # publish on a public interface. Derived rather than failing on a missing
-    # --bind; an explicit --bind always wins.
-    # dns-01 is validated by a TXT record and never connects here, so it stays on
-    # loopback -- these repros run fixed weak credentials, and widening the bind for
-    # a challenge that does not need it would expose them for nothing.
-    req.bind_public = (mode == tlsmod.MODE_ACME
-                       and req.acme_challenge == "tlsalpn"
-                       and not req.bind)
+    # The workspace stays on loopback whatever the challenge. It publishes no TLS
+    # port at all now, so there is nothing for Let's Encrypt to connect TO here --
+    # the EDGE answers the TLS-ALPN challenge on 443, for every name it serves.
+    # Widening a workspace's bind (these run fixed weak credentials) for a
+    # challenge that no longer reaches it would expose them for nothing.
+    req.bind_public = False
 
     host = domain or tlsmod.local_host_for(repro_name)
-    # A real domain answers on 443 so the URL carries no port; a .localhost name
-    # gets an allocated port, because every repro would otherwise want 443.
-    port = 443 if mode != tlsmod.MODE_LOCAL else _pick_tls_port(exclude=exclude)
-    # Ports this repro already claims are exempt from the probe, exactly as
-    # pick_host_port does it: on `up --force` its OWN Traefik is still running and
-    # still holding 443, so probing would report "in use" and refuse to recreate
-    # the very repro that owns it.
-    own = own_ports(exclude) if exclude else set()
-    if mode != tlsmod.MODE_LOCAL and port not in own and not runner.port_free(port):
-        raise ConflictError(
-            f"port {port} is already in use on this machine, and a repro on a real "
-            "domain has to own it. Free it, or `rc-repro down` whatever holds it.")
-    # A domain-backed repro also publishes :80 and redirects it to https, the way the
-    # official rocketchat-compose Traefik files do -- otherwise typing the bare
-    # hostname reaches nothing, because browsers try http first.
-    #
-    # Best-effort, NOT required: refusing to create the repro because something else
-    # holds 80 would block --domain entirely for anyone running a web server there,
-    # and TLS-ALPN validates on 443, not 80.
-    redirect = False
-    if tlsmod.can_redirect_http(mode, port):
-        redirect = 80 in own or runner.port_free(80)
-        if not redirect:
-            warn(emit, "port 80 is in use, so http:// will not redirect to https. The "
-                       "workspace still serves fine on https - you just have to type "
-                       "the scheme.", phase="tls")
+    # Every name answers on the edge's 443. No port is allocated per workspace and
+    # no port is probed: this workspace terminates no TLS, so there is nothing to
+    # conflict with. That deletes the whole port-443 arbitration -- the conflict
+    # error, the `own_ports` exemption, `_pick_tls_port`, and the http-redirect
+    # probe, which the edge does once for every name instead of each workspace
+    # fighting over :80.
+    port = 443
 
     return tlsmod.TlsSpec(
         mode=mode, host=host, port=port, acme_email=req.acme_email,
         acme_staging=req.acme_staging, acme_challenge=req.acme_challenge,
-        acme_dns_provider=req.acme_dns_provider, http_redirect=redirect)
+        acme_dns_provider=req.acme_dns_provider)
 
 
 def _pick_challenge(req: CreateReq, cfg: dict, emit: Emit = null_emit) -> None:
@@ -326,25 +531,6 @@ def _pick_challenge(req: CreateReq, cfg: dict, emit: Emit = null_emit) -> None:
     req.acme_dns_provider = provider
     info(emit, f"using the dns-01 challenge via {provider} ({detail}) — no inbound "
                "connection needed, so the workspace stays on loopback", phase="tls")
-
-
-def _pick_tls_port(exclude: str = "") -> int:
-    """A free host port for the TLS entrypoint, avoiding every port other repros
-    claim. Separate from pick_host_port so RC keeps its own contiguous range.
-
-    `own` is exempted from the port_free() probe, the same way pick_host_port does
-    it: on `up --force` the repro's OWN Traefik is still running and still holding
-    the port, so probing it would report "in use" and drift to the next number --
-    changing the workspace URL on every recreate.
-    """
-    own = own_ports(exclude) if exclude else set()
-    used = runner.used_ports() - own
-    for p in range(8443, runner.PORT_MAX):
-        if p in used:
-            continue
-        if p in own or runner.port_free(p):
-            return p
-    raise ConflictError("no free host port for the HTTPS entrypoint (tried 8443+)")
 
 
 def _unknown_params(params: dict, pre: presets.Preset) -> list[str]:
@@ -389,7 +575,7 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
     derived here rather than inside, because the lock needs it before any work
     starts -- it depends only on the request, so it is cheap to compute twice.
     """
-    name = sanitize(req.name) if req.name else derive_name(req.version, req.preset)
+    name = _derive_for(req)
     if not name:
         raise ValidationError(
             f"name {req.name!r} contains no usable characters (want a-z, 0-9, '-')")
@@ -423,7 +609,11 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
             f"unknown --set param(s) for preset {req.preset!r}: {', '.join(unknown)} - valid: {valid}")
 
     wait = req.wait or bool(pre.post_ready) or req.seed
-    repro_name = sanitize(req.name) if req.name else derive_name(req.version, req.preset)
+    repro_name = _derive_for(req)
+    # Before any docker work, and only for a workspace that does not exist yet:
+    # `up` on an existing one reuses its containers and adds nothing.
+    if not runner.exists(_derive_for(req)) and not req.force:
+        check_capacity(req, req.preset, emit)
     if not repro_name:
         raise ValidationError(f"name {req.name!r} contains no usable characters (want a-z, 0-9, '-')")
     # sanitize() fixes the CHARACTERS but not the length, and the first thing below
@@ -501,6 +691,10 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
         meta.extra["sidecar_ports"] = pre.ports
     if env_overrides:
         meta.extra["env"] = env_overrides
+    if req.actor:
+        # Who owns this. Shown by `list` and the GUI card, so a shared server can
+        # say whose workspace this is without guessing from the name prefix.
+        meta.extra["created_by"] = req.actor
     if req.params:
         # Recorded so a repro can be rebuilt exactly: `backup` copies these into its
         # manifest, and `restore --new` would otherwise recreate an s3_minio repro
@@ -509,12 +703,47 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
     files = list(pre.files)
     if tlsspec:
         from rc_repro import tls as tlsmod
-        cert_pem = key_pem = ""
-        if tlsspec.mode == tlsmod.MODE_LOCAL:
-            from rc_repro import tls_local
+
+        # ONE path, whether the name is a real domain or a .rcrepro.localhost one.
+        # The only difference is where the certificate comes from, and that is the
+        # edge's business -- so no tls/ files are written here, no port is claimed,
+        # and nothing about this workspace's containers depends on it.
+        local = tlsspec.mode == tlsmod.MODE_LOCAL
+        if local:
             info(emit, f"issuing a local certificate for {tlsspec.host}", phase="tls")
-            cert_pem, key_pem = tls_local.issue_leaf(tlsspec.host)
+            edgesvc.issue_local_cert(tlsspec.host)
         else:
+            # Traefik writes acme.json here; it must exist and be private BEFORE
+            # the container mounts it, or Traefik refuses to use it.
+            tlsmod.acme_dir().mkdir(parents=True, exist_ok=True)
+            tlsmod.acme_dir().chmod(0o700)
+
+        # Started HERE, not in _resolve_tls. Lazily, by the first workspace that
+        # needs a name -- not at install, not by `serve`, since whether the GUI has
+        # a public hostname is an unrelated question. It has to happen where docker
+        # work legitimately happens, though: putting it in _resolve_tls made a
+        # resolve function start containers, and the TEST SUITE then started a real
+        # edge that held :443 and broke a live run. Caught by running it.
+        # The email goes WITH it: an edge started bare by an earlier `--https`
+        # declares no resolver, and a --domain route naming one it does not have
+        # is rejected at load, so the name 404s while looking correct outside.
+        if not edgesvc.running() or (not local and not edgesvc.has_acme()):
+            info(emit, "starting the edge (one Traefik, :80 and :443 for every name)",
+                 phase="tls")
+            if not edgesvc.ensure_running(
+                    acme_email="" if local else tlsspec.acme_email,
+                    acme_staging=tlsspec.acme_staging):
+                holder = edgesvc.port_holder(443)
+                because = f" — {holder} is holding :443" if holder else ""
+                warn(emit, f"the edge did not start{because}, so {tlsspec.host} will "
+                           "not answer yet. The workspace itself is unaffected; free "
+                           "the port and `rc-repro edge start`.", phase="tls")
+
+        needs_cert = edgesvc.register(repro_name, tlsspec.host,
+                                      instances=pre.instances or 1, local=local)
+        if local:
+            pass
+        elif needs_cert:
             # No reachability checks. Whether the domain resolves here, and how
             # traffic gets to this host, is the operator's business -- rc-repro
             # cannot see a tunnel, a port-forward or a firewall from in here, and
@@ -522,21 +751,32 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
             # source of confusion in this path.
             info(emit, f"requesting a certificate from Let's Encrypt "
                        f"({'staging' if tlsspec.acme_staging else 'production'}) "
-                       f"for {tlsspec.host} — Traefik does this in the background; "
-                       f"confirm with `rc-repro tls-status -n {repro_name}`", phase="tls")
-            # Traefik writes acme.json here; it must exist and be private BEFORE
-            # the container mounts it, or Traefik refuses to use it.
-            tlsmod.acme_dir().mkdir(parents=True, exist_ok=True)
-            tlsmod.acme_dir().chmod(0o700)
-        files += tlsmod.files(tlsspec, compose.rc_service_names(pre.instances),
-                             cert_pem, key_pem)
+                       f"for {tlsspec.host} — the edge does this in the background; "
+                       f"confirm with `rc-repro tls-status -n {repro_name}`",
+                 phase="tls")
+            # Counted BEFORE the warning, so the name being created is included --
+            # the useful number is "after this one", not "before it".
+            tlsmod.record_issuance(tlsspec.host)
+            budget = tlsmod.budget_warning(tlsspec.host)
+            if budget:
+                warn(emit, budget, phase="tls")
+        else:
+            info(emit, f"registering {tlsspec.host} — covered by the wildcard, "
+                       "no certificate request", phase="tls")
+
         meta.extra["tls"] = tlsspec.mode
-        meta.extra["tls_ports"] = [tlsspec.port]
-        if tlsspec.mode == tlsmod.MODE_ACME:
+        meta.extra["edge"] = True
+        # Deliberately NO tls_ports: used_ports() feeds port allocation, and
+        # claiming a port this workspace does not publish would make every later
+        # workspace route around one it never held.
+        if not local:
             meta.extra["tls_staging"] = tlsspec.acme_staging
             meta.extra["tls_email"] = tlsspec.acme_email
         meta.extra.setdefault("notes", [])
-        meta.extra["notes"] = list(meta.extra["notes"]) + tlsmod.notes(tlsspec, repro_name)
+        meta.extra["notes"] = list(meta.extra["notes"]) + [
+            f"served by the edge at https://{tlsspec.host}",
+            "the edge holds :443 for the whole box; this workspace publishes none",
+        ]
     if req.monitor:
         from rc_repro import monitoring
         targets = compose.rc_service_names(pre.instances)
@@ -579,6 +819,14 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
             f"{head} Workspace kept for inspection - retry with --force, or discard: "
             f"rc-repro down --name {repro_name} --volumes")
 
+    # AFTER the workspace is up, because attaching needs the network `docker
+    # compose up` has only just created. Registering during the build wrote a
+    # correct route to a backend the edge could not resolve, so the name answered
+    # 502 -- and 502 is not an error anyone sees, it just looks like a broken
+    # workspace. Idempotent: register() attaches too, for every later call.
+    if tlsspec:
+        edgesvc.attach(repro_name)
+
     result = _summary(meta)
     result["reused"] = False
     result["waited"] = wait
@@ -587,6 +835,33 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
     if req.seed:
         result["seed"] = run_seed_inline(meta, req.seed_profile, req.stats, emit)
     return result
+
+
+def _restore_route(meta: "runner.Metadata", emit: Emit = null_emit) -> None:
+    """Re-register a workspace's https name with the edge. Best-effort.
+
+    Never fatal: the workspace is up and usable either way, and failing a reuse
+    over the ingress would be the wrong trade.
+    """
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    if not (extra.get("tls") and meta.public_url):
+        return
+    from rc_repro import tls as tlsmod
+
+    host = meta.public_url.split("://", 1)[-1].split("/", 1)[0]
+    local = extra.get("tls") == tlsmod.MODE_LOCAL
+    try:
+        if not edgesvc.running():
+            edgesvc.ensure_running(acme_email="" if local else extra.get("tls_email", ""),
+                                   acme_staging=bool(extra.get("tls_staging")))
+        if local:
+            edgesvc.issue_local_cert(host)
+        instances = extra.get("instances") if isinstance(extra.get("instances"), int) else 1
+        edgesvc.register(meta.name, host, instances=instances, local=local)
+        info(emit, f"{host} is served by the edge again", phase="tls")
+    except Exception as exc:  # noqa: BLE001 - the workspace is fine regardless
+        warn(emit, f"could not restore the https name {host}: {exc}. "
+                   "`rc-repro edge status` reports it.", phase="tls")
 
 
 def _reuse(name: str, wait: bool, req: CreateReq, emit: Emit, *, stream_output: bool,
@@ -617,6 +892,13 @@ def _reuse(name: str, wait: bool, req: CreateReq, emit: Emit, *, stream_output: 
         info(emit, f"{name!r} already exists - bringing it back up.", phase="create")
         if _up(name, pull=False, emit=emit, stream_output=stream_output) != 0:
             raise DockerError("`docker compose up` failed")
+    # A reused workspace gets its https name back. This path never resolved TLS --
+    # it reuses the record as-is -- so after a `down`, `up` printed
+    # "URL https://…" from that record while the name served nothing at all: the
+    # route was removed by the teardown and never rewritten. Cheap to put right
+    # now that a name is a file rather than a Traefik of its own.
+    _restore_route(meta, emit)
+
     result = _summary(meta)
     result["reused"] = True
     result["waited"] = wait
@@ -829,7 +1111,9 @@ def list_repros() -> list[dict]:
         state = "?" if not docker_up else repro_state(rc_status, bool(states.get(m.project)))
         uptime, health = _uptime_health(rc_status)
         monitored = bool(isinstance(m.extra, dict) and m.extra.get("monitoring"))
-        out.append({"name": m.name, "rc_version": m.rc_version, "mongo_tag": m.mongo_tag,
+        owner = m.extra.get("created_by", "") if isinstance(m.extra, dict) else ""
+        out.append({"name": m.name, "created_by": owner,
+                    "rc_version": m.rc_version, "mongo_tag": m.mongo_tag,
                     "host_port": m.host_port, "root_url": m.root_url, "state": state,
                     # The https URL when `up --https` was used; "" otherwise. The CLI
                     # and GUI show this in preference to root_url, which stays http.
@@ -896,6 +1180,7 @@ def detail(name: str) -> dict:
     # The list payload has carried `default` all along; the panel needs it too, so
     # it can offer "Make default" only where that would change something.
     d["is_default"] = target == config.load_config().get("default_repro")
+    d["created_by"] = m.extra.get("created_by", "") if isinstance(m.extra, dict) else ""
     # The panel keys its HTTPS row and its "Check TLS" action off these. list_repros()
     # carried them and detail() did not, so the feature was invisible in the panel.
     d["public_url"] = m.public_url
@@ -942,14 +1227,23 @@ def set_state(name: str, action: str) -> None:
     fn = {"start": runner.start, "stop": runner.stop, "restart": runner.restart}.get(action)
     if fn is None:
         raise ValidationError(f"unknown action {action!r} (want start|stop|restart)")
-    if fn(target) != 0:
-        # A `down`ed repro has no containers, so `compose start` can never revive
-        # it. Say what actually works instead of just reporting the exit code.
-        hint = ""
-        if action in ("start", "restart") and runner.rc_state(target) == "absent":
-            hint = (f" - {target!r} was `down`ed, so it has no containers to "
-                    "start; recreate them from its stored metadata instead")
-        raise DockerError(f"`docker compose {action}` failed for {target!r}{hint}")
+    # Locked like every other mutator. Stop/Restart are always-enabled GUI buttons,
+    # so they were clickable straight through a create, backup or upgrade running on
+    # the same repro -- and app.js's PENDING map only blocks within ONE tab, so a
+    # second tab, a second user or the CLI walked right past it. Stopping mid-backup
+    # is the nastiest: _Quiesced.__exit__ restarts the services afterwards, so the
+    # stack silently comes back up and the "workspace is stopped" warning never fires.
+    # A short timeout because this is interactive: waiting 15 minutes on a click is
+    # not a better answer than "something else is working on it, try again".
+    with runner.repro_lock(target, timeout=_INTERACTIVE_LOCK_WAIT):
+        if fn(target) != 0:
+            # A `down`ed repro has no containers, so `compose start` can never
+            # revive it. Say what actually works instead of the exit code.
+            hint = ""
+            if action in ("start", "restart") and runner.rc_state(target) == "absent":
+                hint = (f" - {target!r} was `down`ed, so it has no containers to "
+                        "start; recreate them from its stored metadata instead")
+            raise DockerError(f"`docker compose {action}` failed for {target!r}{hint}")
 
 
 def _clear_default_if(name: str) -> None:
@@ -968,11 +1262,31 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
     if volumes and not confirm:
         raise ValidationError(f"deleting {target!r}'s data volume and record is irreversible - "
                               "pass confirm=true")
-    if runner.down(target, volumes=volumes) != 0:
-        raise DockerError(f"`docker compose down` failed for {target!r}")
-    if volumes:
-        runner.remove(target)
-        _clear_default_if(target)
+    # Recorded BEFORE the work, not after: a teardown that dies half way through
+    # has still destroyed containers, and that is exactly the event someone will
+    # come looking for. Auditing here rather than at the route/command covers the
+    # CLI and the GUI at once -- the single web-side call site missed both of the
+    # destructive operations entirely.
+    auditsvc.record("down-volumes" if volumes else "down", target)
+    # Locked: `down` during a create races `docker compose up` and leaves orphaned
+    # containers behind -- the exact corruption repro_lock exists to prevent -- and
+    # `down --volumes` during an upgrade destroys the workspace while its
+    # pre-upgrade bundle survives, so `upgrade --rollback` can never find it again.
+    with runner.repro_lock(target, timeout=_INTERACTIVE_LOCK_WAIT):
+        # BEFORE `down`, not after: compose cannot remove a network that still has
+        # an active endpoint, and the edge attached to it is exactly that -- so
+        # leaving it attached makes `down` fail with "network has active
+        # endpoints" and strands the workspace half torn down.
+        edgesvc.detach(target)
+        if runner.down(target, volumes=volumes) != 0:
+            raise DockerError(f"`docker compose down` failed for {target!r}")
+        # A route left behind points the edge at a container that no longer
+        # exists, so that hostname would 502 instead of 404 -- and the name could
+        # never be reused by anyone else.
+        edgesvc.deregister(target)
+        if volumes:
+            runner.remove(target)
+            _clear_default_if(target)
     info(emit, f"{target!r} {'removed' if volumes else 'down (data kept)'}", phase="done")
     return {"name": target, "removed": volumes}
 
@@ -994,12 +1308,29 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         return {"targets": [], "removed": []}
     if not confirm:
         raise ValidationError(f"prune deletes {len(targets)} down repro(s) incl. data - pass confirm=true")
+    auditsvc.record("prune", ",".join(targets))
     removed = []
     for name in targets:
-        if runner.down(name, volumes=True) != 0:
-            warn(emit, f"could not clean up {name!r} - skipping", phase="done")
+        # Per repro, not around the whole loop: prune touches every `down` repro,
+        # and holding them all would block unrelated work for the length of the
+        # sweep. A repro that somebody grabbed in between is skipped rather than
+        # waited on -- it is no longer idle, so it no longer qualifies for pruning.
+        try:
+            with runner.repro_lock(name, timeout=5.0):
+                # Detach BEFORE `down`: compose cannot remove a network that still
+                # has an active endpoint, and the attached edge is one.
+                edgesvc.detach(name)
+                if runner.down(name, volumes=True) != 0:
+                    warn(emit, f"could not clean up {name!r} - skipping", phase="done")
+                    continue
+                # prune bypasses teardown(), so it drops the route itself or the
+                # edge is left pointing at nothing.
+                edgesvc.deregister(name)
+                runner.remove(name)
+        except ConflictError:
+            warn(emit, f"{name!r} is in use by another operation - skipping",
+                 phase="done")
             continue
-        runner.remove(name)
         _clear_default_if(name)
         removed.append(name)
         info(emit, f"pruned {name!r}", phase="done")

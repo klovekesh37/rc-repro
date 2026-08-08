@@ -11,6 +11,13 @@
     <div class="brand"><span class="dollar">$</span> rc-repro</div>
     <!-- A button, not a span: when this says "down" the diagnosis is what you want next. -->
     <button id="docker-badge" class="chip" title="Run the environment check">docker: ?</button>
+    <!-- Hidden until a login is actually in force; a single-user box has nobody
+         to distinguish from. -->
+    <span id="whoami" class="whoami" hidden></span>
+    <!-- Hidden until an edge exists. It is not a workspace, so it never appears
+         in the card grid -- but something holding :443 and routing every https
+         name has to be visible somewhere, and this is it. -->
+    <button id="edge-badge" class="chip" title="The shared Traefik serving every https name" hidden></button>
     <div class="topbar-actions">
       <button id="btn-new" class="btn primary">+ New repro</button>
       <button id="btn-bench" class="btn">Benchmark</button>
@@ -336,6 +343,20 @@
     <menu>
       <button type="button" id="doctor-recheck" class="btn">Re-check</button>
       <button type="button" id="doctor-close" class="btn primary">Close</button>
+    </menu>
+  </dialog>
+
+  <!-- The edge: one Traefik serving every https name. Its own dialog rather than
+       the doctor one, whose heading, hint and Re-check button all belong to a
+       different question. -->
+  <dialog id="edge-dialog">
+    <h2>Edge</h2>
+    <p class="hint">One Traefik holds <code>:80</code> and <code>:443</code> for every https
+      name on this box. It is not a workspace, so it never appears in the grid — manage it
+      with <code>rc-repro edge</code>.</p>
+    <div id="edge-body" class="plan"></div>
+    <menu>
+      <button type="button" id="edge-close" class="btn primary">Close</button>
     </menu>
   </dialog>
 

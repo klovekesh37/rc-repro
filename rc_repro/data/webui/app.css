@@ -67,6 +67,19 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 .chip.up::before { color: var(--green); }
 .chip.down::before { color: var(--red); }
 
+/* ---- who is signed in, and who owns what ----
+   On a shared box the first question at a glance is "which of these are mine".
+   Owned-by-you is the accent; everyone else is quiet, because muting the majority
+   is what makes the few stand out. */
+.whoami { font-family: var(--mono); font-size: .74rem; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 999px; padding: .18rem .6rem; }
+.whoami::before { content: "@"; color: var(--dim); }
+.owner { font-family: var(--mono); font-size: .7rem; color: var(--muted);
+  border: 1px solid var(--line2); border-radius: 999px; padding: .05rem .45rem; }
+.owner::before { content: "@"; color: var(--dim); }
+.owner.me { color: var(--cyan); border-color: rgba(86,212,221,.4); background: rgba(86,212,221,.07); }
+.owner.me::before { color: var(--cyan); }
+
 /* ---- main / split layout ---- */
 .layout { flex: 1; width: 100%; max-width: 1500px; margin: 0 auto; padding: 1.4rem 1.4rem 3.5rem;
   display: grid; grid-template-columns: minmax(360px, 460px) 1fr; gap: 1.2rem; align-items: start; }
@@ -274,6 +287,9 @@ form menu { display: flex; justify-content: flex-end; gap: .5rem; padding: 0; ma
 .jstatus { font-family: var(--mono); font-size: .7rem; text-transform: uppercase; letter-spacing: .04em;
   border: 1px solid var(--line2); border-radius: 999px; padding: .1rem .45rem; flex: 0 0 auto; }
 .jstatus.running { color: var(--blue); border-color: rgba(88,166,255,.45); }
+/* Queued: started nothing yet, waiting for a free slot. Muted, so it reads as
+   "not yet" rather than as a state you need to act on. */
+.jstatus.queued { color: var(--muted); border-color: rgba(139,148,158,.45); }
 .jstatus.done { color: var(--green); border-color: rgba(63,185,80,.45); }
 .jstatus.error { color: var(--red); border-color: rgba(248,81,73,.45); }
 .plan hr, .result hr { border: none; border-top: 1px solid var(--line); margin: .5rem 0; }
@@ -310,3 +326,8 @@ body { overflow-x: hidden; }
 
 /* the job dialog has no <form>, so `form menu` never matched its footer */
 #job-dialog menu { display: flex; justify-content: flex-end; padding: 0; margin: .8rem 0 0; }
+
+/* Who ran a job, in the activity list. Only rendered when the GUI has named
+   accounts; in token mode there is nobody to name. */
+.jactor { color: var(--muted); font-size: 12px; }
+.jactor::before { content: "by "; opacity: .6; }

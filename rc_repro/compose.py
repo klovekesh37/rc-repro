@@ -348,27 +348,21 @@ def build(spec: Spec) -> dict:
             else:
                 svc.pop("ports", None)
 
-    # --- optional HTTPS add-on (Traefik terminating TLS) ---
-    if spec.tls:
-        from rc_repro import tls as tlsmod
-        if tlsmod.SERVICE in doc["services"]:
-            # multi-instance already runs its own Traefik as the entry_service.
-            # Merging a second TLS entrypoint into it is doable but subtle (one
-            # command list, one dynamic.yml, two routers), and getting it wrong
-            # yields a repro that boots and serves nothing. Refuse plainly.
-            raise ValueError(
-                f"preset {spec.preset.name!r} already runs {tlsmod.SERVICE!r}; "
-                "--https cannot layer onto it yet - use the preset without --https, "
-                "or a single-instance preset with --https")
-        # Assigned, not _add_depends: that only extends an EXISTING depends_on, and
-        # a freshly built Traefik service has none — so it silently did nothing.
-        doc["services"][tlsmod.SERVICE] = {
-            **tlsmod.service(spec.tls),
-            "depends_on": list(rc_services),
-        }
-        # RC keeps its own published http port. That is what rc-repro's own API
-        # calls use (see Metadata.public_url) so nothing internal has to trust the
-        # local CA, and `curl http://localhost:<port>` still works for debugging.
+    # --- HTTPS ---
+    # Nothing here. A workspace never terminates TLS: the edge does, for all of
+    # them, and it reaches this one over the private network compose already made.
+    #
+    # So this document is IDENTICAL whether the workspace serves https or not,
+    # which is the property the whole design rests on -- adding or removing a name
+    # is a route file appearing or disappearing, and no container is ever rebuilt
+    # to gain or lose TLS. The previous version emitted either a Traefik sidecar or
+    # a shared-network join depending on a flag resolved at CREATE time, and every
+    # painful thing about it (port arbitration, `--adopt`, recreating containers to
+    # migrate) came from that decision being frozen into this file.
+    #
+    # RC keeps its published http port. rc-repro's own API calls use it (see
+    # Metadata.public_url), so nothing internal has to trust the local CA, and
+    # `curl http://localhost:<port>` still works for debugging.
 
     # --- optional monitoring add-on (Prometheus + Grafana) ---
     if spec.monitoring:

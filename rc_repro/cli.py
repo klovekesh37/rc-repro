@@ -33,6 +33,18 @@ app = typer.Typer(
     help="Launch version-matched Rocket.Chat reproduction environments.",
 )
 
+
+@app.callback()
+def _before_any_command() -> None:
+    """Runs before every command.
+
+    Publishes who is running this so the service layer can audit without every
+    command passing an actor down. Without it, `rc-repro down --volumes` on a
+    shared box appended a line reading `-` -- present, but useless.
+    """
+    from rc_repro.services import audit as auditsvc
+    auditsvc.set_actor(_cli_actor())
+
 # --- helpers ------------------------------------------------------------------
 
 
@@ -43,9 +55,14 @@ def _resolve_name(name: str | None) -> str:
     """Return the target repro name: explicit, else the configured default.
 
     Delegates to the service layer so both front-ends share one implementation
-    (and one set of name-validation rules) rather than drifting apart."""
+    (and one set of name-validation rules) rather than drifting apart.
+
+    The actor goes with it so a name typed WITHOUT the owner prefix still finds
+    the workspace it created: `up --name test` makes `alice-test`, and every other
+    command has to accept `test` for it or the documented workflow breaks the day
+    somebody runs `users add`."""
     try:
-        return lcsvc.resolve_name(name)
+        return lcsvc.resolve_name(name, actor=_cli_actor())
     except errors.ReproError as exc:
         _err(str(exc))
 
@@ -99,6 +116,32 @@ def _tls_label(meta: runner.Metadata) -> str:
     }.get(str(meta.extra.get("tls") or ""), "enabled")
 
 
+def _cli_actor() -> str:
+    """Who is running the CLI, on a shared box only.
+
+    Team mode is opt-in: it starts the moment somebody runs `rc-repro users add`.
+    Until then this returns "" and every workspace keeps the name it has always
+    had. Once accounts exist, the login name is used if it matches one, so nobody
+    has to remember a flag before typing `up`. RC_REPRO_USER overrides it for the
+    case where the OS account and the GUI account differ.
+    """
+    from rc_repro.services import users
+    if not users.any_users():
+        return ""
+    known = {u.name for u in users.list_users()}
+    named = os.environ.get("RC_REPRO_USER", "").strip().lower()
+    if named:
+        # Explicit: honoured even if unknown, so the mismatch shows up in `list`
+        # rather than silently falling back to the shared namespace.
+        return named
+    try:
+        login = os.getlogin()
+    except OSError:                     # no controlling terminal (cron, container)
+        login = os.environ.get("USER", "")
+    login = login.strip().lower()
+    return login if login in known else ""
+
+
 def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | None = None) -> None:
     """The boxed repro summary (URL + login + versions), shared by up/ready/info,
     followed by multi-instance URLs. Title is the repro name only — kept pure
@@ -113,6 +156,9 @@ def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | No
         ("URL", meta.external_url),
         ("Login", f"{config.ADMIN_USERNAME} / {config.ADMIN_PASSWORD}"),
     ]
+    owner = meta.extra.get("created_by", "") if isinstance(meta.extra, dict) else ""
+    if owner:
+        rows.append(("Owner", owner))
     if meta.public_url:
         rows.append(("TLS", _tls_label(meta)))
         rows.append(("Direct HTTP", meta.root_url))
@@ -193,7 +239,7 @@ def up(
         bind=bind, rc_image=rc_image, mongo=mongo, reg_token=reg_token,
         params=_parse_set_params(set_), seed=False, pin=pin,
         wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
-        force=force, monitor=monitor,
+        force=force, monitor=monitor, actor=_cli_actor(),
         https=https, domain=domain, acme_email=email,
         env={**envsvc.parse_set(env or []), **envsvc.as_setting(setting or [])},
     )
@@ -351,12 +397,26 @@ def down(
 ) -> None:
     """Remove a repro's containers. Keeps data (and the record) unless --volumes."""
     target = _resolve_name(name)
-    if volumes and not yes:
-        # --volumes is irreversible (deletes the Mongo data + the record). Confirm.
-        typer.confirm(
-            f"This permanently deletes {target!r}'s data volume and record. Continue?",
-            abort=True,
-        )
+    if volumes:
+        # --volumes is irreversible (deletes the Mongo data + the record). On a
+        # shared box the thing you most need to know first is whose it is, so the
+        # owner leads the prompt -- and is still printed under --yes, where there
+        # is no prompt to read but there is a log to read afterwards.
+        owner, me = lcsvc.owner_of(target), _cli_actor()
+        whose = f" -- owned by {owner}" if owner and owner != me else ""
+        if not yes:
+            if whose:
+                ui.warn(f"{target!r} belongs to {owner}, not you.")
+            typer.confirm(
+                # No !r: the quotes it adds collide with the possessive and the
+                # prompt reads "deletes 'alice-rc8-6-1''s data volume", which is
+                # a confusing thing to put in front of somebody about to type y.
+                f"This permanently deletes the data volume and record for {target}"
+                f"{whose}. Continue?",
+                abort=True,
+            )
+        elif whose:
+            ui.warn(f"deleting {target!r}, owned by {owner}.")
     try:
         # confirm=True: the prompt above (or --yes) already gated it.
         lcsvc.teardown(target, volumes=volumes, confirm=True)
@@ -411,8 +471,10 @@ def prune(
         return
     if not yes:
         typer.echo("These down repros will be deleted — containers, data volumes, and records:")
+        me = _cli_actor()
         for t in targets:
-            typer.echo(f"  - {t}")
+            owner = lcsvc.owner_of(t)
+            typer.echo(f"  - {t}" + (f"   (owned by {owner})" if owner and owner != me else ""))
         typer.confirm("Continue?", abort=True)
     try:
         res = lcsvc.prune(confirm=True, emit=_cli_emit)
@@ -473,11 +535,16 @@ def list_cmd() -> None:
     if not repros:
         typer.echo("No repros yet. Create one with `rc-repro up --version <X.Y.Z>`.")
         return
-    typer.echo(f"{'NAME':<20} {'RC':<9} {'MONGO':<7} {'PORT':<6} {'STATE':<10} URL")
+    # The owner column only appears on a shared box, so single-user output --
+    # and anything parsing it -- is unchanged.
+    shared = any(r.get("created_by") for r in repros)
+    owner_h = f"{'OWNER':<12} " if shared else ""
+    typer.echo(f"{'NAME':<20} {owner_h}{'RC':<9} {'MONGO':<7} {'PORT':<6} {'STATE':<10} URL")
     for r in repros:
         flag = "*" if r["default"] else (" " if not r["pinned"] else "·")
+        owner = f"{(r.get('created_by') or '-'):<12} " if shared else ""
         typer.echo(
-            f"{flag}{r['name']:<19} {r['rc_version']:<9} {r['mongo_tag']:<7} "
+            f"{flag}{r['name']:<19} {owner}{r['rc_version']:<9} {r['mongo_tag']:<7} "
             f"{r['host_port']:<6} {r['state']:<10} {r.get('public_url') or r['root_url']}"
         )
     typer.echo("\n* = default repro   · = pinned")
@@ -508,6 +575,140 @@ _CONFIG_KEYS: dict[str, str] = {
     # on their own; normally it is inferred.
     "acme.dns_provider": "acme_dns_provider",
 }
+
+
+@app.command(name="users")
+def users_cmd(
+    action: str = typer.Argument("list", help="list | add | passwd | remove"),
+    name: str = typer.Argument("", help="the user name, for add/passwd/remove"),
+) -> None:
+    """Manage who can sign in to the web GUI.
+
+    A shared `rc-repro serve` needs named accounts rather than one session token:
+    the token is handed to everybody, changes on every restart, and cannot answer
+    "who tore down TICKET-1234?". With users, every job records who ran it.
+
+    Passwords are prompted for, never taken as an argument — `ps` shows command
+    lines to every user on the machine.
+    """
+    from rc_repro.services import users as usersvc
+
+    if action == "list":
+        rows = usersvc.list_users()
+        if not rows:
+            ui.note("no users yet — add one with `rc-repro users add <name>`")
+            ui.hint("  until then, `rc-repro serve` uses its one-time session token.")
+            return
+        ui.panel("GUI users", [(u.name, u.created_at + (f"  [{u.role}]" if u.role else ""))
+                               for u in rows])
+        return
+
+    if not name:
+        _err(f"`users {action}` needs a name, e.g. `rc-repro users {action} alice`")
+
+    if action == "remove":
+        try:
+            usersvc.remove(name)
+            usersvc.forget(name)      # a removed account must not survive the cache
+        except errors.ReproError as exc:
+            _err(str(exc))
+        ui.ok(f"✓ user {name!r} removed.")
+        return
+
+    if action in ("add", "passwd"):
+        try:
+            usersvc.require_valid_name(name)
+        except errors.ReproError as exc:
+            _err(str(exc))
+        pw = typer.prompt(f"Password for {name}", hide_input=True)
+        again = typer.prompt("Repeat", hide_input=True)
+        if pw != again:
+            _err("the two passwords do not match")
+        try:
+            if action == "add":
+                usersvc.add(name, pw)
+            else:
+                usersvc.set_password(name, pw)
+                usersvc.forget(name)   # the old password must stop working now
+        except errors.ReproError as exc:
+            _err(str(exc))
+        ui.ok(f"✓ user {name!r} {'added' if action == 'add' else 'password changed'}.")
+        if action == "add" and len(usersvc.list_users()) == 1:
+            ui.hint("  `rc-repro serve` will now ask for a login instead of using a token.")
+        return
+
+    _err(f"unknown action {action!r} (want: list | add | passwd | remove)")
+
+
+@app.command(name="edge")
+def edge_cmd(
+    action: str = typer.Argument("status", help="status | start | stop | restart"),
+) -> None:
+    """The shared Traefik that serves every HTTPS name on this box.
+
+    It is not a workspace, so it never appears in `list` and `prune`/`down` cannot
+    touch it — but something holding :443 and routing your traffic should be
+    answerable, and this is where it answers.
+
+    It starts by itself when the first workspace needs a name. `stop` frees :80
+    and :443 for something else; routes are files, so starting it again restores
+    every name with no re-registration.
+    """
+    from rc_repro.services import edge as edgesvc
+
+    if action == "status":
+        st = edgesvc.status()
+        if not st["installed"]:
+            ui.note("no edge yet — it starts with the first `--https` or `--domain` "
+                    "workspace.")
+            return
+        domain = edgesvc.served_domain()
+        rows = [("State", "running" if st["running"] else "STOPPED"),
+                ("Project", f"{edgesvc.PROJECT} ({edgesvc.edge_dir()})")]
+        if domain:
+            rows.append(("GUI name", domain))
+        ui.panel("rc-repro edge", rows)
+        if not st["running"]:
+            ui.warn("  ⚠ every https name on this box is unreachable while it is "
+                    "stopped — `rc-repro edge start`")
+        if not st["routes"]:
+            ui.hint("  no names registered yet.")
+            return
+        # Attachment and route side by side: a route whose network the edge never
+        # joined is a 502, not an error, and that is the hardest failure to read.
+        attached = set(st["attached"])
+        typer.echo(f"\n{'NAME':<28} {'SERVES':<38} REACHABLE")
+        for name in st["routes"]:
+            host = _edge_route_host(edgesvc, name)
+            ok = edgesvc.workspace_network(name) in attached
+            typer.echo(f"{name:<28} {host:<38} {'yes' if ok else 'NO (502)'}")
+        return
+
+    if action in ("start", "stop", "restart"):
+        if not edgesvc.installed() and action != "stop":
+            edgesvc.write(edgesvc.Edge())
+        if action in ("stop", "restart"):
+            edgesvc.down()
+            ui.ok("✓ edge stopped; :80 and :443 are free.")
+        if action in ("start", "restart"):
+            if edgesvc.up(pull=False) != 0:
+                _err("the edge did not start. Check nothing else holds :80 or :443:\n"
+                     "    sudo lsof -i :443")
+            ui.ok("✓ edge running — every registered name is served again.")
+        return
+
+    _err(f"unknown action {action!r} (want: status | start | stop | restart)")
+
+
+def _edge_route_host(edgesvc, name: str) -> str:
+    """The hostname a route file serves, for display only."""
+    try:
+        for line in edgesvc.route_path(name).read_text().splitlines():
+            if "rule:" in line and "Host(" in line:
+                return line.split("Host(`", 1)[1].split("`", 1)[0]
+    except (OSError, IndexError):
+        pass
+    return "?"
 
 
 @app.command(name="config")
@@ -607,7 +808,12 @@ def tls_status(name: str = typer.Option("", "--name", "-n")) -> None:
 
     mode = str(m.extra.get("tls") or "")
     host = m.public_url.split("://", 1)[1].split(":")[0]
-    port = int(m.extra.get("tls_ports", [443])[0])
+    # An edge-served workspace publishes no TLS port of its own, so tls_ports is
+    # absent OR an empty list (adoption clears it). `[0]` on the empty list was an
+    # IndexError -- a traceback from `tls-status` on exactly the workspaces the
+    # edge serves, which is all of them now.
+    claimed = [int(p) for p in (m.extra.get("tls_ports") or []) if str(p).isdigit()]
+    port = claimed[0] if claimed else 443
     cafile = str(tlsmod.ca_dir() / tlsmod.CA_CRT) if mode == tlsmod.MODE_LOCAL else None
     typer.echo(f"Checking {m.public_url} ...")
 
@@ -2032,18 +2238,34 @@ def doctor() -> None:
 @app.command()
 def serve(
     port: int = typer.Option(7070, "--port", help="host port for the web GUI"),
-    bind: str = typer.Option("127.0.0.1", "--bind", help="interface to bind (loopback by default; use 0.0.0.0 behind a proxy/remote lab)"),
+    domain: str = typer.Option("", "--domain", help="serve the GUI over HTTPS on this hostname, via rc-repro's shared front door"),
+    email: str = typer.Option("", "--email", help="contact address for the Let's Encrypt certificate (remembered after the first use)"),
+    # Default resolved below, not here: with --domain the GUI should bind the
+    # Docker bridge, and an empty default is the only way to tell "the user chose
+    # 127.0.0.1" from "the user chose nothing".
+    bind: str = typer.Option("", "--bind", help="interface to bind (default: loopback, or the Docker bridge with --domain)"),
     allow_host: list[str] = typer.Option(None, "--allow-host", help="extra Host header to accept, e.g. a reverse-proxy domain (repeatable; '*' = any host). Needed for iximiuz/Codespaces/remote access"),
     no_open: bool = typer.Option(False, "--no-open", help="don't open a browser"),
     no_token: bool = typer.Option(False, "--no-token", help="disable the session token (loopback dev / trusted proxy only)"),
+    print_service: bool = typer.Option(False, "--print-service", help="print how to keep this running (systemd unit, or nohup) and exit — writes nothing"),
+    insecure: bool = typer.Option(False, "--insecure", help="serve the named-user login over plain http — when TLS terminates upstream (remote proxy/lab), or for local testing"),
 ) -> None:
     """Launch the local web GUI (needs `pip install 'rc-repro[gui]'`).
 
-    Behind a reverse proxy (iximiuz Labs, Codespaces, ngrok, …): bind a reachable
-    interface and allow the proxy's hostname, e.g.
-      rc-repro serve --bind 0.0.0.0 --allow-host '*' --no-token
-    (in an ephemeral lab that's fine; otherwise keep the token and append
-    `?t=<token>` to the proxy URL, and pass the real --allow-host domain).
+    With accounts (`rc-repro users add <name>`) the browser asks for a login and
+    every action records who took it. Without them it falls back to a one-time
+    session token in the URL, which is fine on a laptop.
+
+    For a team, give it a real name and rc-repro arranges HTTPS itself:
+      rc-repro serve --domain support.example.com --email ops@example.com
+    That starts the shared front door, which holds 443 and serves both the GUI and
+    every `up --domain ...` workspace. `--print-service` prints how to keep it up.
+
+    Behind SOMEBODY ELSE's reverse proxy (iximiuz Labs, Codespaces, ngrok, …):
+    bind a reachable interface and allow the proxy's hostname, e.g.
+      rc-repro serve --bind 0.0.0.0 --allow-host rcrepro.example.com
+    With accounts, add --insecure there: that proxy terminates TLS, so only the
+    last hop is plain http and this cannot see that from here.
     """
     try:
         import uvicorn
@@ -2053,21 +2275,191 @@ def serve(
     import secrets
     import webbrowser
 
+    from rc_repro import tls as tlsmod
+    from rc_repro.services import edge as edgesvc
+    from rc_repro.services import users as usersvc
+
     allow = list(allow_host or [])
-    token = "" if no_token else secrets.token_urlsafe(16)
+    # Accounts win when they exist: an install that has never run `users add`
+    # keeps today's token behaviour exactly.
+    basic = usersvc.any_users()
+
+    door: "edgesvc.Edge | None" = None
+    if domain:
+        # Normalized before anything reads it: it becomes the Host() rule, a TLS
+        # SNI name and the printed URL, so a surviving scheme corrupts all three.
+        domain, fixed = tlsmod.normalize_domain(domain)
+        if fixed:
+            ui.note(f"  using --domain {domain} ({fixed})")
+        cfg = config.load_config()
+        email = email or str(cfg.get("acme_email") or "")
+        if not email:
+            _err("a Let's Encrypt certificate needs a contact email:\n"
+                 f"  rc-repro serve --domain {domain} --email you@example.com\n"
+                 "It is remembered after the first use, or set it once with:\n"
+                 "  rc-repro config set acme.email you@example.com")
+        if not basic:
+            ui.warn("  ⚠ this publishes the GUI on the internet with no login — "
+                    "anyone who finds the name can create and delete repros.")
+            ui.warn("    `rc-repro users add <name>` first, then restart, gives "
+                    "each person their own account.")
+        # The bridge, not 0.0.0.0: the front door is the only thing that needs to
+        # reach the GUI, so the port never has to be exposed to the network.
+        gui_bind = bind or edgesvc.bridge_address()
+        if not gui_bind:
+            _err("could not read the Docker bridge address, which is how the front "
+                 "door reaches the GUI.\n"
+                 "  Is Docker running? `rc-repro doctor` checks.")
+        bind = gui_bind
+        # Traefik forwards the original Host, so the allow-list has to accept it
+        # or every proxied request is a 403.
+        allow.append(domain)
+        # resolve(), not the constructor: the challenge and whether a wildcard is
+        # possible are both derived from whether DNS credentials exist, the same
+        # rule `up --domain` already uses. Never asked for.
+        door = edgesvc.Edge.resolve(domain, email, gui_host=bind, gui_port=port)
+    elif not bind:
+        bind = "127.0.0.1"
+
     loopback = bind in ("127.0.0.1", "localhost", "::1")
-    if not loopback:
+    token = "" if (no_token or basic) else secrets.token_urlsafe(16)
+
+    # --domain means rc-repro is arranging TLS itself, through its own front door.
+    # It therefore KNOWS the browser hop is https and the plain-http last hop is
+    # container-to-host on the bridge -- so the refusal below would be refusing
+    # its own most secure configuration.
+    tls_upstream = bool(domain) or insecure
+
+    if not basic and not token and not loopback and not insecure:
+        # --no-token on a reachable interface is NO authentication at all, on a
+        # control plane that creates and deletes containers and volumes, mints
+        # admin tokens and proxies arbitrary REST calls. That was a warning, while
+        # the far milder case below (a password, merely unencrypted) was refused --
+        # backwards. --insecure is the same "I know, this hop is protected" opt-in
+        # used there, so an ephemeral lab still works with one flag.
+        _err("--no-token on " + bind + " serves docker control with NO "
+             "authentication.\n"
+             "  Give people accounts instead — they survive restarts and record "
+             "who acted:\n"
+             "    rc-repro users add <name>\n"
+             "  Ephemeral lab, and you mean it? Say so:\n"
+             "    add --insecure to the command you just ran")
+
+    if basic and not loopback and not tls_upstream:
+        # Basic Auth puts the password on the wire with EVERY request, so a plain
+        # http bind on a reachable interface is refused unless it is asked for.
+        #
+        # But this process cannot tell whether the password is actually exposed:
+        # behind a TLS-terminating proxy the browser speaks https and only the
+        # last hop is plain, which is safe and is how a shared box normally runs.
+        # So both ways out have to be offered. The first version named only the
+        # loopback one, which is no route at all when the proxy lives on another
+        # machine -- it cannot reach a loopback bind -- and that made accounts
+        # unusable on exactly the shared server they exist for.
+        #
+        # The second route is spelled out rather than echoed back as a full
+        # command: an echo built from bind+port drops any --allow-host that was
+        # passed, and the copy-pasted result then 403s the proxy's Host header.
+        _err("named-user login sends the password on every request, so plain http "
+             f"on {bind} is refused by default.\n"
+             "  Have a hostname pointing here? Let rc-repro do the TLS:\n"
+             "    rc-repro serve --domain <your-domain> --email you@example.com\n"
+             "  TLS proxy on THIS box? Keep the GUI on loopback and point the "
+             "proxy at it:\n"
+             f"    rc-repro serve --bind 127.0.0.1 --port {port} "
+             "--allow-host <your-domain>\n"
+             "  TLS terminating upstream (remote proxy, lab, load balancer), or "
+             "testing locally?\n"
+             "    add --insecure to the command you just ran")
+
+    # Not for the bridge: that address is reachable from containers on this box,
+    # not from the network, which is the entire reason the front door uses it.
+    if not loopback and not door:
         ui.warn(f"  ⚠ binding {bind} exposes docker control (create/delete repros + volumes) "
                 "to your network — use only if you mean to.")
     if "*" in allow:
         ui.warn("  ⚠ --allow-host '*' accepts ANY Host header — only on a trusted/ephemeral network.")
-    url = f"http://localhost:{port}/" + (f"?t={token}" if token else "")
+
+    if print_service:
+        # Printed after the checks above, never before: a unit that reproduces a
+        # command which would be refused is worse than no unit at all.
+        import shlex
+
+        # systemd REFUSES a relative ExecStart, so this has to be absolute even
+        # when rc-repro is not on PATH. In a venv the console script sits next to
+        # the interpreter, which is the case `which` misses.
+        exe = shutil.which("rc-repro") or str(Path(sys.executable).parent / "rc-repro")
+        parts = [exe, "serve"]
+        if domain:
+            parts += ["--domain", domain, "--email", email]
+        else:
+            parts += ["--bind", bind]
+            if insecure:
+                parts.append("--insecure")
+        if port != 7070:
+            parts += ["--port", str(port)]
+        for h in (allow_host or []):     # not `allow`: --domain re-adds itself
+            parts += ["--allow-host", h]
+        if no_token:
+            parts.append("--no-token")
+        parts.append("--no-open")        # no browser to open from a service
+        cmdline = " ".join(shlex.quote(p) for p in parts)
+
+        typer.echo(f"\n# systemd — survives logout, restarts on crash, starts on boot.\n"
+                   f"# Write this to {edgesvc.UNIT_PATH}:\n")
+        typer.echo(edgesvc.systemd_unit(cmdline, os.environ.get("USER", "rcrepro")))
+        typer.echo("# Then:")
+        typer.echo(f"    sudo tee {edgesvc.UNIT_PATH} > /dev/null   # paste the above")
+        typer.echo("    sudo systemctl daemon-reload")
+        typer.echo("    sudo systemctl enable --now rc-repro")
+        typer.echo("    systemctl status rc-repro && journalctl -u rc-repro -f")
+        typer.echo("\n# No systemd? nohup survives logout — and nothing else:")
+        typer.echo(f"    nohup {cmdline} > {config.home() / 'serve.log'} 2>&1 &")
+        typer.echo("# It will NOT restart on crash, NOT come back after a reboot,")
+        typer.echo("# NOT rotate that log, and there is no `status` to ask.")
+        if not basic:
+            typer.echo("\n# Note: no accounts exist, so this would serve with a session")
+            typer.echo("# token that changes on every restart — which defeats the point")
+            typer.echo("# of running it as a service. `rc-repro users add <name>` first.")
+        raise typer.Exit(0)
+
+    if door:
+        ui.note("starting the edge (one Traefik, :80 and :443 for every name)…")
+        edgesvc.write(door)
+        if not edgesvc.ensure_running(acme_email=email):
+            holder = edgesvc.port_holder(443)
+            _err("the edge did not start"
+                 + (f" — {holder} is holding :443.\n" if holder else ".\n")
+                 + f"  Its compose project is `{edgesvc.PROJECT}` in "
+                 f"{edgesvc.edge_dir()}; `rc-repro edge status` reports it.")
+        url = f"https://{domain}/"
+    else:
+        url = f"http://localhost:{port}/" + (f"?t={token}" if token else "")
     typer.secho(f"rc-repro GUI: {url}", bold=True)
-    if token:
+    if door:
+        if door.wildcard:
+            ui.hint(f"  one *.{domain} certificate covers every workspace — no "
+                    "per-name issuance, no weekly limit to hit.")
+        else:
+            ui.hint(f"  each workspace name gets its own certificate. A DNS API "
+                    f"token in {tlsmod.dns_env_path()} would make it one wildcard.")
+        ui.hint(f"  {domain} must already resolve to this machine, or the "
+                "certificate cannot be issued.")
+        ui.hint("  the first request may take a few seconds while Let's Encrypt "
+                "issues it.")
+        ui.hint(f"  workspaces published under this name: rc-repro up -v <X.Y.Z> "
+                f"--domain <ticket>.{domain}")
+    if basic:
+        names = ", ".join(u.name for u in usersvc.list_users())
+        ui.hint(f"  sign in as: {names}")
+        ui.hint("  every action is recorded against the account that took it.")
+    elif token:
         ui.hint("  (the ?t=... token authorizes this browser session)")
+        ui.hint("  sharing this with a team? `rc-repro users add <name>` gives each "
+                "person a login that survives restarts.")
         if not loopback or allow:
             ui.hint(f"  via a proxy? open the proxy URL with the token appended: ...<proxy-url>/?t={token}")
-    app_obj = create_app(token=token, allow_hosts=allow)
+    app_obj = create_app(token=token, allow_hosts=allow, basic_auth=basic)
     if not no_open and loopback:
         try:
             webbrowser.open(url)

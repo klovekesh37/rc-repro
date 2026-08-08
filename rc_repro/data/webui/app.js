@@ -67,6 +67,11 @@ function healthClass(r) {
   if (h === "healthy" || h === "running") return "running";
   return stateClass(r.state);
 }
+let ME = "";                  // the signed-in user, "" when nobody is signed in
+// A job that has not reached a terminal state. "queued" is one: heavy and
+// measurement jobs wait for a slot before they start, and testing only for
+// "running" made every one of them look like it had already finished.
+const jobActive = (s) => s === "running" || s === "queued";
 const dstate = { tab: "overview", detail: null, statsTimer: null, points: [] };
 
 async function loadRepros() {
@@ -75,6 +80,12 @@ async function loadRepros() {
       api("/api/repros"), api("/api/health").catch(() => ({ docker: false })),
     ]);
     ALL_REPROS = repros;
+    refreshEdgeBadge();          // its own request: /api/health must stay cheap
+    // Empty on a single-user box (no accounts, no login) -- in which case the
+    // chip stays hidden and every card renders exactly as it always has.
+    ME = health.actor || "";
+    const who = $("#whoami");
+    who.textContent = ME; who.hidden = !ME;
     const dockerTxt = "docker: " + (health.docker ? "up" : "down");
     const badge = $("#docker-badge");
     badge.textContent = dockerTxt; badge.className = "chip " + (health.docker ? "up" : "down");
@@ -82,6 +93,64 @@ async function loadRepros() {
     if (SELECTED && !ALL_REPROS.find((r) => r.name === SELECTED)) closeDetail();
     render();
   } catch (e) { toast(e.message); }
+}
+
+// ---- the edge ---------------------------------------------------------------
+// One Traefik serves every https name on the box. It is NOT a workspace, so it
+// never appears in the grid and cannot be stopped from here -- but it holds :443
+// for everyone, and something invisible that can take every name down at once is
+// worse than one more chip.
+let EDGE = null;
+
+async function refreshEdgeBadge() {
+  const badge = $("#edge-badge");
+  try { EDGE = await api("/api/edge"); }
+  catch (_) { badge.hidden = true; return; }        // no gui extra / no permission
+  if (!EDGE.installed) { badge.hidden = true; return; }
+
+  // A route the edge cannot reach answers 502 rather than erroring, so it would
+  // otherwise look like a broken workspace. Surfaced ahead of "running".
+  const broken = (EDGE.routes || []).filter((r) => !r.reachable).length;
+  const n = (EDGE.routes || []).length;
+  badge.hidden = false;
+  if (!EDGE.running) {
+    badge.textContent = `edge: stopped`;
+    badge.className = "chip down";
+  } else if (broken) {
+    badge.textContent = `edge: ${broken} unreachable`;
+    badge.className = "chip down";
+  } else {
+    badge.textContent = `edge: ${n} name${n === 1 ? "" : "s"}`;
+    badge.className = "chip up";
+  }
+}
+
+function openEdge() {
+  const body = $("#edge-body");
+  body.innerHTML = "";
+  if (!EDGE || !EDGE.installed) {
+    body.append(el("p", { class: "kv" },
+      "No edge yet — it starts with the first --https or --domain workspace."));
+  } else {
+    body.append(el("div", { class: "kv" },
+      EDGE.running ? "Running — holds :80 and :443 for every https name"
+                   : "STOPPED — every https name on this box is unreachable"));
+    if (EDGE.domain) body.append(el("div", { class: "kv" }, `GUI name: ${EDGE.domain}`));
+    if (!(EDGE.routes || []).length) {
+      body.append(el("p", { class: "kv" }, "No names registered yet."));
+    }
+    for (const r of EDGE.routes || []) {
+      body.append(el("div", { class: "dcheck " + (r.reachable ? "ok" : "warn") },
+        el("span", { class: "dmark" }, r.reachable ? "✓" : "!"),
+        el("span", {}, `${r.host || r.name} → ${r.name}`
+          + (r.reachable ? "" : "  (unreachable — answers 502)"))));
+    }
+    if ((EDGE.routes || []).some((r) => !r.reachable)) {
+      body.append(el("p", { class: "banner warn" },
+        "Run `rc-repro edge restart` to re-attach them."));
+    }
+  }
+  if (!$("#edge-dialog").open) $("#edge-dialog").showModal();
 }
 
 function render() {
@@ -130,6 +199,11 @@ function card(r) {
   const meta = el("div", { class: "card-meta" },
     `RC ${r.rc_version} · Mongo ${r.mongo_tag} · :${r.host_port} · ${r.preset}`
     + (r.monitoring ? " · monitored" : ""));
+  if (r.created_by) {
+    meta.append(" ");
+    meta.append(el("span", { class: "owner" + (r.created_by === ME ? " me" : "") },
+                   r.created_by));
+  }
 
   const actions = el("div", { class: "card-actions" });
   // "?" means docker could not be asked, so EVERY action below would fail -- the
@@ -368,6 +442,17 @@ function renderTab() {
       kv("RC Version", d.rc_version), kv("MongoDB", d.mongo_tag),
       kv("Port", ":" + d.host_port), kv("Uptime", d.uptime || "—", d.uptime ? "green" : ""),
       kv("Preset", d.preset), kv("Health", d.health || "—", d.health === "healthy" ? "green" : ""));
+    if (d.created_by) grid.append(kv("Owner", d.created_by + (d.created_by === ME ? " (you)" : "")));
+    // Where its https name is actually served from. Without this the panel shows
+    // a workspace with no TLS port and no Traefik, which now looks like HTTPS is
+    // simply missing rather than handled one layer up.
+    if (d.public_url) {
+      const route = (EDGE && EDGE.routes || []).find((r) => r.name === d.name);
+      const reachable = route ? route.reachable : null;
+      grid.append(kv("Served by", "the edge" + (
+        reachable === false ? " — unreachable, answers 502" : ""),
+        reachable === false ? "bad" : ""));
+    }
     // A climbing restart count separates "slow to boot" from "crash-looping".
     // The backend has always been able to read it (wait_serving warns on it
     // during a create); nothing ever showed it afterwards.
@@ -904,8 +989,13 @@ async function doDown(name) {
   // Two steps so Cancel can actually abort: the single confirm sent the DELETE
   // on both branches, so a mis-click still tore the stack down.
   if (!confirm(`Remove ${name}'s containers?\n\nOK to continue, Cancel to abort.`)) return;
+  // Everyone can act on everything -- that is deliberate, support engineers cover
+  // for each other. What they must not do is destroy a colleague's data without
+  // being told whose it is.
+  const owner = (ALL_REPROS.find((r) => r.name === name) || {}).created_by || "";
+  const whose = owner && owner !== ME ? `\n\nThis workspace belongs to ${owner}, not you.` : "";
   const vol = confirm(
-    `Also DELETE ${name}'s data volume and record?\n\n` +
+    `Also DELETE ${name}'s data volume and record?${whose}\n\n` +
     `OK = delete everything (irreversible).\nCancel = keep the data.`);
   // Also synchronous, and slower than Stop (it tears containers down and may
   // remove volumes), so it gets the same treatment.
@@ -1105,7 +1195,7 @@ async function reconcileJob(job) {
     finishJob(job, true, {});
     return;
   }
-  if (state.status === "running") {
+  if (jobActive(state.status)) {
     if (job.retries++ < 5) {
       logLine({ level: "warn", message: "progress stream dropped — reconnecting…" });
       setTimeout(() => { if (JOB === job && !job.finished) connectJob(job); }, 1000);
@@ -1129,7 +1219,7 @@ async function watchDetachedJob(job) {
     await new Promise((r) => setTimeout(r, 1000));
     let state;
     try { state = await api(`/api/jobs/${job.id}`); } catch (_) { return; }
-    if (state.status === "running") continue;
+    if (jobActive(state.status)) continue;
     toast(state.status === "error" ? `${job.title} failed: ${state.error || ""}` : `${job.title} finished`,
           state.status === "error" ? "error" : "ok");
     loadRepros().then(refreshDetail);
@@ -1505,6 +1595,7 @@ function jobAge(j) {
   const end = j.finished_at || Date.now() / 1000;
   const s = Math.max(0, Math.round(end - j.started_at));
   const dur = s >= 60 ? `${Math.floor(s / 60)}m${s % 60}s` : `${s}s`;
+  if (j.status === "queued") return "waiting for a slot";
   return j.status === "running" ? `${dur} and counting` : dur;
 }
 async function openJobs() {
@@ -1758,6 +1849,8 @@ $("#call-close").addEventListener("click", () => $("#call-dialog").close());
 $("#call-copy").addEventListener("click", () =>
   CALL_TEXT ? copy(CALL_TEXT) : toast("nothing to copy — send a request first"));
 $("#docker-badge").addEventListener("click", openDoctor);
+$("#edge-badge").addEventListener("click", openEdge);
+$("#edge-close").addEventListener("click", () => $("#edge-dialog").close());
 $("#doctor-recheck").addEventListener("click", openDoctor);
 $("#doctor-close").addEventListener("click", () => $("#doctor-dialog").close());
 $("#cap-cancel").addEventListener("click", () => $("#cap-dialog").close());

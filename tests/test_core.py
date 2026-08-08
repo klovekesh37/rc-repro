@@ -350,7 +350,7 @@ def test_port_free_detects_loopback_listener():
 def test_pick_port_bounded(monkeypatch):
     # Hosts where nothing can bind (sandboxes) must get a clean error, not an
     # OverflowError from scanning past 65535.
-    monkeypatch.setattr(runner, "port_free", lambda p: False)
+    monkeypatch.setattr(runner, "port_free", lambda p, h="": False)
     monkeypatch.setattr(runner, "used_ports", set)
     try:
         runner.pick_port()
@@ -1606,14 +1606,55 @@ def test_resolve_name_rejects_a_name_that_is_not_a_repro(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     from rc_repro import errors
     from rc_repro.services import lifecycle as lcsvc
-    # The name becomes a filesystem path and a compose project name; sanitize()
-    # only runs at creation, so every other entry point validates the shape.
-    for bad in ("../../etc", "..", "Has-Caps", "with space", "semi;colon"):
+    # The name becomes a filesystem path and a compose project name, so nothing
+    # unsafe may come back. Resolution now SANITIZES rather than validating --
+    # creation always did, and the two disagreeing is what stopped `--name` round
+    # tripping -- so the guarantee is that these resolve to nothing, not that they
+    # raise one particular error: 'Has-Caps' is a legal request for 'has-caps'.
+    for bad in ("../../etc", "..", "Has-Caps", "with space", "semi;colon",
+                "../" * 20 + "etc", "a/b", "x\x00y"):
         try:
-            lcsvc.resolve_name(bad)
-        except errors.ValidationError:
+            got = lcsvc.resolve_name(bad)
+        except errors.ReproError:
             continue
-        raise AssertionError(f"expected ValidationError for {bad!r}")
+        raise AssertionError(f"{bad!r} resolved to {got!r}; expected a refusal")
+
+
+def test_resolve_name_never_returns_a_path_that_escapes_the_repro_dir(tmp_path, monkeypatch):
+    """The candidates are either already-legal names or sanitize() output, so a
+    traversal cannot survive to become runner.workspace()."""
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from rc_repro.services import lifecycle as lcsvc
+
+    for bad in ("../../etc", "a/b", "..", "./x", "x/../../y"):
+        for cand in lcsvc.name_candidates(bad, actor="alice"):
+            assert "/" not in cand and ".." not in cand, cand
+
+
+def test_a_name_round_trips_through_create_and_resolve(tmp_path, monkeypatch):
+    """The README's own first example: `up --name TICKET-1234` then
+    `down --name TICKET-1234`. Creation sanitizes; resolution has to agree."""
+    import dataclasses
+    import json
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from rc_repro import runner
+    from rc_repro.services import lifecycle as lcsvc
+
+    for typed, actor in (("TICKET-1234", ""), ("test", "alice"), ("TICKET-1234", "alice")):
+        req = lcsvc.CreateReq(version="8.5.1", name=typed, actor=actor)
+        made = lcsvc._derive_for(req)
+        ws = runner.workspace(made)
+        ws.mkdir(parents=True, exist_ok=True)
+        f = {x.name: "" for x in dataclasses.fields(runner.Metadata)}
+        f.update(name=made, project="rcrepro-" + made, rc_version="8.5.1",
+                 mongo_tag="8.0", host_port=3000, preset="default",
+                 root_url="http://localhost:3000", extra={})
+        (ws / "repro.json").write_text(json.dumps(dataclasses.asdict(runner.Metadata(**f))))
+        (ws / "docker-compose.yml").write_text("services: {}\n")
+        assert lcsvc.resolve_name(typed, actor=actor) == made, (typed, actor, made)
+        # and the full name still resolves to itself, never double-prefixed
+        assert lcsvc.resolve_name(made, actor=actor) == made
 
 
 def test_detail_redacts_secret_env_values():
@@ -1835,97 +1876,6 @@ def test_local_ca_is_created_once_and_leaf_carries_the_right_sans(monkeypatch, t
     assert v.returncode == 0, v.stdout + v.stderr
 
 
-def test_https_adds_traefik_and_leaves_rocketchats_own_port_published():
-    """RC keeps its http port so rc-repro's own API calls need no CA.
-
-    login/PAT/seed/loadtest all use meta.root_url in 70+ places; pointing those at
-    a locally-signed https URL would fail verification in every one of them.
-    """
-    pre = presets.load("default")
-    res = versions.resolve("8.6.1", offline=True)
-    st = _tls_spec()
-    spec = compose.Spec.from_resolved(
-        res, project_name="rcrepro-x", root_url=st.root_url, host_port=3000,
-        reg_token=None, preset=pre, tls=st)
-    doc = compose.build(spec)
-
-    assert "traefik" in doc["services"]
-    t = doc["services"]["traefik"]
-    assert t["ports"] == ["127.0.0.1:8443:443"]
-    assert t["depends_on"] == ["rocketchat"], "must not route before RC exists"
-    # RC advertises https, but still publishes its own plain port.
-    assert doc["services"]["rocketchat"]["environment"]["ROOT_URL"] == st.root_url
-    assert doc["services"]["rocketchat"]["ports"] == ["127.0.0.1:3000:3000"]
-
-
-def test_https_refuses_to_layer_onto_a_preset_that_already_runs_traefik():
-    """multi-instance owns its own Traefik; two would fight over the entrypoint.
-
-    Silently merging produced a repro that booted and served nothing, with the
-    reason only in `docker compose logs traefik`.
-    """
-    import pytest
-    pre = presets.load("multi-instance", {"instances": "2"})
-    res = versions.resolve("8.6.1", offline=True)
-    spec = compose.Spec.from_resolved(
-        res, project_name="rcrepro-x", root_url="https://x", host_port=3000,
-        reg_token=None, preset=pre, tls=_tls_spec())
-    with pytest.raises(ValueError, match="already runs"):
-        compose.build(spec)
-
-
-def test_acme_flags_map_to_traefik_resolver_args():
-    from rc_repro import tls
-    prod = tls.service(_tls_spec(mode=tls.MODE_ACME, host="rc1.example.com", port=443,
-                                 acme_email="ops@example.com"))
-    cmd = " ".join(prod["command"])
-    assert "--certificatesresolvers.le.acme.email=ops@example.com" in cmd
-    assert "acme.tlschallenge=true" in cmd, "default challenge needs only :443"
-    assert "caserver" not in cmd, "production must not point at the staging directory"
-    # acme.json lives outside the workspace, so `down --volumes` cannot force a
-    # re-issue (5 certs per identical hostname per 7 days).
-    assert any(str(tls.acme_dir()) in v for v in prod["volumes"])
-
-    stg = tls.service(_tls_spec(mode=tls.MODE_ACME, host="rc1.example.com", port=443,
-                                acme_email="a@b.c", acme_staging=True))
-    assert "acme-staging-v02" in " ".join(stg["command"])
-
-    # :80 and the permanent redirect to https, matching the official
-    # rocketchat-compose Traefik files. Decided by the caller (it has to probe the
-    # port), so the builder just honours the flag.
-    plain = tls.service(_tls_spec(mode=tls.MODE_ACME, host="h", port=443,
-                                  acme_email="a@b.c"))
-    assert "--entryPoints.web.address=:80" not in plain["command"]
-    assert "80:80" not in plain["ports"]
-
-    redir = tls.service(_tls_spec(mode=tls.MODE_ACME, host="h", port=443,
-                                  acme_email="a@b.c", http_redirect=True))
-    cmd = redir["command"]
-    assert "--entryPoints.web.address=:80" in cmd
-    assert "--entryPoints.web.http.redirections.entryPoint.to=websecure" in cmd
-    assert "--entryPoints.web.http.redirections.entryPoint.scheme=https" in cmd
-    assert "--entryPoints.web.http.redirections.entryPoint.permanent=true" in cmd
-    assert "80:80" in redir["ports"]
-
-    # Local mode is on an allocated port, so a redirect does not apply at all.
-    assert tls.can_redirect_http(tls.MODE_LOCAL, 8443) is False
-    assert tls.can_redirect_http(tls.MODE_ACME, 443) is True
-
-
-def test_dynamic_config_uses_a_static_pair_locally_and_a_resolver_for_acme():
-    from rc_repro import tls
-    local = dict(tls.files(_tls_spec(), ["rocketchat"], "CERT", "KEY"))
-    assert local["tls/certs/tls.crt"] == "CERT" and local["tls/certs/tls.key"] == "KEY"
-    assert "certFile: /etc/traefik/certs/tls.crt" in local["tls/dynamic.yml"]
-    assert "certResolver" not in local["tls/dynamic.yml"]
-
-    acme = dict(tls.files(_tls_spec(mode=tls.MODE_ACME, host="h", port=443), ["rocketchat"]))
-    assert "tls/certs/tls.crt" not in acme, "ACME certs come from Traefik, not the workspace"
-    assert "certResolver: le" in acme["tls/dynamic.yml"]
-    # The DDP websocket must not be bounced between instances mid-session.
-    assert "sticky" in acme["tls/dynamic.yml"] and "secure: true" in acme["tls/dynamic.yml"]
-
-
 def test_metadata_external_url_prefers_https_and_survives_an_old_repro_json(tmp_path, monkeypatch):
     """public_url is additive: a repro.json written before it must still load."""
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
@@ -2083,31 +2033,6 @@ def test_verify_reads_a_real_endpoint_and_separates_the_two_trust_questions(tmp_
     assert dead["serving"] is False and dead["error"]
 
 
-def test_staging_and_production_use_separate_acme_storage():
-    """Traefik keys stored certs by RESOLVER name, not by CA server.
-
-    Pointing one resolver at staging and then at production leaves the staging
-    certificate in storage and keeps serving it -- the well-known "delete
-    acme.json when you switch" trap. Separate files make the switch real.
-    """
-    from rc_repro import tls
-
-    def storage(staging):
-        spec = tls.TlsSpec(mode=tls.MODE_ACME, host="h", port=443,
-                           acme_email="a@b.c", acme_staging=staging)
-        return [a for a in tls.service(spec)["command"] if ".acme.storage=" in a][0]
-
-    assert storage(True) != storage(False)
-    assert tls.ACME_FILE_STAGING in storage(True)
-    assert storage(False).endswith("/" + tls.ACME_FILE)
-    # Only the staging run may point at the staging directory.
-    stg = tls.TlsSpec(mode=tls.MODE_ACME, host="h", port=443, acme_email="a@b.c",
-                      acme_staging=True)
-    prod = tls.TlsSpec(mode=tls.MODE_ACME, host="h", port=443, acme_email="a@b.c")
-    assert "acme-staging-v02" in " ".join(tls.service(stg)["command"])
-    assert "acme-staging-v02" not in " ".join(tls.service(prod)["command"])
-
-
 def test_verify_can_present_a_different_sni_than_the_address_it_dials():
     """tls-status must probe THIS host, not the public name.
 
@@ -2122,71 +2047,6 @@ def test_verify_can_present_a_different_sni_than_the_address_it_dials():
     src = inspect.getsource(tls.verify)
     assert "server_hostname=servername" in src
     assert "server_hostname=host" not in src, "every handshake must honour sni"
-
-
-def test_acme_router_uses_a_host_rule_like_the_official_compose():
-    """`Host(`domain`)`, as compose.traefik.yml does it.
-
-    Traefik derives what to REQUEST from the router's Host() matcher. The old rule
-    was PathPrefix(`/`), which names no host, so ACME had nothing to ask for: it
-    logged "no domain found" and silently served its default certificate --
-    indistinguishable from a failed challenge, with no request ever made. Naming
-    the host in the rule removes that failure mode and drops the `domains:` block.
-    """
-    from rc_repro import tls
-    spec = tls.TlsSpec(mode=tls.MODE_ACME, host="testrepo.kestron.org", port=443,
-                       acme_email="a@b.c")
-    y = dict(tls.files(spec, ["rocketchat"]))["tls/dynamic.yml"]
-    assert "Host(`testrepo.kestron.org`)" in y
-    assert "certResolver: le" in y
-    assert "domains:" not in y, "a Host() rule makes the domains block redundant"
-
-    # The local certificate is loaded from disk, so it keeps the catch-all rule and
-    # carries no resolver.
-    local = dict(tls.files(tls.TlsSpec(host="x.rcrepro.localhost", port=8443),
-                           ["rocketchat"], "C", "K"))["tls/dynamic.yml"]
-    assert "PathPrefix(`/`)" in local
-    assert "certResolver" not in local
-
-
-def test_domain_is_normalized_the_way_the_official_docs_require():
-    """The Rocket.Chat compose docs say DOMAIN must have no scheme or trailing slash.
-
-    They say it because people get it wrong, and unguarded it corrupted three
-    things at once: ROOT_URL became "https://https://host", the ACME `domains`
-    entry became a value Let's Encrypt rejects, and the TLS SNI name never matched.
-    """
-    import pytest
-    from rc_repro import tls
-    from rc_repro.errors import ValidationError
-
-    # One obvious meaning -> corrected, and the correction is reported.
-    for given in ("rc1.example.com", "https://rc1.example.com", "http://rc1.example.com/",
-                  "RC1.Example.COM.", "  rc1.example.com  ", "rc1.example.com."):
-        host, note = tls.normalize_domain(given)
-        assert host == "rc1.example.com", given
-        if given != "rc1.example.com":
-            assert note, f"{given!r} was changed silently"
-
-    # Ambiguous or unsupported -> refused, because silently dropping part of what
-    # was asked for is worse than saying no.
-    for given, expect in [
-        ("rc1.example.com:8443", "contains a port"),
-        ("rc1.example.com/chat", "contains a path"),
-        ("*.example.com", "is a wildcard"),
-        ("bad_host.example.com", "not a valid hostname"),
-        ("-x.example.com", "not a valid hostname"),
-        ("https://", "empty"),
-    ]:
-        with pytest.raises(ValidationError, match=expect):
-            tls.normalize_domain(given)
-
-    # And the normalized host is what reaches ROOT_URL and the ACME domains block.
-    host, _ = tls.normalize_domain("HTTPS://RC1.Example.COM/")
-    spec = tls.TlsSpec(mode=tls.MODE_ACME, host=host, port=443, acme_email="a@b.c")
-    assert spec.root_url == "https://rc1.example.com"
-    y = dict(tls.files(spec, ["rocketchat"]))["tls/dynamic.yml"]
-    assert "Host(`rc1.example.com`)" in y
 
 
 # --- env var overrides (up --env / rc-repro env) -------------------------------
@@ -2329,3 +2189,113 @@ def test_bare_setting_warning_asks_the_workspace_and_stays_quiet_when_it_cannot(
     monkeypatch.setattr(rcapi, "setting_ids", lambda *a, **k: None)
     envvars.warn_bare_settings(meta, ["Message_AllowEditing"], seen.append)
     assert seen == []
+
+
+def test_a_workspace_is_not_readable_by_other_local_users(tmp_path, monkeypatch):
+    """The compose file carries ADMIN_PASS and REG_TOKEN, and preset files carry
+    LDAP/MinIO credentials. At the default umask every local user could read them
+    -- fine on a laptop, not on the shared box this is for."""
+    import stat
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from rc_repro import runner
+
+    runner.write("x", "services: {}\n",
+                 runner.Metadata(name="x", project="p", rc_version="8.5.1",
+                                 rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                                 preset="default", root_url="u", host_port=3000,
+                                 version_source="s"),
+                 files=[("ldap/seed.ldif", "userPassword: secret\n")])
+    ws = runner.workspace("x")
+    # The DIRECTORY is the barrier: 0700 means no other local user can traverse
+    # in, so nothing inside is reachable whatever its own mode.
+    assert stat.S_IMODE(ws.stat().st_mode) == 0o700
+    # Nested directories stay traversable: some volumes mount a DIRECTORY and the
+    # container must list it. Prometheus globs its file_sd_configs dir, and at
+    # 0700 it started cleanly and scraped NOTHING -- worse than crashing. The
+    # 0700 root keeps other users out of these regardless of their own mode.
+    assert stat.S_IMODE((ws / "ldap").stat().st_mode) == 0o755
+    # Files stay readable, and MUST: half of these are bind-mounted into
+    # containers that run as non-root (Prometheus as 65534, Grafana, Loki, the
+    # OTel collector). 0600 made them unreadable and Prometheus crash-looped on
+    # "open /etc/prometheus/prometheus.yml: permission denied". Verified that a
+    # container reads a 0644 file inside a 0700 directory perfectly well -- the
+    # bind mount is resolved by the daemon, so the host directory never applies.
+    for rel in ("docker-compose.yml", "repro.json", "ldap/seed.ldif"):
+        mode = stat.S_IMODE((ws / rel).stat().st_mode)
+        assert mode == 0o644, f"{rel} is {oct(mode)}"
+
+
+# --- docker query memo (F17) ----------------------------------------------------
+# Each open tab polls /api/repros every 4s: `docker compose ls` + `docker ps` +
+# `docker info`. Ten teammates with a tab open is ~40 process spawns every four
+# seconds on the shared box.
+
+def test_repeated_dashboard_polls_do_not_respawn_docker(monkeypatch):
+    from rc_repro import runner
+
+    runner.invalidate_docker_queries()
+    calls = []
+    monkeypatch.setattr(runner, "_compose_ls", lambda: calls.append(1) or [])
+    for _ in range(10):
+        runner.project_states()
+    assert len(calls) == 1, f"{len(calls)} docker calls for 10 polls"
+
+
+def test_a_state_change_is_never_served_from_the_memo(monkeypatch):
+    """A dashboard still showing "running" two seconds after a Stop is a cache the
+    user can notice -- worse than the spawns it saves."""
+    from rc_repro import runner
+
+    runner.invalidate_docker_queries()
+    state = {"status": "running(1)"}
+    monkeypatch.setattr(runner, "_compose_ls",
+                        lambda: [{"Name": "rcrepro-x", "Status": state["status"]}])
+    assert runner.project_states()["rcrepro-x"] == "running(1)"
+
+    # Stop it: the compose call is faked, but the invalidation is the real one.
+    monkeypatch.setattr(runner, "_compose", lambda name, *a, **k: type("P", (), {"returncode": 0})())
+    state["status"] = "exited(1)"
+    runner.stop("x")
+    assert runner.project_states()["rcrepro-x"] == "exited(1)", "stale after a stop"
+
+
+def test_docker_available_is_memoised_but_forcible(monkeypatch):
+    import subprocess
+
+    from rc_repro import runner
+
+    runner.invalidate_docker_queries()
+    calls = []
+
+    def fake_run(*a, **k):
+        calls.append(1)
+        return subprocess.CompletedProcess(a[0] if a else [], 0, "", "")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    for _ in range(5):
+        runner.docker_available()
+    assert len(calls) == 1
+    runner.docker_available(max_age=0)          # doctor wants the truth, now
+    assert len(calls) == 2
+
+
+def test_multi_instance_and_https_no_longer_conflict(tmp_path, monkeypatch):
+    """`--https` used to be REFUSED on the multi-instance preset, because that
+    preset runs its own Traefik as its entry service and a second TLS sidecar in
+    one project was too subtle to get right. There is no second Traefik now -- the
+    edge routes to the instances directly, with the sticky cookie DDP needs -- so
+    the combination just works.
+    """
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from rc_repro import compose, presets, tls
+
+    pre = presets.load("multi-instance", {"instances": "3"})
+    spec = compose.Spec(
+        project_name="rcrepro-w", rc_image="rc", rc_tag="8.5.1", mongo_tag="8.0",
+        mongo_flavor="official", mongo_shell="mongosh", oplog=True,
+        root_url="http://localhost:3000", host_port=3000, reg_token=None,
+        preset=pre,
+        tls=tls.TlsSpec(mode=tls.MODE_ACME, host="t1.example.com", port=443))
+    doc = compose.build(spec)          # used to raise ValueError
+    assert doc["services"]
