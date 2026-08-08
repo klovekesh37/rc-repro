@@ -2432,7 +2432,11 @@ def serve(
                  + (f" — {holder} is holding :443.\n" if holder else ".\n")
                  + f"  Its compose project is `{edgesvc.PROJECT}` in "
                  f"{edgesvc.edge_dir()}; `rc-repro edge status` reports it.")
-        url = f"https://{domain}/"
+        # The token goes in THIS url too. Without it the page loaded and then
+        # every API call answered "bad or missing token", because the guard only
+        # covers /api/ -- so the GUI rendered an empty shell with an error and no
+        # hint that a token existed at all, let alone what it was.
+        url = f"https://{domain}/" + (f"?t={token}" if token else "")
     else:
         url = f"http://localhost:{port}/" + (f"?t={token}" if token else "")
     typer.secho(f"rc-repro GUI: {url}", bold=True)

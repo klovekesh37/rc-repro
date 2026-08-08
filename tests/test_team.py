@@ -419,3 +419,24 @@ def test_no_token_stays_available_for_an_ephemeral_lab(served):
 def test_no_token_on_loopback_is_untouched(served):
     r = cli_runner.invoke(cli.app, ["serve", "--no-token", "--no-open"])
     assert r.exit_code == 0, r.output
+
+
+def test_a_domain_served_gui_still_carries_its_token(fronted):
+    """Reported from EC2: the page loaded and every API call answered "bad or
+    missing token". A token IS minted when there are no accounts, but the printed
+    https URL left the ?t= off -- and the guard only covers /api/, so the SPA
+    rendered an empty shell with an error and no hint a token even existed."""
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--domain", "rc.example.com", "--email", "ops@example.com"])
+    assert r.exit_code == 0, r.output
+    line = next(ln for ln in r.output.splitlines() if "rc-repro GUI:" in ln)
+    assert "?t=" in line, line
+
+
+def test_with_accounts_the_url_carries_no_token(fronted):
+    """Accounts replace the token entirely; a ?t= there would be meaningless."""
+    users.add("alice", GOOD)
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--domain", "rc.example.com", "--email", "ops@example.com"])
+    line = next(ln for ln in r.output.splitlines() if "rc-repro GUI:" in ln)
+    assert "?t=" not in line and line.strip().endswith("rc.example.com/")
