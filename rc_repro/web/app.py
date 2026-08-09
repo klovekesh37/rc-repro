@@ -912,7 +912,8 @@ def create_app(allow_hosts: list[str] | None = None, *,
             raise ValidationError("that is not your current password")
         usersvc.require_valid_password(new)
         usersvc.set_password(me, new)
-        keep = request.cookies.get(cookie_name(_peer(request)[1]), "")
+        _addr, https = _peer(request)
+        keep = request.cookies.get(cookie_name(https), "")
         current = sessions.verify(keep)
         ended = sessions.revoke_user(me)
         token = sessions.create(me, label=current.label if current else "",
@@ -920,7 +921,17 @@ def create_app(allow_hosts: list[str] | None = None, *,
         auditsvc.record("me-passwd", me)
         resp = JSONResponse({"ok": True, "sessions_ended": max(0, ended - 1)})
         if token:
-            _set_session_cookie(resp, token)
+            # `https` is not optional here, and leaving it off was a real bug. The
+            # cookie's NAME and its Secure flag both follow the browser's hop, and
+            # behind --trust-proxy that hop is https while app.state.public_https
+            # is False (rc-repro did not arrange the TLS itself). So this wrote
+            # `rc_repro_session` while the guard three hundred lines up read
+            # `__Host-rc_repro_session`: changing your own password signed you out,
+            # having just answered {"ok": true}, and the replacement token went out
+            # without Secure and without the prefix that stops a sibling workspace
+            # shadowing this cookie. Every other call site passed it; this one did
+            # not, and no test covered me_password behind a proxy.
+            _set_session_cookie(resp, token, https)
         return resp
 
     @app.get("/api/audit")

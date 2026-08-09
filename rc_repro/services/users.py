@@ -21,6 +21,7 @@ import re
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +73,27 @@ def hash_password(password: str, *, salt: bytes | None = None) -> str:
     return f"scrypt${_N}${_R}${_P}${_b64(salt)}${_b64(digest)}"
 
 
+#: What an unknown user is checked against, so a miss costs the same as a hit.
+#:
+#: Built as a STRING rather than by calling hash_password(), and that is the whole
+#: point. The obvious version --
+#:
+#:     _check(password, hash_password("dummy-not-a-real-password"))
+#:
+#: -- derives scrypt TWICE: once to build the dummy, once to check against it. So
+#: an unknown user cost exactly double a known one, and the timing side channel the
+#: line was written to close was instead created by it, twice as loud as the early
+#: return it replaced. Measured before this change: 46.6 ms unknown vs 23.7 ms
+#: known, a ratio of 1.97.
+#:
+#: A well-formed line with a random salt and a random digest costs nothing to build
+#: and makes _check() do exactly one derivation, which is what the real path does.
+#: The digest is never meant to match; a password deriving to these 32 bytes has
+#: the same odds as guessing the salt.
+_DUMMY_HASH = (f"scrypt${_N}${_R}${_P}${_b64(secrets.token_bytes(_SALT))}"
+               f"${_b64(secrets.token_bytes(_DKLEN))}")
+
+
 def _check(password: str, stored: str) -> bool:
     """Constant-time verify against a stored hash."""
     try:
@@ -119,6 +141,55 @@ def _read() -> dict[str, tuple[str, str, str]]:
         if parsed:
             out[parsed[0]] = (parsed[1], parsed[2], parsed[3])
     return out
+
+
+_write_lock = threading.Lock()
+
+
+@contextmanager
+def _locked():
+    """Exclusive access for a read-modify-write of the users file.
+
+    Every mutation here is read-whole-file -> change one entry -> rewrite. Without
+    this, two of them interleave and the later `_write` reads a snapshot taken
+    before the earlier one landed, so the earlier change is gone -- with both
+    callers told they succeeded. Measured before this existed: eight concurrent
+    `rc-repro users add` left TWO accounts on disk, and the other six were reported
+    created, complete with a minted password.
+
+    The sharpest case is not `add`, it is a password reset. `users passwd` on a
+    compromised account can be silently discarded by any concurrent write, and the
+    admin is looking at a new password while the old one still works.
+
+    Two layers, for the same reasons services/sessions.py and runner.repro_lock
+    give: `serve` mutates this from worker threads, the CLI mutates it from another
+    process entirely, and flock is per open file description so a thread lock is
+    not redundant.
+
+    READS ARE DELIBERATELY NOT LOCKED. `_write` lands through os.replace, which is
+    atomic, so a reader sees the whole old file or the whole new one and never a
+    torn mix. That matters: `role_of()` runs in the web guard on EVERY api request,
+    and putting an flock on that path would buy nothing and cost a syscall per
+    request.
+
+    Not shared with sessions._flocked() on purpose -- that one's thread lock does
+    double duty guarding an in-memory cache this module does not have, so folding
+    them together would mean one lock with two unrelated jobs.
+    """
+    with _write_lock:
+        try:
+            import fcntl
+        except ImportError:                       # pragma: no cover - Windows
+            yield
+            return
+        lock_dir = config.home() / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        with open(lock_dir / "users.lock", "w", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def _write(users: dict[str, tuple[str, str, str]]) -> None:
@@ -261,61 +332,79 @@ def default_role_for_new_account() -> str:
 def add(name: str, password: str, *, role: str = "") -> User:
     require_valid_name(name)
     require_valid_password(password)
-    role = role or default_role_for_new_account()
-    require_valid_role(role)
-    users = _read()
-    if name in users:
-        raise ConflictError(f"user {name!r} already exists "
-                            f"(change the password with `rc-repro users passwd {name}`)")
+    if role:
+        require_valid_role(role)
+    # Derived OUTSIDE the lock: scrypt is ~25 ms by design and it depends on
+    # nothing in the file, so holding the lock across it would serialise account
+    # creation on the one part of it that does not need to be.
+    hashed = hash_password(password)
     # Date, not a full timestamp: ":" is the field delimiter, and an ISO time
     # ("...T08:52:23+00:00") splits straight into the role column. Only ever
     # displayed, so day granularity is enough.
     created = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    users[name] = (hash_password(password), created, role)
-    _write(users)
+    with _locked():
+        # Resolved inside the lock: default_role_for_new_account() answers "is the
+        # file empty?", so two concurrent first accounts would otherwise both read
+        # empty and both come out admin.
+        chosen = role or default_role_for_new_account()
+        require_valid_role(chosen)
+        users = _read()
+        if name in users:
+            raise ConflictError(f"user {name!r} already exists "
+                                f"(change the password with `rc-repro users passwd {name}`)")
+        users[name] = (hashed, created, chosen)
+        _write(users)
     # Audited HERE, not at the two front ends. audit.py's own docstring records
     # why: the single call site used to be JobManager.submit(), so everything
     # synchronous wrote nothing -- and that set was the destructive operations.
     # Account changes have the same shape, and `rc-repro users role` proved it by
     # writing no line at all while the identical HTTP call wrote one.
-    auditsvc.record("user-add", f"{name} role={role}")
-    return User(name=name, created_at=created, role=role)
+    auditsvc.record("user-add", f"{name} role={chosen}")
+    return User(name=name, created_at=created, role=chosen)
 
 
 def set_password(name: str, password: str) -> None:
     require_valid_password(password)
-    users = _read()
-    if name not in users:
-        raise NotFoundError(f"no user {name!r} (see `rc-repro users list`)")
-    _hashed, created, role = users[name]
-    users[name] = (hash_password(password), created, role)
-    _write(users)
+    hashed = hash_password(password)          # outside the lock, as in add()
+    with _locked():
+        users = _read()
+        if name not in users:
+            raise NotFoundError(f"no user {name!r} (see `rc-repro users list`)")
+        _old_hash, created, role = users[name]
+        users[name] = (hashed, created, role)
+        _write(users)
     auditsvc.record("user-passwd", name)
 
 
 def remove(name: str) -> None:
-    users = _read()
-    if name not in users:
-        raise NotFoundError(f"no user {name!r} (see `rc-repro users list`)")
-    _require_not_last_admin(name, users, "removing them")
-    del users[name]
-    _write(users)
+    with _locked():
+        users = _read()
+        if name not in users:
+            raise NotFoundError(f"no user {name!r} (see `rc-repro users list`)")
+        _require_not_last_admin(name, users, "removing them")
+        del users[name]
+        _write(users)
     auditsvc.record("user-remove", name)
 
 
 def set_role(name: str, role: str) -> User:
     """Change what `name` may do. Returns the updated user."""
     require_valid_role(role)
-    users = _read()
-    if name not in users:
-        raise NotFoundError(f"no user {name!r} (see `rc-repro users list`)")
-    hashed, created, _old = users[name]
-    if normalise_role(role) != "admin":
-        _require_not_last_admin(name, users, f"making them {role}")
-    users[name] = (hashed, created, normalise_role(role))
-    _write(users)
-    auditsvc.record("user-role", f"{name} -> {normalise_role(role)}")
-    return User(name=name, created_at=created, role=normalise_role(role))
+    wanted = normalise_role(role)
+    with _locked():
+        users = _read()
+        if name not in users:
+            raise NotFoundError(f"no user {name!r} (see `rc-repro users list`)")
+        hashed, created, _old = users[name]
+        # Read AND checked under the lock: a demotion racing another demotion could
+        # otherwise take the last admin away, each having seen the other still in
+        # place.
+        if wanted != "admin":
+            _require_not_last_admin(name, users, f"making them {role}")
+        users[name] = (hashed, created, wanted)
+        _write(users)
+    auditsvc.record("user-role", f"{name} -> {wanted}")
+    return User(name=name, created_at=created, role=wanted)
 
 
 # --- verification ------------------------------------------------------------------
@@ -421,7 +510,9 @@ def verify(name: str, password: str, *, source: str = "") -> bool:
     stored = users.get(name)
     if stored is None:
         # Burn the same work as a real check so timing does not enumerate users.
-        _check(password, hash_password("dummy-not-a-real-password"))
+        # ONE derivation, exactly like the branch below -- see _DUMMY_HASH for the
+        # version of this line that burned two.
+        _check(password, _DUMMY_HASH)
         _record_failure(name, source)
         return False
     if not _check(password, stored[0]):

@@ -336,6 +336,104 @@ def test_a_changed_password_invalidates_the_old_one_immediately(tmp_path, monkey
     assert usersvc.verify("alice", "brand-new-password") is True
 
 
+def test_verifying_an_unknown_user_derives_scrypt_exactly_once():
+    """An unknown name must cost the SAME work as a known one, not double it.
+
+    The dummy check used to be `_check(password, hash_password("dummy..."))`, which
+    derives twice: once to build the throwaway hash, once to check against it. So a
+    miss took twice as long as a hit and the timing channel the line exists to close
+    was created by it instead -- measured at 46.6 ms unknown vs 23.7 ms known, a
+    ratio of 1.97.
+
+    Counting derivations rather than timing them: the invariant is "the same work",
+    and a wall-clock assertion on a shared CI box is a flake waiting to happen.
+    """
+    import hashlib
+
+    users.add("alice", GOOD)
+    calls = []
+    real = hashlib.scrypt
+
+    def counting(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+
+    original, hashlib.scrypt = hashlib.scrypt, counting
+    try:
+        users.verify("alice", "not-the-right-password")
+        known = len(calls)
+        calls.clear()
+        users.verify("no-such-person", "not-the-right-password")
+        unknown = len(calls)
+    finally:
+        hashlib.scrypt = original
+
+    assert known == 1, "a known user with a wrong password derives once"
+    assert unknown == known, (
+        f"an unknown user derived {unknown} times against {known} for a known one; "
+        "that difference is a user-enumeration oracle")
+
+
+def test_concurrent_writes_in_one_process_do_not_lose_accounts():
+    """Eight threads adding at once must leave eight accounts.
+
+    Every mutation is read-whole-file -> change -> rewrite, so without exclusion
+    the later write is based on a snapshot taken before the earlier one landed and
+    the earlier account vanishes -- while its caller was told it was created, and
+    handed the password to prove it.
+    """
+    import threading
+
+    errors_seen: list[str] = []
+
+    def add(i):
+        try:
+            users.add(f"racer{i}", GOOD, role="member")
+        except Exception as exc:                      # noqa: BLE001 - reported below
+            errors_seen.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=add, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert errors_seen == []
+    names = sorted(u.name for u in users.list_users())
+    assert names == [f"racer{i}" for i in range(8)], \
+        f"accounts were lost to a concurrent write: {names}"
+
+
+def test_a_second_process_cannot_clobber_an_account(tmp_path):
+    """The same race across PROCESSES, which is the one that actually happens.
+
+    `serve` writes this file from its worker threads while somebody runs
+    `rc-repro users add` in a terminal, and a thread lock says nothing about that.
+    Measured before the flock existed: eight concurrent `users add` left TWO
+    accounts, and the other six were reported created.
+
+    Slower than the thread test and kept anyway -- it is the only one of the two
+    that would notice the file lock being dropped.
+    """
+    import subprocess
+    import sys
+
+    prog = (
+        "import os, sys;"
+        "os.environ['RC_REPRO_HOME'] = sys.argv[1];"
+        "from rc_repro.services import users;"
+        "users.add(sys.argv[2], 'correct-horse-battery', role='member')")
+    procs = [subprocess.Popen([sys.executable, "-c", prog, str(tmp_path), f"proc{i}"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+             for i in range(8)]
+    failed = [p.communicate()[1].decode()[-300:] for p in procs if p.wait() != 0]
+    assert failed == [], f"a concurrent `users add` failed outright: {failed}"
+
+    names = sorted(u.name for u in users.list_users())
+    assert names == [f"proc{i}" for i in range(8)], \
+        f"accounts were lost across processes: {names}"
+
+
 def test_a_new_account_never_becomes_an_implicit_admin():
     """Blank-means-admin is the MIGRATION for accounts that predate roles. If it
     were also the behaviour for new ones, `rc-repro users add bob` would silently

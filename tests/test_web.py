@@ -1837,8 +1837,10 @@ def _app(**kw):
     if not usersvc.any_users():
         usersvc.add("alice", PASSWORD, role="admin")
     peer = kw.pop("peer", "127.0.0.1")
-    return TestClient(create_app(**kw), base_url="http://localhost",
-                      client=(peer, 5555))
+    # `base` matters once a test follows a cookie the proxy's scheme made Secure:
+    # httpx, like a browser, will not send one back over http://.
+    base = kw.pop("base", "http://localhost")
+    return TestClient(create_app(**kw), base_url=base, client=(peer, 5555))
 
 
 def test_forwarded_headers_are_ignored_from_an_untrusted_peer():
@@ -1894,6 +1896,38 @@ def test_the_throttle_keys_on_the_real_client_behind_a_trusted_proxy():
     other = {**_FWD, "X-Forwarded-For": "203.0.113.77"}
     assert c.post("/api/session", json={"user": "alice", "password": PASSWORD},
                   headers=other).status_code == 200
+
+
+def test_changing_your_own_password_behind_a_proxy_keeps_you_signed_in():
+    """The cookie's NAME and its Secure flag follow the BROWSER's hop, not the bind.
+
+    Behind --trust-proxy that hop is https while public_https is False (rc-repro
+    did not arrange the TLS), so the guard reads `__Host-rc_repro_session`.
+    me_password was the one call site of four that did not pass the resolved
+    scheme, so it wrote the plain name: every session was revoked, the replacement
+    went out under a name nothing reads, and changing your own password signed you
+    out having just answered {"ok": true}. The replacement also went out WITHOUT
+    Secure and without the prefix that stops a sibling workspace -- which the
+    design puts on a neighbouring host, running admin/admin123 -- shadowing it.
+
+    Nothing covered me_password behind a proxy, which is why it shipped.
+    """
+    c = _app(trust_proxy=["127.0.0.1"], base="https://localhost")
+    r = c.post("/api/session", json={"user": "alice", "password": PASSWORD},
+               headers=_FWD)
+    assert r.status_code == 200
+    assert r.headers["set-cookie"].startswith("__Host-rc_repro_session=")
+
+    r = c.post("/api/me/password",
+               json={"old": PASSWORD, "new": "a-brand-new-password"}, headers=_FWD)
+    assert r.status_code == 200, r.text
+    cookie = r.headers["set-cookie"]
+    assert cookie.startswith("__Host-rc_repro_session="), \
+        f"the replacement cookie is under a name the guard does not read: {cookie}"
+    assert "Secure" in cookie, f"a session token went out without Secure: {cookie}"
+
+    who = c.get("/api/session", headers=_FWD)
+    assert who.json()["user"] == "alice", "changing my own password signed me out"
 
 
 def test_a_cidr_is_accepted_and_a_typo_simply_trusts_nothing():
