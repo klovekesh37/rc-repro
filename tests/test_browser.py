@@ -392,3 +392,142 @@ def test_the_log_viewer_streams_container_output(serve, page, monkeypatch):
         body = page.text_content("#logview")
         assert "line 0" in body and "line 4" in body
         assert page.errors == [], page.errors
+
+
+def test_the_backups_tab_lists_what_is_there(serve, page, monkeypatch):
+    """The tab fetches AFTER it renders, so it opens showing "loading…". Asserting
+    on the container rather than on its content would pass whether or not
+    /api/backups works — that mistake was made once already in this file."""
+    from rc_repro.services import backup as backupsvc
+
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    monkeypatch.setattr(backupsvc, "list_backups", lambda name="": [
+        {"path": "/tmp/t1234-2026-08-09.tar.zst", "bytes": 1234567,
+         "rc_version": "7.4.1", "mongo_tag": "7.0", "preset": "base",
+         "label": "", "created_at": "2026-08-09T10:00:00+00:00"}])
+
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        page.click("button.tab:has-text('Backups')")
+        page.wait_for_function(
+            "() => document.querySelector('#d-body').textContent"
+            ".includes('t1234-2026-08-09')")
+        assert "7.4.1" in page.text_content("#d-body")
+        assert page.errors == [], page.errors
+
+
+def test_the_load_test_dialog_opens_from_the_panel(serve, page, monkeypatch):
+    """Reached only from the detail panel's action row, so it needs a workspace to
+    exist before it can be rendered at all — which is why nothing had rendered it."""
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        page.click("button:has-text('Load test')")
+        page.wait_for_selector("#perf-dialog[open]")
+        assert "t1234" in page.text_content("#perf-title")
+        # `live` needs the monitoring stack, and the fixture says it is off
+        assert page.is_disabled("#perf-form >> [name=live]"), \
+            "the live option must be disabled without monitoring attached"
+        page.click("#perf-cancel")
+        page.wait_for_function("() => !document.querySelector('#perf-dialog').open")
+        assert page.errors == [], page.errors
+
+
+def test_the_doctor_dialog_renders_its_checks(serve, page, monkeypatch):
+    """The badge could only ever say up/down. This is the panel that says WHY."""
+    from rc_repro.services import doctor as doctorsvc
+
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    monkeypatch.setattr(doctorsvc, "run_checks", lambda: {
+        "checks": [{"status": "ok", "message": "Docker daemon running (27.0.3)"},
+                   {"status": "fail",
+                    "message": "2 GB free - a workspace needs about 6"}],
+        "counts": {}, "verdict": "fail",
+        "repros": {"total": 1, "running": 1}})
+
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#docker-badge")
+        page.click("#docker-badge")
+        page.wait_for_selector("#doctor-dialog[open]")
+        page.wait_for_function(
+            "() => !document.querySelector('#doctor-body').textContent.includes('Checking')")
+        body = page.text_content("#doctor-body")
+        assert "Docker daemon running" in body
+        assert "a workspace needs about 6" in body, "the reason has to reach the screen"
+        assert "1 total, 1 running" in body
+        page.click("#doctor-close")
+        assert page.errors == [], page.errors
+
+
+def test_the_edge_badge_surfaces_an_unreachable_route(serve, page, monkeypatch):
+    """A route the edge cannot reach answers 502 rather than erroring, so it looks
+    like a broken workspace instead of a broken route. Surfacing that is the whole
+    reason the badge exists.
+
+    Deliberately NOT the empty state: refreshEdgeBadge() hides the badge when no
+    edge is installed, so "No edge yet" is unreachable from it and a test clicking
+    there would only ever have proved the badge was hidden.
+    """
+    from rc_repro.services import edge as edgesvc
+
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    monkeypatch.setattr(edgesvc, "status", lambda: {
+        "installed": True, "running": True, "routes": ["t1234", "t9999"],
+        "attached": ["rcrepro-t1234_default"]})
+    monkeypatch.setattr(edgesvc, "served_domain", lambda: "support.example.com")
+    monkeypatch.setattr(edgesvc, "workspace_network",
+                        lambda n: f"rcrepro-{n}_default")
+
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#edge-badge:not([hidden])")
+        assert "1 unreachable" in page.text_content("#edge-badge"), \
+            "t9999's network is not attached, so the edge cannot reach it"
+        page.click("#edge-badge")
+        page.wait_for_selector("#edge-dialog[open]")
+        assert "t9999" in page.text_content("#edge-body")
+        page.click("#edge-close")
+        page.wait_for_function("() => !document.querySelector('#edge-dialog').open")
+        assert page.errors == [], page.errors
+
+
+def test_a_readonly_user_is_offered_nothing_in_the_detail_panel_either(serve, page,
+                                                                       monkeypatch):
+    """The panel's action row branches on canWrite(), and two buttons were appended
+    PAST the branch: "Make default" and the red, destructive "Down". So a readonly
+    user saw "you can look, but not change anything here" with two change buttons
+    directly beneath it.
+
+    The existing readonly test covers the dashboard toolbar and the cards, which
+    were right -- the card renderer returns early. Nothing covered the panel.
+
+    Found in the audit trail, not by reading:
+        dheeraj  denied  POST /api/repros/{name}/default needs member
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    usersvc.add("ronly", "read-only-password", role="readonly")
+    with serve() as s:
+        _sign_in(page, s.url, user="ronly", password="read-only-password")
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        assert "readonly" in page.text_content(".d-actions")
+        for label in ("Make default", "Down", "Stop", "Restart", "Load test"):
+            assert page.locator(f".d-actions button:has-text('{label}')").count() == 0, \
+                f"a readonly user is offered {label!r}, which the server refuses"
+        # ...and the thing that IS allowed is still there.
+        assert page.locator(".d-actions a:has-text('Open RC')").count() == 1, \
+            "opening the workspace is a link, not an action on it"
+        assert page.errors == [], page.errors

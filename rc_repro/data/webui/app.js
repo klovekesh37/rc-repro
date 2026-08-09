@@ -490,14 +490,26 @@ function renderDetail() {
     actions.append(dBtn("Stop", () => doState(d.name, "stop")));
     actions.append(dBtn("Restart", () => doState(d.name, "restart")));
   }
-  // The `default` pill was displayed but unmovable from the GUI -- the create
-  // dialog's Pin checkbox was the only way to set it.
-  if (!d.is_default) {
-    actions.append(dBtn("Make default", () => doDefault(d.name), "",
-      "Use this repro for name-less CLI commands (rc-repro use)."));
-  }
-  if (d.state !== "?") {
-    actions.append(dBtn("Down", () => doDown(d.name), "danger"));
+  // Both of these sit AFTER the canWrite() chain above, and both used to render
+  // for everybody -- so a readonly user was shown "readonly — you can look, but
+  // not change anything here" and then, directly beneath it, a Make default button
+  // and a red Down button. The card renderer got this right by returning early;
+  // the panel appended them past the branch and nobody noticed.
+  //
+  // Found in the audit trail rather than by reading, which is what it is for:
+  //   dheeraj  denied  POST /api/repros/{name}/default needs member
+  // A readonly user clicked a button the interface offered and got a 403, which
+  // is exactly how somebody concludes roles are broken.
+  if (canWrite()) {
+    // The `default` pill was displayed but unmovable from the GUI -- the create
+    // dialog's Pin checkbox was the only way to set it.
+    if (!d.is_default) {
+      actions.append(dBtn("Make default", () => doDefault(d.name), "",
+        "Use this repro for name-less CLI commands (rc-repro use)."));
+    }
+    if (d.state !== "?") {
+      actions.append(dBtn("Down", () => doDown(d.name), "danger"));
+    }
   }
   panel.append(head, tabs, actions, el("div", { class: "d-body", id: "d-body" }));
   renderTab();
