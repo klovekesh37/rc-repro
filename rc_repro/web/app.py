@@ -159,6 +159,9 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("POST", "/api/users/{name}/role"): _ADMIN,
     ("POST", "/api/users/{name}/password"): _ADMIN,
     ("POST", "/api/me/password"): _READ,        # your own, whoever you are
+    # readonly+ : the handler forces non-admins to their OWN lines, so the
+    # role gate here is "signed in", not "may see everyone".
+    ("GET", "/api/audit"): _READ,
 }
 
 
@@ -460,11 +463,20 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
                 from rc_repro.services import users as usersvc
                 role = usersvc.role_of(actor)      # live, never from the session
                 if need is None:
+                    auditsvc.audit(actor, "denied", f"{request.method} {template} "
+                                   "(no role declared)", origin_="session",
+                                   outcome="denied")
                     return JSONResponse(
                         {"error": f"{request.method} {template} declares no minimum "
                                   "role, so it is refused (see ROUTE_ROLES)",
                          "kind": "Forbidden"}, status_code=403)
                 if not usersvc.at_least(role, need):
+                    # Recorded, because "is readonly drawn in the right place?" is
+                    # an open question in the design and `grep denied` is the
+                    # evidence to settle it with -- opinion is not.
+                    auditsvc.audit(actor, "denied",
+                                   f"{request.method} {template} needs {need}",
+                                   origin_="session", outcome="denied")
                     return JSONResponse(
                         {"error": f"this needs the {need!r} role; you are {role!r}",
                          "kind": "Forbidden"}, status_code=403)
@@ -493,6 +505,9 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
         # `def` handler runs.
         request.state.actor = actor
         jobs_mod.CURRENT_ACTOR.set(actor)
+        # How that identity was established, so the log can say which of its lines
+        # are evidence. "session" only when a real credential was checked.
+        auditsvc.set_origin("session" if actor else "")
         response = await call_next(request)
         response.headers.setdefault("Content-Security-Policy", csp)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -692,7 +707,6 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
         usersvc.require_valid_role(role)
         password = secrets.token_urlsafe(_NEW_PASSWORD_BYTES)
         usersvc.add(name, password, role=usersvc.normalise_role(role))
-        auditsvc.record("user-add", f"{name} role={role}")
         return {"name": name, "role": usersvc.normalise_role(role),
                 "password": password,
                 "note": "shown once; rc-repro does not store it in readable form"}
@@ -707,7 +721,6 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
         # the least likely to sign out. (role_of is read live per request, so this
         # is belt and braces; the sign-out is what makes it visible to them.)
         ended = sessions.revoke_user(name)
-        auditsvc.record("user-role", f"{name} -> {u.role}")
         return {"name": u.name, "role": u.role, "sessions_ended": ended}
 
     @app.post("/api/users/{name}/password")
@@ -717,7 +730,6 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
         password = secrets.token_urlsafe(_NEW_PASSWORD_BYTES)
         usersvc.set_password(name, password)
         ended = sessions.revoke_user(name)
-        auditsvc.record("user-passwd", name)
         return {"name": name, "password": password, "sessions_ended": ended}
 
     @app.delete("/api/users/{name}")
@@ -725,7 +737,6 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
         from rc_repro.services import users as usersvc
         usersvc.remove(name)                 # refuses the last admin
         ended = sessions.revoke_user(name)
-        auditsvc.record("user-remove", name)
         return {"name": name, "removed": True, "sessions_ended": ended}
 
     @app.post("/api/me/password")
@@ -752,6 +763,25 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
         if token:
             _set_session_cookie(resp, token)
         return resp
+
+    @app.get("/api/audit")
+    def audit_read(request: Request, limit: int = 200, actor: str = "",
+                   kind: str = "", q: str = "", since: str = ""):
+        """The activity trail. Until now it was written and never read.
+
+        An admin sees every line. A member or readonly sees only their OWN,
+        forced server-side -- self-audit rather than admin-only, because "wait,
+        did I do that?" is a legitimate question and answering it with a 403
+        teaches people the log is not for them.
+        """
+        from rc_repro.services import users as usersvc
+        me = getattr(request.state, "actor", "") or ""
+        if me and not usersvc.at_least(usersvc.role_of(me), "admin"):
+            actor = me                       # not a filter they can widen
+        out = auditsvc.read(limit=max(1, min(int(limit), 1000)),
+                            actor_name=actor, kind=kind, q=q, since=since)
+        out["scope"] = "all" if actor == "" else actor
+        return out
 
     # --- read (blocking -> def -> threadpool) ---------------------------------
     @app.get("/api/health")
@@ -907,12 +937,23 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
             from rc_repro.services import users as usersvc
             need = route_requirement("WS", "/api/repros/{name}/logs/stream")
             if need is None or not usersvc.at_least(usersvc.role_of(sess.user), need):
+                auditsvc.audit(sess.user, "logs-open", name,
+                               origin_="session", outcome="denied")
                 await ws.close(code=1008); return
+            # This handler never passes through `guard`, so it publishes its own
+            # identity or the logs-open line below is written with no actor.
+            auditsvc.set_actor(sess.user)
+            auditsvc.set_origin("session")
         elif token and ws.query_params.get("t") != token:
             await ws.close(code=1008); return
         await ws.accept()
         try:
             target = lc.resolve_name(name)
+            # Once per stream, never per line: these logs carry LDAP bind
+            # passwords and OAuth client secrets, so who opened one is worth
+            # recording -- and a line per log line would be a denial of service
+            # against the log itself.
+            auditsvc.record("logs-open", target)
         except ReproError as exc:
             await ws.send_json({"error": str(exc)}); await ws.close(); return
 
@@ -1201,7 +1242,8 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
             # Not `token` -- that name is create_app's server auth token, and
             # rebinding it here reads like the handler is overwriting it.
             pat = rcapi.generate_pat(meta.root_url, auth, config.ADMIN_PASSWORD,
-                                     token_name=label, bypass_2fa=bypass_2fa)
+                                     token_name=label, bypass_2fa=bypass_2fa,
+                                     workspace=meta.name)
         except Exception as exc:  # noqa: BLE001 - surface as a 409, not a 500
             raise NotReadyError(
                 f"could not create a token (is it ready? `rc-repro ready -n {meta.name}`): {exc}"
@@ -1412,13 +1454,18 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
                 # customer script does, through a token rather than a login session.
                 auth = rcapi.Auth(
                     token=rcapi.generate_pat(meta.root_url, auth, config.ADMIN_PASSWORD,
-                                             bypass_2fa=True),
+                                             bypass_2fa=True, workspace=meta.name),
                     user_id=auth.user_id)
         except Exception as exc:  # noqa: BLE001 - surface as a 409, not a 500
             raise NotReadyError(
                 f"could not authenticate (is it ready? `rc-repro ready -n {meta.name}`): {exc}"
             ) from exc
 
+        # Audited at the USER-INITIATED call site, never inside rcapi.call() --
+        # that is the internal transport for login, seeding and every load test,
+        # so auditing there would drown the log in rc-repro talking to itself.
+        # The body is never recorded: it can carry a password being set.
+        auditsvc.record("api-call", f"{meta.name} {method} {path}")
         extra = rcapi.password_2fa_headers(config.ADMIN_PASSWORD) if two_fa else None
         started = time.monotonic()
         try:

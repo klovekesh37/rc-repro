@@ -260,6 +260,7 @@ def generate_pat(
     token_name: str = "rc-repro",
     bypass_2fa: bool = True,
     timeout: float = 15.0,
+    workspace: str = "",
 ) -> str:
     """Create (or regenerate) a Personal Access Token and return the token string.
 
@@ -267,6 +268,16 @@ def generate_pat(
     (bypass_2fa=True). Generating a PAT is itself a 2FA-guarded action, satisfied
     here with the password method.
     """
+    # Audited HERE, not at the handlers. Verified: this function has exactly eight
+    # non-test call sites (web/app.py x2, cli.py x4, services/perf.py x2), so a
+    # fix at one handler would have missed six -- and a bypass-2FA admin token for
+    # somebody else's workspace is one of the two most sensitive things this tool
+    # can do. `workspace` is passed by every caller; root_url is the fallback so a
+    # ninth site still writes a usable line rather than an anonymous one.
+    from rc_repro.services import audit as auditsvc
+    auditsvc.record("pat", f"{workspace or root_url} label={token_name} "
+                           f"bypass_2fa={bool(bypass_2fa)}")
+
     base = f"{root_url.rstrip('/')}/api/v1"
     hdr = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
 

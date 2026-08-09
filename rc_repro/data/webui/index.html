@@ -365,8 +365,17 @@
   <!-- Activity: running + recent jobs, reopenable -->
   <dialog id="jobs-dialog">
     <h2>Activity</h2>
-    <p class="hint">Jobs keep running on the server after their dialog is closed — including
-      across a page refresh. Click one to reopen its output.</p>
+    <div class="tabs" id="act-tabs">
+      <button class="tab active" id="act-tab-running" type="button">Running</button>
+      <button class="tab" id="act-tab-history" type="button">History</button>
+    </div>
+    <p class="hint" id="jobs-hint">Jobs keep running on the server after their dialog is
+      closed — including across a page refresh. Click one to reopen its output.</p>
+    <div id="jobs-filter" class="row2" hidden>
+      <input id="act-grep" class="input" placeholder="filter by action or target…"
+             aria-label="filter activity">
+      <label class="logfollow"><input type="checkbox" id="act-denied"> refusals only</label>
+    </div>
     <div id="jobs-list" class="plan"></div>
     <menu><button type="button" id="jobs-close" class="btn">Close</button></menu>
   </dialog>

@@ -1133,10 +1133,18 @@ def test_the_audit_log_survives_a_restart(basic_client, monkeypatch, tmp_path):
     basic_client.post("/api/repros", headers=_auth("alice", "correct-horse-battery"),
                       json={"version": "8.5.1"})
     from rc_repro.web.jobs import AUDIT_FILE
-    line = (tmp_path / AUDIT_FILE).read_text().strip()
-    when, who, kind, label = line.split("\t")
+    # Account changes are audited too now, so pick the line under test rather
+    # than assuming the file has exactly one.
+    lines = [ln for ln in (tmp_path / AUDIT_FILE).read_text().splitlines()
+             if "\tcreate\t" in ln]
+    assert len(lines) == 1, lines
+    when, who, kind, label, origin, outcome = lines[0].split("\t")
     assert who == "alice" and kind == "create" and label == "8.5.1"
     assert when.startswith("20")
+    # The two new columns are APPENDED, so the four an existing `cut -f2` reads
+    # are still in the same positions.
+    assert origin == "session", "a signed-in GUI request, so the identity is checked"
+    assert outcome == "ok"
 
 
 def test_token_mode_records_no_actor(monkeypatch):
@@ -1565,3 +1573,68 @@ def test_only_an_admin_may_choose_the_image_or_the_interface(basic_client, monke
     # the ordinary body still works for a member
     assert basic_client.post("/api/repros", headers=_auth(),
                              json={"version": "8.5.1"}).status_code == 200
+
+
+# --- the activity trail gets readers (H5) -----------------------------------------
+
+def test_the_audit_log_can_finally_be_read(basic_client, monkeypatch):
+    """It has been written since accounts landed and read by nothing -- no CLI
+    command, no endpoint, no view. "Who tore down TICKET-1234?" meant ssh and cat."""
+    monkeypatch.setattr(lc, "create_repro",
+                        lambda req, emit, stream_output=False: {"name": "x"})
+    basic_client.post("/api/repros", headers=_auth(), json={"version": "8.5.1"})
+    out = basic_client.get("/api/audit", headers=_auth()).json()
+    kinds = [r["kind"] for r in out["lines"]]
+    assert "create" in kinds
+    row = next(r for r in out["lines"] if r["kind"] == "create")
+    assert row["actor"] == "alice" and row["origin"] == "session"
+    assert row["outcome"] == "ok"
+
+
+def test_a_non_admin_only_ever_sees_their_own_lines(basic_client):
+    """Self-audit rather than admin-only: "wait, did I do that?" is a legitimate
+    question, and a 403 there teaches people the log is not for them."""
+    from rc_repro.services import users as usersvc
+    usersvc.add("bob", "bobs-good-password", role="member")
+    # alice (admin) generates a line of her own
+    basic_client.post("/api/users/bob/role", json={"role": "member"}, headers=_auth())
+    _as(basic_client, "bob", "bobs-good-password")
+    out = basic_client.get("/api/audit?actor=alice", headers=_auth()).json()
+    assert out["scope"] == "bob", "the actor filter is forced, not honoured"
+    assert all(r["actor"] == "bob" for r in out["lines"])
+
+
+def test_a_refusal_is_recorded_so_the_role_lines_can_be_reviewed(basic_client):
+    """Whether `readonly` is drawn in the right place is an open question in the
+    design; `grep denied` is the evidence to settle it with."""
+    from rc_repro.services import users as usersvc
+    usersvc.add("ronly", "read-only-password", role="readonly")
+    _as(basic_client, "ronly", "read-only-password")
+    assert basic_client.post("/api/repros", json={"version": "8.5.1"},
+                             headers=_auth()).status_code == 403
+    out = basic_client.get("/api/audit", headers=_auth()).json()
+    denied = [r for r in out["lines"] if r["outcome"] == "denied"]
+    assert denied and "needs member" in denied[0]["label"]
+
+
+def test_minting_a_token_is_audited_at_the_one_place_all_callers_pass_through():
+    """generate_pat has eight non-test call sites, so a fix at one handler would
+    have missed six -- and a bypass-2FA admin token is one of the two most
+    sensitive things this tool can do."""
+    import inspect
+    from rc_repro import rcapi
+    src = inspect.getsource(rcapi.generate_pat)
+    assert "auditsvc.record(\"pat\"" in src
+
+
+def test_a_legacy_four_field_line_still_parses(tmp_path, monkeypatch):
+    """The two new columns are APPENDED, so an old log stays readable rather than
+    being silently skipped by the reader that was supposed to make it useful."""
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from rc_repro.services import audit as auditsvc
+    auditsvc.audit_path().parent.mkdir(parents=True, exist_ok=True)
+    auditsvc.audit_path().write_text(
+        "2026-01-01T00:00:00+00:00\talice\tdown-volumes\tticket-1234\n", encoding="utf-8")
+    (row,) = auditsvc.read()["lines"]
+    assert row["actor"] == "alice" and row["kind"] == "down-volumes"
+    assert row["origin"] == "" and row["outcome"] == "ok"

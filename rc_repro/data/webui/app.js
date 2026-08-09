@@ -46,6 +46,15 @@ function localUrl(u) {
 // problem, not an expired session, and bouncing to /signin would be wrong.
 let ACCOUNTS = false;
 let MY_ROLE = "";
+// What this session may do, so the interface can say so BEFORE the click rather
+// than refusing after it. The server is the boundary -- every one of these is
+// enforced in `guard` regardless -- but a button that always answers with a red
+// toast reads as a broken feature, not as a permission.
+// Token mode has no roles, so everything is allowed there exactly as before.
+const canWrite = () => !ACCOUNTS || MY_ROLE !== "readonly";
+const canAdmin = () => !ACCOUNTS || MY_ROLE === "admin";
+const READONLY_WHY = "Your role is readonly. Workspace logs carry LDAP bind "
+  + "passwords and OAuth secrets, so readonly cannot read them either.";
 let SIGNING_OUT = false;
 
 // A session can expire mid-session (12h idle / 7d absolute) or be revoked from
@@ -113,6 +122,12 @@ async function loadRepros() {
       ME = me.user || "";
       MY_ROLE = me.role || "";
     } catch (_) { /* signed out; api() has already redirected */ }
+    // The top bar too: "+ New repro" and "Prune down" are member+, so a readonly
+    // session should not be offered them at all.
+    for (const [sel, ok] of [["#btn-new", canWrite()], ["#btn-prune", canWrite()],
+                             ["#btn-bench", canWrite()]]) {
+      const b = $(sel); if (b) b.hidden = !ok;
+    }
     const who = $("#whoami");
     who.textContent = ME + (MY_ROLE && MY_ROLE !== "admin" ? ` · ${MY_ROLE}` : "");
     who.hidden = !ME;
@@ -209,7 +224,7 @@ function render() {
   if (!ALL_REPROS.length) grid.append(el("p", { class: "empty" }, "No repros yet. Click “+ New repro”."));
   else if (!list.length) grid.append(el("p", { class: "empty" }, "No repros match this filter."));
   for (const r of list) grid.append(card(r));
-  grid.append(el("div", { class: "card new", onclick: openCreate },
+  if (canWrite()) grid.append(el("div", { class: "card new", onclick: openCreate },
     el("div", { class: "plus" }, "+"),
     el("div", { class: "t" }, "New repro"),
     el("div", { class: "s" }, "Spin up a fresh RC + Mongo sandbox")));
@@ -239,6 +254,24 @@ function card(r) {
   // "?" means docker could not be asked, so EVERY action below would fail -- the
   // card used to offer three buttons that all produced a red toast.
   const dockerOk = r.state !== "?";
+  if (!canWrite()) {
+    // Open RC still works: it is a link to the workspace, not an action on it.
+    if (dockerOk) {
+      actions.append(stop(el("a", { href: localUrl(r.root_url), target: "_blank", style: "text-decoration:none" },
+        el("button", { class: "btn small primary" }, "Open RC"))));
+    }
+    actions.append(el("span", { class: "inline-note", title: READONLY_WHY }, "readonly"));
+    const foot0 = el("div", { class: "card-foot" },
+      el("span", {}, "Uptime: " + (r.uptime || "—")),
+      el("span", { class: "health " + healthClass(r) }, r.health || r.state));
+    const c0 = el("div", {
+      class: "card st-" + stateClass(r.state) + (r.name === SELECTED ? " selected" : ""),
+      role: "button", tabindex: "0", "aria-label": `${r.name} — ${r.state}`,
+      onclick: () => selectRepro(r.name),
+      onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectRepro(r.name); } },
+    }, head, meta, actions, foot0);
+    return c0;
+  }
   if (dockerOk) {
     actions.append(stop(el("a", { href: localUrl(r.root_url), target: "_blank", style: "text-decoration:none" },
       el("button", { class: "btn small primary" }, "Open RC"))));
@@ -384,15 +417,22 @@ function renderDetail() {
   const tabs = el("div", { class: "tabs" });
   for (const t of ["overview", "logs", "containers", "env vars", "backups"]) {
     const key = t === "env vars" ? "env" : t;
+    // Logs and env are member+ on the server: both hand over real credentials.
+    // Rendering a tab that can only answer 403 is worse than not rendering it.
+    if (!canWrite() && (key === "logs" || key === "env")) continue;
     tabs.append(el("button", { class: "tab" + (dstate.tab === key ? " active" : ""), onclick: () => switchTab(key) },
       t.charAt(0).toUpperCase() + t.slice(1)));
   }
+  if (!canWrite() && (dstate.tab === "logs" || dstate.tab === "env")) dstate.tab = "overview";
   const actions = el("div", { class: "d-actions" });
   if (d.state !== "?") {
     actions.append(el("a", { href: localUrl(d.root_url), target: "_blank", style: "text-decoration:none" },
       el("button", { class: "btn primary" }, "↗ Open RC")));
   }
-  if (d.state === "running") {
+  if (!canWrite()) {
+    actions.append(el("span", { class: "inline-note", title: READONLY_WHY },
+      "readonly — you can look, but not change anything here"));
+  } else if (d.state === "running") {
     actions.append(dBtn("Stop", () => doState(d.name, "stop")));
     actions.append(dBtn("Restart", () => doState(d.name, "restart")));
     actions.append(dBtn("Seed", () => openSeed(d.name)));
@@ -1629,23 +1669,75 @@ function jobAge(j) {
   if (j.status === "queued") return "waiting for a slot";
   return j.status === "running" ? `${dur} and counting` : dur;
 }
-async function openJobs() {
-  let rows;
-  try { rows = (await api("/api/jobs")).jobs; }
-  catch (e) { toast(e.message); return; }
+let ACT_TAB = "running";
+
+async function openJobs(tab) {
+  if (tab) ACT_TAB = tab;
+  $("#act-tab-running").className = "tab" + (ACT_TAB === "running" ? " active" : "");
+  $("#act-tab-history").className = "tab" + (ACT_TAB === "history" ? " active" : "");
+  $("#jobs-filter").hidden = ACT_TAB !== "history";
+  $("#jobs-hint").textContent = ACT_TAB === "running"
+    ? "Jobs keep running on the server after their dialog is closed — including across a page refresh. Click one to reopen its output."
+    : (canAdmin()
+        ? "Everything anyone has done on this box. Refusals are recorded too."
+        : "Everything you have done on this box. Admins see everyone's.");
   const box = $("#jobs-list");
   box.innerHTML = "";
-  if (!rows.length) box.append(el("div", { class: "empty" }, "No jobs yet."));
+  box.append(el("p", { class: "empty" }, "loading…"));
+  if (!$("#jobs-dialog").open) $("#jobs-dialog").showModal();
+  if (ACT_TAB === "running") return renderRunning(box);
+  return renderHistory(box);
+}
+
+async function renderRunning(box) {
+  let rows;
+  try { rows = (await api("/api/jobs")).jobs; }
+  catch (e) { box.innerHTML = ""; box.append(el("p", { class: "empty" }, e.message)); return; }
+  box.innerHTML = "";
+  if (!rows.length) { box.append(el("div", { class: "empty" }, "No jobs yet.")); return; }
   for (const j of rows) {
-    box.append(el("button", {
+    const row = el("button", {
       class: "jobrow", type: "button",
       onclick: () => { $("#jobs-dialog").close(); reopenJob(j); },
     },
       el("span", { class: "jstatus " + j.status }, j.status),
-      el("span", { class: "jkind" }, jobTitle(j)),
-      el("span", { class: "jage" }, jobAge(j))));
+      el("span", { class: "jkind" }, jobTitle(j)));
+    // The API has returned `actor` since accounts landed and this dropped it on
+    // the floor -- which is most of why the shared box could not answer "who?".
+    if (j.actor) row.append(el("span", { class: "jactor" }, j.actor));
+    row.append(el("span", { class: "jage" }, jobAge(j)));
+    box.append(row);
   }
-  $("#jobs-dialog").showModal();
+}
+
+async function renderHistory(box) {
+  const q = $("#act-grep").value.trim();
+  const denied = $("#act-denied").checked;
+  let res;
+  try { res = await api("/api/audit?limit=200" + (q ? `&q=${encodeURIComponent(q)}` : "")); }
+  catch (e) { box.innerHTML = ""; box.append(el("p", { class: "empty" }, e.message)); return; }
+  const rows = (res.lines || []).filter((r) => !denied || r.outcome === "denied");
+  box.innerHTML = "";
+  if (!rows.length) { box.append(el("p", { class: "empty" }, "Nothing recorded yet.")); return; }
+  for (const r of rows) {
+    const row = el("div", { class: "jobrow" });
+    row.append(el("span", { class: "jstatus " + (r.outcome === "denied" ? "error" : "done") },
+      r.outcome === "denied" ? "denied" : r.kind));
+    row.append(el("span", { class: "jkind" },
+      (r.outcome === "denied" ? "" : "") + r.label));
+    if (r.actor) row.append(el("span", { class: "jactor" }, r.actor));
+    // Only shown when it is NOT a checked session: that is the common, trustworthy
+    // case, and a column that says "session" on every line teaches nothing.
+    if (r.origin && r.origin !== "session") {
+      row.append(el("span", { class: "pill small", title: "how this identity was established" }, r.origin));
+    }
+    row.append(el("span", { class: "jage" }, (r.ts || "").slice(0, 19).replace("T", " ")));
+    box.append(row);
+  }
+  if (res.truncated) {
+    box.append(el("p", { class: "hint" },
+      "Stopped early — the log is large. Filter it, or ship it somewhere with an index."));
+  }
 }
 // since=0, so the retained events replay from the start; the terminal event is
 // among them, which is what re-renders a finished job's result table.
@@ -2027,7 +2119,11 @@ $("#import-apply").addEventListener("click", applyImport);
 $("#perf-cancel").addEventListener("click", () => $("#perf-dialog").close());
 $("#perf-submit").addEventListener("click", submitPerf);
 $("#btn-bench").addEventListener("click", openBench);
-$("#btn-jobs").addEventListener("click", openJobs);
+$("#btn-jobs").addEventListener("click", () => openJobs("running"));
+$("#act-tab-running").addEventListener("click", () => openJobs("running"));
+$("#act-tab-history").addEventListener("click", () => openJobs("history"));
+$("#act-grep").addEventListener("input", () => { if (ACT_TAB === "history") renderHistory($("#jobs-list")); });
+$("#act-denied").addEventListener("change", () => { if (ACT_TAB === "history") renderHistory($("#jobs-list")); });
 $("#jobs-close").addEventListener("click", () => $("#jobs-dialog").close());
 $("#pat-close").addEventListener("click", () => $("#pat-dialog").close());
 $("#pat-copy").addEventListener("click", () => copy(PAT_HEADERS));

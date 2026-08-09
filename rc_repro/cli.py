@@ -43,7 +43,9 @@ def _before_any_command() -> None:
     shared box appended a line reading `-` -- present, but useless.
     """
     from rc_repro.services import audit as auditsvc
-    auditsvc.set_actor(_cli_actor())
+    actor, how = _cli_actor_and_origin()
+    auditsvc.set_actor(actor)
+    auditsvc.set_origin(how)
 
 # --- helpers ------------------------------------------------------------------
 
@@ -117,7 +119,21 @@ def _tls_label(meta: runner.Metadata) -> str:
 
 
 def _cli_actor() -> str:
-    """Who is running the CLI, on a shared box only.
+    return _cli_actor_and_origin()[0]
+
+
+def _cli_actor_and_origin() -> tuple[str, str]:
+    """Who is running the CLI, and how confident we are about it.
+
+    The second value is the audit log's `origin` column, and it exists because
+    these two cases are NOT the same evidence:
+
+      local     os.getlogin() matched a known account. The OS said so.
+      asserted  RC_REPRO_USER was set. Honoured even for an unknown name (see
+                below), so it is a claim, not a check.
+
+    Recording them identically would make every line only as trustworthy as the
+    weakest one.
 
     Team mode is opt-in: it starts the moment somebody runs `rc-repro users add`.
     Until then this returns "" and every workspace keeps the name it has always
@@ -127,19 +143,19 @@ def _cli_actor() -> str:
     """
     from rc_repro.services import users
     if not users.any_users():
-        return ""
+        return "", "system"
     known = {u.name for u in users.list_users()}
     named = os.environ.get("RC_REPRO_USER", "").strip().lower()
     if named:
         # Explicit: honoured even if unknown, so the mismatch shows up in `list`
         # rather than silently falling back to the shared namespace.
-        return named
+        return named, "asserted"
     try:
         login = os.getlogin()
     except OSError:                     # no controlling terminal (cron, container)
         login = os.environ.get("USER", "")
     login = login.strip().lower()
-    return login if login in known else ""
+    return (login, "local") if login in known else ("", "system")
 
 
 def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | None = None) -> None:
@@ -1028,7 +1044,7 @@ def api(
     try:
         auth = _login(m)
         if pat:
-            token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, bypass_2fa=True)
+            token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, bypass_2fa=True, workspace=m.name)
             auth = rcapi.Auth(token=token, user_id=auth.user_id)  # use the PAT as the auth token
     except Exception as exc:  # noqa: BLE001
         _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
@@ -1067,7 +1083,7 @@ def pat(
     m = runner.read_meta(_resolve_name(name))
     try:
         auth = _login(m)
-        token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, token_name=label, bypass_2fa=bypass_2fa)
+        token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, token_name=label, bypass_2fa=bypass_2fa, workspace=m.name)
     except Exception as exc:  # noqa: BLE001
         _err(f"could not create PAT (ready? `rc-repro ready --name {m.name}`): {exc}")
     typer.echo(f"# Personal Access Token for {m.name} ({m.root_url}) — bypass_2fa={bypass_2fa}")
@@ -1773,7 +1789,8 @@ def loadtest(
     try:
         auth = _login(m)
         token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD,
-                                   token_name="rc-repro-loadtest", bypass_2fa=True)
+                                   token_name="rc-repro-loadtest", bypass_2fa=True,
+                                   workspace=m.name)
     except Exception as exc:  # noqa: BLE001
         _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
 
@@ -2053,7 +2070,8 @@ def capacity(
     try:
         auth = _login(m)
         token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD,
-                                   token_name="rc-repro-loadtest", bypass_2fa=True)
+                                   token_name="rc-repro-loadtest", bypass_2fa=True,
+                                   workspace=m.name)
     except Exception as exc:  # noqa: BLE001
         _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
     users = _login_seed_users(m, users_n) if users_n > 0 else []
@@ -2249,6 +2267,55 @@ def versions_cmd(
     typer.echo(f"  resolved via : {r.source}")
     if r.note:
         typer.echo(f"  note         : {r.note}")
+
+
+@app.command(name="audit")
+def audit_cmd(
+    actor: str = typer.Option("", "--actor", help="only this account"),
+    kind: str = typer.Option("", "--kind", help="only this action, e.g. down-volumes"),
+    since: str = typer.Option("", "--since", help="only after this ISO date, e.g. 2026-08-01"),
+    q: str = typer.Option("", "--grep", help="substring of the action or its target"),
+    n: int = typer.Option(50, "-n", "--lines", help="how many to show"),
+    denied: bool = typer.Option(False, "--denied", help="only refusals"),
+    tsv: bool = typer.Option(False, "--tsv", help="raw tab-separated, for awk/cut and log shipping"),
+) -> None:
+    """Read the activity trail: who did what, and whether it was allowed.
+
+    The log has been written since accounts landed and there was no way to read
+    it -- "who tore down TICKET-1234?" meant ssh and `cat`. Six tab-separated
+    columns: time, who, action, target, origin, outcome.
+
+    `origin` says how the identity was established, which is what makes a line
+    evidence or not:
+
+      session   a signed-in GUI request; the server checked a credential
+      local     the CLI, where the OS login matched a known account
+      asserted  the CLI with RC_REPRO_USER set -- honoured as given, so a CLAIM
+      system    rc-repro acting on its own behalf
+    """
+    from rc_repro.services import audit as auditsvc
+    res = auditsvc.read(limit=max(1, n), actor_name=actor, kind=kind, q=q, since=since)
+    rows = [r for r in res["lines"] if not denied or r["outcome"] == "denied"]
+    if not rows:
+        ui.note(f"nothing matched in {res['path']}")
+        return
+    if tsv:
+        for r in rows:
+            typer.echo(f"{r['ts']}\t{r['actor'] or '-'}\t{r['kind']}\t{r['label']}\t"
+                       f"{r['origin'] or '-'}\t{r['outcome']}")
+        return
+    width = max(len(r["actor"] or "-") for r in rows)
+    for r in reversed(rows):            # oldest first, like a log
+        colour = typer.colors.RED if r["outcome"] == "denied" else None
+        # The origin is only worth the column width when it is NOT a checked
+        # session -- that is the common case and the trustworthy one.
+        mark = "" if r["origin"] == "session" else f"  [{r['origin'] or 'legacy'}]"
+        typer.secho(f"{r['ts'][:19]}  {(r['actor'] or '-'):<{width}}  "
+                    f"{r['kind']:<14} {r['label']}{mark}"
+                    + ("  DENIED" if r["outcome"] == "denied" else ""), fg=colour)
+    if res["truncated"]:
+        ui.hint(f"  (stopped early: {res['path']} is large. Narrow it with --since "
+                "or --actor, or ship it somewhere with an index.)")
 
 
 @app.command()

@@ -27,6 +27,7 @@ from pathlib import Path
 
 from rc_repro import config
 from rc_repro.errors import ConflictError, NotFoundError, ValidationError
+from rc_repro.services import audit as auditsvc
 
 USERS_FILE = "users"
 
@@ -272,6 +273,12 @@ def add(name: str, password: str, *, role: str = "") -> User:
     created = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     users[name] = (hash_password(password), created, role)
     _write(users)
+    # Audited HERE, not at the two front ends. audit.py's own docstring records
+    # why: the single call site used to be JobManager.submit(), so everything
+    # synchronous wrote nothing -- and that set was the destructive operations.
+    # Account changes have the same shape, and `rc-repro users role` proved it by
+    # writing no line at all while the identical HTTP call wrote one.
+    auditsvc.record("user-add", f"{name} role={role}")
     return User(name=name, created_at=created, role=role)
 
 
@@ -283,6 +290,7 @@ def set_password(name: str, password: str) -> None:
     _hashed, created, role = users[name]
     users[name] = (hash_password(password), created, role)
     _write(users)
+    auditsvc.record("user-passwd", name)
 
 
 def remove(name: str) -> None:
@@ -292,6 +300,7 @@ def remove(name: str) -> None:
     _require_not_last_admin(name, users, "removing them")
     del users[name]
     _write(users)
+    auditsvc.record("user-remove", name)
 
 
 def set_role(name: str, role: str) -> User:
@@ -305,6 +314,7 @@ def set_role(name: str, role: str) -> User:
         _require_not_last_admin(name, users, f"making them {role}")
     users[name] = (hashed, created, normalise_role(role))
     _write(users)
+    auditsvc.record("user-role", f"{name} -> {normalise_role(role)}")
     return User(name=name, created_at=created, role=normalise_role(role))
 
 

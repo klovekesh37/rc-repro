@@ -117,7 +117,8 @@ def run_loadtest(req: LoadtestReq, emit: Emit = null_emit) -> dict:
     try:
         auth = lifecycle.login(m)
         token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD,
-                                   token_name="rc-repro-loadtest", bypass_2fa=True)
+                                   token_name="rc-repro-loadtest", bypass_2fa=True,
+                                   workspace=m.name)
     except Exception as exc:  # noqa: BLE001
         raise NotReadyError(f"could not authenticate (ready?): {exc}") from exc
 
@@ -261,7 +262,8 @@ def run_capacity(req: CapacityReq, emit: Emit = null_emit) -> dict:
     try:
         auth = lifecycle.login(m)
         token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD,
-                                   token_name="rc-repro-loadtest", bypass_2fa=True)
+                                   token_name="rc-repro-loadtest", bypass_2fa=True,
+                                   workspace=m.name)
     except Exception as exc:  # noqa: BLE001
         raise NotReadyError(f"could not authenticate (ready?): {exc}") from exc
     users = _login_seed_users(m.root_url, req.users_n) if req.users_n > 0 else []

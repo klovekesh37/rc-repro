@@ -21,7 +21,8 @@ from rc_repro.errors import ConflictError, ReproError
 # without importing the web layer, and so destructive operations are recorded
 # where they HAPPEN rather than only where jobs are submitted. Re-exported here:
 # these names are what the web layer already imports.
-from rc_repro.services.audit import AUDIT_FILE, CURRENT_ACTOR, audit  # noqa: F401
+from rc_repro.services.audit import (AUDIT_FILE, CURRENT_ACTOR,  # noqa: F401
+                                     CURRENT_ORIGIN, audit)
 from rc_repro.services.events import Event
 
 
@@ -190,6 +191,12 @@ class JobManager:
             raise ConflictError(
                 "rc-repro is shutting down and is not accepting new work")
         actor = actor or CURRENT_ACTOR.get("")
+        # Captured HERE, on the request thread, because contextvars do not cross
+        # into a bare threading.Thread -- measured: the worker sees "". Latent
+        # until something inside a job audits; services/perf.py mints a PAT inside
+        # the loadtest and capacity jobs, so the moment that is audited every one
+        # of those lines would have been written with no actor at all.
+        origin = CURRENT_ORIGIN.get("")
         slots = _slots_for(kind)
         job = Job(id="job_" + uuid.uuid4().hex[:10], kind=kind, label=label,
                   actor=actor,
@@ -197,12 +204,15 @@ class JobManager:
                   # that is queued has not started, and saying so is the whole
                   # point of bounding this.
                   status="queued" if slots is not None else "running")
-        audit(actor, kind, label)
+        audit(actor, kind, label, origin_=origin)
         with self._lock:
             self._jobs[job.id] = job
             self._evict_locked()
 
         def run() -> None:
+            # Re-establish the request's identity on this thread (see above).
+            CURRENT_ACTOR.set(actor)
+            CURRENT_ORIGIN.set(origin)
             # Set status/result BEFORE emitting the terminal event: a client that
             # polls /api/jobs/<id> on seeing `terminal` would otherwise still read
             # status="running", result=null. finished_at goes with them, for the
