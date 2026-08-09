@@ -199,6 +199,22 @@ _API_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH")
 _UPLOAD_ID_RE = re.compile(r"^u[0-9a-f]{12}$")
 
 
+def open_log_process(workspace, tail: int):
+    """Start `docker compose logs -f` for one workspace.
+
+    A named function for the same reason make_log_offer() is one: it is the single
+    docker call the log endpoint makes, and a test that wants to drive the log
+    viewer without an engine needs somewhere to stand. The alternative — patching
+    `subprocess.Popen` — reaches every other docker call in the process, including
+    the stats poll and the edge status check that run at the same moment, and turns
+    an unrelated failure into a mystery.
+    """
+    return subprocess.Popen(
+        ["docker", "compose", "logs", "-f", "--no-color", "--tail", str(tail)],
+        cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1)
+
+
 def make_log_offer(q, dropped: list):
     """The log stream's overflow policy: drop the OLDEST line, and count it.
 
@@ -929,15 +945,14 @@ def create_app(allow_hosts: list[str] | None = None, *,
         """Reset somebody's password to a freshly minted one, shown once."""
         from rc_repro.services import users as usersvc
         password = usersvc.mint_password()
-        usersvc.set_password(name, password)
-        ended = sessions.revoke_user(name)
+        ended = usersvc.set_password(name, password)   # ...which ends their sessions
         return {"name": name, "password": password, "sessions_ended": ended}
 
     @app.delete("/api/users/{name}")
     def users_remove(name: str):
         from rc_repro.services import users as usersvc
-        usersvc.remove(name)                 # refuses the last admin
-        ended = sessions.revoke_user(name)
+        # Refuses the last admin, and ends their sessions.
+        ended = usersvc.remove(name)
         return {"name": name, "removed": True, "sessions_ended": ended}
 
     @app.post("/api/me/password")
@@ -966,11 +981,14 @@ def create_app(allow_hosts: list[str] | None = None, *,
             raise ValidationError("that is not your current password")
         _signin_ok(source)
         usersvc.require_valid_password(new)
-        usersvc.set_password(me, new)
         _addr, https = _peer(request)
+        # Read BEFORE set_password, which now ends every session this account
+        # holds. Asking afterwards would always answer None, so the tab that
+        # changed the password would be handed no replacement cookie and would be
+        # signed out -- the exact thing the docstring above promises it is not.
         keep = request.cookies.get(cookie_name(https), "")
         current = sessions.verify(keep)
-        ended = sessions.revoke_user(me)
+        ended = usersvc.set_password(me, new)
         token = sessions.create(me, label=current.label if current else "",
                                 origin="session") if current else ""
         auditsvc.record("me-passwd", me)
@@ -1183,11 +1201,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
 
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue(maxsize=WS_QUEUE_MAX)
-        proc = subprocess.Popen(
-            ["docker", "compose", "logs", "-f", "--no-color",
-             "--tail", str(_clamp_tail(tail))],
-            cwd=runner.workspace(target), stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1)
+        proc = open_log_process(runner.workspace(target), _clamp_tail(tail))
 
         dropped = [0]
         offer = make_log_offer(q, dropped)

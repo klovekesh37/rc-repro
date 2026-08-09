@@ -28,6 +28,7 @@ from pathlib import Path
 from rc_repro import config
 from rc_repro.errors import ConflictError, NotFoundError, ValidationError
 from rc_repro.services import audit as auditsvc
+from rc_repro.services import sessions as sessionsvc
 
 USERS_FILE = "users"
 
@@ -384,7 +385,22 @@ def add(name: str, password: str, *, role: str = "") -> User:
     return User(name=name, created_at=created, role=chosen)
 
 
-def set_password(name: str, password: str) -> None:
+def set_password(name: str, password: str) -> int:
+    """Replace a password. Returns how many live sessions that ended.
+
+    The revocation belongs HERE, not at the two front ends, for exactly the reason
+    services/audit.py gives about auditing: an invariant that every caller has to
+    remember is an invariant the next caller silently breaks. A credential that has
+    been replaced must not keep working through a session that outlived it --
+    changing a compromised password while the intruder stays signed in for seven
+    days is not a fix, and both `rc-repro users passwd` and the GUI's reset button
+    had to remember that separately.
+
+    Revoked OUTSIDE the users lock: it takes a different file's lock, and holding
+    one while reaching for another is how a deadlock gets built. The window in
+    between is harmless -- the old password no longer verifies the moment _write
+    lands.
+    """
     require_valid_password(password)
     hashed = hash_password(password)          # outside the lock, as in add()
     with _locked():
@@ -395,9 +411,17 @@ def set_password(name: str, password: str) -> None:
         users[name] = (hashed, created, role)
         _write(users)
     auditsvc.record("user-passwd", name)
+    return sessionsvc.revoke_user(name)
 
 
-def remove(name: str) -> None:
+def remove(name: str) -> int:
+    """Delete an account. Returns how many live sessions that ended.
+
+    Same argument as set_password(): an account that can no longer sign in but is
+    still signed in has not been removed. (The guard also refuses it either way --
+    role_of() answers "" for a missing account and at_least("", anything) is False
+    -- so the window between the two writes is closed from both directions.)
+    """
     with _locked():
         users = _read()
         if name not in users:
@@ -406,6 +430,7 @@ def remove(name: str) -> None:
         del users[name]
         _write(users)
     auditsvc.record("user-remove", name)
+    return sessionsvc.revoke_user(name)
 
 
 def set_role(name: str, role: str) -> User:

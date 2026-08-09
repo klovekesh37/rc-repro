@@ -667,15 +667,15 @@ def users_cmd(
 
     if action == "remove":
         try:
-            usersvc.remove(name)
-            # A removed account must not keep working through a session that
-            # outlived it -- revocation has to reach the credential the browser
-            # actually carries, not just the one in the file.
-            sessionsvc.revoke_user(name)
-
+            # remove() ends their sessions itself -- a removed account that is
+            # still signed in has not been removed, and that is the service's job
+            # to guarantee rather than each front end's to remember.
+            ended = usersvc.remove(name)
         except errors.ReproError as exc:
             _err(str(exc))
         ui.ok(f"✓ user {name!r} removed.")
+        if ended:
+            ui.hint(f"  {ended} active session(s) signed out.")
         return
 
     if action in ("add", "passwd"):
@@ -699,12 +699,10 @@ def users_cmd(
             if action == "add":
                 added = usersvc.add(name, pw)
             else:
-                usersvc.set_password(name, pw)
-                # Every session minted with the OLD password ends here. Without
-                # this, changing a compromised password leaves the intruder
-                # signed in for up to seven days.
-                ended = sessionsvc.revoke_user(name)
-
+                # set_password() ends every session the OLD password minted, so
+                # changing a compromised one does not leave the intruder signed in
+                # for seven days. Enforced in the service, not here.
+                ended = usersvc.set_password(name, pw)
         except errors.ReproError as exc:
             _err(str(exc))
         ui.ok(f"✓ user {name!r} {'added' if action == 'add' else 'password changed'}.")

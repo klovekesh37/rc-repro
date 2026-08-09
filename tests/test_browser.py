@@ -245,3 +245,150 @@ def test_the_activity_dialog_opens_both_of_its_tabs(serve, page):
         page.wait_for_function(
             "() => document.querySelector('#jobs-list').textContent.includes('alice')")
         assert page.errors == [], page.errors
+
+
+# --- surfaces the auth tests never render -------------------------------------------
+#
+# Everything above this line is about signing in. The create dialog, the log viewer
+# and the backups tab had never been rendered by any test at all -- and app.js is
+# ~2200 lines where a typo fails nothing. These are the same kind of smoke test:
+# one path through each screen, enough to catch "it is blank" or "the button does
+# nothing".
+
+def _fake_detail(name="t1234", state="running"):
+    """A detail payload shaped like lc.detail()'s, so the panel renders offline.
+
+    Every key the panel INDEXES INTO has to be here -- `d.containers.map` on an
+    undefined throws, which surfaces as a blank panel rather than an error, and
+    that is precisely the failure these tests exist to catch.
+    """
+    return {
+        "name": name, "state": state, "rc_version": "7.4.1", "mongo_tag": "7.0",
+        "mongo_flavor": "mongodb", "host_port": 3001, "uptime": "2h", "preset": "base",
+        "health": "healthy", "url": "http://localhost:3001", "root_url": "http://localhost:3001",
+        "public_url": "", "login": {"user": "admin", "password": "admin123"},
+        # `service`, not `name` -- that is the key the containers tab reads, and
+        # getting it wrong renders an empty table rather than an error.
+        "containers": [{"service": "rocketchat", "state": "running",
+                        "status": "Up 2 hours", "health": "healthy"}],
+        "env": {"ROOT_URL": "http://localhost:3001"},
+        "links": [], "notes": "", "restarts": 0, "monitoring": False,
+        "tls": {}, "is_default": False, "created_by": "alice", "owner": "alice",
+        "made_by": "alice", "owner_history": [], "workspace": "/tmp/ws", "default": False,
+        "grafana_url": "", "diag": {},
+    }
+
+
+def _stub_lifecycle(monkeypatch, detail=None):
+    from rc_repro.services import lifecycle as lc
+    d = detail or _fake_detail()
+    monkeypatch.setattr(lc, "list_repros", lambda: [dict(d)])
+    monkeypatch.setattr(lc, "detail", lambda name: dict(d))
+    monkeypatch.setattr(lc, "resolve_name", lambda name: d["name"])
+    return d
+
+
+def test_the_dashboard_renders_a_workspace_card(serve, page, monkeypatch):
+    d = _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.wait_for_function(
+            "() => document.querySelector('#repros').textContent.includes('t1234')")
+        assert d["name"] in page.text_content("#repros")
+        assert page.errors == [], page.errors
+
+
+def test_the_detail_panel_opens_and_switches_tabs(serve, page, monkeypatch):
+    """The panel is built by hand from ~200 lines of el() calls. A single undefined
+    key throws mid-render and leaves half a panel on screen."""
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        assert "7.4.1" in page.text_content("#detail"), "the overview did not render"
+        page.click("button.tab:has-text('Containers')")
+        page.wait_for_function(
+            "() => document.querySelector('#d-body').textContent.includes('rocketchat')")
+        assert page.errors == [], page.errors
+
+
+def test_the_create_dialog_opens_and_lists_presets(serve, page, monkeypatch):
+    """The most-used dialog in the product, and nothing had ever rendered it."""
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#btn-new")
+        page.click("#btn-new")
+        page.wait_for_selector("#create-dialog[open]")
+        page.wait_for_function(
+            "() => document.querySelector('#preset-select').options.length > 0")
+        opts = page.eval_on_selector(
+            "#preset-select", "s => [...s.options].map(o => o.value)")
+        assert "default" in opts and "ldap" in opts, \
+            f"the built-in presets are missing: {opts}"
+        page.click("#create-cancel")
+        # A closed <dialog> is not "hidden" in the way wait_for_selector means, so
+        # ask the element itself.
+        page.wait_for_function(
+            "() => !document.querySelector('#create-dialog').open")
+        assert page.errors == [], page.errors
+
+
+def test_the_log_viewer_streams_container_output(serve, page, monkeypatch):
+    """The log tab and its WebSocket, which no test had ever rendered. `docker` is
+    replaced by a fake process, so this needs no engine.
+
+    The OVERFLOW policy is covered by unit tests in test_web.py rather than here:
+    tripping it through a browser needs 3000+ lines and a reader slow enough to
+    fall behind, which is a flake generator, not a test.
+    """
+    from rc_repro import runner
+    from rc_repro.web import app as webapp
+
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+
+    # Stubbed BEFORE Popen is replaced: the stats poll runs every three seconds
+    # against this same repro and would otherwise reach the fake through
+    # runner.container_ids, which is not what it expects at all.
+    monkeypatch.setattr(runner, "container_ids", lambda name: [])
+    monkeypatch.setattr(runner, "docker_stats", lambda ids: "")
+
+    class _FakeProc:
+        """Stands in for `docker compose logs -f`."""
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+
+        def __init__(self, *a, **kw):
+            lines = [f'rcrepro-t1234-rocketchat-1  | {{"level":30,"msg":"line {i}"}}'
+                     for i in range(5)]
+            self.stdout = iter(line + "\n" for line in lines)
+            self.returncode = 0
+
+        def terminate(self): pass
+        def wait(self, timeout=None): return 0
+        def kill(self): pass
+
+    monkeypatch.setattr(webapp, "open_log_process", lambda ws, tail: _FakeProc())
+    monkeypatch.setattr(runner, "workspace", lambda name: "/tmp")
+
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        page.click("button.tab:has-text('Logs')")
+        page.wait_for_selector("button.tab.active:has-text('Logs')")
+        page.wait_for_selector("#logview")
+        page.wait_for_function(
+            "() => document.querySelector('#logview').textContent.includes('line 4')",
+            timeout=10000)
+        body = page.text_content("#logview")
+        assert "line 0" in body and "line 4" in body
+        assert page.errors == [], page.errors

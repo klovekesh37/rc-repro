@@ -529,3 +529,48 @@ def test_listing_sessions_survives_the_cache_being_rebuilt_underneath(monkeypatc
     out = sessionsvc.list_for("alice")        # must not raise
     assert len(out) == 20
     assert state["n"] >= 1, "the interleaving actually happened"
+
+
+def test_the_service_ends_sessions_when_a_CREDENTIAL_is_invalidated():
+    """The invariant lives in the service, not in each front end.
+
+    It used to be enforced four times in web/app.py and three times in cli.py --
+    an invariant that every caller has to remember is one the next caller silently
+    breaks, and the thing it protects is "a replaced or deleted credential must not
+    keep working through a session that outlived it".
+    """
+    from rc_repro.services import sessions as sessionsvc
+
+    users.add("alice", GOOD, role="admin")
+    users.add("bob", GOOD, role="member")
+
+    bob = sessionsvc.create("bob")
+    assert sessionsvc.verify(bob) is not None
+    assert users.set_password("bob", "a-brand-new-password") == 1
+    assert sessionsvc.verify(bob) is None, "the old session outlived the password"
+
+    again = sessionsvc.create("bob")
+    assert users.remove("bob") == 1
+    assert sessionsvc.verify(again) is None, "a removed account was still signed in"
+
+    # ...and alice, who was not touched, keeps hers.
+    alice = sessionsvc.create("alice")
+    users.add("carol", GOOD, role="member")
+    assert sessionsvc.verify(alice) is not None
+
+
+def test_a_role_change_is_NOT_a_credential_change():
+    """Deliberately not folded in with the two above. The web guard reads role_of()
+    live on every request, so a demotion already takes effect at once -- signing the
+    person out on top of that is a courtesy the front ends choose, not something the
+    service must guarantee. Bundling it here would make `users role` end sessions
+    from the CLI too, which is a different decision than the one being made.
+    """
+    from rc_repro.services import sessions as sessionsvc
+
+    users.add("alice", GOOD, role="admin")
+    users.add("bob", GOOD, role="member")
+    token = sessionsvc.create("bob")
+    users.set_role("bob", "readonly")
+    assert sessionsvc.verify(token) is not None, "set_role must not revoke by itself"
+    assert users.role_of("bob") == "readonly", "but the demotion is already in force"

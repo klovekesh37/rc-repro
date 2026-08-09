@@ -1095,8 +1095,13 @@ def test_a_password_change_ends_every_session_it_minted(basic_client, monkeypatc
     from rc_repro.services import users as usersvc
     monkeypatch.setattr(lc, "list_repros", lambda: [])
     assert basic_client.get("/api/repros", headers=_auth()).status_code == 200
-    usersvc.set_password("alice", "a-brand-new-password")
-    assert sessionsvc.revoke_user("alice") == 1
+    # set_password does the revoking ITSELF now. This used to read
+    # `usersvc.set_password(...)` then `assert sessionsvc.revoke_user("alice") == 1`
+    # -- which asserted the opposite: that the caller still had to remember. Any
+    # caller that forgot left a replaced credential working for seven days.
+    ended = usersvc.set_password("alice", "a-brand-new-password")
+    assert ended == 1, "the service, not the caller, ends the sessions"
+    assert sessionsvc.revoke_user("alice") == 0, "there is nothing left to revoke"
     assert basic_client.get("/api/repros", headers=_auth()).status_code == 401
 
 
