@@ -183,6 +183,12 @@ def route_requirement(method: str, template: str) -> str | None:
 TAIL_MAX = 5000
 # An uploaded support dump is read into memory; cap it rather than trusting it.
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
+# Which palette to render the SIGN-IN page in. Written by app.js, never by the
+# server, and read only here: it decides a colour and nothing else, which is why
+# it is not HttpOnly (a script has to set it) and why an unrecognised value is
+# simply ignored rather than rejected. `prefers-color-scheme` in app.css covers
+# the browser that has never had it.
+THEME_COOKIE = "rc_repro_theme"
 # Bounded so a chatty container plus a slow reader can't grow the queue forever.
 # Bounded so a chatty container plus a slow reader can't grow the queue forever.
 #
@@ -703,11 +709,12 @@ def create_app(allow_hosts: list[str] | None = None, *,
         return app.state.first_run and not usersvc.any_users()
 
     @app.get("/setup")
-    def setup_page():
+    def setup_page(request: Request):
         if not _first_run_open():
             return JSONResponse({"error": "not found", "kind": "NotFoundError"},
                                 status_code=404)
-        return HTMLResponse(signin_page.setup_page())
+        return HTMLResponse(
+            signin_page.setup_page(theme=request.cookies.get(THEME_COOKIE, "")))
 
     @app.get("/setup.js")
     def setup_script():
@@ -785,7 +792,8 @@ def create_app(allow_hosts: list[str] | None = None, *,
             error=e, next_url=next,
             server=(request.headers.get("host") or "").split(":")[0],
             secure=https or local,
-            retry_after=_signin_retry_after(addr))
+            retry_after=_signin_retry_after(addr),
+            theme=request.cookies.get(THEME_COOKIE, ""))
         return HTMLResponse(html, status_code=401 if e in ("bad", "rate") else 200)
 
     @app.post("/signin")

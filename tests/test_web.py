@@ -1048,6 +1048,31 @@ def test_the_sign_in_page_and_its_stylesheet_are_reachable_signed_out(anon_clien
     assert anon_client.get("/app.css", headers={"Host": "localhost"}).status_code == 200
 
 
+def test_the_sign_in_page_is_rendered_in_the_theme_the_browser_is_using(anon_client):
+    """It loads app.css but has no script, so nothing ever set `data-theme` and it
+    came up white on a dark desktop — the one screen in the product that could not
+    ask. app.js writes the choice to a cookie; the server stamps it here. A browser
+    that has never had the cookie gets no attribute, and `prefers-color-scheme` in
+    app.css decides.
+    """
+    h = {"Host": "localhost"}
+    assert "data-theme" not in anon_client.get("/signin", headers=h).text
+
+    anon_client.cookies.set("rc_repro_theme", "dark")
+    assert '<html lang="en" data-theme="dark">' in anon_client.get("/signin", headers=h).text
+    anon_client.cookies.set("rc_repro_theme", "light")
+    assert '<html lang="en" data-theme="light">' in anon_client.get("/signin", headers=h).text
+
+    # The value lands in the document, and a cookie is attacker-settable. Anything
+    # that is not one of the two literals yields no attribute at all.
+    for junk in ('dark"><script>alert(1)</script>', "DARK", "", "; --bg: red"):
+        anon_client.cookies.set("rc_repro_theme", junk)
+        body = anon_client.get("/signin", headers=h).text
+        assert "data-theme" not in body, junk
+        assert "<script>" not in body, junk
+    anon_client.cookies.delete("rc_repro_theme")
+
+
 def test_signing_in_sets_a_session_cookie_and_admits(anon_client, monkeypatch):
     monkeypatch.setattr(lc, "list_repros", lambda: [])
     r = anon_client.post("/signin", follow_redirects=False,

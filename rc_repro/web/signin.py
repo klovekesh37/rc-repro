@@ -38,6 +38,18 @@ STATES: dict[str, tuple[str, str]] = {
 }
 
 
+def theme_attr(value: str | None) -> str:
+    """`data-theme="dark"` for the stored choice, or "" to let CSS decide.
+
+    The page has no script, so it cannot read the localStorage key app.js keeps —
+    hence the cookie, which carries nothing but the palette. Anything that is not
+    one of the two literals yields no attribute at all: this string is
+    interpolated into the document, and a cookie is attacker-settable.
+    """
+    v = (value or "").strip()
+    return f' data-theme="{v}"' if v in ("dark", "light") else ""
+
+
 def safe_next(value: str | None) -> str:
     """Where to go after signing in — reduced to a same-origin path.
 
@@ -53,7 +65,7 @@ def safe_next(value: str | None) -> str:
 
 
 def page(*, error: str = "", next_url: str = "/", server: str = "",
-         secure: bool = True, retry_after: int = 0) -> str:
+         secure: bool = True, retry_after: int = 0, theme: str = "") -> str:
     """The whole document. Pure — no request object, so it unit-tests directly."""
     kind, message = STATES.get(error, ("", ""))
     banner = (f'<p class="signin-banner {kind}">{message}</p>') if message else ""
@@ -72,7 +84,7 @@ def page(*, error: str = "", next_url: str = "/", server: str = "",
     where = html.escape(server or "this host")
     nxt = html.escape(safe_next(next_url), quote=True)
     return f"""<!doctype html>
-<html lang="en">
+<html lang="en"{theme_attr(theme)}>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -155,10 +167,10 @@ form.addEventListener("submit", function (e) {
 """
 
 
-def setup_page() -> str:
+def setup_page(theme: str = "") -> str:
     """The first-run document: create the first admin, once."""
     return f"""<!doctype html>
-<html lang="en">
+<html lang="en"{theme_attr(theme)}>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">

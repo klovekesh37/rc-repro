@@ -27,6 +27,23 @@
   --on-accent: #0B0E14;
   --dot: #1A2130; --bar: rgba(13,17,23,.85);
 }
+/* Before anything has said which theme this is. app.js stamps `data-theme` on
+   its first line, so this only ever reaches a page that has no script to do it:
+   the SIGN-IN page, which is deliberately server-rendered with none. It arrived
+   white on a dark desktop, being the one screen in the product that could not
+   ask. `:not([data-theme])` is what keeps it from ever fighting an explicit
+   choice -- in either direction. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+    --bg: #0E1116; --panel: #151922; --panel2: #1B2028; --line: #242A35; --line2: #333B49;
+    --ink: #E6E9EF; --muted: #8A93A3; --dim: #5C6472;
+    --green: #4ADE80; --red: #FF6B6B; --blue: #7C93F5; --amber: #F0B429;
+    --cyan: #56D4DD; --violet: #A371F7;
+    --on-accent: #0B0E14;
+    --dot: #1A2130; --bar: rgba(13,17,23,.85);
+  }
+}
 * { box-sizing: border-box; }
 /* The UA's `[hidden] { display: none }` loses to ANY author rule that sets
    `display` on the same element -- and `form label`/`.checks label` below both

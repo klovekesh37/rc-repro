@@ -2602,6 +2602,14 @@ $("#btn-refresh").addEventListener("click", loadRepros);
 const THEME_KEY = "rc-repro-theme";
 function applyTheme(name) {
   document.documentElement.dataset.theme = name === "dark" ? "dark" : "light";
+  // Also in a cookie, because the SIGN-IN page is server-rendered with no script
+  // (deliberately -- see web/signin.py) and localStorage is unreadable without
+  // one. Nothing but the palette depends on it, so it is not HttpOnly and carries
+  // no security weight; the server accepts only the two literal values.
+  try {
+    document.cookie = "rc_repro_theme=" + (name === "dark" ? "dark" : "light")
+      + ";path=/;max-age=31536000;samesite=lax";
+  } catch (_) { /* cookies off; prefers-color-scheme still applies */ }
   const b = $("#theme-toggle");
   if (b) {
     b.textContent = name === "dark" ? "light" : "dark";
