@@ -573,7 +573,10 @@ def test_a_policy_typo_is_refused_rather_than_silently_meaning_strict():
     assert bad.exit_code != 0
     assert "takes 'anyone'" in bad.output
 
-    ok = cli_runner.invoke(cli.app, ["config", "set", "gui.create_policy", "anyone"])
-    assert ok.exit_code == 0, ok.output
     from rc_repro.services import lifecycle as lc
-    assert lc.may_set_privileged_fields("nobody-in-particular") is True
+    users.add("bob", GOOD, role="member")
+    assert lc.may_set_privileged_fields("bob") is True, "open by default"
+
+    ok = cli_runner.invoke(cli.app, ["config", "set", "gui.create_policy", "admin"])
+    assert ok.exit_code == 0, ok.output
+    assert lc.may_set_privileged_fields("bob") is False, "and narrowing works"

@@ -218,6 +218,18 @@ def run_checks() -> dict:
                              f"{', '.join(implicit)} — that is the migration for "
                              "accounts made before roles existed, not a choice. "
                              f"`rc-repro users role {implicit[0]} member`")
+            # Reported rather than warned about: this is the default and it is a
+            # deliberate one, but "what may a member actually do on this box?" should
+            # be answerable without reading source. Same reason `serve` names the
+            # implicit admins -- a state that is visible is a state somebody can
+            # disagree with.
+            from rc_repro.services import lifecycle as lcsvc
+            if config.load_config().get(lcsvc.CREATE_POLICY_KEY) == "admin":
+                line("ok", "members may not set --rc-image/--reg-token/--bind "
+                           "(gui.create_policy admin)")
+            else:
+                line("ok", "members may set --rc-image/--reg-token/--bind — narrow "
+                           "it with `rc-repro config set gui.create_policy admin`")
         for path in (usersvc.users_file(), sessionsvc.sessions_file(),
                      config.home() / "audit.log"):
             if path.exists() and (path.stat().st_mode & 0o077):

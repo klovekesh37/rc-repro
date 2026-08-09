@@ -912,11 +912,13 @@ lines to every user on the machine.
 Stored in `~/.rc-repro/users`, mode `0600`, hashed with `hashlib.scrypt` from the
 standard library (no new dependency).
 
-Two box-level policies decide how much the middle tier may do, because the right
-answer differs by deployment:
+A `member` may set `--rc-image`, `--reg-token` and `--bind` — they can already
+create workspaces and tear them down with their data, so withholding the interface
+their own listens on would be an inconsistent ladder rather than a boundary. Two
+box-level policies change that where an account is not the same thing as trust:
 
 ```bash
-rc-repro config set gui.create_policy anyone    # members may set --rc-image,
+rc-repro config set gui.create_policy admin     # only admins may set --rc-image,
                                                 # --reg-token and --bind
 rc-repro config set gui.destroy_policy anyone   # members may delete anyone's
                                                 # workspace, not just their own
@@ -924,11 +926,9 @@ rc-repro config set bind_host 0.0.0.0           # every workspace on this box,
                                                 # one decision instead of per-create
 ```
 
-Both default to the strict reading. On a support team's shared box, where every
-account is a colleague who can already create workspaces and tear them down with
-their data, `anyone` is usually what you want — "you may destroy Maria's customer
-repro but not choose which interface your own listens on" is not a boundary, it is
-an inconsistent ladder.
+They default opposite ways on purpose. A create field only affects the workspace
+being created; destroying somebody else's loses a colleague's in-progress work,
+which no create field can do. `rc-repro doctor` reports which way this box is set.
 
 Once **any** account exists, `rc-repro serve` asks the browser to sign in. Ten
 failed attempts from one address in sixty seconds and the login refuses to spend

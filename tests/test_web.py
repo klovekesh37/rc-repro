@@ -1579,9 +1579,15 @@ def test_only_an_admin_may_choose_the_image_or_the_interface(basic_client, monke
     `port` was in this list and has been REMOVED — see the test below. It is the
     counter-example: a role check that guarded nothing while costing a member the
     most reachable field in the create dialog.
+
+    This is no longer the DEFAULT: a member may set all three unless the box has
+    narrowed `gui.create_policy`, which is what this sets up. See
+    test_a_member_may_set_the_image_and_bind_by_default.
     """
+    from rc_repro import config as cfgmod
     from rc_repro.services import users as usersvc
     monkeypatch.setattr(lc, "require_docker", lambda: None)
+    cfgmod.update_config(lambda c: c.__setitem__(lc.CREATE_POLICY_KEY, "admin"))
     usersvc.add("bob", "bobs-good-password", role="member")
     _as(basic_client, "bob", "bobs-good-password")
     for field, value in (("rc_image", "evil/image"), ("bind", "0.0.0.0"),
@@ -1593,6 +1599,12 @@ def test_only_an_admin_may_choose_the_image_or_the_interface(basic_client, monke
     # the ordinary body still works for a member
     assert basic_client.post("/api/repros", headers=_auth(),
                              json={"version": "8.5.1"}).status_code == 200
+    # ...and an admin is unaffected by the narrowing.
+    _as(basic_client, "alice", PASSWORD)
+    assert basic_client.post(
+        "/api/repros", headers=_auth(),
+        json={"version": "8.5.1", "bind": "0.0.0.0", "rc_image": "registry/rc:x",
+              "reg_token": "tok", "port": 3999}).status_code == 200
 
 
 def test_a_member_may_still_choose_a_host_port(basic_client, monkeypatch):
@@ -2129,62 +2141,13 @@ def test_the_end_of_stream_sentinel_is_never_dropped():
     assert items[-1] is None, "the sentinel was dropped by the overflow policy"
 
 
-def test_a_member_may_choose_a_host_port():
-    """`port` used to be admin-only alongside rc_image/reg_token/bind, and it should
-    not have been. The only harm it could do was taking a privileged port -- 80 or
-    443, out from under the edge -- and lifecycle refuses anything outside
-    1024-65535 for everybody already. So the role check protected nothing and cost
-    a member the most reachable field in the create dialog: "Host port" is in the
-    main section, not behind Advanced.
-    """
-    c = client(role="member")
-    r = c.post("/api/repros", json={"version": "8.5.1", "port": 3999}, headers=H)
-    assert r.status_code == 200, r.text
-    assert "job_id" in r.json()
-
-
-def test_a_member_may_not_choose_the_image_or_the_interface():
-    c = client(role="member")
-    for field, value in (("rc_image", "evil/registry:latest"),
-                         ("reg_token", "a-cloud-token"),
-                         ("bind", "0.0.0.0")):
-        r = c.post("/api/repros", json={"version": "8.5.1", field: value}, headers=H)
-        assert r.status_code == 400, f"{field} was accepted from a member: {r.text}"
-        assert field in r.json()["error"]
-
-
-def test_the_bind_refusal_names_the_box_level_setting():
-    """A boundary with no door on the other side is just a wall. `bind_host` was
-    read by lifecycle and mapped from RC_REPRO_BIND_HOST, but it was not a
-    `config set` key -- so a member was told "only an admin can set this" and the
-    admin had nowhere to set it either."""
-    from rc_repro.cli import _CONFIG_KEYS
-
-    assert "bind_host" in _CONFIG_KEYS, "the setting the message points at must exist"
-    c = client(role="member")
-    r = c.post("/api/repros", json={"version": "8.5.1", "bind": "0.0.0.0"}, headers=H)
-    assert r.status_code == 400
-    assert "config set bind_host" in r.json()["error"], \
-        "the refusal has to say what to do instead"
-
-
-def test_an_admin_may_still_set_all_three():
-    c = client(role="admin")
-    r = c.post("/api/repros", json={"version": "8.5.1", "bind": "0.0.0.0",
-                                    "rc_image": "registry/rocket.chat:x",
-                                    "reg_token": "tok", "port": 3999}, headers=H)
-    assert r.status_code == 200, r.text
-
-
 # --- gui.create_policy: whose box is it? -------------------------------------------
 
-def test_a_member_may_set_the_image_and_bind_once_the_box_says_so(basic_client,
-                                                                  monkeypatch):
-    """`gui.create_policy anyone` is for the deployment this product was built for:
-    a support team's shared box where every account is a colleague who can already
-    create workspaces and tear them down WITH their data. "You may destroy Maria's
-    customer repro but not choose which interface your own listens on" is not a
-    security boundary, it is an inconsistent ladder.
+def test_a_member_may_set_the_image_and_bind_by_default(basic_client, monkeypatch):
+    """A member can already create workspaces and tear them down WITH their data.
+    Against that, "you may destroy Maria's customer repro but not choose which
+    interface your own listens on" is not a security boundary, it is an inconsistent
+    ladder — so the default is open and `gui.create_policy admin` narrows it.
     """
     from rc_repro import config as cfgmod
     from rc_repro.services import users as usersvc
@@ -2193,25 +2156,27 @@ def test_a_member_may_set_the_image_and_bind_once_the_box_says_so(basic_client,
     usersvc.add("bob", "bobs-good-password", role="member")
     _as(basic_client, "bob", "bobs-good-password")
 
-    # strict by default
-    assert basic_client.post("/api/repros", headers=_auth(),
-                             json={"version": "8.5.1", "bind": "0.0.0.0"}
-                             ).status_code == 400
-
-    cfgmod.update_config(lambda c: c.__setitem__(lc.CREATE_POLICY_KEY, "anyone"))
     for field, value in (("bind", "0.0.0.0"), ("rc_image", "registry/rc:x"),
                          ("reg_token", "an-ee-licence")):
         r = basic_client.post("/api/repros", headers=_auth(),
                               json={"version": "8.5.1", field: value})
-        assert r.status_code == 200, f"{field} still refused: {r.text}"
+        assert r.status_code == 200, f"{field} refused by default: {r.text}"
+
+    # ...and a box that wants the boundary still gets it.
+    cfgmod.update_config(lambda c: c.__setitem__(lc.CREATE_POLICY_KEY, "admin"))
+    assert basic_client.post("/api/repros", headers=_auth(),
+                             json={"version": "8.5.1", "bind": "0.0.0.0"}
+                             ).status_code == 400
 
 
 def test_the_refusal_names_the_setting_that_opens_it(basic_client, monkeypatch):
     """A boundary with no door on the other side is just a wall — the lesson from
     bind_host, which lifecycle read and `config set` would not write."""
+    from rc_repro import config as cfgmod
     from rc_repro.cli import _CONFIG_KEYS
     from rc_repro.services import users as usersvc
     monkeypatch.setattr(lc, "require_docker", lambda: None)
+    cfgmod.update_config(lambda c: c.__setitem__(lc.CREATE_POLICY_KEY, "admin"))
     usersvc.add("bob", "bobs-good-password", role="member")
     _as(basic_client, "bob", "bobs-good-password")
     r = basic_client.post("/api/repros", headers=_auth(),
@@ -2231,9 +2196,9 @@ def test_settings_tells_the_dialog_who_may_set_the_privileged_fields(basic_clien
     usersvc.add("bob", "bobs-good-password", role="member")
     _as(basic_client, "bob", "bobs-good-password")
     body = basic_client.get("/api/settings", headers=_auth()).json()
-    assert body["may_set_privileged"] is False
+    assert body["may_set_privileged"] is True, "open by default"
     assert body["privileged_fields"] == list(lc.PRIVILEGED_CREATE_FIELDS)
 
-    cfgmod.update_config(lambda c: c.__setitem__(lc.CREATE_POLICY_KEY, "anyone"))
+    cfgmod.update_config(lambda c: c.__setitem__(lc.CREATE_POLICY_KEY, "admin"))
     assert basic_client.get("/api/settings",
-                            headers=_auth()).json()["may_set_privileged"] is True
+                            headers=_auth()).json()["may_set_privileged"] is False

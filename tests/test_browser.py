@@ -539,9 +539,13 @@ def test_the_create_dialog_follows_the_box_policy_not_the_role(serve, page,
     refused them from a non-admin, so a member could fill one in and have the whole
     create fail -- app.py's comment claimed the GUI "never sends them for a member".
 
-    It asks the SERVER now (GET /api/settings -> may_set_privileged), so opening
-    `gui.create_policy` reaches the interface too. Two places computing one
-    permission is what produced the mismatch in the first place.
+    It asks the SERVER now (GET /api/settings -> may_set_privileged), so the box
+    policy reaches the interface too. Two places computing one permission is what
+    produced the mismatch in the first place.
+
+    Open is the DEFAULT: a member can already create workspaces and tear them down
+    with their data, so withholding the interface their own listens on is an
+    inconsistent ladder rather than a boundary.
 
     `port` is deliberately always offered: it is not privileged any more, because
     the privileged-port range it might have guarded is refused for everyone anyway.
@@ -569,18 +573,18 @@ def test_the_create_dialog_follows_the_box_policy_not_the_role(serve, page,
         page.wait_for_selector("#btn-new")
         open_dialog()
         for name in lcmod.PRIVILEGED_CREATE_FIELDS:
-            assert page.is_hidden(f"#create-form [name={name}]"), \
-                f"a member is offered {name!r}, which the server refuses"
+            assert page.is_visible(f"#create-form [name={name}]"), \
+                f"a member is not offered {name!r}, which the server accepts"
         assert page.is_visible("#create-form [name=port]"), \
             "a host port is a member's to choose"
         page.click("#create-cancel")
         page.wait_for_function("() => !document.querySelector('#create-dialog').open")
 
-        # ...and the box opens the policy: the same member, same session.
+        # ...and a box that narrows the policy: the same member, same session.
         cfgmod.update_config(
-            lambda c: c.__setitem__(lcmod.CREATE_POLICY_KEY, "anyone"))
+            lambda c: c.__setitem__(lcmod.CREATE_POLICY_KEY, "admin"))
         open_dialog()
         for name in lcmod.PRIVILEGED_CREATE_FIELDS:
-            assert page.is_visible(f"#create-form [name={name}]"), \
-                f"gui.create_policy=anyone did not reach the dialog for {name!r}"
+            assert page.is_hidden(f"#create-form [name={name}]"), \
+                f"gui.create_policy=admin did not reach the dialog for {name!r}"
         assert page.errors == [], page.errors

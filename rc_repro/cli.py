@@ -610,9 +610,13 @@ _CONFIG_KEYS: dict[str, str] = {
     # as bind_host above, in the same file, unnoticed for the same reason. A policy
     # nobody can set is a comment.
     #
-    #   gui.create_policy   admin (default) | anyone   -- rc_image, reg_token, bind
-    #   gui.destroy_policy  owner (default) | anyone   -- `down --volumes` on
+    #   gui.create_policy   anyone (default) | admin  -- rc_image, reg_token, bind
+    #   gui.destroy_policy  owner (default)  | anyone  -- `down --volumes` on
     #                                                     somebody else's workspace
+    #
+    # They default OPPOSITE ways on purpose. A create field only ever affects the
+    # workspace being created; destroying somebody else's loses a colleague's
+    # in-progress work, which no create field can do.
     "gui.create_policy": "gui.create_policy",
     "gui.destroy_policy": "gui.destroy_policy",
 }
@@ -836,10 +840,13 @@ def config_cmd(
     gui.create_policy, gui.destroy_policy. Stored in ~/.rc-repro/config.yaml.
 
     \b
-    On a box where every account is a colleague:
-        rc-repro config set gui.create_policy anyone   # members may set
-                                                       # --rc-image/--reg-token/--bind
-        rc-repro config set bind_host 0.0.0.0          # every workspace, one decision
+    Members may set --rc-image/--reg-token/--bind by default. Where an account is
+    not the same thing as trust, narrow it:
+        rc-repro config set gui.create_policy admin
+    \b
+    And to publish every workspace on this box beyond loopback, one decision
+    instead of one per create:
+        rc-repro config set bind_host 0.0.0.0
     """
     if action == "list":
         cfg = config.load_config()

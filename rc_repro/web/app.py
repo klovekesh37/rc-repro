@@ -1306,13 +1306,15 @@ def create_app(allow_hosts: list[str] | None = None, *,
         if privileged:
             who = getattr(request.state, "actor", "") or ""
             if not lc.may_set_privileged_fields(who):
+                # Reachable only where somebody has narrowed the policy on purpose,
+                # so the message says that rather than implying a built-in rule.
                 extra = ("  For a workspace everyone on this box should reach, "
                          "`rc-repro config set bind_host 0.0.0.0` sets it once for "
                          "the box." if "bind" in privileged else "")
                 raise ValidationError(
-                    f"{', '.join(privileged)} may only be set by an admin here — "
-                    "they decide what code runs and where it listens. On a box "
-                    "where every account is a colleague, open it with "
+                    f"{', '.join(privileged)} is limited to admins on this box "
+                    "(`gui.create_policy admin`) — they decide what code runs and "
+                    "where it listens. An admin can widen it again with "
                     "`rc-repro config set gui.create_policy anyone`." + extra)
         creq = lc.CreateReq(**fields)
         job = jobs.submit("create", lc.create_repro, creq, stream_output=True,

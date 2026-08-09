@@ -1315,28 +1315,33 @@ def _clear_default_if(name: str) -> None:
 DESTROY_POLICY_KEY = "gui.destroy_policy"
 
 #: Who may set the create fields that decide what CODE runs and where it LISTENS:
-#: `rc_image`, `reg_token`, `bind`. Default admin; `anyone` means any account that
-#: may create at all, which is member and up.
+#: `rc_image`, `reg_token`, `bind`.
 #:
-#: A policy rather than a fixed rule, because the right answer genuinely differs by
-#: deployment and the strict one does not survive contact with the case this product
-#: was built for. On a support team's shared box everybody with an account is a
-#: colleague who can already create workspaces and tear them down WITH their data --
-#: so "you may destroy Maria's customer repro but not choose which interface your own
-#: listens on" is not a security boundary, it is an inconsistent ladder. A member who
-#: needs `--reg-token` to reproduce an Enterprise bug, or `--bind` because the whole
-#: point of the box is that teammates reach it, is doing the job.
+#: DEFAULT: anyone who may create at all, which is member and up. Set it to `admin`
+#: to narrow it.
 #:
-#: The strict default stays for the deployment where an account is not the same thing
-#: as trust. What each field actually costs, so the choice is informed:
+#: The default started as `admin` and was wrong, for a reason worth keeping written
+#: down. A member can already create workspaces and tear them down WITH their data.
+#: Against that, "you may destroy Maria's customer repro but not choose which
+#: interface your own listens on" is not a security boundary -- it is an
+#: inconsistent ladder, and every rung it adds is friction for somebody doing the
+#: job. A member who needs `--reg-token` to reproduce an Enterprise bug, or `--bind`
+#: because the entire point of the box is that teammates reach it, is not escalating
+#: anything; they are using the product.
+#:
+#: What each field actually costs, so narrowing it is an informed choice rather than
+#: a reflex:
 #:
 #:   rc_image   the sharpest. An arbitrary image runs as the user running `serve`.
 #:              Anyone with a shell on this box can already do it -- the CLI has no
-#:              roles -- so this only binds people who ONLY have the GUI.
+#:              roles -- so restricting it only binds people who ONLY have the GUI.
 #:   reg_token  an EE licence the caller SUPPLIES. Not a secret they extract: the env
 #:              tab masks anything key-named like a credential, REG_TOKEN included.
 #:   bind       publishes a workspace running fixed admin/admin123. Prefer setting
 #:              `bind_host` once for the box; this is the per-workspace override.
+#:
+#: Narrow it where an account is not the same thing as trust:
+#:     rc-repro config set gui.create_policy admin
 CREATE_POLICY_KEY = "gui.create_policy"
 
 #: The fields CREATE_POLICY_KEY governs. Named here rather than inline in web/app.py
@@ -1347,10 +1352,12 @@ PRIVILEGED_CREATE_FIELDS = ("rc_image", "reg_token", "bind")
 def may_set_privileged_fields(actor: str) -> bool:
     """Whether `actor` may set rc_image / reg_token / bind on a create.
 
-    Same shape as may_destroy(): the policy opens it, an empty actor means this box
-    has no accounts and therefore nothing to bound, and otherwise it is admin.
+    Open unless the box has explicitly narrowed it. Note the asymmetry with
+    may_destroy() below, which defaults the OTHER way and should: destroying
+    somebody else's workspace loses a colleague's in-progress work, and no create
+    field does that.
     """
-    if config.load_config().get(CREATE_POLICY_KEY) == "anyone":
+    if config.load_config().get(CREATE_POLICY_KEY) != "admin":
         return True
     if not actor:                     # no accounts on this box: nothing to bound
         return True
