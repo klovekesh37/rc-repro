@@ -2382,22 +2382,51 @@ def serve(
     insecure: bool = typer.Option(False, "--insecure", help="serve the login over plain http (deprecated: prefer --trust-proxy, which also fixes the cookie)"),
     trust_proxy: list[str] = typer.Option(None, "--trust-proxy", help="believe X-Forwarded-Proto/-For from this address or CIDR (repeatable). Needed when TLS terminates at somebody else's proxy: without it the session cookie is not marked Secure and the sign-in page warns about a connection that is actually encrypted"),
 ) -> None:
-    """Launch the local web GUI (needs `pip install 'rc-repro[gui]'`).
+    """Launch the web GUI (needs `pip install 'rc-repro[gui]'`).
 
-    With accounts (`rc-repro users add <name>`) the browser asks for a login and
-    every action records who took it. Without them it falls back to a one-time
-    session token in the URL, which is fine on a laptop.
+    \b
+    ON THIS MACHINE — no domain, no email, nothing to configure:
+        rc-repro serve
 
-    For a team, give it a real name and rc-repro arranges HTTPS itself:
-      rc-repro serve --domain support.example.com --email ops@example.com
-    That starts the shared front door, which holds 443 and serves both the GUI and
-    every `up --domain ...` workspace. `--print-service` prints how to keep it up.
+    The first run prints a one-time link ending in /setup#k=... — open the WHOLE
+    url, including the part after #, and it creates the first account. After that
+    it is a normal sign-in page. Everything below is only about who else can
+    reach it.
 
-    Behind SOMEBODY ELSE's reverse proxy (iximiuz Labs, Codespaces, ngrok, …):
-    bind a reachable interface and allow the proxy's hostname, e.g.
-      rc-repro serve --bind 0.0.0.0 --allow-host rcrepro.example.com
-    With accounts, add --insecure there: that proxy terminates TLS, so only the
-    last hop is plain http and this cannot see that from here.
+    \b
+    REACHABLE FROM YOUR NETWORK, plain http:
+        rc-repro serve --bind 0.0.0.0 --allow-host 192.168.1.50 --insecure
+
+    --allow-host is the one people miss: the Host allow-list is a DNS-rebinding
+    guard, so whatever you type in the address bar has to be named here (an IP, a
+    hostname, several of them, or '*' on a throwaway network). Without it every
+    request is a 403. --insecure acknowledges that the password crosses the wire
+    in the clear.
+
+    \b
+    HTTPS, with a name that already points at this host:
+        rc-repro serve --domain support.example.com --email ops@example.com
+
+    rc-repro gets the certificate itself and starts the shared front door, which
+    holds :443 and serves both the GUI and every `up --domain ...` workspace. The
+    email is Let's Encrypt's contact address and is remembered after the first
+    use. --print-service prints a systemd unit to keep it running.
+
+    \b
+    BEHIND SOMEBODY ELSE'S TLS (a lab, Codespaces, ngrok, a load balancer):
+        rc-repro serve --bind 0.0.0.0 --allow-host rc.example.com \\
+                       --trust-proxy 10.0.0.1
+
+    Name the proxy's address. Without it rc-repro cannot tell that the browser's
+    hop is https, so it will not mark the session cookie Secure and the sign-in
+    page will warn about a connection that is actually encrypted. --trust-proxy
+    is always the better answer than --insecure when something in front really is
+    doing TLS.
+
+    Binding anything but loopback exposes docker control — creating and deleting
+    containers and their volumes, minting admin tokens — to whoever can reach the
+    port. Accounts and roles bound what each person may do; they do not make the
+    port safe to leave open.
     """
     try:
         import uvicorn
@@ -2654,8 +2683,22 @@ def serve(
     if basic:
         how = ("https, arranged by rc-repro" if domain
                else f"https, trusted from {', '.join(trusted)}" if trusted
-               else "plain http on this bind")
+               # Loopback is not "plain http" in any sense that matters: the
+               # password crosses no network. Saying so keeps the warning that
+               # DOES matter (the line below, on a reachable bind) meaningful.
+               else "loopback, so nothing crosses a network" if loopback
+               else "PLAIN HTTP on a reachable interface")
         ui.hint(f"  auth: named accounts over {how}")
+        if loopback and not domain:
+            # The commonest question after "it works": how do I let anyone else
+            # in. Answered here rather than only in --help, because this is the
+            # screen somebody is actually looking at.
+            ui.hint("  reachable from this machine only. To share it or add "
+                    "HTTPS:")
+            ui.hint("    rc-repro serve --bind 0.0.0.0 --allow-host <ip-or-name> "
+                    "--insecure")
+            ui.hint("    rc-repro serve --domain <name.example.com> --email "
+                    "you@example.com")
         if not domain and not trusted and not loopback:
             ui.warn("  ⚠ the session cookie will NOT be marked Secure, and the "
                     "sign-in page will warn\n    about an unencrypted connection. "
