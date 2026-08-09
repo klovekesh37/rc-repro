@@ -26,3 +26,6 @@ env/
 DESIGN.md
 docs/
 .docs/
+.claude/
+.codex/
+.agents/
