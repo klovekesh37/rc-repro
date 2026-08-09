@@ -1107,6 +1107,28 @@ every restart minted a new one and killed every bookmark.
 
 ---
 
+## Reaching a preset console through an HTTPS proxy
+
+Preset consoles are published on plain http host ports. Put a TLS-terminating
+proxy in front of one — an iximiuz lab forward, Codespaces, ngrok, a corporate
+proxy — and only **Keycloak** (`oidc`, `saml`) has trouble: it builds *absolute*
+URLs for its assets and endpoints, so an https page ends up requesting http
+resources and the browser blocks them.
+
+```
+Mixed Content: The page at 'https://<host>/admin/master/console/' was loaded over
+HTTPS, but requested an insecure resource 'http://<host>/resources/master/admin/en'.
+```
+
+rc-repro sets `KC_PROXY_HEADERS=xforwarded`, so Keycloak believes the proxy's
+`X-Forwarded-Proto`/`-Host` and generates matching URLs. Nothing is needed from
+you — but the proxy **must** send those headers; a bare TCP forward (plain
+`kubectl port-forward`, `ssh -L`) does not, and Keycloak cannot know.
+
+MinIO's console and Mailpit use relative URLs and are unaffected.
+
+---
+
 # API testing
 
 Auth is set up so you can hit the REST API immediately:

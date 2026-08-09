@@ -96,6 +96,37 @@ def test_keycloak_shared_scaffolding():
     assert realm["realm"] == "rcrepro" and len(realm["users"]) == 2
 
 
+def test_keycloak_believes_a_proxys_forwarded_scheme():
+    """Keycloak builds ABSOLUTE urls for its assets, its issuer and every OIDC
+    endpoint, derived from the connection it can see -- plain http on a published
+    port. Reached through anything that terminates TLS in front (an iximiuz lab
+    forward, Codespaces, ngrok), that serves an https PAGE asking for http
+    RESOURCES and the browser blocks all of them:
+
+        Mixed Content: the page at 'https://<host>/admin/master/console/' was
+        loaded over HTTPS, but requested an insecure resource
+        'http://<host>/resources/master/admin/en'.
+
+    The console renders blank and the container log says nothing, because the
+    failure is entirely in the browser. Measured against keycloak:26.0 with one
+    request carrying X-Forwarded-Proto/-Host:
+
+        without : issuer http://127.0.0.1:18085/realms/master
+        with    : issuer https://lab.example.com/realms/master
+
+    Both IdP presets share this scaffolding, so both get it.
+    """
+    from rc_repro.presets import _keycloak
+    for kwargs in ({}, {"http_port": 8085}):
+        env = _keycloak.service("./x/realm.json", 8081, **kwargs)["environment"]
+        # KC_PROXY_HEADERS, not KC_PROXY: `proxy` was deprecated in Keycloak 24 and
+        # REMOVED in 26, which is the version this preset pins.
+        assert env["KC_PROXY_HEADERS"] == "xforwarded"
+        assert "KC_PROXY" not in env
+    assert _keycloak.KC_IMAGE.startswith("quay.io/keycloak/keycloak:26"), \
+        "KC_PROXY_HEADERS is the Keycloak 26 spelling — recheck it on a major bump"
+
+
 def test_unknown_preset_raises():
     try:
         presets.load("does-not-exist")
