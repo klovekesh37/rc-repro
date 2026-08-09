@@ -2505,8 +2505,10 @@ def serve(
     tls_upstream = bool(domain) or insecure or bool(trust_proxy)
 
     if basic and not loopback and not tls_upstream:
-        # Basic Auth puts the password on the wire with EVERY request, so a plain
-        # http bind on a reachable interface is refused unless it is asked for.
+        # Sessions send the password ONCE, at sign-in -- but that one time is
+        # still in the clear on plain http, and the cookie minted from it then
+        # rides every request. So a plain-http bind on a reachable interface is
+        # still refused unless somebody says the transport is protected.
         #
         # But this process cannot tell whether the password is actually exposed:
         # behind a TLS-terminating proxy the browser speaks https and only the
@@ -2519,8 +2521,9 @@ def serve(
         # The second route is spelled out rather than echoed back as a full
         # command: an echo built from bind+port drops any --allow-host that was
         # passed, and the copy-pasted result then 403s the proxy's Host header.
-        _err("named-user login sends the password on every request, so plain http "
-             f"on {bind} is refused by default.\n"
+        _err(f"signing in over plain http on {bind} puts the password on the wire "
+             "once, and the\n  session cookie on every request after it — both "
+             "readable by anyone on the path.\n  Refused by default.\n"
              "  Have a hostname pointing here? Let rc-repro do the TLS:\n"
              "    rc-repro serve --domain <your-domain> --email you@example.com\n"
              "  TLS proxy on THIS box? Keep the GUI on loopback and point the "
