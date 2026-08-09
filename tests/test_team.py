@@ -493,3 +493,74 @@ def test_the_email_is_remembered_after_the_first_use(fronted, tmp_path):
 
     r = cli_runner.invoke(cli.app, ["serve", "--domain", "rc.example.com"])
     assert r.exit_code == 0, r.output      # no --email needed the second time
+
+
+# --- `users add` mints a password, like the GUI always has -------------------------
+
+def test_users_add_generates_the_password_and_shows_it_once():
+    """The GUI has always minted these. The CLI took whatever a human typed above a
+    twelve-character minimum, which is the only thing between an account and a
+    distributed guessing attack -- the sign-in throttle bounds one address, and
+    nothing bounds a thousand.
+
+    Two properties: the password works, and it appears in the output exactly once
+    because that is the only moment it exists in readable form anywhere.
+    """
+    r = cli_runner.invoke(cli.app, ["users", "add", "bob"])
+    assert r.exit_code == 0, r.output
+
+    # pull the minted value back out of the panel and prove it is the real one
+    words = [w for w in r.output.replace("|", " ").split()
+             if len(w) >= 16 and w not in ("rc-repro",)]
+    minted = next(w for w in words if users.verify("bob", w))
+    assert users.verify("bob", minted) is True
+    assert r.output.count(minted) == 1, "shown once, or it is not 'shown once'"
+    assert "Shown once" in r.output
+
+
+def test_users_add_still_lets_you_type_one():
+    """An escape hatch, not a default. Somebody restoring a documented account, or
+    working where copying a generated string is awkward, still needs this."""
+    r = cli_runner.invoke(cli.app, ["users", "add", "carol", "--ask-password"],
+                          input="a-typed-out-password\na-typed-out-password\n")
+    assert r.exit_code == 0, r.output
+    assert users.verify("carol", "a-typed-out-password") is True
+    assert "Shown once" not in r.output, "nothing was minted, so nothing to show"
+
+
+def test_a_typed_password_that_does_not_match_is_refused():
+    r = cli_runner.invoke(cli.app, ["users", "add", "dave", "--ask-password"],
+                          input="one-good-password\na-different-password\n")
+    assert r.exit_code != 0
+    assert "do not match" in r.output
+    assert users.list_users() == []
+
+
+def test_users_passwd_mints_too_and_ends_the_old_sessions():
+    from rc_repro.services import sessions as sessionsvc
+
+    users.add("erin", GOOD, role="admin")
+    token = sessionsvc.create("erin")
+    assert sessionsvc.verify(token) is not None
+
+    r = cli_runner.invoke(cli.app, ["users", "passwd", "erin"])
+    assert r.exit_code == 0, r.output
+    assert users.verify("erin", GOOD) is False, "the old password still worked"
+    minted = next(w for w in r.output.replace("|", " ").split()
+                  if len(w) >= 16 and users.verify("erin", w))
+    assert users.verify("erin", minted) is True
+    assert sessionsvc.verify(token) is None, "a reset must reach the live sessions"
+
+
+def test_both_front_ends_mint_the_same_shape_of_password():
+    """One definition of "a password rc-repro generated", or the two drift apart on
+    the single value that decides whether an account is guessable."""
+    import re
+
+    from rc_repro.services import users as usersvc
+    minted = usersvc.mint_password()
+    assert len(minted) >= 16
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", minted), "must survive a URL and a shell"
+    assert minted != usersvc.mint_password()
+    # and it clears the policy the service enforces on typed ones
+    usersvc.require_valid_password(minted)

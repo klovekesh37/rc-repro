@@ -328,6 +328,28 @@ def default_role_for_new_account() -> str:
     return "admin" if not _read() else "member"
 
 
+#: Bytes of entropy in a password rc-repro generates. 12 bytes is ~96 bits, which
+#: is long enough that guessing it is not a threat model, and short enough to read
+#: aloud once over a call.
+_NEW_PASSWORD_BYTES = 12
+
+
+def mint_password() -> str:
+    """A password the server chose, not a person.
+
+    Lives here rather than in web/app.py because BOTH front ends need it and the
+    argument for it is the same in both. An admin who types a colleague's password
+    also knows it, which makes every audit line signed with that name deniable;
+    generating it means an admin can reset the credential but never hold it.
+
+    It is also the only real defence left against distributed online guessing. The
+    per-address throttle in web/app.py bounds one source; nothing bounds a thousand.
+    A ~96-bit secret does not care how many sources there are, and a human-chosen
+    twelve-character one very much does.
+    """
+    return secrets.token_urlsafe(_NEW_PASSWORD_BYTES)
+
+
 def add(name: str, password: str, *, role: str = "") -> User:
     require_valid_name(name)
     require_valid_password(password)

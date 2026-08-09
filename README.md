@@ -890,19 +890,35 @@ rc-repro behaves exactly as it always has.
 ## Accounts
 
 ```bash
-rc-repro users add alice        # prompts for the password twice, never on argv
+rc-repro users add alice        # GENERATES the password and shows it once
+rc-repro users add alice --ask-password   # type one instead
 rc-repro users list             # names and dates — never hashes
-rc-repro users passwd alice
+rc-repro users passwd alice     # generates a new one, ends alice's sessions
 rc-repro users remove alice
 ```
 
-Stored in `~/.rc-repro/users`, mode `0600`, hashed with `hashlib.scrypt` from the
-standard library (no new dependency). Passwords are at least 12 characters.
+The password is generated, not typed, for the same two reasons the GUI has always
+minted them. An admin who types a colleague's password also knows it, which makes
+every audit line signed with that name deniable. And a generated one is ~96 bits,
+where a typed one clears the 12-character minimum and is otherwise whatever
+somebody thought of. Either way it is never an *argument* — `ps` shows command
+lines to every user on the machine.
 
-Once **any** account exists, `rc-repro serve` asks the browser to sign in instead
-of using a token. Five failed attempts start an exponential backoff, and an
-unknown username still performs a full hash derivation so response time cannot be
-used to enumerate who exists.
+Stored in `~/.rc-repro/users`, mode `0600`, hashed with `hashlib.scrypt` from the
+standard library (no new dependency).
+
+Once **any** account exists, `rc-repro serve` asks the browser to sign in. Ten
+failed attempts from one address in sixty seconds and the login refuses to spend
+any more CPU on that address; there is deliberately no per-*account* lockout,
+because anyone who can reach the port could then lock out a named colleague, and
+names are not secret here. Every failure is recorded instead:
+
+```bash
+rc-repro audit --kind signin     # who was guessed at, from where, and when
+```
+
+An unknown username performs exactly the same hash derivation as a known one, so
+response time cannot be used to enumerate who exists.
 
 > **Basic Auth sends the password on every request**, so `serve` refuses to do it
 > over plain http on a network-reachable interface. Three ways forward, and it

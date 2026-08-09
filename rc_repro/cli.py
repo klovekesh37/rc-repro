@@ -598,6 +598,9 @@ def users_cmd(
     action: str = typer.Argument("list", help="list | add | passwd | remove | role"),
     name: str = typer.Argument("", help="the user name, for add/passwd/remove/role"),
     role: str = typer.Argument("", help="admin | member | readonly, for `role`"),
+    ask_password: bool = typer.Option(
+        False, "--ask-password",
+        help="type a password instead of letting rc-repro generate one"),
 ) -> None:
     """Manage who can sign in to the web GUI.
 
@@ -605,8 +608,21 @@ def users_cmd(
     the token is handed to everybody, changes on every restart, and cannot answer
     "who tore down TICKET-1234?". With users, every job records who ran it.
 
-    Passwords are prompted for, never taken as an argument — `ps` shows command
-    lines to every user on the machine.
+    \b
+    `add` and `passwd` GENERATE the password and show it once:
+        rc-repro users add bob
+        rc-repro users add bob --ask-password    # type one instead
+
+    The GUI has always minted them, and for two reasons that apply just as much at
+    a terminal. An admin who types a colleague's password also knows it, which
+    makes every audit line signed with that name deniable. And a generated one is
+    ~96 bits, where a typed one clears a twelve-character minimum and is otherwise
+    whatever somebody thought of — which is the only thing standing between an
+    account and a distributed guessing attack, because the sign-in throttle bounds
+    one address and nothing bounds a thousand.
+
+    Either way the password is never an ARGUMENT: `ps` shows command lines to every
+    user on the machine.
     """
     from rc_repro.services import sessions as sessionsvc
     from rc_repro.services import users as usersvc
@@ -615,7 +631,8 @@ def users_cmd(
         rows = usersvc.list_users()
         if not rows:
             ui.note("no users yet — add one with `rc-repro users add <name>`")
-            ui.hint("  until then, `rc-repro serve` uses its one-time session token.")
+            ui.hint("  or just run `rc-repro serve` — it prints a one-time link that "
+                "creates the first one.")
             return
         ui.panel("GUI users", [
             (u.name, u.created_at + "  [" + usersvc.role_of(u.name)
@@ -667,10 +684,17 @@ def users_cmd(
             usersvc.require_valid_name(name)
         except errors.ReproError as exc:
             _err(str(exc))
-        pw = typer.prompt(f"Password for {name}", hide_input=True)
-        again = typer.prompt("Repeat", hide_input=True)
-        if pw != again:
-            _err("the two passwords do not match")
+        if ask_password:
+            pw = typer.prompt(f"Password for {name}", hide_input=True)
+            again = typer.prompt("Repeat", hide_input=True)
+            if pw != again:
+                _err("the two passwords do not match")
+            minted = False
+        else:
+            # The same function the GUI's People dialog calls, so "a password
+            # rc-repro generated" means one thing on this box rather than two.
+            pw = usersvc.mint_password()
+            minted = True
         try:
             if action == "add":
                 added = usersvc.add(name, pw)
@@ -684,6 +708,13 @@ def users_cmd(
         except errors.ReproError as exc:
             _err(str(exc))
         ui.ok(f"✓ user {name!r} {'added' if action == 'add' else 'password changed'}.")
+        if minted:
+            # Printed, not logged and not stored: this is the only moment it
+            # exists in readable form anywhere.
+            ui.panel(f"password for {name}", [(pw, "")])
+            ui.hint("  Shown once. rc-repro keeps only a scrypt hash, so nobody — "
+                    "including you —\n  can read it back. Send it over something "
+                    "the person can delete afterwards.")
         if action == "passwd" and ended:
             ui.hint(f"  {ended} active session(s) signed out.")
         if action == "add":
@@ -692,7 +723,8 @@ def users_cmd(
                 "anyone)" if added.role == "admin"
                 else "  — change it with `rc-repro users role %s <role>`" % name))
         if action == "add" and len(usersvc.list_users()) == 1:
-            ui.hint("  `rc-repro serve` will now ask for a login instead of using a token.")
+            ui.hint("  `rc-repro serve` will now ask for this login, and the "
+                    "first-run link is spent.")
         return
 
     _err(f"unknown action {action!r} (want: list | add | passwd | remove | role)")

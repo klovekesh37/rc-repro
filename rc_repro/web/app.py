@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-import secrets
 import sys
 from contextlib import asynccontextmanager
 import json
@@ -835,8 +834,10 @@ def create_app(allow_hosts: list[str] | None = None, *,
         return {"ok": True, "ended": 1}
 
     # --- people (admin) -------------------------------------------------------
-    #: Long enough that guessing is hopeless, short enough to read aloud once.
-    _NEW_PASSWORD_BYTES = 12
+    # The password generator lives in services/users.py, not here: `rc-repro users
+    # add` mints them too, and two definitions of "a password rc-repro generated"
+    # is how the two front ends quietly drift apart on the one value that decides
+    # whether an account is guessable.
 
     @app.get("/api/users")
     def users_list():
@@ -864,7 +865,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
         role = str(body.get("role") or "member")
         usersvc.require_valid_name(name)
         usersvc.require_valid_role(role)
-        password = secrets.token_urlsafe(_NEW_PASSWORD_BYTES)
+        password = usersvc.mint_password()
         usersvc.add(name, password, role=usersvc.normalise_role(role))
         return {"name": name, "role": usersvc.normalise_role(role),
                 "password": password,
@@ -886,7 +887,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
     def users_reset_password(name: str):
         """Reset somebody's password to a freshly minted one, shown once."""
         from rc_repro.services import users as usersvc
-        password = secrets.token_urlsafe(_NEW_PASSWORD_BYTES)
+        password = usersvc.mint_password()
         usersvc.set_password(name, password)
         ended = sessions.revoke_user(name)
         return {"name": name, "password": password, "sessions_ended": ended}
