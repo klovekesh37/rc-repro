@@ -16,21 +16,49 @@ from rc_repro import errors  # noqa: E402
 from rc_repro.services import lifecycle as lc  # noqa: E402
 from rc_repro.web.app import create_app  # noqa: E402
 
-TOKEN = "secret-token"
-H = {"X-RC-Repro-Token": TOKEN}
+#: Every request now carries a session cookie, so `H` is just the Host header the
+#: allow-list wants. Kept under its old name so the ~90 call sites did not have to
+#: change when the credential did.
+H = {"Host": "localhost"}
+PASSWORD = "correct-horse-battery"
 
 
-def client(host="http://localhost"):
-    return TestClient(create_app(token=TOKEN), base_url=host)
+def _fresh_auth_state():
+    from rc_repro.services import sessions as sessionsvc
+    from rc_repro.services import users as usersvc
+    usersvc._failures.clear()
+    sessionsvc._cache.clear()
+    sessionsvc._stamp = (-1, -1)
+    sessionsvc._flushed.clear()
+    from rc_repro.web import app as webapp
+    webapp._signin_fails.clear()
 
 
-def test_health_needs_no_token():
-    r = client().get("/api/health")
+def client(host="http://localhost", *, sign_in=True, role=""):
+    """An app with accounts, signed in as alice unless told otherwise.
+
+    There is no token mode any more: a session is the only way in, so the default
+    client holds one. `sign_in=False` gives the signed-out view.
+    """
+    from rc_repro.services import users as usersvc
+    _fresh_auth_state()
+    if not usersvc.any_users():
+        usersvc.add("alice", PASSWORD, role=role or "admin")
+    c = TestClient(create_app(), base_url=host)
+    if sign_in:
+        r = c.post("/signin", data={"user": "alice", "password": PASSWORD},
+                   follow_redirects=False, headers=H)
+        assert r.status_code == 303, r.text
+    return c
+
+
+def test_health_needs_no_session():
+    r = client(sign_in=False).get("/api/health", headers=H)
     assert r.status_code == 200 and "docker" in r.json()
 
 
-def test_api_requires_token(monkeypatch):
-    assert client().get("/api/repros").status_code == 401
+def test_api_requires_a_session(monkeypatch):
+    assert client(sign_in=False).get("/api/repros", headers=H).status_code == 401
     # Mock the service so the authorized half is a real assertion — it used to be
     # `== 200 or True`, which passes unconditionally.
     monkeypatch.setattr(lc, "list_repros", lambda: [])
@@ -49,7 +77,7 @@ def test_host_guard_is_case_insensitive():
     both got "host not allowed", which reads like the guard is broken rather
     than like a spelling difference.
     """
-    app = create_app(token="", allow_hosts=["Lab.Example.Com"])
+    app = create_app(allow_hosts=["Lab.Example.Com"])
     c = TestClient(app, base_url="http://localhost")
     for hdr in ("LOCALHOST", "LocalHost", "localhost",
                 "lab.example.com", "LAB.EXAMPLE.COM", "Lab.Example.Com:443"):
@@ -62,10 +90,10 @@ def test_host_guard_is_case_insensitive():
 def test_allow_host_permits_proxy_domain():
     # reverse-proxy access (iximiuz/Codespaces): allow the proxy host, or '*'.
     proxy = "https://x.iximiuz.com"
-    assert TestClient(create_app(token=""), base_url=proxy).get("/api/health").status_code == 403
-    assert TestClient(create_app(token="", allow_hosts=["x.iximiuz.com"]),
+    assert TestClient(create_app(), base_url=proxy).get("/api/health").status_code == 403
+    assert TestClient(create_app(allow_hosts=["x.iximiuz.com"]),
                       base_url=proxy).get("/api/health").status_code == 200
-    assert TestClient(create_app(token="", allow_hosts=["*"]),
+    assert TestClient(create_app(allow_hosts=["*"]),
                       base_url=proxy).get("/api/health").status_code == 200
 
 
@@ -372,8 +400,8 @@ def test_jobs_list_carries_label_and_survives_the_dialog(monkeypatch):
     assert "result" not in row and "events" not in row
 
 
-def test_jobs_list_needs_a_token():
-    assert client().get("/api/jobs").status_code == 401
+def test_jobs_list_needs_a_session():
+    assert client(sign_in=False).get("/api/jobs").status_code == 401
 
 
 def test_doctor_endpoint_returns_the_same_report_the_cli_renders(monkeypatch):
@@ -389,8 +417,8 @@ def test_doctor_endpoint_returns_the_same_report_the_cli_renders(monkeypatch):
     assert body["checks"][0]["status"] == "fail"
 
 
-def test_doctor_endpoint_needs_a_token():
-    assert client().get("/api/doctor").status_code == 401
+def test_doctor_endpoint_needs_a_session():
+    assert client(sign_in=False).get("/api/doctor").status_code == 401
 
 
 def test_set_default_endpoint(monkeypatch, tmp_path):
@@ -539,8 +567,8 @@ def test_api_call_maps_a_dead_workspace_to_not_ready(monkeypatch):
     assert r.status_code == 409 and "connection refused" in r.json()["error"]
 
 
-def test_api_call_needs_a_token():
-    assert client().post("/api/repros/x/call", json={"method": "GET", "path": "/"}).status_code == 401
+def test_api_call_needs_a_session():
+    assert client(sign_in=False).post("/api/repros/x/call", json={"method": "GET", "path": "/"}).status_code == 401
 
 
 def test_tls_endpoint_probes_this_host_not_the_public_name(monkeypatch):
@@ -596,8 +624,8 @@ def test_tls_endpoint_refuses_a_repro_without_https(monkeypatch):
     assert r.status_code == 400 and "not created with --https" in r.json()["error"]
 
 
-def test_tls_endpoint_needs_a_token():
-    assert client().get("/api/repros/t/tls").status_code == 401
+def test_tls_endpoint_needs_a_session():
+    assert client(sign_in=False).get("/api/repros/t/tls").status_code == 401
 
 
 def test_env_endpoints(monkeypatch):
@@ -634,9 +662,9 @@ def test_env_post_rejects_the_wrong_shapes(monkeypatch):
         assert r.status_code == 400 and msg in r.json()["error"], body
 
 
-def test_env_endpoints_need_a_token():
-    assert client().get("/api/repros/e/env").status_code == 401
-    assert client().post("/api/repros/e/env", json={"set": {}}).status_code == 401
+def test_env_endpoints_need_a_session():
+    assert client(sign_in=False).get("/api/repros/e/env").status_code == 401
+    assert client(sign_in=False).post("/api/repros/e/env", json={"set": {}}).status_code == 401
 
 
 def test_env_post_keeps_settings_and_plain_vars_apart(monkeypatch):
@@ -819,11 +847,11 @@ def test_upgrade_and_rollback_are_jobs(monkeypatch):
     assert r.status_code == 200 and r.json()["job_id"].startswith("job_")
 
 
-def test_backup_endpoints_need_a_token():
-    assert client().post("/api/repros/x/backup", json={}).status_code == 401
-    assert client().get("/api/backups").status_code == 401
-    assert client().post("/api/restore", json={"bundle": "/a"}).status_code == 401
-    assert client().get("/api/repros/x/upgrade").status_code == 401
+def test_backup_endpoints_need_a_session():
+    assert client(sign_in=False).post("/api/repros/x/backup", json={}).status_code == 401
+    assert client(sign_in=False).get("/api/backups").status_code == 401
+    assert client(sign_in=False).post("/api/restore", json={"bundle": "/a"}).status_code == 401
+    assert client(sign_in=False).get("/api/repros/x/upgrade").status_code == 401
 # --- untyped JSON bodies (#audit) ------------------------------------------------
 #
 # A body field arrives as whatever JSON says it is. Each of these reached code that
@@ -892,8 +920,8 @@ def test_settings_says_whether_an_email_is_remembered_without_leaking_it(monkeyp
     assert "ops@rocket.chat" not in r.text, "the address itself must never be returned"
 
 
-def test_settings_needs_a_token():
-    assert client().get("/api/settings").status_code == 401
+def test_settings_needs_a_session():
+    assert client(sign_in=False).get("/api/settings").status_code == 401
 
 
 # --- named-user login (#team-auth) ------------------------------------------------
@@ -932,7 +960,7 @@ def anon_client(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     _reset_auth_state()
     usersvc.add("alice", "correct-horse-battery")
-    yield TestClient(create_app(accounts=True), base_url="http://localhost")
+    yield TestClient(create_app(), base_url="http://localhost")
     _reset_auth_state()
 
 
@@ -995,7 +1023,7 @@ def test_the_cookie_is_host_prefixed_and_secure_only_when_the_browser_hop_is_htt
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     _reset_auth_state()
     usersvc.add("alice", "correct-horse-battery")
-    c = TestClient(create_app(accounts=True, public_https=True),
+    c = TestClient(create_app(public_https=True),
                    base_url="http://localhost")
     r = c.post("/signin", follow_redirects=False,
                data={"user": "alice", "password": "correct-horse-battery"})
@@ -1104,15 +1132,6 @@ def test_the_sign_in_endpoint_is_throttled_per_address(anon_client, monkeypatch)
     assert ok.status_code == 200 and ok.json()["user"] == "alice"
 
 
-def test_the_token_path_is_untouched_when_there_are_no_users(monkeypatch):
-    """An existing single-user install must behave exactly as before."""
-    c = client()
-    assert c.get("/api/repros").status_code == 401          # token missing
-    monkeypatch.setattr(lc, "list_repros", lambda: [])
-    assert c.get("/api/repros", headers=H).status_code == 200
-    assert c.get("/").status_code == 200, "the SPA is not gated in token mode"
-
-
 def test_a_job_records_who_ran_it(basic_client, monkeypatch, tmp_path):
     """Attribution is the point of named accounts — without it they are just a
     shared password with extra steps."""
@@ -1145,16 +1164,6 @@ def test_the_audit_log_survives_a_restart(basic_client, monkeypatch, tmp_path):
     # are still in the same positions.
     assert origin == "session", "a signed-in GUI request, so the identity is checked"
     assert outcome == "ok"
-
-
-def test_token_mode_records_no_actor(monkeypatch):
-    """A shared secret genuinely cannot say who acted; claiming otherwise would be
-    worse than an empty column."""
-    monkeypatch.setattr(lc, "create_repro",
-                        lambda req, emit, stream_output=False: {"name": "x"})
-    c = client()
-    c.post("/api/repros", headers=H, json={"version": "8.5.1"})
-    assert c.get("/api/jobs", headers=H).json()["jobs"][0]["actor"] == ""
 
 
 def test_an_unwritable_audit_log_does_not_break_the_job(monkeypatch):
@@ -1387,7 +1396,7 @@ def test_new_work_is_refused_once_shutting_down():
 def test_the_app_drains_on_shutdown(monkeypatch):
     """The hook has to be wired to the app, not just exist."""
     drained = []
-    app = create_app(token=TOKEN)
+    app = create_app()
     monkeypatch.setattr(type(app.state.jobs), "drain",
                         lambda self, timeout=25.0: drained.append(True) or [])
     with TestClient(app, base_url="http://localhost") as c:
@@ -1457,7 +1466,7 @@ def test_every_api_route_declares_a_minimum_role():
     build rather than waiting to be noticed.
     """
     from rc_repro.web import app as webapp
-    app = create_app(accounts=True)
+    app = create_app()
     missing = []
     for route in app.routes:
         path = getattr(route, "path", "")
@@ -1638,3 +1647,58 @@ def test_a_legacy_four_field_line_still_parses(tmp_path, monkeypatch):
     (row,) = auditsvc.read()["lines"]
     assert row["actor"] == "alice" and row["kind"] == "down-volumes"
     assert row["origin"] == "" and row["outcome"] == "ok"
+
+
+# --- first run (D8): creating the very first account ------------------------------
+
+def _first_run_client(tmp_path, monkeypatch):
+    from rc_repro.services import firstrun as frsvc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    _fresh_auth_state()
+    key = frsvc.mint()
+    return TestClient(create_app(first_run=True), base_url="http://localhost"), key
+
+
+def test_the_first_account_is_created_by_spending_the_key(tmp_path, monkeypatch):
+    """One step, not two. A key-for-session exchange followed by an account
+    creation would mean a privileged session with no account behind it existing
+    in between -- the anonymous admin mode this design removes."""
+    c, key = _first_run_client(tmp_path, monkeypatch)
+    assert c.get("/setup", headers=H).status_code == 200
+    r = c.post("/api/session/first-run", headers=H,
+               json={"key": key, "user": "alice", "password": "alice-good-password"})
+    assert r.status_code == 200 and r.json() == {"user": "alice", "role": "admin"}
+    assert "rc_repro_session=" in r.headers["set-cookie"]
+    assert c.get("/api/session", headers=H).json()["role"] == "admin"
+
+
+def test_the_key_is_single_use_and_setup_disappears_with_it(tmp_path, monkeypatch):
+    c, key = _first_run_client(tmp_path, monkeypatch)
+    c.post("/api/session/first-run", headers=H,
+           json={"key": key, "user": "alice", "password": "alice-good-password"})
+    again = c.post("/api/session/first-run", headers=H,
+                   json={"key": key, "user": "eve", "password": "eves-good-password"})
+    assert again.status_code == 409
+    # and the door itself is gone, so a stale bookmark is not a second way in
+    assert c.get("/setup", headers=H).status_code == 404
+    assert c.get("/setup.js", headers=H).status_code == 404
+
+
+def test_a_wrong_key_creates_nothing(tmp_path, monkeypatch):
+    from rc_repro.services import users as usersvc
+    c, _key = _first_run_client(tmp_path, monkeypatch)
+    r = c.post("/api/session/first-run", headers=H,
+               json={"key": "not-the-key", "user": "eve", "password": "eves-good-password"})
+    assert r.status_code == 401
+    assert usersvc.any_users() is False, "a failed attempt must create no account"
+
+
+def test_setup_is_closed_when_the_flow_was_never_opened(tmp_path, monkeypatch):
+    """`serve` sets first_run only on a loopback bind with no accounts. Anywhere
+    else these must not exist at all."""
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    _fresh_auth_state()
+    c = TestClient(create_app(first_run=False), base_url="http://localhost")
+    assert c.get("/setup", headers=H).status_code == 404
+    assert c.post("/api/session/first-run", headers=H,
+                  json={"key": "x", "user": "a", "password": "b"}).status_code == 409

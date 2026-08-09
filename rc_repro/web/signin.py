@@ -21,6 +21,7 @@ from __future__ import annotations
 import html
 
 from rc_repro import __version__
+from rc_repro.services.users import MIN_PASSWORD
 
 #: The banner shown for each `?e=` value. Absent or unknown -> no banner, which is
 #: the first-visit case. Keyed rather than free text so a redirect can never put
@@ -100,6 +101,90 @@ def page(*, error: str = "", next_url: str = "/", server: str = "",
     <code>rc-repro users passwd &lt;name&gt;</code>
   </p>
 </main>
+</body>
+</html>
+"""
+
+
+# --- first run ------------------------------------------------------------------
+
+#: The only script rc-repro serves to an unauthenticated caller. It exists because
+#: a URL fragment is readable ONLY by JavaScript -- which is exactly the property
+#: that keeps the first-run key out of access logs, proxy logs and Referer headers.
+#: app.js is not opened for this: that file maps the whole API surface, and this
+#: needs two fields and one POST.
+SETUP_JS = """\
+"use strict";
+var key = (location.hash || "").replace(/^#k=/, "");
+// Out of the address bar on first paint, so it does not survive a screenshot or
+// a shared link. Doing it before anything else means even an error leaves no key.
+history.replaceState(null, "", "/setup");
+var form = document.getElementById("f");
+var err = document.getElementById("err");
+if (!key) {
+  err.textContent = "This page needs the setup link rc-repro printed. "
+    + "Copy the whole URL, including the part after #.";
+  err.hidden = false;
+  form.hidden = true;
+}
+form.addEventListener("submit", function (e) {
+  e.preventDefault();
+  err.hidden = true;
+  var btn = form.querySelector("button");
+  btn.disabled = true; btn.textContent = "Creating…";
+  fetch("/api/session/first-run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({
+      key: key, user: form.user.value.trim(), password: form.password.value,
+    }),
+  }).then(function (r) {
+    return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+  }).then(function (res) {
+    if (res.ok) { location.assign("/"); return; }
+    err.textContent = res.d.error || "That did not work.";
+    err.hidden = false;
+    btn.disabled = false; btn.textContent = "Create admin account";
+  }).catch(function () {
+    err.textContent = "Could not reach the server.";
+    err.hidden = false;
+    btn.disabled = false; btn.textContent = "Create admin account";
+  });
+});
+"""
+
+
+def setup_page() -> str:
+    """The first-run document: create the first admin, once."""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set up rc-repro</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body class="signin-body">
+<main class="signin">
+  <div class="brand"><span class="dollar">$</span> rc-repro</div>
+  <p class="signin-banner ok">This server has no accounts yet. Create the first
+    one — it will be an admin, because somebody has to be able to add everyone
+    else.</p>
+  <p class="signin-banner bad" id="err" hidden></p>
+  <form class="signin-form" id="f">
+    <label for="u">Name</label>
+    <input id="u" name="user" autocomplete="username" autocapitalize="none"
+           autocorrect="off" spellcheck="false" autofocus required>
+    <label for="p">Password</label>
+    <input id="p" name="password" type="password"
+           autocomplete="new-password" minlength="{MIN_PASSWORD}" required>
+    <button class="btn primary" type="submit">Create admin account</button>
+  </form>
+  <p class="signin-foot">At least {MIN_PASSWORD} characters. rc-repro stores only a
+    scrypt hash — there is no password recovery, an admin resets it.</p>
+</main>
+<script src="/setup.js"></script>
 </body>
 </html>
 """

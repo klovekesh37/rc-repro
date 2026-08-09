@@ -201,7 +201,7 @@ def test_insecure_serves_the_login_on_a_reachable_interface(served):
     assert r.exit_code == 0, r.output
     assert served["host"] == "0.0.0.0" and served["port"] == 9944
     assert served["accounts"] is True
-    assert served["token"] == "", "accounts replace the session token"
+    assert "token" not in served, "there is no session token any more, at all"
 
 
 def test_loopback_needs_no_flag(served):
@@ -211,13 +211,13 @@ def test_loopback_needs_no_flag(served):
     assert served["accounts"] is True
 
 
-def test_without_accounts_a_reachable_bind_is_still_allowed(served):
-    """The refusal is about the password, so it must not fire in token mode --
-    that would break every existing lab/Codespaces setup."""
+def test_without_accounts_a_reachable_bind_is_refused(served):
+    """This USED to be allowed, because token mode filled the gap. Token mode is
+    gone, so a reachable interface with no accounts no longer starts -- the lab
+    and Codespaces path is `users add` first, then --allow-host as before."""
     r = cli_runner.invoke(cli.app, ["serve", "--bind", "0.0.0.0", "--no-open"])
-    assert r.exit_code == 0, r.output
-    assert served["accounts"] is False
-    assert served["token"], "token mode still mints one"
+    assert r.exit_code != 0
+    assert "refusing to start" in r.output and served == {}
 
 
 # --- serve --domain: rc-repro arranges the TLS itself ---------------------------
@@ -287,13 +287,14 @@ def test_a_domain_without_an_email_says_how_to_set_one(fronted):
     assert "--email" in r.output and "config set acme.email" in r.output
 
 
-def test_a_domain_with_no_accounts_is_warned_about_loudly(fronted):
-    """Publishing the control plane on the internet with only a session token is
-    exactly what accounts exist to end."""
+def test_a_domain_with_no_accounts_is_refused_not_merely_warned(fronted):
+    """It used to warn and start anyway. Publishing the control plane on the
+    internet with only a session token is what accounts exist to end, and a
+    warning is advice nobody reads until afterwards."""
     r = cli_runner.invoke(cli.app, [
         "serve", "--domain", "support.example.com", "--email", "ops@example.com"])
-    assert r.exit_code == 0, r.output
-    assert "no login" in r.output and "users add" in r.output
+    assert r.exit_code != 0
+    assert "refusing to start" in r.output and "users add" in r.output
 
 
 def test_a_scheme_in_the_domain_is_corrected_not_carried(fronted):
@@ -399,39 +400,52 @@ def test_the_audit_log_is_not_world_readable(monkeypatch):
     assert mode == 0o600, oct(mode)
 
 
-# --- serve: no authentication at all (F5) ---------------------------------------
+# --- serve: posture is decided by the BIND (F5) -----------------------------------
+# Security should not be a side effect of whether <home>/users happens to be
+# empty. The session token that used to fill that gap is gone: it was a standing
+# credential with no identity behind it, regenerated on every restart, and it made
+# audit.log record `-` for every action in the mode that shipped by default.
 
-def test_no_token_on_a_reachable_bind_is_refused(served):
-    """No accounts and no token on a public interface is unauthenticated docker
-    control -- containers, volumes, admin tokens, arbitrary REST."""
-    r = cli_runner.invoke(cli.app, ["serve", "--bind", "0.0.0.0", "--no-token", "--no-open"])
+def test_a_reachable_bind_with_no_accounts_refuses_to_start(served):
+    """The replacement for the token is not a smaller token."""
+    r = cli_runner.invoke(cli.app, ["serve", "--bind", "0.0.0.0", "--no-open"])
     assert r.exit_code != 0
-    assert "NO authentication" in r.output and "users add" in r.output
+    assert "refusing to start" in r.output and "users add" in r.output
     assert served == {}, "nothing should be bound"
 
 
-def test_no_token_stays_available_for_an_ephemeral_lab(served):
+def test_insecure_does_not_buy_a_way_past_it(served):
+    """--insecure says "this hop is protected", not "skip authentication"."""
     r = cli_runner.invoke(cli.app, [
-        "serve", "--bind", "0.0.0.0", "--no-token", "--insecure", "--no-open"])
-    assert r.exit_code == 0, r.output
-    assert served["token"] == "" and served["accounts"] is False
+        "serve", "--bind", "0.0.0.0", "--insecure", "--no-open"])
+    assert r.exit_code != 0 and "refusing to start" in r.output
 
 
-def test_no_token_on_loopback_is_untouched(served):
-    r = cli_runner.invoke(cli.app, ["serve", "--no-token", "--no-open"])
-    assert r.exit_code == 0, r.output
-
-
-def test_a_domain_served_gui_still_carries_its_token(fronted):
-    """Reported from EC2: the page loaded and every API call answered "bad or
-    missing token". A token IS minted when there are no accounts, but the printed
-    https URL left the ?t= off -- and the guard only covers /api/, so the SPA
-    rendered an empty shell with an error and no hint a token even existed."""
-    r = cli_runner.invoke(cli.app, [
-        "serve", "--domain", "rc.example.com", "--email", "ops@example.com"])
+def test_loopback_with_no_accounts_prints_a_one_time_setup_link(served):
+    r = cli_runner.invoke(cli.app, ["serve", "--no-open"])
     assert r.exit_code == 0, r.output
     line = next(ln for ln in r.output.splitlines() if "rc-repro GUI:" in ln)
-    assert "?t=" in line, line
+    assert "/setup#k=" in line, line
+    assert "?t=" not in line, "no credential in the query string any more"
+    assert served["first_run"] is True
+
+
+def test_the_setup_key_is_in_the_fragment_so_it_reaches_no_log(served):
+    """A fragment is never sent to the server: not to an access log, not to a
+    proxy log, not in a Referer."""
+    r = cli_runner.invoke(cli.app, ["serve", "--no-open"])
+    url = next(ln for ln in r.output.splitlines() if "rc-repro GUI:" in ln).split()[-1]
+    path, _, frag = url.partition("#")
+    assert path.endswith("/setup") and frag.startswith("k=")
+
+
+def test_a_domain_with_no_accounts_refuses_rather_than_minting_anything(fronted):
+    """Reported from EC2 against the old design: the page loaded and every API
+    call answered "bad or missing token". There is no token to leave off now --
+    a public name with no accounts does not start at all."""
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--domain", "rc.example.com", "--email", "ops@example.com"])
+    assert r.exit_code != 0 and "refusing to start" in r.output
 
 
 def test_with_accounts_the_url_carries_no_token(fronted):
@@ -448,6 +462,7 @@ def test_serve_reuses_the_domain_the_box_was_set_up_with(fronted):
     parameters?" It was yes -- and a plain `serve` did not merely forget, it went
     back to loopback while the edge's GUI route still pointed at a process it
     could no longer reach, so the name 502'd."""
+    users.add("alice", GOOD)   # serve refuses to start without one
     # Set it up the way somebody actually would, once.
     first = cli_runner.invoke(cli.app, [
         "serve", "--domain", "rc.example.com", "--email", "ops@example.com"])
@@ -471,6 +486,7 @@ def test_no_domain_gives_a_deliberately_local_session(fronted):
 def test_the_email_is_remembered_after_the_first_use(fronted, tmp_path):
     """`up` documents it as remembered; for serve it was not, so every restart
     needed it retyped."""
+    users.add("alice", GOOD)   # serve refuses to start without one
     from rc_repro import config
 
     cli_runner.invoke(cli.app, [

@@ -162,6 +162,9 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     # readonly+ : the handler forces non-admins to their OWN lines, so the
     # role gate here is "signed in", not "may see everyone".
     ("GET", "/api/audit"): _READ,
+    # first run: reachable only while there are no accounts at all
+    ("GET", "/setup"): _OPEN, ("GET", "/setup.js"): _OPEN,
+    ("POST", "/api/session/first-run"): _OPEN,
 }
 
 
@@ -251,15 +254,19 @@ def _read_upload(file: UploadFile) -> bytes:
     return data
 
 
-def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
-               basic_auth: bool = False, accounts: bool = False,
-               public_https: bool = False) -> FastAPI:
-    # `accounts` replaces `basic_auth`: same meaning (named accounts exist, so the
-    # login is enforced), different mechanism behind it. The old name is still
-    # accepted so nothing outside has to change in the same commit.
-    accounts = accounts or basic_auth
+def create_app(allow_hosts: list[str] | None = None, *,
+               accounts: bool = True, public_https: bool = False,
+               first_run: bool = False) -> FastAPI:
+    """The GUI application. There is exactly one way in: a session.
+
+    `token=` and `basic_auth=` are gone. Both were credentials the browser had to
+    carry on every request -- one in the URL, one in a header -- and both are
+    replaced by a cookie the server can revoke. `accounts` survives as a switch
+    only so a test can build an app with the login disabled; `serve` always
+    passes True.
+    """
     # openapi_url=None as well as the doc UIs: the schema path does not start
-    # with /api/, so `guard` below would hand it out without a token.
+    # with /api/, so `guard` below would serve it to anyone.
     jobs = JobManager()
 
     @asynccontextmanager
@@ -279,7 +286,6 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
 
     app = FastAPI(title="rc-repro", docs_url=None, redoc_url=None, openapi_url=None,
                   lifespan=lifespan)
-    app.state.token = token
     app.state.jobs = jobs
     # Whether the login is enforced.
     app.state.basic_auth = accounts      # legacy name, still read by tests
@@ -292,6 +298,10 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
     # `Secure` and `__Host-` prefix, so guessing here would be guessing about a
     # security attribute.
     app.state.public_https = public_https
+    # Whether the first-run flow is available. `serve` sets it only on a
+    # loopback bind with no accounts -- a bootstrap credential reachable from
+    # the network is the thing being removed, not a smaller version of it.
+    app.state.first_run = first_run
 
     # Host allow-list (DNS-rebind/CSRF guard). Loopback always allowed; extra
     # hosts (e.g. a reverse-proxy domain like *.iximiuz.com) opt in via
@@ -413,7 +423,7 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
         for name in (COOKIE_SECURE, COOKIE_PLAIN):
             response.delete_cookie(name, path="/")
 
-    # --- security: Host allow-list, then Basic Auth or the session token
+    # --- security: Host allow-list, cross-site guard, session, role
     @app.middleware("http")
     async def guard(request: Request, call_next):
         if not host_ok(request.headers.get("host")):
@@ -495,12 +505,8 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
                 return RedirectResponse(
                     f"/signin?e=required&next={quote(nxt, safe='/?=&')}",
                     status_code=303)
-        elif token and path.startswith("/api/") and path != "/api/health":
-            given = request.headers.get("x-rc-repro-token") or request.query_params.get("t")
-            if given != token:
-                return JSONResponse({"error": "bad or missing token"}, status_code=401)
-        # Who did this, for job attribution. "" when the token is in use, because a
-        # shared secret genuinely cannot say. A contextvar rather than fifteen
+        # Who did this, for job attribution. Every action now has a name behind
+        # it -- the shared secret that could not say is gone. A contextvar rather than fifteen
         # extra handler parameters; it propagates into the threadpool where every
         # `def` handler runs.
         request.state.actor = actor
@@ -521,8 +527,9 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
         # answers 304, so this costs a conditional request, not a re-download.
         if not path.startswith("/api/"):
             response.headers.setdefault("Cache-Control", "no-cache")
-        # The session token rides in ?t= (EventSource/WebSocket cannot set
-        # headers), so suppress the Referer that would carry it off-origin.
+        # No credential rides in a URL any more, but the first-run key does ride
+        # in a FRAGMENT -- suppress the Referer regardless, so nothing about this
+        # origin travels with an outbound link.
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         return response
 
@@ -553,6 +560,80 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
             return "", "bad"
         _signin_ok(source)
         return sessions.create(user, label=sessions.describe_agent(agent)), ""
+
+    # --- first run: creating the very first account ---------------------------
+    # Reachable ONLY while there are no accounts. Once one exists these 404, so a
+    # stale /setup bookmark cannot become a second way in.
+    def _first_run_open() -> bool:
+        from rc_repro.services import users as usersvc
+        return app.state.first_run and not usersvc.any_users()
+
+    @app.get("/setup")
+    def setup_page():
+        if not _first_run_open():
+            return JSONResponse({"error": "not found", "kind": "NotFoundError"},
+                                status_code=404)
+        return HTMLResponse(signin_page.setup_page())
+
+    @app.get("/setup.js")
+    def setup_script():
+        """The one script served to an unauthenticated caller, and it is ~40 lines.
+
+        A key in the URL fragment can only be read by JavaScript -- that is the
+        property that keeps it out of every server log. app.js is not opened for
+        it: that file maps the whole API surface, and this needs two fields.
+        """
+        if not _first_run_open():
+            return JSONResponse({"error": "not found", "kind": "NotFoundError"},
+                                status_code=404)
+        return HTMLResponse(signin_page.SETUP_JS, media_type="application/javascript")
+
+    @app.post("/api/session/first-run")
+    def first_run(request: Request, body: dict = Body(...)):
+        """Exchange the first-run key for the first admin account, in one step.
+
+        Deliberately not two. A key-for-session exchange followed by an
+        account-creation call would mean a privileged session with no account
+        behind it existing in between, however briefly -- which is the anonymous
+        admin mode this whole design removes. Here the key is only ever spent
+        creating a named person.
+        """
+        from rc_repro.services import firstrun as frsvc
+        from rc_repro.services import users as usersvc
+        if not _first_run_open():
+            return JSONResponse({"error": "this server already has accounts",
+                                 "kind": "ConflictError"}, status_code=409)
+        source = _client(request)
+        if _signin_retry_after(source):
+            return JSONResponse({"error": "too many attempts from this address",
+                                 "kind": "Unauthorized"}, status_code=429)
+        if not frsvc.valid(str(body.get("key") or "")):
+            _signin_failed(source)
+            return JSONResponse(
+                {"error": "that setup link is wrong or has expired. Restart "
+                          "`rc-repro serve` for a fresh one.", "kind": "Unauthorized"},
+                status_code=401)
+        name = str(body.get("user") or "").strip().lower()
+        password = str(body.get("password") or "")
+        usersvc.require_valid_name(name)
+        usersvc.require_valid_password(password)
+        # Publish the identity BEFORE creating the account, so the `user-add` line
+        # services/users.py writes carries this actor and origin. Without it the
+        # very first line in a new box's log has no name against it -- which is
+        # exactly the gap the origin column exists to close.
+        auditsvc.set_actor(name)
+        auditsvc.set_origin("setup")
+        usersvc.add(name, password, role="admin")   # the first account must be one
+        frsvc.consume()
+        _signin_ok(source)
+        token = sessions.create(name, origin="setup",
+                                label=sessions.describe_agent(
+                                    request.headers.get("user-agent", "")))
+        auditsvc.audit(name, "first-run", "first account created",
+                       origin_="setup", outcome="ok")
+        resp = JSONResponse({"user": name, "role": "admin"})
+        _set_session_cookie(resp, token)
+        return resp
 
     @app.get("/signin")
     def signin_form(request: Request, e: str = "", next: str = "/"):
@@ -944,8 +1025,6 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
             # identity or the logs-open line below is written with no actor.
             auditsvc.set_actor(sess.user)
             auditsvc.set_origin("session")
-        elif token and ws.query_params.get("t") != token:
-            await ws.close(code=1008); return
         await ws.accept()
         try:
             target = lc.resolve_name(name)

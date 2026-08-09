@@ -2356,7 +2356,8 @@ def serve(
     bind: str = typer.Option("", "--bind", help="interface to bind (default: loopback, or the Docker bridge with --domain)"),
     allow_host: list[str] = typer.Option(None, "--allow-host", help="extra Host header to accept, e.g. a reverse-proxy domain (repeatable; '*' = any host). Needed for iximiuz/Codespaces/remote access"),
     no_open: bool = typer.Option(False, "--no-open", help="don't open a browser"),
-    no_token: bool = typer.Option(False, "--no-token", help="disable the session token (loopback dev / trusted proxy only)"),
+    no_token: bool = typer.Option(False, "--no-token", hidden=True,
+                                  help="deprecated no-op: there is no session token any more"),
     print_service: bool = typer.Option(False, "--print-service", help="print how to keep this running (systemd unit, or nohup) and exit — writes nothing"),
     insecure: bool = typer.Option(False, "--insecure", help="serve the named-user login over plain http — when TLS terminates upstream (remote proxy/lab), or for local testing"),
 ) -> None:
@@ -2382,16 +2383,17 @@ def serve(
         from rc_repro.web.app import create_app
     except ImportError:
         _err("the web GUI needs extra deps — install them with: pip install 'rc-repro[gui]'")
-    import secrets
     import webbrowser
 
     from rc_repro import tls as tlsmod
     from rc_repro.services import edge as edgesvc
     from rc_repro.services import users as usersvc
 
+    from rc_repro.services import firstrun as frsvc
+
     allow = list(allow_host or [])
-    # Accounts win when they exist: an install that has never run `users add`
-    # keeps today's token behaviour exactly.
+    # Posture is decided by the BIND, not by whether <home>/users happens to be
+    # empty. Security should not be a side effect of a file's contents.
     basic = usersvc.any_users()
 
     door: "edgesvc.Edge | None" = None
@@ -2447,28 +2449,35 @@ def serve(
         bind = "127.0.0.1"
 
     loopback = bind in ("127.0.0.1", "localhost", "::1")
-    token = "" if (no_token or basic) else secrets.token_urlsafe(16)
+    # No accounts? Two cases, and only one of them starts.
+    #
+    # A session token in the URL is gone: it was a standing credential with no
+    # identity behind it, regenerated on every restart, landing in shell history
+    # and screenshots -- and it made `audit.log` record `-` for every action, in
+    # the mode that shipped by default.
+    setup_key = ""
+    if not basic:
+        if loopback and not domain:
+            # A fresh key per start. The design proposed reporting an outstanding
+            # one instead, which cannot be done: only its sha256 is stored, on
+            # purpose, so it cannot be reprinted. Minting again is the honest
+            # version -- the URL just printed is always the one that works.
+            setup_key = frsvc.mint()
+        else:
+            _err("refusing to start: this will be reachable from the network and "
+                 "has no accounts.\n"
+                 "  Create the first one, then start it again:\n"
+                 "    rc-repro users add <name>\n"
+                 "  (On a loopback bind rc-repro prints a one-time setup link "
+                 "instead. A bootstrap\n"
+                 "  credential reachable from the network is not something it "
+                 "will hand out.)")
 
     # --domain means rc-repro is arranging TLS itself, through its own front door.
     # It therefore KNOWS the browser hop is https and the plain-http last hop is
     # container-to-host on the bridge -- so the refusal below would be refusing
     # its own most secure configuration.
     tls_upstream = bool(domain) or insecure
-
-    if not basic and not token and not loopback and not insecure:
-        # --no-token on a reachable interface is NO authentication at all, on a
-        # control plane that creates and deletes containers and volumes, mints
-        # admin tokens and proxies arbitrary REST calls. That was a warning, while
-        # the far milder case below (a password, merely unencrypted) was refused --
-        # backwards. --insecure is the same "I know, this hop is protected" opt-in
-        # used there, so an ephemeral lab still works with one flag.
-        _err("--no-token on " + bind + " serves docker control with NO "
-             "authentication.\n"
-             "  Give people accounts instead — they survive restarts and record "
-             "who acted:\n"
-             "    rc-repro users add <name>\n"
-             "  Ephemeral lab, and you mean it? Say so:\n"
-             "    add --insecure to the command you just ran")
 
     if basic and not loopback and not tls_upstream:
         # Basic Auth puts the password on the wire with EVERY request, so a plain
@@ -2525,8 +2534,7 @@ def serve(
             parts += ["--port", str(port)]
         for h in (allow_host or []):     # not `allow`: --domain re-adds itself
             parts += ["--allow-host", h]
-        if no_token:
-            parts.append("--no-token")
+
         parts.append("--no-open")        # no browser to open from a service
         cmdline = " ".join(shlex.quote(p) for p in parts)
 
@@ -2543,9 +2551,8 @@ def serve(
         typer.echo("# It will NOT restart on crash, NOT come back after a reboot,")
         typer.echo("# NOT rotate that log, and there is no `status` to ask.")
         if not basic:
-            typer.echo("\n# Note: no accounts exist, so this would serve with a session")
-            typer.echo("# token that changes on every restart — which defeats the point")
-            typer.echo("# of running it as a service. `rc-repro users add <name>` first.")
+            typer.echo("\n# Note: no accounts exist, so this would refuse to start on a")
+            typer.echo("# reachable interface. `rc-repro users add <name>` first.")
         raise typer.Exit(0)
 
     if door:
@@ -2557,13 +2564,13 @@ def serve(
                  + (f" — {holder} is holding :443.\n" if holder else ".\n")
                  + f"  Its compose project is `{edgesvc.PROJECT}` in "
                  f"{edgesvc.edge_dir()}; `rc-repro edge status` reports it.")
-        # The token goes in THIS url too. Without it the page loaded and then
-        # every API call answered "bad or missing token", because the guard only
-        # covers /api/ -- so the GUI rendered an empty shell with an error and no
-        # hint that a token existed at all, let alone what it was.
-        url = f"https://{domain}/" + (f"?t={token}" if token else "")
+        url = f"https://{domain}/"
+    elif setup_key:
+        # The key rides in the FRAGMENT: a fragment is never sent to the server,
+        # so it cannot land in an access log, a proxy log or a Referer header.
+        url = f"http://localhost:{port}/setup#k={setup_key}"
     else:
-        url = f"http://localhost:{port}/" + (f"?t={token}" if token else "")
+        url = f"http://localhost:{port}/"
     typer.secho(f"rc-repro GUI: {url}", bold=True)
     if door:
         if door.wildcard:
@@ -2590,18 +2597,19 @@ def serve(
             ui.warn(f"  ⚠ admin by default (blank role): {', '.join(implicit)}")
             ui.hint(f"    narrow one with: rc-repro users role {implicit[0]} member")
         ui.hint("  every action is recorded against the account that took it.")
-    elif token:
-        ui.hint("  (the ?t=... token authorizes this browser session)")
-        ui.hint("  sharing this with a team? `rc-repro users add <name>` gives each "
-                "person a login that survives restarts.")
-        if not loopback or allow:
-            ui.hint(f"  via a proxy? open the proxy URL with the token appended: ...<proxy-url>/?t={token}")
+    elif setup_key:
+        ui.hint("  this link creates the first account. It is single-use and "
+                "expires in 15 minutes.")
+        ui.hint("  the part after # never reaches the server, so it cannot appear "
+                "in a log.")
+        ui.hint("  prefer a terminal? `rc-repro users add <name>`, then start this "
+                "again.")
     # public_https is a server-side FACT, not a guess from a header: with --domain
     # rc-repro arranged the TLS itself, so it knows the browser hop is https even
     # though the request reaches uvicorn as plain http over the docker bridge. It
     # decides the session cookie's Secure flag and __Host- prefix.
-    app_obj = create_app(token=token, allow_hosts=allow, accounts=basic,
-                         public_https=bool(domain))
+    app_obj = create_app(allow_hosts=allow, accounts=True,
+                         public_https=bool(domain), first_run=bool(setup_key))
     if not no_open and loopback:
         try:
             webbrowser.open(url)

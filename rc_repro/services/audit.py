@@ -55,11 +55,17 @@ def audit_path():
 #:   local     the CLI, where os.getlogin() matched a known account.
 #:   asserted  the CLI with RC_REPRO_USER set. Taken at face value -- cli.py:132
 #:             honours it even for an unknown name, so this is a CLAIM.
+#:   setup     the one-time first-run key, spent creating the first account.
 #:   system    rc-repro acting on its own behalf (rotation, startup).
 #:
 #: A log that cannot say which of its lines are trustworthy is not much better
 #: than one with no names at all.
-ORIGINS = ("session", "local", "asserted", "system")
+#:
+#: set_origin() silently ignores anything not in this tuple, so a value missing
+#: from it does not raise -- it just writes "-" and looks like a legacy line.
+#: `setup` was omitted at first and did exactly that, on the first two lines of
+#: every new install.
+ORIGINS = ("session", "local", "asserted", "setup", "system")
 
 #: Who is making the current request, and HOW that was established. Set by the
 #: web guard per request and by the CLI at startup, beside CURRENT_ACTOR.

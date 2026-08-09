@@ -1,5 +1,4 @@
 "use strict";
-const TOKEN = new URLSearchParams(location.search).get("t") || "";
 const $ = (sel) => document.querySelector(sel);
 const el = (tag, attrs = {}, ...kids) => {
   const n = document.createElement(tag);
@@ -51,8 +50,8 @@ let MY_ROLE = "";
 // enforced in `guard` regardless -- but a button that always answers with a red
 // toast reads as a broken feature, not as a permission.
 // Token mode has no roles, so everything is allowed there exactly as before.
-const canWrite = () => !ACCOUNTS || MY_ROLE !== "readonly";
-const canAdmin = () => !ACCOUNTS || MY_ROLE === "admin";
+const canWrite = () => MY_ROLE !== "readonly";
+const canAdmin = () => MY_ROLE === "admin";
 const READONLY_WHY = "Your role is readonly. Workspace logs carry LDAP bind "
   + "passwords and OAuth secrets, so readonly cannot read them either.";
 let SIGNING_OUT = false;
@@ -71,13 +70,12 @@ function toSignIn(reason) {
 
 async function api(path, opts = {}) {
   const headers = Object.assign({}, opts.headers || {});
-  if (TOKEN) headers["X-RC-Repro-Token"] = TOKEN;
   if (opts.body) headers["Content-Type"] = "application/json";
   // same-origin credentials so the session cookie rides along; it is HttpOnly,
   // so this file can neither read nor forge it.
   const r = await fetch(path, Object.assign({ credentials: "same-origin" }, opts, { headers }));
   const data = await r.json().catch(() => ({}));
-  if (r.status === 401 && ACCOUNTS) { toSignIn("expired"); throw new Error("signed out"); }
+  if (r.status === 401) { toSignIn("expired"); throw new Error("signed out"); }
   if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
   return data;
 }
@@ -926,8 +924,9 @@ function renderLogs(body, d) {
   body.append(ctl, box);
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const q = (TOKEN ? `t=${encodeURIComponent(TOKEN)}&` : "") + "tail=300";   // the cookie carries the session; ?t= only exists for token mode
-  const ws = new WebSocket(`${proto}://${location.host}/api/repros/${d.name}/logs/stream?${q}`);
+  // No credential in the URL any more: the session cookie rides along on the
+  // upgrade automatically, which is the only reason ?t= ever existed here.
+  const ws = new WebSocket(`${proto}://${location.host}/api/repros/${d.name}/logs/stream?tail=300`);
   dstate.logsWS = ws;
   ws.onmessage = (m) => {
     const e = parseLogLine(m.data);
@@ -1140,7 +1139,7 @@ async function previewImport() {
   let plan;
   try {
     const r = await fetch(`/api/repros/${IMPORT_TARGET}/config-import/plan`, {
-      method: "POST", headers: { "X-RC-Repro-Token": TOKEN }, body: fd });
+      method: "POST", credentials: "same-origin", body: fd });
     plan = await r.json();
     if (!r.ok) throw new Error(plan.error || `HTTP ${r.status}`);
   } catch (e) { toast(e.message); return; }
@@ -1232,7 +1231,7 @@ function connectJob(job) {
   // `since` resumes from the last event we saw, so a reconnect cannot duplicate
   // or skip lines. The server has always accepted it; nothing used to send it.
   const es = new EventSource(
-    `/api/jobs/${job.id}/stream?since=${job.idx}` + (TOKEN ? `&t=${encodeURIComponent(TOKEN)}` : ""));
+    `/api/jobs/${job.id}/stream?since=${job.idx}`);
   job.es = es;
   es.onmessage = (m) => {
     if (JOB !== job) { es.close(); return; }      // superseded — do not write here
