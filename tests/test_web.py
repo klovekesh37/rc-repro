@@ -1183,7 +1183,7 @@ def test_health_says_nothing_about_identity(anon_client):
 def test_who_am_i_is_answerable_without_being_signed_in(anon_client):
     """So the page can tell "signed out" from "this server has no accounts"."""
     me = anon_client.get("/api/session", headers={"Host": "localhost"}).json()
-    assert me == {"user": "", "accounts": True}
+    assert me == {"user": "", "role": "", "accounts": True}
 
 
 # --- CSRF (F2) ------------------------------------------------------------------
@@ -1426,3 +1426,142 @@ def test_edge_endpoint_says_so_when_there_is_none(basic_client):
     body = basic_client.get("/api/edge",
                             headers=_auth("alice", "correct-horse-battery")).json()
     assert body["installed"] is False and body["routes"] == []
+
+
+# --- roles (M10) ------------------------------------------------------------------
+# The role column has been parsed, displayed and enforced NOWHERE since it was
+# added. These lock in what it now means.
+
+def _as(client, name, password):
+    """Sign `client` in as somebody else, replacing whatever session it holds."""
+    client.cookies.clear()
+    r = client.post("/signin", data={"user": name, "password": password},
+                    follow_redirects=False)
+    assert r.status_code == 303, r.text
+    return client
+
+
+def test_every_api_route_declares_a_minimum_role():
+    """DEFAULT DENY covers the runtime; this covers the reviewer.
+
+    An endpoint shipping unguarded is structurally the same mistake as the audit
+    gap -- added in one place, not registered in the other -- so it fails the
+    build rather than waiting to be noticed.
+    """
+    from rc_repro.web import app as webapp
+    app = create_app(accounts=True)
+    missing = []
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        if not (path.startswith("/api/") or path in ("/signin", "/signout")):
+            continue
+        methods = sorted(getattr(route, "methods", None) or ["WS"])
+        for m in methods:
+            if m in ("HEAD", "OPTIONS"):
+                continue
+            if webapp.route_requirement(m, path) is None:
+                missing.append(f"{m} {path}")
+    assert not missing, ("these routes declare no minimum role, so they are "
+                         f"refused at runtime: {missing}")
+
+
+def test_a_readonly_user_may_look_but_not_touch(basic_client, monkeypatch):
+    from rc_repro.services import users as usersvc
+    monkeypatch.setattr(lc, "list_repros", lambda: [])
+    usersvc.add("ronly", "read-only-password", role="readonly")
+    _as(basic_client, "ronly", "read-only-password")
+
+    assert basic_client.get("/api/repros", headers=_auth()).status_code == 200
+    assert basic_client.get("/api/doctor", headers=_auth()).status_code == 200
+    for path in ("/api/repros/x/state", "/api/repros/x/seed", "/api/repros/x/pat"):
+        r = basic_client.post(path, json={}, headers=_auth())
+        assert r.status_code == 403, f"{path} -> {r.status_code}"
+    assert basic_client.delete("/api/repros/x?volumes=true", headers=_auth()).status_code == 403
+
+
+def test_a_readonly_user_cannot_read_logs_or_env(basic_client, monkeypatch):
+    """Not an oversight. A workspace log carries LDAP bind passwords and OAuth
+    client secrets, so "read-only" cannot mean "may read those"."""
+    from rc_repro.services import users as usersvc
+    usersvc.add("ronly", "read-only-password", role="readonly")
+    _as(basic_client, "ronly", "read-only-password")
+    assert basic_client.get("/api/repros/x/logs", headers=_auth()).status_code == 403
+    assert basic_client.get("/api/repros/x/env", headers=_auth()).status_code == 403
+
+
+def test_a_member_cannot_manage_people(basic_client, monkeypatch):
+    from rc_repro.services import users as usersvc
+    usersvc.add("bob", "bobs-good-password", role="member")
+    _as(basic_client, "bob", "bobs-good-password")
+    assert basic_client.get("/api/users", headers=_auth()).status_code == 403
+    assert basic_client.post("/api/users", json={"name": "eve"},
+                             headers=_auth()).status_code == 403
+    # ...but may still change their OWN password
+    r = basic_client.post("/api/me/password", headers=_auth(),
+                          json={"old": "bobs-good-password", "new": "another-good-one"})
+    assert r.status_code == 200
+
+
+def test_an_admin_creates_an_account_and_the_server_mints_the_password(basic_client):
+    """An admin who TYPES a colleague's password also knows it, which makes every
+    audit line signed with that name deniable."""
+    r = basic_client.post("/api/users", json={"name": "carol", "role": "member"},
+                          headers=_auth())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["role"] == "member" and len(body["password"]) >= 12
+    # and it works
+    _as(basic_client, "carol", body["password"])
+    assert basic_client.get("/api/session", headers=_auth()).json()["user"] == "carol"
+
+
+def test_the_last_admin_is_protected_through_the_api(basic_client):
+    r = basic_client.post("/api/users/alice/role", json={"role": "member"},
+                          headers=_auth())
+    assert r.status_code == 409 and "only admin" in r.json()["error"]
+    assert basic_client.delete("/api/users/alice", headers=_auth()).status_code == 409
+
+
+def test_a_blank_role_resolves_to_admin_over_http(basic_client):
+    """The upgrade path: every account created before roles existed has a blank
+    column. If blank did not mean admin, an install whose only account predates
+    this would have zero admins and no way to make one."""
+    from rc_repro.services import users as usersvc
+    # A line written the way a version before roles did it: no role column.
+    stored = usersvc._read()
+    stored["legacy"] = (usersvc.hash_password("legacy-password-here"), "2026-01-01", "")
+    usersvc._write(stored)
+    rows = basic_client.get("/api/users", headers=_auth()).json()
+    legacy = next(u for u in rows["users"] if u["name"] == "legacy")
+    assert legacy["role"] == "admin" and legacy["implicit"] is True
+    assert rows["implicit_admins"] == ["legacy"]
+
+
+def test_changing_a_role_ends_that_users_sessions(basic_client):
+    from rc_repro.services import sessions as sessionsvc
+    from rc_repro.services import users as usersvc
+    usersvc.add("bob", "bobs-good-password", role="member")
+    token = sessionsvc.create("bob")
+    assert sessionsvc.verify(token) is not None
+    basic_client.post("/api/users/bob/role", json={"role": "readonly"}, headers=_auth())
+    assert sessionsvc.verify(token) is None, "a demotion must reach a live session"
+
+
+def test_only_an_admin_may_choose_the_image_or_the_interface(basic_client, monkeypatch):
+    """`rc_image` runs an arbitrary container as the serve user and `bind` can
+    publish a workspace with fixed admin/admin123 credentials to the network.
+    Those decide what code runs and where it listens, which is not the same
+    question as "make me a workspace"."""
+    from rc_repro.services import users as usersvc
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    usersvc.add("bob", "bobs-good-password", role="member")
+    _as(basic_client, "bob", "bobs-good-password")
+    for field, value in (("rc_image", "evil/image"), ("bind", "0.0.0.0"),
+                         ("reg_token", "x"), ("port", 3999)):
+        r = basic_client.post("/api/repros", headers=_auth(),
+                              json={"version": "8.5.1", field: value})
+        assert r.status_code == 400, f"{field} -> {r.status_code}"
+        assert "admin" in r.json()["error"]
+    # the ordinary body still works for a member
+    assert basic_client.post("/api/repros", headers=_auth(),
+                             json={"version": "8.5.1"}).status_code == 200

@@ -45,6 +45,7 @@ function localUrl(u) {
 // Set once the server says a login is in force. Until then every 401 is a token
 // problem, not an expired session, and bouncing to /signin would be wrong.
 let ACCOUNTS = false;
+let MY_ROLE = "";
 let SIGNING_OUT = false;
 
 // A session can expire mid-session (12h idle / 7d absolute) or be revoked from
@@ -110,9 +111,11 @@ async function loadRepros() {
       const me = await api("/api/session");
       ACCOUNTS = !!me.accounts;
       ME = me.user || "";
+      MY_ROLE = me.role || "";
     } catch (_) { /* signed out; api() has already redirected */ }
     const who = $("#whoami");
-    who.textContent = ME; who.hidden = !ME;
+    who.textContent = ME + (MY_ROLE && MY_ROLE !== "admin" ? ` · ${MY_ROLE}` : "");
+    who.hidden = !ME;
     const dockerTxt = "docker: " + (health.docker ? "up" : "down");
     const badge = $("#docker-badge");
     badge.textContent = dockerTxt; badge.className = "chip " + (health.docker ? "up" : "down");
@@ -1813,7 +1816,10 @@ const fmtWhen = (epoch) => {
 };
 
 async function openSessions() {
-  $("#session-title").textContent = `Signed in as ${ME}`;
+  $("#session-title").textContent = `Signed in as ${ME}` + (MY_ROLE ? ` · ${MY_ROLE}` : "");
+  // People lives behind the account menu rather than in the top bar: it is an
+  // admin-only, rarely-used screen, and the top bar is for the work.
+  $("#session-people").hidden = MY_ROLE !== "admin";
   const body = $("#session-body");
   body.innerHTML = "";
   body.append(el("p", { class: "empty" }, "loading…"));
@@ -1859,7 +1865,104 @@ function signOut(everywhere) {
     .finally(() => location.assign("/signin?e=signedout"));
 }
 
+// ---- people (admin only) -----------------------------------------------------
+// The whole dialog is admin-only; a member gets 403 from every endpoint behind it,
+// so the entry point is simply not rendered rather than rendered-and-refused.
+const ROLE_HELP = {
+  admin: "everything, including managing people",
+  member: "full workspace lifecycle — today's behaviour",
+  readonly: "look only. No logs, env or tokens: those carry real secrets",
+};
+
+async function openPeople() {
+  const body = $("#people-body");
+  body.innerHTML = "";
+  body.append(el("p", { class: "empty" }, "loading…"));
+  $("#people-dialog").showModal();
+  let data;
+  try { data = await api("/api/users"); }
+  catch (e) { body.innerHTML = ""; body.append(el("p", { class: "empty" }, e.message)); return; }
+  body.innerHTML = "";
+  for (const u of data.users) {
+    const row = el("div", { class: "jobrow" });
+    row.append(el("span", { class: "jstatus " + (u.role === "admin" ? "done" : "queued") }, u.role));
+    const label = el("span", { class: "jkind" }, u.name === ME ? `${u.name} (you)` : u.name);
+    // Blank role == admin is the MIGRATION for accounts made before roles existed,
+    // not a default. Saying so here is what stops it looking like a mistake.
+    if (u.implicit) label.append(el("span", { class: "yours", title: "role column is blank, which means admin" }, " implicit"));
+    row.append(label);
+    row.append(el("span", { class: "jage" },
+      u.sessions ? `${u.sessions} session${u.sessions === 1 ? "" : "s"}` : "—"));
+    const sel = el("select", { class: "input", "aria-label": `role for ${u.name}`,
+      onchange: (e) => changeRole(u.name, e.target.value) },
+      ...data.roles.map((r) => el("option", { value: r, title: ROLE_HELP[r] || "" }, r)));
+    sel.value = u.role;
+    row.append(sel);
+    row.append(el("button", { class: "btn small", title: "Generate a new password",
+      onclick: () => resetPassword(u.name) }, "reset"));
+    row.append(el("button", { class: "btn small danger",
+      onclick: () => removePerson(u.name) }, "remove"));
+    body.append(row);
+  }
+}
+
+// The password exists in exactly one place for exactly one moment: here.
+function showOnce(title, name, password) {
+  $("#pat-title").textContent = title;
+  $("#pat-body").textContent =
+    `${name}\n\nPassword: ${password}\n\n`
+    + "Shown once. rc-repro stores only a scrypt hash, so nobody — including you —\n"
+    + "can read it back. Send it however you would send anything else, and have\n"
+    + "them change it after signing in.";
+  PAT_HEADERS = password;      // so "Copy headers" copies the password
+  $("#pat-dialog").showModal();
+}
+
+async function addPerson() {
+  const name = $("#new-user").value.trim();
+  if (!name) { toast("enter a name"); return; }
+  try {
+    const r = await api("/api/users", { method: "POST",
+      body: JSON.stringify({ name, role: $("#new-role").value }) });
+    $("#new-user").value = "";
+    openPeople();
+    showOnce(`Account created: ${r.name}`, `${r.name} · ${r.role}`, r.password);
+  } catch (e) { toast(e.message); }
+}
+
+async function changeRole(name, role) {
+  try {
+    const r = await api(`/api/users/${encodeURIComponent(name)}/role`,
+      { method: "POST", body: JSON.stringify({ role }) });
+    toast(`${name} is now ${r.role}` + (r.sessions_ended ? ` (${r.sessions_ended} session(s) ended)` : ""), "ok");
+    openPeople();
+    if (name === ME) location.reload();     // your own menu just changed
+  } catch (e) { toast(e.message); openPeople(); }
+}
+
+async function resetPassword(name) {
+  if (!confirm(`Reset ${name}'s password?\n\nTheir current one stops working and every session they have ends.`)) return;
+  try {
+    const r = await api(`/api/users/${encodeURIComponent(name)}/password`, { method: "POST" });
+    openPeople();
+    showOnce(`Password reset: ${name}`, name, r.password);
+  } catch (e) { toast(e.message); }
+}
+
+async function removePerson(name) {
+  if (!confirm(`Remove ${name}?\n\nThey are signed out immediately and can no longer sign in.\nTheir workspaces are left alone.`)) return;
+  try {
+    await api(`/api/users/${encodeURIComponent(name)}`, { method: "DELETE" });
+    toast(`${name} removed`, "ok"); openPeople();
+  } catch (e) { toast(e.message); }
+}
+
 // ---- wiring -----------------------------------------------------------------
+$("#session-people").addEventListener("click", () => {
+  $("#session-dialog").close(); openPeople();
+});
+$("#people-close").addEventListener("click", () => $("#people-dialog").close());
+$("#people-add-btn").addEventListener("click", addPerson);
 $("#whoami").addEventListener("click", openSessions);
 $("#session-close").addEventListener("click", () => $("#session-dialog").close());
 $("#session-out").addEventListener("click", () => signOut(false));

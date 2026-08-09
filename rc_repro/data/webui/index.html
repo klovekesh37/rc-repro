@@ -371,6 +371,29 @@
     <menu><button type="button" id="jobs-close" class="btn">Close</button></menu>
   </dialog>
 
+  <!-- People: who may sign in, and what they may do. Admin only -- a member
+       gets a 403 from every endpoint behind it, so the button is not rendered. -->
+  <dialog id="people-dialog">
+    <h2>People</h2>
+    <p class="hint">Everyone here can sign in to this server. Roles bound the
+      <b>GUI</b> only — anyone with a shell on this box is already in the docker
+      group, so a readonly user with an ssh key is not readonly.</p>
+    <div id="people-body" class="plan"></div>
+    <div class="row2" id="people-add">
+      <input id="new-user" class="input" placeholder="name" aria-label="new user name">
+      <select id="new-role" class="input" aria-label="role">
+        <option value="member">member</option>
+        <option value="readonly">readonly</option>
+        <option value="admin">admin</option>
+      </select>
+      <button id="people-add-btn" class="btn primary" type="button">Add person</button>
+    </div>
+    <p class="hint">rc-repro generates the password and shows it once — an admin
+      who types a colleague's password also knows it, which makes every audit line
+      signed with that name deniable.</p>
+    <menu><button type="button" id="people-close" class="btn">Close</button></menu>
+  </dialog>
+
   <!-- Your account: the sessions you have open, and the way out. Server-side
        sessions are what make "sign out" and "sign out everywhere" possible at
        all -- HTTP Basic had neither. -->
@@ -381,6 +404,7 @@
     <div id="session-body" class="plan"></div>
     <menu>
       <button type="button" id="session-close" class="btn">Close</button>
+      <button type="button" id="session-people" class="btn" hidden>People…</button>
       <button type="button" id="session-all" class="btn danger">Sign out everywhere</button>
       <button type="button" id="session-out" class="btn primary">Sign out</button>
     </menu>

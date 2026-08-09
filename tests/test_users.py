@@ -27,6 +27,15 @@ def _fresh(tmp_path, monkeypatch):
 GOOD = "correct-horse-battery"
 
 
+def _legacy_account(name: str, password: str = GOOD) -> None:
+    """Write an account line the way a version BEFORE roles existed did: no role
+    column at all. `users.add()` cannot produce this any more, and the whole point
+    of the blank-means-admin rule is what happens to these."""
+    rows = users._read()
+    rows[name] = (users.hash_password(password), "2026-01-01", "")
+    users._write(rows)
+
+
 # --- the file -------------------------------------------------------------------
 
 def test_a_new_install_has_no_users():
@@ -56,7 +65,7 @@ def test_the_created_date_does_not_collide_with_the_field_delimiter():
     users.add("alice", GOOD)
     (only,) = users.list_users()
     assert ":" not in only.created_at
-    assert only.role == "", "the role column must not have been filled by the date"
+    assert only.role == "admin", "the first account, not a date fragment"
     assert len(only.created_at) == 10   # YYYY-MM-DD
 
 
@@ -78,9 +87,9 @@ def test_a_malformed_line_is_skipped_not_fatal():
 def test_a_role_column_round_trips():
     """Reserved for a later readonly/admin tier; must survive a rewrite."""
     users.add("alice", GOOD, role="readonly")
-    users.add("bob", GOOD)
+    users.add("bob", GOOD, role="admin")
     by_name = {u.name: u.role for u in users.list_users()}
-    assert by_name == {"alice": "readonly", "bob": ""}
+    assert by_name == {"alice": "readonly", "bob": "admin"}
 
 
 # --- validation -------------------------------------------------------------------
@@ -143,9 +152,62 @@ def test_changing_a_password_invalidates_the_old_one_immediately():
 
 def test_removing_a_user_takes_effect_at_once():
     users.add("alice", GOOD)
+    users.add("bob", GOOD, role="admin")      # so alice is not the last admin
     assert users.verify("alice", GOOD) is True
     users.remove("alice")
     assert users.verify("alice", GOOD) is False
+
+
+# --- roles ------------------------------------------------------------------------
+
+def test_a_blank_role_column_means_admin():
+    """Not a default -- the migration. Every account made before roles existed has
+    a blank column, and users.py has always documented it as full access. Reading
+    blank as anything narrower would silently demote everyone, and on a box whose
+    only account predates this it would leave ZERO admins and no way to make one
+    from the GUI."""
+    _legacy_account("alice")
+    (only,) = users.list_users()
+    assert only.role == "", "the column itself stays blank"
+    assert users.role_of("alice") == "admin", "but it RESOLVES to admin"
+    assert users.implicit_admins() == ["alice"]
+    assert users.admins() == ["alice"]
+
+
+def test_roles_round_trip_and_are_validated():
+    _legacy_account("alice")
+    users.add("bob", GOOD, role="readonly")
+    assert users.role_of("bob") == "readonly"
+    users.set_role("bob", "member")
+    assert users.role_of("bob") == "member"
+    assert users.implicit_admins() == ["alice"], "bob is explicit now, alice is not"
+    for bad in ("root", "", "superuser", "admin;member"):
+        with pytest.raises(errors.ValidationError):
+            users.set_role("bob", bad)
+    # Case and surrounding whitespace are tolerated and normalised -- these arrive
+    # from a CLI argument and a JSON body, and rejecting " Admin" would be pedantry.
+    users.set_role("bob", "  ReadOnly ")
+    assert users.role_of("bob") == "readonly"
+
+
+def test_the_last_admin_cannot_be_demoted_or_removed():
+    """A box with no admins cannot make one from the GUI, and the repair is hand-
+    editing a file most people would not know to look for."""
+    users.add("alice", GOOD)                  # first account -> admin
+    users.add("bob", GOOD, role="member")
+    with pytest.raises(errors.ConflictError, match="only admin"):
+        users.set_role("alice", "member")
+    with pytest.raises(errors.ConflictError, match="only admin"):
+        users.remove("alice")
+    # With a second admin, both become allowed.
+    users.set_role("bob", "admin")
+    users.set_role("alice", "member")
+    assert users.admins() == ["bob"]
+
+
+def test_role_of_an_unknown_user_is_empty_not_admin():
+    """The blank-means-admin rule must not apply to somebody who does not exist."""
+    assert users.role_of("ghost") == ""
 
 
 def test_repeated_failures_earn_a_backoff():
@@ -272,3 +334,15 @@ def test_a_changed_password_invalidates_the_old_one_immediately(tmp_path, monkey
         "alice", (usersvc.hash_password("brand-new-password"), "2026-01-01", "")))
     assert usersvc.verify("alice", "correct-horse-battery") is False
     assert usersvc.verify("alice", "brand-new-password") is True
+
+
+def test_a_new_account_never_becomes_an_implicit_admin():
+    """Blank-means-admin is the MIGRATION for accounts that predate roles. If it
+    were also the behaviour for new ones, `rc-repro users add bob` would silently
+    hand bob the ability to delete everybody's data."""
+    first = users.add("alice", GOOD)
+    assert first.role == "admin", "the first account must be able to promote others"
+    second = users.add("bob", GOOD)
+    assert second.role == "member"
+    assert users.implicit_admins() == [], "neither line has a blank role column"
+    assert users.role_of("bob") == "member"

@@ -143,6 +143,79 @@ def _write(users: dict[str, tuple[str, str, str]]) -> None:
         Path(tmp).unlink(missing_ok=True)
 
 
+#: The three tiers, widest first. `admin` manages people; `member` is today's
+#: behaviour and the default for a new account; `readonly` may look but not touch,
+#: and specifically may NOT read logs, env or mint tokens -- workspace logs carry
+#: LDAP bind passwords and OAuth client secrets, so "read-only" cannot mean "may
+#: read those".
+ROLES = ("admin", "member", "readonly")
+_RANK = {"admin": 3, "member": 2, "readonly": 1}
+
+#: A BLANK role column means admin, and that is not a default -- it is the
+#: migration. Every account created before roles existed has an empty column, and
+#: users.py has always documented it as `"" = full access`. Reading blank as
+#: anything narrower would silently demote every existing user, and on an install
+#: whose only account predates this change it would leave the box with NO admin
+#: and no way to make one from the GUI. `serve` names them at startup so the state
+#: is visible rather than merely harmless.
+IMPLICIT_ADMIN = "admin"
+
+
+def normalise_role(role: str) -> str:
+    """The effective role for a stored column value."""
+    role = (role or "").strip().lower()
+    return role if role in ROLES else IMPLICIT_ADMIN
+
+
+def at_least(role: str, needed: str) -> bool:
+    """Whether `role` satisfies a minimum of `needed`. Unknown -> False."""
+    return _RANK.get(role or "", 0) >= _RANK.get(needed or "", 99)
+
+
+def require_valid_role(role: str) -> None:
+    if (role or "").strip().lower() not in ROLES:
+        raise ValidationError(
+            f"unknown role {role!r} (want: {', '.join(ROLES)})")
+
+
+def role_of(name: str) -> str:
+    """The effective role of `name`, or "" if there is no such account.
+
+    Read live on every check rather than snapshotted into the session line: a
+    demotion that only takes effect at the user's next sign-in is a demotion that
+    has not happened, and the person you are demoting is the one least likely to
+    sign out.
+    """
+    stored = _read().get(name)
+    return normalise_role(stored[2]) if stored else ""
+
+
+def admins() -> list[str]:
+    return sorted(n for n, (_h, _c, r) in _read().items()
+                  if normalise_role(r) == "admin")
+
+
+def implicit_admins() -> list[str]:
+    """Accounts that are admin only because their role column is blank."""
+    return sorted(n for n, (_h, _c, r) in _read().items()
+                  if not (r or "").strip())
+
+
+def _require_not_last_admin(name: str, users: dict, what: str) -> None:
+    """Refuse to remove the last way back in.
+
+    Enforced here rather than in the web layer so `rc-repro users remove` obeys it
+    too -- a box with zero admins cannot make one from the GUI, and the repair is
+    hand-editing a file most people would not know to look for.
+    """
+    current = [n for n, (_h, _c, r) in users.items() if normalise_role(r) == "admin"]
+    if current == [name]:
+        raise ConflictError(
+            f"{name!r} is the only admin, so {what} would leave this server with "
+            "none and no way to make another from the GUI. Promote somebody first: "
+            "`rc-repro users role <name> admin`")
+
+
 def require_valid_name(name: str) -> None:
     if not _NAME_RE.match(name or ""):
         raise ValidationError(
@@ -170,9 +243,25 @@ def list_users() -> list[User]:
             for n, (_h, c, r) in sorted(_read().items())]
 
 
+def default_role_for_new_account() -> str:
+    """`admin` for the very first account, `member` for every one after it.
+
+    Blank-means-admin is the MIGRATION for accounts that predate roles; it must
+    not become the behaviour for new ones, or `rc-repro users add bob` silently
+    hands bob the ability to delete everybody's data. New accounts therefore
+    always get an EXPLICIT role written to their line.
+
+    The first one has to be admin, though: a box whose only account is a member
+    has nobody who can promote anyone, and no way to fix it from the GUI.
+    """
+    return "admin" if not _read() else "member"
+
+
 def add(name: str, password: str, *, role: str = "") -> User:
     require_valid_name(name)
     require_valid_password(password)
+    role = role or default_role_for_new_account()
+    require_valid_role(role)
     users = _read()
     if name in users:
         raise ConflictError(f"user {name!r} already exists "
@@ -200,8 +289,23 @@ def remove(name: str) -> None:
     users = _read()
     if name not in users:
         raise NotFoundError(f"no user {name!r} (see `rc-repro users list`)")
+    _require_not_last_admin(name, users, "removing them")
     del users[name]
     _write(users)
+
+
+def set_role(name: str, role: str) -> User:
+    """Change what `name` may do. Returns the updated user."""
+    require_valid_role(role)
+    users = _read()
+    if name not in users:
+        raise NotFoundError(f"no user {name!r} (see `rc-repro users list`)")
+    hashed, created, _old = users[name]
+    if normalise_role(role) != "admin":
+        _require_not_last_admin(name, users, f"making them {role}")
+    users[name] = (hashed, created, normalise_role(role))
+    _write(users)
+    return User(name=name, created_at=created, role=normalise_role(role))
 
 
 # --- verification ------------------------------------------------------------------

@@ -579,8 +579,9 @@ _CONFIG_KEYS: dict[str, str] = {
 
 @app.command(name="users")
 def users_cmd(
-    action: str = typer.Argument("list", help="list | add | passwd | remove"),
-    name: str = typer.Argument("", help="the user name, for add/passwd/remove"),
+    action: str = typer.Argument("list", help="list | add | passwd | remove | role"),
+    name: str = typer.Argument("", help="the user name, for add/passwd/remove/role"),
+    role: str = typer.Argument("", help="admin | member | readonly, for `role`"),
 ) -> None:
     """Manage who can sign in to the web GUI.
 
@@ -600,12 +601,36 @@ def users_cmd(
             ui.note("no users yet — add one with `rc-repro users add <name>`")
             ui.hint("  until then, `rc-repro serve` uses its one-time session token.")
             return
-        ui.panel("GUI users", [(u.name, u.created_at + (f"  [{u.role}]" if u.role else ""))
-                               for u in rows])
+        ui.panel("GUI users", [
+            (u.name, u.created_at + "  [" + usersvc.role_of(u.name)
+             + ("" if u.role else " (implicit)") + "]") for u in rows])
+        implicit = usersvc.implicit_admins()
+        if implicit:
+            ui.hint("  (implicit) = the role column is blank, which means admin. "
+                    "That is the\n  migration for accounts made before roles "
+                    "existed, not a default.")
+            ui.hint(f"  narrow one with: rc-repro users role {implicit[0]} member")
         return
 
     if not name:
         _err(f"`users {action}` needs a name, e.g. `rc-repro users {action} alice`")
+
+    if action == "role":
+        if not role:
+            _err(f"`users role {name}` needs a role "
+                 f"({' | '.join(usersvc.ROLES)})")
+        try:
+            u = usersvc.set_role(name, role)
+            ended = sessionsvc.revoke_user(name)
+        except errors.ReproError as exc:
+            _err(str(exc))
+        ui.ok(f"✓ {u.name!r} is now {u.role}.")
+        if ended:
+            ui.hint(f"  {ended} active session(s) signed out, so it takes effect now.")
+        ui.hint("  roles bound the GUI. The CLI has no roles: anyone with a shell "
+                "on this box\n  is already in the docker group. A readonly user "
+                "with an ssh key is not readonly.")
+        return
 
     if action == "remove":
         try:
@@ -632,7 +657,7 @@ def users_cmd(
             _err("the two passwords do not match")
         try:
             if action == "add":
-                usersvc.add(name, pw)
+                added = usersvc.add(name, pw)
             else:
                 usersvc.set_password(name, pw)
                 # Every session minted with the OLD password ends here. Without
@@ -645,11 +670,16 @@ def users_cmd(
         ui.ok(f"✓ user {name!r} {'added' if action == 'add' else 'password changed'}.")
         if action == "passwd" and ended:
             ui.hint(f"  {ended} active session(s) signed out.")
+        if action == "add":
+            ui.hint(f"  role: {added.role}" + (
+                "  (the first account has to be an admin, or nobody could promote "
+                "anyone)" if added.role == "admin"
+                else "  — change it with `rc-repro users role %s <role>`" % name))
         if action == "add" and len(usersvc.list_users()) == 1:
             ui.hint("  `rc-repro serve` will now ask for a login instead of using a token.")
         return
 
-    _err(f"unknown action {action!r} (want: list | add | passwd | remove)")
+    _err(f"unknown action {action!r} (want: list | add | passwd | remove | role)")
 
 
 @app.command(name="edge")
@@ -2482,8 +2512,16 @@ def serve(
         ui.hint(f"  workspaces published under this name: rc-repro up -v <X.Y.Z> "
                 f"--domain <ticket>.{domain}")
     if basic:
-        names = ", ".join(u.name for u in usersvc.list_users())
+        names = ", ".join(f"{u.name} ({usersvc.role_of(u.name)})"
+                          for u in usersvc.list_users())
         ui.hint(f"  sign in as: {names}")
+        implicit = usersvc.implicit_admins()
+        if implicit:
+            # Said out loud rather than left to be discovered: these accounts are
+            # admin because their role column is blank, which is the migration for
+            # everything created before roles existed.
+            ui.warn(f"  ⚠ admin by default (blank role): {', '.join(implicit)}")
+            ui.hint(f"    narrow one with: rc-repro users role {implicit[0]} member")
         ui.hint("  every action is recorded against the account that took it.")
     elif token:
         ui.hint("  (the ?t=... token authorizes this browser session)")

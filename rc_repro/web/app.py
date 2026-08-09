@@ -9,6 +9,7 @@ jobs.py) streamed to the browser over SSE.
 from __future__ import annotations
 
 import asyncio
+import secrets
 import sys
 from contextlib import asynccontextmanager
 import json
@@ -27,12 +28,14 @@ from fastapi import (Body, FastAPI, File, Form, Request, UploadFile, WebSocket,
 from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
                                StreamingResponse)
 from fastapi.staticfiles import StaticFiles
+from starlette.routing import Match
 
 from rc_repro import config
 from rc_repro import presets as presets_mod
 from rc_repro import runner
 from rc_repro.errors import NotReadyError, ReproError, ValidationError
 from rc_repro.services import data as datasvc
+from rc_repro.services import audit as auditsvc
 from rc_repro.services import lifecycle as lc
 from rc_repro.services import sessions
 from rc_repro.web import jobs as jobs_mod
@@ -73,6 +76,99 @@ def _signin_failed(source: str) -> None:
 def _signin_ok(source: str) -> None:
     with _signin_lock:
         _signin_fails.pop(source, None)
+
+
+# The minimum role for every route, by (method, route template). Three rules make
+# this the whole of the authorization story rather than a checklist that drifts:
+#
+#   * DEFAULT DENY. A route missing from this table is admin-only at runtime, and
+#     a test walks app.routes and fails the build if any /api/ route is unlisted.
+#     An endpoint shipping unguarded is structurally the same mistake as the audit
+#     gap -- something added in one place and not registered in the other.
+#   * It lives in the WEB layer, deliberately, not in the service layer. The CLI
+#     reaches the same service functions and `_cli_actor` honours RC_REPRO_USER as
+#     given (cli.py:132), so a service-layer check would make `RC_REPRO_USER=<any
+#     admin>` a one-word escalation -- a boundary that is not one.
+#   * Reads are readonly+, writes are member+, and people-management is admin.
+#     The exceptions are the reads that are not really reads: logs, the effective
+#     environment, a minted PAT and an arbitrary REST call all hand over
+#     credentials, so they are member+.
+#
+#   "" (empty) marks a route reachable with no session at all -- see `open_path`.
+_OPEN, _READ, _WRITE, _ADMIN = "", "readonly", "member", "admin"
+
+ROUTE_ROLES: dict[tuple[str, str], str] = {
+    # the login itself, and the uptime check
+    ("GET", "/signin"): _OPEN, ("POST", "/signin"): _OPEN,
+    ("POST", "/signout"): _OPEN,
+    ("GET", "/api/health"): _OPEN,
+    ("GET", "/api/session"): _OPEN, ("POST", "/api/session"): _OPEN,
+    ("DELETE", "/api/session"): _OPEN,
+    # your own sessions
+    ("GET", "/api/sessions"): _READ, ("DELETE", "/api/sessions"): _READ,
+    # looking
+    ("GET", "/api/repros"): _READ,
+    ("GET", "/api/repros/{name}"): _READ,
+    ("GET", "/api/repros/{name}/detail"): _READ,
+    ("GET", "/api/repros/{name}/stats"): _READ,
+    ("GET", "/api/repros/{name}/tls"): _READ,
+    ("GET", "/api/repros/{name}/upgrade"): _READ,
+    ("GET", "/api/jobs"): _READ,
+    ("GET", "/api/jobs/{job_id}"): _READ,
+    ("GET", "/api/jobs/{job_id}/stream"): _READ,
+    ("GET", "/api/backups"): _READ,
+    ("POST", "/api/backups/compatibility"): _READ,   # a question, not a change
+    ("GET", "/api/doctor"): _READ,
+    ("GET", "/api/edge"): _READ,
+    ("GET", "/api/presets"): _READ,
+    ("GET", "/api/settings"): _READ,
+    ("GET", "/api/versions/{version}"): _READ,
+    # reads that hand over credentials -- see the note above
+    ("GET", "/api/repros/{name}/logs"): _WRITE,
+    ("WS", "/api/repros/{name}/logs/stream"): _WRITE,
+    ("GET", "/api/repros/{name}/env"): _WRITE,
+    # changing a workspace
+    ("POST", "/api/repros"): _WRITE,
+    ("POST", "/api/repros/{name}/up"): _WRITE,
+    ("POST", "/api/repros/{name}/state"): _WRITE,
+    ("POST", "/api/repros/{name}/ready"): _WRITE,
+    ("POST", "/api/repros/{name}/seed"): _WRITE,
+    ("POST", "/api/repros/{name}/scale"): _WRITE,
+    ("DELETE", "/api/repros/{name}/scale"): _WRITE,
+    ("POST", "/api/repros/{name}/env"): _WRITE,
+    ("POST", "/api/repros/{name}/monitor"): _WRITE,
+    ("POST", "/api/repros/{name}/default"): _WRITE,
+    ("POST", "/api/repros/{name}/config-import"): _WRITE,
+    ("POST", "/api/repros/{name}/config-import/plan"): _WRITE,
+    ("POST", "/api/repros/{name}/backup"): _WRITE,
+    ("POST", "/api/repros/{name}/upgrade"): _WRITE,
+    ("POST", "/api/repros/{name}/upgrade/rollback"): _WRITE,
+    ("POST", "/api/repros/{name}/loadtest"): _WRITE,
+    ("POST", "/api/repros/{name}/capacity"): _WRITE,
+    ("POST", "/api/benchmark"): _WRITE,
+    ("POST", "/api/restore"): _WRITE,
+    ("POST", "/api/repros/{name}/pat"): _WRITE,
+    ("POST", "/api/repros/{name}/call"): _WRITE,
+    ("DELETE", "/api/repros/{name}"): _WRITE,   # ownership is checked in the handler
+    ("POST", "/api/prune"): _WRITE,
+    ("DELETE", "/api/backups"): _WRITE,
+    # people
+    ("GET", "/api/users"): _ADMIN,
+    ("POST", "/api/users"): _ADMIN,
+    ("DELETE", "/api/users/{name}"): _ADMIN,
+    ("POST", "/api/users/{name}/role"): _ADMIN,
+    ("POST", "/api/users/{name}/password"): _ADMIN,
+    ("POST", "/api/me/password"): _READ,        # your own, whoever you are
+}
+
+
+def route_requirement(method: str, template: str) -> str | None:
+    """The minimum role for a route, or None when it is not in the table.
+
+    None means DENY -- returned rather than defaulted so the caller can tell
+    "admin only" apart from "nobody registered this", and log the difference.
+    """
+    return ROUTE_ROLES.get((method.upper(), template))
 
 # `docker compose logs --tail N` is buffered in memory server-side, so a
 # caller-supplied N needs a ceiling.
@@ -278,6 +374,21 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
     def cookie_name() -> str:
         return COOKIE_SECURE if app.state.public_https else COOKIE_PLAIN
 
+    def _matched_template(scope) -> str:
+        """The route TEMPLATE this request will dispatch to, e.g.
+        "/api/repros/{name}".
+
+        Resolved by asking Starlette's own matcher rather than by keeping a second
+        regex table beside ROUTE_ROLES: two independent ways of deciding which
+        route a path belongs to is precisely the drift the table exists to stop.
+        Needed because middleware runs BEFORE the router, so scope["route"] does
+        not exist yet.
+        """
+        for route in app.router.routes:
+            if route.matches(scope)[0] is Match.FULL:
+                return getattr(route, "path", "")
+        return ""
+
     def _session_token(headers_cookies) -> str:
         return headers_cookies.get(cookie_name(), "")
 
@@ -334,10 +445,29 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
             #                      for a caller who is not
             #   /app.css           or the sign-in page is unstyled
             #   /api/health        so a monitor needs no credential
-            open_path = path in ("/signin", "/signout", "/api/session",
-                                 "/app.css", "/api/health")
+            template = _matched_template(request.scope)
+            need = route_requirement(request.method, template)
+            # `""` in the table means "reachable with no session". /app.css is
+            # open too, or the sign-in page is an unstyled wall of text.
+            open_path = need == _OPEN or path == "/app.css"
             sess = sessions.verify(request.cookies.get(cookie_name(), ""))
             actor = sess.user if sess else ""
+            if actor and path.startswith("/api/") and not open_path:
+                # DEFAULT DENY. `need is None` means the route is not in the
+                # table at all -- a new endpoint that nobody registered. Denying
+                # is the only safe reading, and the message says which case it is
+                # so it is a five-second fix rather than a mystery.
+                from rc_repro.services import users as usersvc
+                role = usersvc.role_of(actor)      # live, never from the session
+                if need is None:
+                    return JSONResponse(
+                        {"error": f"{request.method} {template} declares no minimum "
+                                  "role, so it is refused (see ROUTE_ROLES)",
+                         "kind": "Forbidden"}, status_code=403)
+                if not usersvc.at_least(role, need):
+                    return JSONResponse(
+                        {"error": f"this needs the {need!r} role; you are {role!r}",
+                         "kind": "Forbidden"}, status_code=403)
             if not open_path and not actor:
                 # An API caller gets a machine-readable 401 it can act on; a
                 # BROWSER gets sent to the page that fixes the problem, carrying
@@ -467,10 +597,12 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
     def session_whoami(request: Request):
         """Who am I. Replaces the `actor` field bolted onto /api/health, which
         only existed because there was nowhere else to ask."""
+        from rc_repro.services import users as usersvc
         sess = sessions.verify(request.cookies.get(cookie_name(), ""))
         if not sess:
-            return {"user": "", "accounts": bool(app.state.accounts)}
-        return {"user": sess.user, "accounts": True, "origin": sess.origin,
+            return {"user": "", "role": "", "accounts": bool(app.state.accounts)}
+        return {"user": sess.user, "role": usersvc.role_of(sess.user),
+                "accounts": True, "origin": sess.origin,
                 "expires_at": sess.expires_at, "label": sess.label}
 
     @app.delete("/api/session")
@@ -527,6 +659,99 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
                                 status_code=404)
         sessions.revoke_sid(target.sid)
         return {"ok": True, "ended": 1}
+
+    # --- people (admin) -------------------------------------------------------
+    #: Long enough that guessing is hopeless, short enough to read aloud once.
+    _NEW_PASSWORD_BYTES = 12
+
+    @app.get("/api/users")
+    def users_list():
+        from rc_repro.services import users as usersvc
+        rows = []
+        for u in usersvc.list_users():
+            live = sessions.list_for(u.name)
+            rows.append({"name": u.name, "role": usersvc.role_of(u.name),
+                         "implicit": not u.role, "created_at": u.created_at,
+                         "sessions": len(live),
+                         "last_seen": max((s.last_seen for s in live), default=0)})
+        return {"users": rows, "roles": list(usersvc.ROLES),
+                "implicit_admins": usersvc.implicit_admins()}
+
+    @app.post("/api/users")
+    def users_add(body: dict = Body(...)):
+        """Create an account. The SERVER mints the password and returns it once.
+
+        An admin who types a colleague's password also knows it, which makes every
+        audit line signed with that name deniable. Generating it means the admin
+        can reset the credential but never hold it.
+        """
+        from rc_repro.services import users as usersvc
+        name = str(body.get("name") or "").strip().lower()
+        role = str(body.get("role") or "member")
+        usersvc.require_valid_name(name)
+        usersvc.require_valid_role(role)
+        password = secrets.token_urlsafe(_NEW_PASSWORD_BYTES)
+        usersvc.add(name, password, role=usersvc.normalise_role(role))
+        auditsvc.record("user-add", f"{name} role={role}")
+        return {"name": name, "role": usersvc.normalise_role(role),
+                "password": password,
+                "note": "shown once; rc-repro does not store it in readable form"}
+
+    @app.post("/api/users/{name}/role")
+    def users_role(name: str, body: dict = Body(...)):
+        from rc_repro.services import users as usersvc
+        role = str(body.get("role") or "")
+        u = usersvc.set_role(name, role)
+        # A demotion must reach the sessions the user already holds, or it takes
+        # effect only when they next sign in -- and the person being demoted is
+        # the least likely to sign out. (role_of is read live per request, so this
+        # is belt and braces; the sign-out is what makes it visible to them.)
+        ended = sessions.revoke_user(name)
+        auditsvc.record("user-role", f"{name} -> {u.role}")
+        return {"name": u.name, "role": u.role, "sessions_ended": ended}
+
+    @app.post("/api/users/{name}/password")
+    def users_reset_password(name: str):
+        """Reset somebody's password to a freshly minted one, shown once."""
+        from rc_repro.services import users as usersvc
+        password = secrets.token_urlsafe(_NEW_PASSWORD_BYTES)
+        usersvc.set_password(name, password)
+        ended = sessions.revoke_user(name)
+        auditsvc.record("user-passwd", name)
+        return {"name": name, "password": password, "sessions_ended": ended}
+
+    @app.delete("/api/users/{name}")
+    def users_remove(name: str):
+        from rc_repro.services import users as usersvc
+        usersvc.remove(name)                 # refuses the last admin
+        ended = sessions.revoke_user(name)
+        auditsvc.record("user-remove", name)
+        return {"name": name, "removed": True, "sessions_ended": ended}
+
+    @app.post("/api/me/password")
+    def me_password(request: Request, body: dict = Body(...)):
+        """Change your OWN password. Requires the current one.
+
+        Every other session you hold ends; this one survives, so changing your
+        password does not sign you out of the tab you changed it in.
+        """
+        from rc_repro.services import users as usersvc
+        me = getattr(request.state, "actor", "") or ""
+        old, new = str(body.get("old") or ""), str(body.get("new") or "")
+        if not usersvc.verify(me, old, source=_client(request)):
+            raise ValidationError("that is not your current password")
+        usersvc.require_valid_password(new)
+        usersvc.set_password(me, new)
+        keep = request.cookies.get(cookie_name(), "")
+        current = sessions.verify(keep)
+        ended = sessions.revoke_user(me)
+        token = sessions.create(me, label=current.label if current else "",
+                                origin="session") if current else ""
+        auditsvc.record("me-passwd", me)
+        resp = JSONResponse({"ok": True, "sessions_ended": max(0, ended - 1)})
+        if token:
+            _set_session_cookie(resp, token)
+        return resp
 
     # --- read (blocking -> def -> threadpool) ---------------------------------
     @app.get("/api/health")
@@ -673,7 +898,15 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
             # The cookie rides along on the upgrade automatically, which is what
             # finally takes the credential out of the query string: `?t=` was only
             # ever there because a browser cannot set headers on a WebSocket.
-            if not sessions.verify(ws.cookies.get(cookie_name(), "")):
+            sess = sessions.verify(ws.cookies.get(cookie_name(), ""))
+            if not sess:
+                await ws.close(code=1008); return
+            # The role table is consulted here too: the middleware never sees a
+            # WebSocket, so a check that lives only there does not cover the one
+            # endpoint that streams credentials.
+            from rc_repro.services import users as usersvc
+            need = route_requirement("WS", "/api/repros/{name}/logs/stream")
+            if need is None or not usersvc.at_least(usersvc.role_of(sess.user), need):
                 await ws.close(code=1008); return
         elif token and ws.query_params.get("t") != token:
             await ws.close(code=1008); return
@@ -776,6 +1009,20 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
         # documented HTTP API rather than the GUI (which always sends the key).
         if not str(fields.get("version") or "").strip():
             raise ValidationError("`version` is required, e.g. {\"version\": \"8.5.1\"}")
+        # Four fields decide what CODE runs and where it listens, which is a
+        # different question from "make me a workspace". `rc_image` runs an
+        # arbitrary image as the serve user; `bind` can publish a workspace with
+        # fixed admin/admin123 credentials to the whole network. The GUI never
+        # sends them for a member -- it sends the resolved image for the version.
+        privileged = [k for k in ("rc_image", "reg_token", "bind", "port")
+                      if fields.get(k)]
+        if privileged:
+            from rc_repro.services import users as usersvc
+            who = getattr(request.state, "actor", "") or ""
+            if who and not usersvc.at_least(usersvc.role_of(who), "admin"):
+                raise ValidationError(
+                    f"{', '.join(privileged)} may only be set by an admin — they "
+                    "choose the image and the interface, not just the workspace")
         creq = lc.CreateReq(**fields)
         job = jobs.submit("create", lc.create_repro, creq, stream_output=True,
                           label=creq.name or creq.version)
