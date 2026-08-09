@@ -2379,7 +2379,8 @@ def serve(
     no_token: bool = typer.Option(False, "--no-token", hidden=True,
                                   help="deprecated no-op: there is no session token any more"),
     print_service: bool = typer.Option(False, "--print-service", help="print how to keep this running (systemd unit, or nohup) and exit — writes nothing"),
-    insecure: bool = typer.Option(False, "--insecure", help="serve the named-user login over plain http — when TLS terminates upstream (remote proxy/lab), or for local testing"),
+    insecure: bool = typer.Option(False, "--insecure", help="serve the login over plain http (deprecated: prefer --trust-proxy, which also fixes the cookie)"),
+    trust_proxy: list[str] = typer.Option(None, "--trust-proxy", help="believe X-Forwarded-Proto/-For from this address or CIDR (repeatable). Needed when TLS terminates at somebody else's proxy: without it the session cookie is not marked Secure and the sign-in page warns about a connection that is actually encrypted"),
 ) -> None:
     """Launch the local web GUI (needs `pip install 'rc-repro[gui]'`).
 
@@ -2497,7 +2498,11 @@ def serve(
     # It therefore KNOWS the browser hop is https and the plain-http last hop is
     # container-to-host on the bridge -- so the refusal below would be refusing
     # its own most secure configuration.
-    tls_upstream = bool(domain) or insecure
+    # --trust-proxy is a STRONGER statement than --insecure: it names which peer
+    # terminates TLS, rather than merely asserting that somebody does. So it
+    # satisfies the same bind-time check, and unlike --insecure it also makes the
+    # cookie Secure and silences the (then false) transport warning.
+    tls_upstream = bool(domain) or insecure or bool(trust_proxy)
 
     if basic and not loopback and not tls_upstream:
         # Basic Auth puts the password on the wire with EVERY request, so a plain
@@ -2522,8 +2527,10 @@ def serve(
              "proxy at it:\n"
              f"    rc-repro serve --bind 127.0.0.1 --port {port} "
              "--allow-host <your-domain>\n"
-             "  TLS terminating upstream (remote proxy, lab, load balancer), or "
-             "testing locally?\n"
+             "  TLS terminating upstream (remote proxy, lab, load balancer)?\n"
+             "    tell rc-repro which peer, so the cookie is marked Secure too:\n"
+             "      --trust-proxy <the proxy's address>\n"
+             "  Just testing locally, and you accept a plain-http password?\n"
              "    add --insecure to the command you just ran")
 
     # Not for the bridge: that address is reachable from containers on this box,
@@ -2550,6 +2557,8 @@ def serve(
             parts += ["--bind", bind]
             if insecure:
                 parts.append("--insecure")
+            for cidr in (trust_proxy or []):
+                parts += ["--trust-proxy", cidr]
         if port != 7070:
             parts += ["--port", str(port)]
         for h in (allow_host or []):     # not `allow`: --domain re-adds itself
@@ -2591,6 +2600,38 @@ def serve(
         url = f"http://localhost:{port}/setup#k={setup_key}"
     else:
         url = f"http://localhost:{port}/"
+    trusted = list(trust_proxy or [])
+    if domain:
+        # The edge terminates TLS for --domain, so its own container addresses are
+        # trusted automatically -- the EXACT set, never the bridge subnet, which
+        # also contains every workspace's containers.
+        trusted += edgesvc.container_addresses()
+
+    # Nothing tightens <home> today -- runner._restrict only covers workspaces --
+    # and it holds the users file, the sessions file and the audit trail. That is
+    # the design's own adversary #2: another local user on the shared box.
+    try:
+        home = config.home()
+        home.mkdir(parents=True, exist_ok=True)
+        if (home.stat().st_mode & 0o077):
+            home.chmod(0o700)
+            ui.note(f"  tightened {home} to 0700 (it holds accounts, sessions and "
+                    "the audit log)")
+        # And the files themselves. They are CREATED 0600, but os.open does not
+        # change the mode of a file that already exists -- so one written by an
+        # older rc-repro keeps whatever the umask gave it, forever. Found by
+        # `doctor` on a real box: audit.log was 664.
+        from rc_repro.services import sessions as _s
+        from rc_repro.services import users as _u
+        for _f in (_u.users_file(), _s.sessions_file(), home / "audit.log"):
+            try:
+                if _f.exists() and (_f.stat().st_mode & 0o077):
+                    _f.chmod(0o600)
+                    ui.note(f"  tightened {_f.name} to 0600")
+            except OSError:
+                pass
+    except OSError:
+        pass
     typer.secho(f"rc-repro GUI: {url}", bold=True)
     if door:
         if door.wildcard:
@@ -2605,6 +2646,18 @@ def serve(
                 "issues it.")
         ui.hint(f"  workspaces published under this name: rc-repro up -v <X.Y.Z> "
                 f"--domain <ticket>.{domain}")
+    # One line naming the posture, so an operator can read how people sign in and
+    # whether the transport is believed, without inferring it from flags.
+    if basic:
+        how = ("https, arranged by rc-repro" if domain
+               else f"https, trusted from {', '.join(trusted)}" if trusted
+               else "plain http on this bind")
+        ui.hint(f"  auth: named accounts over {how}")
+        if not domain and not trusted and not loopback:
+            ui.warn("  ⚠ the session cookie will NOT be marked Secure, and the "
+                    "sign-in page will warn\n    about an unencrypted connection. "
+                    "If TLS terminates at a proxy in front,\n    tell rc-repro "
+                    "which one: --trust-proxy <its address>")
     if basic:
         names = ", ".join(f"{u.name} ({usersvc.role_of(u.name)})"
                           for u in usersvc.list_users())
@@ -2629,7 +2682,8 @@ def serve(
     # though the request reaches uvicorn as plain http over the docker bridge. It
     # decides the session cookie's Secure flag and __Host- prefix.
     app_obj = create_app(allow_hosts=allow, accounts=True,
-                         public_https=bool(domain), first_run=bool(setup_key))
+                         public_https=bool(domain), first_run=bool(setup_key),
+                         trust_proxy=trusted)
     if not no_open and loopback:
         try:
             webbrowser.open(url)

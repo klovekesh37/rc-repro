@@ -543,6 +543,23 @@ def bridge_address() -> str:
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
+def container_addresses() -> list[str]:
+    """Every IP the edge container currently holds, one per network it has joined.
+
+    This is what `serve --domain` trusts for X-Forwarded-*, and it has to be the
+    EXACT set rather than a subnet: the edge reaches the host from an address on a
+    workspace network, and that /16 also contains the customer-image Rocket.Chat
+    containers. A CIDR here would hand X-Forwarded-For to every workspace.
+
+    Re-read rather than cached: the set changes as the edge joins networks.
+    """
+    out = _docker("inspect", CONTAINER, "--format",
+                  "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}")
+    if out.returncode != 0:
+        return []
+    return [a for a in out.stdout.split() if a]
+
+
 def attached_networks() -> set[str]:
     """Workspace networks the edge is currently joined to."""
     out = _docker("inspect", CONTAINER, "--format",

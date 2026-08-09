@@ -193,6 +193,58 @@ def run_checks() -> dict:
     except Exception:  # noqa: BLE001 - a check must never break the report
         line("warn", "Edge status could not be determined")
 
+    # Identity: who can sign in, and whether the files that decide it are sound.
+    # Nothing else reports this, and an install with no admin cannot make one from
+    # the GUI -- the repair is hand-editing a file most people would not think to
+    # look for.
+    try:
+        from rc_repro.services import sessions as sessionsvc
+        from rc_repro.services import users as usersvc
+
+        if not usersvc.any_users():
+            line("warn", "No GUI accounts — `rc-repro serve` will refuse to start on "
+                         "anything but loopback (`rc-repro users add <name>`)")
+        else:
+            admins = usersvc.admins()
+            if admins:
+                line("ok", f"{len(usersvc.list_users())} GUI account(s), "
+                           f"admin: {', '.join(admins)}")
+            else:
+                line("fail", "No admin account — nobody can manage people from the "
+                             "GUI. `rc-repro users role <name> admin`")
+            implicit = usersvc.implicit_admins()
+            if implicit:
+                line("warn", f"admin by default (blank role column): "
+                             f"{', '.join(implicit)} — that is the migration for "
+                             "accounts made before roles existed, not a choice. "
+                             f"`rc-repro users role {implicit[0]} member`")
+        for path in (usersvc.users_file(), sessionsvc.sessions_file(),
+                     config.home() / "audit.log"):
+            if path.exists() and (path.stat().st_mode & 0o077):
+                line("warn", f"{path} is readable by other local users "
+                             f"(mode {oct(path.stat().st_mode)[-3:]}); it should be 0600")
+        home = config.home()
+        if home.exists() and (home.stat().st_mode & 0o077):
+            line("warn", f"{home} is 0{oct(home.stat().st_mode)[-3:]}, so another "
+                         "local user can read the accounts and sessions inside it "
+                         "— `serve` tightens it to 0700 at startup")
+        # A state file written by a NEWER rc-repro must not be half-understood.
+        marker = "# rc-repro-state: "
+        try:
+            for ln in sessionsvc.sessions_file().read_text().splitlines():
+                if ln.startswith(marker):
+                    seen = int(ln[len(marker):].strip())
+                    if seen > sessionsvc.STATE_VERSION:
+                        line("fail", f"{sessionsvc.sessions_file()} was written by a "
+                                     f"newer rc-repro (state v{seen}, this reads "
+                                     f"v{sessionsvc.STATE_VERSION}) — upgrade rather "
+                                     "than run against it")
+                    break
+        except OSError:
+            pass
+    except Exception:  # noqa: BLE001 - a check must never break the report
+        line("warn", "Identity status could not be determined")
+
     counts = {s: sum(1 for r in rows if r["status"] == s) for s in ("ok", "warn", "fail")}
     verdict = "fail" if counts["fail"] else ("warn" if counts["warn"] else "ok")
 

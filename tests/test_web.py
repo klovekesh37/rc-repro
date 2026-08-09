@@ -1817,3 +1817,87 @@ def test_a_null_origin_without_sec_fetch_site_is_still_refused(basic_client):
     r = basic_client.post("/api/repros/x/state", json={"action": "stop"},
                           headers={"Host": "localhost", "Origin": "null"})
     assert r.status_code == 403
+
+
+# --- --trust-proxy (P12): whose X-Forwarded-* is believed -------------------------
+
+_FWD = {"Host": "localhost", "X-Forwarded-Proto": "https",
+        "X-Forwarded-For": "203.0.113.9", "Sec-Fetch-Site": "same-origin"}
+
+
+def _app(**kw):
+    """A client whose peer address is a real IP.
+
+    TestClient reports its peer as the literal string "testclient", which is not
+    an address and is therefore never trusted -- correct behaviour, but it makes
+    the trusted case untestable unless the client is given one.
+    """
+    from rc_repro.services import users as usersvc
+    _fresh_auth_state()
+    if not usersvc.any_users():
+        usersvc.add("alice", PASSWORD, role="admin")
+    peer = kw.pop("peer", "127.0.0.1")
+    return TestClient(create_app(**kw), base_url="http://localhost",
+                      client=(peer, 5555))
+
+
+def test_forwarded_headers_are_ignored_from_an_untrusted_peer():
+    """uvicorn believes X-Forwarded-* from 127.0.0.1 by DEFAULT, so on the default
+    bind any other local user could rewrite the client address and the scheme --
+    both of which decide security here. `serve` passes proxy_headers=False and
+    this resolves it explicitly instead."""
+    c = _app()                      # no trust_proxy at all
+    r = c.post("/signin", data={"user": "alice", "password": PASSWORD},
+               headers=_FWD, follow_redirects=False)
+    assert r.status_code == 303
+    cookie = r.headers["set-cookie"]
+    assert "Secure" not in cookie, "a client must not be able to claim https"
+    assert "__Host-" not in cookie
+
+
+def test_a_trusted_proxy_makes_the_cookie_secure_and_host_prefixed():
+    """The live symptom this fixes: behind a TLS-terminating proxy the session
+    cookie was issued without Secure and without __Host-, on a public https URL,
+    and the sign-in page warned about a connection that was actually encrypted."""
+    c = _app(trust_proxy=["127.0.0.1"])
+    r = c.post("/signin", data={"user": "alice", "password": PASSWORD},
+               headers=_FWD, follow_redirects=False)
+    assert r.status_code == 303
+    cookie = r.headers["set-cookie"]
+    assert "__Host-rc_repro_session=" in cookie and "Secure" in cookie
+
+
+def test_the_transport_warning_follows_the_same_decision():
+    """Deriving the banner and the cookie independently is how a misconfigured
+    proxy ends up minting a cookie the browser then sends in clear.
+
+    The peer is non-loopback in both halves: on loopback the warning is suppressed
+    regardless, because there the password crosses no network.
+    """
+    warned = _app(peer="10.0.0.9").get("/signin", headers=_FWD)
+    assert "not encrypted" in warned.text, "an untrusted X-Forwarded-Proto is ignored"
+    quiet = _app(peer="10.0.0.9", trust_proxy=["10.0.0.0/8"]).get("/signin", headers=_FWD)
+    assert "not encrypted" not in quiet.text
+
+
+def test_the_throttle_keys_on_the_real_client_behind_a_trusted_proxy():
+    """Without this every user shares one bucket -- the proxy's address -- so one
+    person mistyping their password ten times locks out the whole team."""
+    from rc_repro.web import app as webapp
+    c = _app(trust_proxy=["127.0.0.1"])
+    for _ in range(webapp.SIGNIN_MAX_FAILURES):
+        c.post("/api/session", json={"user": "alice", "password": "wrong-wrong-x"},
+               headers=_FWD)
+    assert c.post("/api/session", json={"user": "alice", "password": "wrong-wrong-x"},
+                  headers=_FWD).status_code == 429
+    # a DIFFERENT client behind the same proxy is unaffected
+    other = {**_FWD, "X-Forwarded-For": "203.0.113.77"}
+    assert c.post("/api/session", json={"user": "alice", "password": PASSWORD},
+                  headers=other).status_code == 200
+
+
+def test_a_cidr_is_accepted_and_a_typo_simply_trusts_nothing():
+    from rc_repro.web.app import parse_trusted
+    assert len(parse_trusted(["10.0.0.0/8", "127.0.0.1"])) == 2
+    assert parse_trusted(["not-an-address", ""]) == [], \
+        "a typo must mean 'not trusted', not a server that will not start"

@@ -9,6 +9,7 @@ jobs.py) streamed to the browser over SSE.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import secrets
 import sys
 from contextlib import asynccontextmanager
@@ -255,9 +256,29 @@ def _read_upload(file: UploadFile) -> bytes:
     return data
 
 
+def parse_trusted(entries) -> list:
+    """`--trust-proxy` values -> networks. A bare address becomes a /32 or /128.
+
+    Refuses nothing loudly: an unparseable entry is dropped rather than crashing
+    `serve`, because the failure mode of a typo here should be "the proxy is not
+    trusted" (which is safe and visible) rather than a server that will not start.
+    """
+    out = []
+    for raw in entries or []:
+        for part in str(raw).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                out.append(ipaddress.ip_network(part, strict=False))
+            except ValueError:
+                continue
+    return out
+
+
 def create_app(allow_hosts: list[str] | None = None, *,
                accounts: bool = True, public_https: bool = False,
-               first_run: bool = False) -> FastAPI:
+               first_run: bool = False, trust_proxy=None) -> FastAPI:
     """The GUI application. There is exactly one way in: a session.
 
     `token=` and `basic_auth=` are gone. Both were credentials the browser had to
@@ -303,6 +324,13 @@ def create_app(allow_hosts: list[str] | None = None, *,
     # loopback bind with no accounts -- a bootstrap credential reachable from
     # the network is the thing being removed, not a smaller version of it.
     app.state.first_run = first_run
+    #: Peers whose X-Forwarded-* headers are believed. EMPTY by default, and that
+    #: is the whole point: uvicorn trusts 127.0.0.1 out of the box, so on the
+    #: default bind any other local user could rewrite the client address and the
+    #: scheme -- both of which decide security here. `serve` passes
+    #: proxy_headers=False to uvicorn and resolves it below instead, where the
+    #: trust is explicit and per-peer.
+    app.state.trusted_proxies = parse_trusted(trust_proxy)
 
     # Host allow-list (DNS-rebind/CSRF guard). Loopback always allowed; extra
     # hosts (e.g. a reverse-proxy domain like *.iximiuz.com) opt in via
@@ -401,8 +429,38 @@ def create_app(allow_hosts: list[str] | None = None, *,
     COOKIE_SECURE = "__Host-rc_repro_session"
     COOKIE_PLAIN = "rc_repro_session"
 
-    def cookie_name() -> str:
-        return COOKIE_SECURE if app.state.public_https else COOKIE_PLAIN
+    def resolve_peer(scope_headers, peer: str) -> tuple[str, bool]:
+        """(client address, is the BROWSER's hop https).
+
+        One decision, three consumers -- the cookie's Secure flag and prefix, the
+        sign-in page's transport warning, and the sign-in throttle key. Deriving
+        them independently is how a misconfigured proxy ends up minting a cookie
+        the browser then sends in clear.
+
+        X-Forwarded-* is believed ONLY from a peer inside --trust-proxy. From
+        anyone else both headers are ignored entirely, because a client that can
+        choose its own address can dodge the throttle, and a client that can
+        choose the scheme can turn Secure off.
+        """
+        https = bool(app.state.public_https)
+        trusted = app.state.trusted_proxies
+        if trusted and peer:
+            try:
+                addr = ipaddress.ip_address(peer)
+            except ValueError:
+                return peer, https
+            if any(addr in net for net in trusted):
+                fwd = scope_headers.get("x-forwarded-for", "")
+                if fwd:
+                    peer = fwd.split(",")[0].strip()
+                proto = scope_headers.get("x-forwarded-proto", "")
+                if proto:
+                    https = proto.split(",")[0].strip().lower() == "https"
+        return peer, https
+
+    def cookie_name(https: bool | None = None) -> str:
+        secure = app.state.public_https if https is None else https
+        return COOKIE_SECURE if secure else COOKIE_PLAIN
 
     def _matched_template(scope) -> str:
         """The route TEMPLATE this request will dispatch to, e.g.
@@ -419,13 +477,10 @@ def create_app(allow_hosts: list[str] | None = None, *,
                 return getattr(route, "path", "")
         return ""
 
-    def _session_token(headers_cookies) -> str:
-        return headers_cookies.get(cookie_name(), "")
-
-    def _set_session_cookie(response, token: str) -> None:
-        secure = bool(app.state.public_https)
+    def _set_session_cookie(response, token: str, https: bool | None = None) -> None:
+        secure = bool(app.state.public_https if https is None else https)
         response.set_cookie(
-            cookie_name(), token,
+            cookie_name(secure), token,
             max_age=sessions.ABSOLUTE_SECONDS, path="/", httponly=True,
             secure=secure,
             # Lax, not Strict: pasting a workspace link into chat and following it
@@ -480,7 +535,8 @@ def create_app(allow_hosts: list[str] | None = None, *,
             # `""` in the table means "reachable with no session". /app.css is
             # open too, or the sign-in page is an unstyled wall of text.
             open_path = need == _OPEN or path == "/app.css"
-            sess = sessions.verify(request.cookies.get(cookie_name(), ""))
+            _addr, _https = _peer(request)
+            sess = sessions.verify(request.cookies.get(cookie_name(_https), ""))
             actor = sess.user if sess else ""
             if actor and path.startswith("/api/") and not open_path:
                 # DEFAULT DENY. `need is None` means the route is not in the
@@ -557,7 +613,11 @@ def create_app(allow_hosts: list[str] | None = None, *,
 
     # --- the session: sign in, sign out, who am I -----------------------------
     def _client(request: Request) -> str:
-        return request.client.host if request.client else ""
+        return _peer(request)[0]
+
+    def _peer(request: Request) -> tuple[str, bool]:
+        return resolve_peer(request.headers,
+                            request.client.host if request.client else "")
 
     def _do_signin(user: str, password: str, source: str, agent: str):
         """Shared by the form post and the JSON twin. Returns (token, error).
@@ -620,7 +680,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
         if not _first_run_open():
             return JSONResponse({"error": "this server already has accounts",
                                  "kind": "ConflictError"}, status_code=409)
-        source = _client(request)
+        source, https = _peer(request)
         if _signin_retry_after(source):
             return JSONResponse({"error": "too many attempts from this address",
                                  "kind": "Unauthorized"}, status_code=429)
@@ -649,31 +709,32 @@ def create_app(allow_hosts: list[str] | None = None, *,
         auditsvc.audit(name, "first-run", "first account created",
                        origin_="setup", outcome="ok")
         resp = JSONResponse({"user": name, "role": "admin"})
-        _set_session_cookie(resp, token)
+        _set_session_cookie(resp, token, https)
         return resp
 
     @app.get("/signin")
     def signin_form(request: Request, e: str = "", next: str = "/"):
         # Already signed in? Nobody needs to see this page. Straight through to
         # where they were going, so a stale /signin bookmark is not a dead end.
-        if sessions.verify(request.cookies.get(cookie_name(), "")):
+        if sessions.verify(request.cookies.get(cookie_name(_peer(request)[1]), "")):
             return RedirectResponse(signin_page.safe_next(next), status_code=303)
         # The "not encrypted" warning is about the password crossing a NETWORK.
         # On a loopback connection it does not, so showing it there is a false
         # alarm on the most common install -- and a red banner that is wrong on a
         # laptop is how people learn to ignore red banners.
-        local = _client(request) in ("127.0.0.1", "::1", "localhost")
+        addr, https = _peer(request)
+        local = addr in ("127.0.0.1", "::1", "localhost")
         html = signin_page.page(
             error=e, next_url=next,
             server=(request.headers.get("host") or "").split(":")[0],
-            secure=bool(app.state.public_https) or local,
-            retry_after=_signin_retry_after(_client(request)))
+            secure=https or local,
+            retry_after=_signin_retry_after(addr))
         return HTMLResponse(html, status_code=401 if e in ("bad", "rate") else 200)
 
     @app.post("/signin")
     def signin_submit(request: Request, user: str = Form(""),
                       password: str = Form(""), next: str = Form("/")):
-        source = _client(request)
+        source, https = _peer(request)
         token, err = _do_signin(user, password, source,
                                 request.headers.get("user-agent", ""))
         target = signin_page.safe_next(next)
@@ -685,13 +746,13 @@ def create_app(allow_hosts: list[str] | None = None, *,
                                     status_code=303)
         # 303 so the POST is not in history and a refresh cannot resubmit it.
         resp = RedirectResponse(target, status_code=303)
-        _set_session_cookie(resp, token)
+        _set_session_cookie(resp, token, https)
         return resp
 
     @app.post("/api/session")
     def session_create(request: Request, body: dict = Body(default={})):
         """The JSON twin of POST /signin, for scripts and for the SPA."""
-        source = _client(request)
+        source, https = _peer(request)
         token, err = _do_signin(str(body.get("user") or ""),
                                 str(body.get("password") or ""), source,
                                 request.headers.get("user-agent", ""))
@@ -703,7 +764,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
                                 status_code=429 if err == "rate" else 401)
         sess = sessions.verify(token)
         resp = JSONResponse({"user": sess.user, "expires_at": sess.expires_at})
-        _set_session_cookie(resp, token)
+        _set_session_cookie(resp, token, https)
         return resp
 
     @app.get("/api/session")
@@ -711,7 +772,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
         """Who am I. Replaces the `actor` field bolted onto /api/health, which
         only existed because there was nowhere else to ask."""
         from rc_repro.services import users as usersvc
-        sess = sessions.verify(request.cookies.get(cookie_name(), ""))
+        sess = sessions.verify(request.cookies.get(cookie_name(_peer(request)[1]), ""))
         if not sess:
             return {"user": "", "role": "", "accounts": bool(app.state.accounts)}
         return {"user": sess.user, "role": usersvc.role_of(sess.user),
@@ -721,7 +782,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
     @app.delete("/api/session")
     def session_end(request: Request):
         """Sign out — a logout that actually ends something on the server."""
-        raw = request.cookies.get(cookie_name(), "")
+        raw = request.cookies.get(cookie_name(_peer(request)[1]), "")
         ended = sessions.revoke(raw) if raw else False
         resp = JSONResponse({"ok": True, "ended": ended})
         _clear_session_cookie(resp)
@@ -729,7 +790,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
 
     @app.post("/signout")
     def signout_form(request: Request):
-        raw = request.cookies.get(cookie_name(), "")
+        raw = request.cookies.get(cookie_name(_peer(request)[1]), "")
         if raw:
             sessions.revoke(raw)
         # No goodbye page: what you want next is to walk away or to sign back in,
@@ -743,7 +804,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
         """Your own live sessions. The answer to "I signed in on the customer's
         laptop", which no cookie attribute gives you and which only exists
         because sessions are server-side."""
-        sess = sessions.verify(request.cookies.get(cookie_name(), ""))
+        sess = sessions.verify(request.cookies.get(cookie_name(_peer(request)[1]), ""))
         if not sess:
             return {"sessions": []}
         here = sess.sid[:8]
@@ -752,7 +813,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
 
     @app.delete("/api/sessions")
     def sessions_revoke(request: Request, all: bool = False, sid: str = ""):
-        sess = sessions.verify(request.cookies.get(cookie_name(), ""))
+        sess = sessions.verify(request.cookies.get(cookie_name(_peer(request)[1]), ""))
         if not sess:
             return JSONResponse({"error": "not signed in", "kind": "Unauthorized"},
                                 status_code=401)
@@ -851,7 +912,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
             raise ValidationError("that is not your current password")
         usersvc.require_valid_password(new)
         usersvc.set_password(me, new)
-        keep = request.cookies.get(cookie_name(), "")
+        keep = request.cookies.get(cookie_name(_peer(request)[1]), "")
         current = sessions.verify(keep)
         ended = sessions.revoke_user(me)
         token = sessions.create(me, label=current.label if current else "",
@@ -1026,7 +1087,8 @@ def create_app(allow_hosts: list[str] | None = None, *,
             # The cookie rides along on the upgrade automatically, which is what
             # finally takes the credential out of the query string: `?t=` was only
             # ever there because a browser cannot set headers on a WebSocket.
-            sess = sessions.verify(ws.cookies.get(cookie_name(), ""))
+            _ws_https = resolve_peer(ws.headers, ws.client.host if ws.client else "")[1]
+            sess = sessions.verify(ws.cookies.get(cookie_name(_ws_https), ""))
             if not sess:
                 await ws.close(code=1008); return
             # The role table is consulted here too: the middleware never sees a
