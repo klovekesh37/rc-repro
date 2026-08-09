@@ -46,8 +46,20 @@ def run_checks() -> dict:
     """
     rows: list[dict] = []
 
-    def line(status: str, msg: str) -> None:
-        rows.append({"status": status, "message": msg})
+    def line(status: str, msg: str, elsewhere: str = "") -> None:
+        """`elsewhere` names a place the GUI shows this fact PERMANENTLY.
+
+        The web report drops those rows (see the /api/doctor endpoint). A terminal
+        has no header chip, no user list and no workspace rail, so `rc-repro
+        doctor` is the only place a CLI user learns them and they stay; in the
+        browser they were a report restating what was already on the screen.
+        Only ever set on an `ok` row -- a WARNING about the same subject is not
+        something the chip beside it says, and those all still appear.
+        """
+        row = {"status": status, "message": msg}
+        if elsewhere:
+            row["elsewhere"] = elsewhere
+        rows.append(row)
 
     # Docker daemon (everything else that needs Docker degrades gracefully).
     # max_age=0: the dashboard poll memoises this, but somebody running `doctor`
@@ -105,13 +117,17 @@ def run_checks() -> dict:
     # question anybody is actually asking. Added after seven concurrent stacks
     # OOM-killed a 10 GB host: every `up` had succeeded, and nothing anywhere
     # reported that the machine was nearly full.
-    mem = runner.host_memory()
-    if mem:
-        total_mb, avail_mb, swap_mb = mem
-        room = max(0, avail_mb - lc.host_reserve_mb(total_mb)) // lc.WORKSPACE_MB
+    cap = lc.capacity()
+    if cap["known"]:
+        total_mb, avail_mb, swap_mb = cap["total_mb"], cap["available_mb"], cap["swap_mb"]
+        room = cap["room"]
         detail = f"{avail_mb} MB available of {total_mb} MB"
         if room >= 2:
-            line("ok", f"Memory: {detail} — room for about {room} more workspace(s)")
+            # No count when there is plenty. The count exists to answer "can I
+            # start another one", and while the answer is an unqualified yes it is
+            # a number to read past; the two rows below still say it the moment it
+            # stops being one.
+            line("ok", f"Memory: {detail}")
         elif room == 1:
             line("warn", f"Memory: {detail} — room for about 1 more workspace")
         else:
@@ -157,7 +173,8 @@ def run_checks() -> dict:
                 line("warn", f"Edge{where} installed — cannot check it, Docker is down")
             elif edgesvc.running():
                 line("ok", f"Edge running{where} — holds :80/:443, "
-                           f"{len(routes)} workspace route(s)")
+                           f"{len(routes)} workspace route(s)",
+                     elsewhere="the edge chip in the header")
             else:
                 # Name what is holding the port. "the edge is not running" sends
                 # you looking at the edge, when the cause is usually something
@@ -208,7 +225,8 @@ def run_checks() -> dict:
             admins = usersvc.admins()
             if admins:
                 line("ok", f"{len(usersvc.list_users())} GUI account(s), "
-                           f"admin: {', '.join(admins)}")
+                           f"admin: {', '.join(admins)}",
+                     elsewhere="the People page")
             else:
                 line("fail", "No admin account — nobody can manage people from the "
                              "GUI. `rc-repro users role <name> admin`")
@@ -226,10 +244,12 @@ def run_checks() -> dict:
             from rc_repro.services import lifecycle as lcsvc
             if config.load_config().get(lcsvc.CREATE_POLICY_KEY) == "admin":
                 line("ok", "members may not set --rc-image/--reg-token/--bind "
-                           "(gui.create_policy admin)")
+                           "(gui.create_policy admin)",
+                     elsewhere="which fields the New workspace form offers")
             else:
                 line("ok", "members may set --rc-image/--reg-token/--bind — narrow "
-                           "it with `rc-repro config set gui.create_policy admin`")
+                           "it with `rc-repro config set gui.create_policy admin`",
+                     elsewhere="which fields the New workspace form offers")
         for path in (usersvc.users_file(), sessionsvc.sessions_file(),
                      config.home() / "audit.log"):
             if path.exists() and (path.stat().st_mode & 0o077):

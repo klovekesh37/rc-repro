@@ -1,9 +1,31 @@
+/* Light by default, dark on request — one token set, two palettes.
+   `color-scheme` matters as much as the colours: without it the browser paints
+   its own scrollbars, selects and checkboxes for the WRONG theme, and a light
+   page ends up with black form controls that nothing in this file can reach. */
 :root {
-  --bg: #0b0e14; --panel: #11151e; --panel2: #161b26; --line: #232b3a; --line2: #2d3648;
-  --ink: #d8dee9; --muted: #7d8697; --dim: #5a6474;
-  --green: #3fb950; --red: #f85149; --blue: #58a6ff; --amber: #d29922; --cyan: #56d4dd; --violet: #a371f7;
+  color-scheme: light;
+  --bg: #F4F6F8; --panel: #FFFFFF; --panel2: #EDF0F4; --line: #E2E6EC; --line2: #C9D0DA;
+  --ink: #14171C; --muted: #5B6472; --dim: #8A93A1;
+  /* Colour is a signal, never decoration: green = running, amber = wants you,
+     red = about to destroy something, blue = you can click it. Every value below
+     clears 4.5:1 on its own ground, checked. */
+  --green: #067647; --red: #D92D20; --blue: #3B5BDB; --amber: #B45309;
+  --cyan: #0E7490; --violet: #6D28D9;
+  --on-accent: #FFFFFF;
+  /* The page's dot grid and the bar's translucent ground: both were literals
+     that assumed a dark page and survived the token swap unnoticed. */
+  --dot: #DDE2E9; --bar: rgba(255,255,255,.88);
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0E1116; --panel: #151922; --panel2: #1B2028; --line: #242A35; --line2: #333B49;
+  --ink: #E6E9EF; --muted: #8A93A3; --dim: #5C6472;
+  --green: #4ADE80; --red: #FF6B6B; --blue: #7C93F5; --amber: #F0B429;
+  --cyan: #56D4DD; --violet: #A371F7;
+  --on-accent: #0B0E14;
+  --dot: #1A2130; --bar: rgba(13,17,23,.85);
 }
 * { box-sizing: border-box; }
 /* The UA's `[hidden] { display: none }` loses to ANY author rule that sets
@@ -15,22 +37,22 @@
 html, body { height: 100%; }
 body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans);
   display: flex; flex-direction: column; min-height: 100vh;
-  background-image: radial-gradient(circle at 1px 1px, #1a2130 1px, transparent 0); background-size: 26px 26px; }
+  background-image: radial-gradient(circle at 1px 1px, var(--dot) 1px, transparent 0); background-size: 26px 26px; }
 
 /* ---- top bar ---- */
 .topbar { display: flex; align-items: center; gap: .9rem; padding: .8rem 1.4rem;
-  border-bottom: 1px solid var(--line); background: rgba(13,17,23,.85); backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--line); background: var(--bar); backdrop-filter: blur(6px);
   position: sticky; top: 0; z-index: 10; }
 .brand { font-family: var(--mono); font-weight: 700; font-size: 1.05rem; letter-spacing: -.01em; }
 .brand .dollar { color: var(--green); }
 .topbar-actions { margin-left: auto; display: flex; gap: .5rem; }
 
 /* ---- buttons / chips ---- */
-.btn { font-family: var(--mono); font-size: .82rem; padding: .42rem .8rem; border-radius: 8px;
+.btn { font-size: .82rem; padding: .42rem .8rem; border-radius: 9px;
   border: 1px solid var(--line2); background: var(--panel2); color: var(--ink); cursor: pointer; transition: .12s; white-space: nowrap; }
-.btn:hover { border-color: var(--blue); color: #fff; }
+.btn:hover { border-color: var(--blue); color: var(--blue); }
 .btn.primary { background: rgba(88,166,255,.14); border-color: var(--blue); color: var(--blue); }
-.btn.primary:hover { background: var(--blue); color: #06121f; }
+.btn.primary:hover { background: var(--blue); color: var(--on-accent); }
 .btn.danger { color: var(--red); border-color: transparent; background: transparent; }
 .btn.danger:hover { border-color: var(--red); background: rgba(248,81,73,.1); }
 .btn.small { padding: .3rem .6rem; font-size: .78rem; }
@@ -51,7 +73,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
   .spin { animation: none; }              /* the verb still says what is happening */
   .pill.working { animation: none; }
 }
-.chip { font-family: var(--mono); font-size: .74rem; color: var(--muted); border: 1px solid var(--line);
+.chip { font-size: .74rem; color: var(--muted); border: 1px solid var(--line);
   border-radius: 999px; padding: .18rem .6rem; display: inline-flex; align-items: center; gap: .35rem;
   background: none; cursor: pointer; }
 .chip:hover { border-color: var(--blue); color: var(--ink); }
@@ -71,7 +93,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
    On a shared box the first question at a glance is "which of these are mine".
    Owned-by-you is the accent; everyone else is quiet, because muting the majority
    is what makes the few stand out. */
-.whoami { font-family: var(--mono); font-size: .74rem; color: var(--muted);
+.whoami { font-size: .74rem; color: var(--muted);
   border: 1px solid var(--line); border-radius: 999px; padding: .18rem .6rem;
   background: none; cursor: pointer; }
 .whoami:hover { border-color: var(--blue); color: var(--ink); }
@@ -90,13 +112,13 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 .signin-form label { display: block; margin: 0 0 .3rem; font-size: .8rem;
   color: var(--muted); }
 .signin-form input { width: 100%; margin-bottom: 1rem; padding: .55rem .7rem;
-  border: 1px solid var(--line2); border-radius: 8px; background: var(--bg);
+  border: 1px solid var(--line2); border-radius: 9px; background: var(--bg);
   color: var(--ink); font: inherit; }
 .signin-form input:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
 .signin-form button { width: 100%; padding: .55rem; margin-top: .2rem; }
 /* Banners carry the ?e= state and the transport warning. Colour is the only
    difference between them, so each one names its own severity. */
-.signin-banner { font-size: .84rem; border-radius: 8px; padding: .6rem .75rem;
+.signin-banner { font-size: .84rem; border-radius: 9px; padding: .6rem .75rem;
   margin: 0 0 1rem; border: 1px solid var(--line2); background: var(--panel2); }
 .signin-banner.bad { border-color: rgba(248,81,73,.45); background: rgba(248,81,73,.09);
   color: #ffb4b0; }
@@ -107,26 +129,16 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 .signin-foot { color: var(--dim); font-size: .76rem; text-align: center;
   margin: 1rem 0 0; line-height: 1.6; }
 .signin-foot code { font-family: var(--mono); color: var(--muted); }
-.owner { font-family: var(--mono); font-size: .7rem; color: var(--muted);
+.owner { font-size: .7rem; color: var(--muted);
   border: 1px solid var(--line2); border-radius: 999px; padding: .05rem .45rem; }
 .owner::before { content: "@"; color: var(--dim); }
 .owner.me { color: var(--cyan); border-color: rgba(86,212,221,.4); background: rgba(86,212,221,.07); }
 .owner.me::before { color: var(--cyan); }
 
 /* ---- main / split layout ---- */
-.layout { flex: 1; width: 100%; max-width: 1500px; margin: 0 auto; padding: 1.4rem 1.4rem 3.5rem;
-  display: grid; grid-template-columns: minmax(360px, 460px) 1fr; gap: 1.2rem; align-items: start; }
-.layout.no-detail { grid-template-columns: 1fr; max-width: 1180px; }
-.list { min-width: 0; }
-.toolbar { display: flex; align-items: center; gap: 1rem; margin-bottom: .8rem; flex-wrap: wrap; }
-.toolbar-title { display: flex; align-items: center; gap: .7rem; }
-.toolbar-title h1 { font-family: var(--mono); font-size: 1.35rem; margin: 0; letter-spacing: -.01em; }
-.toolbar-controls { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }
-.input { font-family: var(--mono); font-size: .82rem; padding: .45rem .7rem; border-radius: 8px;
-  border: 1px solid var(--line2); background: var(--panel); color: var(--ink); }
-.input::placeholder { color: var(--dim); }
-#filter { min-width: 220px; }
-.pill { font-family: var(--mono); font-size: .74rem; border-radius: 999px; padding: .2rem .6rem;
+/* Status pills: still used by the rail header count, the detail badge and
+   the job list. They were collateral in the layout replacement. */
+.pill { font-size: .74rem; border-radius: 999px; padding: .2rem .6rem;
   display: inline-flex; align-items: center; gap: .35rem; border: 1px solid transparent; }
 .pill::before { content: "●"; font-size: .6rem; }
 .pill.running { color: var(--green); border-color: rgba(63,185,80,.4); background: rgba(63,185,80,.1); }
@@ -150,93 +162,159 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 .pill.default::before { content: none; }
 
 /* ---- cards (left list) ---- */
-.cards { display: flex; flex-direction: column; gap: .9rem; }
-.card { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--line2);
-  border-radius: 12px; padding: .9rem 1rem; display: flex; flex-direction: column; gap: .6rem;
-  transition: .14s; position: relative; cursor: pointer; }
-.card:hover { border-color: var(--line2); background: var(--panel2); }
-.card.selected { border-color: var(--blue); border-left-color: var(--blue); background: var(--panel2); }
-.card .chev { margin-left: auto; color: var(--dim); font-family: var(--mono); }
-.card.st-running { border-left-color: var(--green); }
-.card.st-stopped { border-left-color: var(--amber); }
-.card.st-down { border-left-color: var(--dim); }
-.card.st-unknown { border-left-color: var(--muted); }
-/* Docker reports these verbatim and repro_state() now passes them through, so
-   they reach the UI as real states instead of being flattened to "stopped".
-   `restarting` is the crash-loop signal -- it gets the alarming colour. */
-.card.st-restarting, .card.st-dead { border-left-color: var(--red); }
-.card.st-paused, .card.st-created { border-left-color: var(--amber); }
-.card-head { display: flex; align-items: center; gap: .5rem; }
-.card-head .name { font-family: var(--mono); font-weight: 700; font-size: 1.02rem; }
-.card-meta { font-family: var(--mono); font-size: .78rem; color: var(--muted); margin: -.3rem 0 0; }
-.card-links { display: flex; flex-wrap: wrap; gap: .4rem; }
-.linkchip { font-family: var(--mono); font-size: .74rem; text-decoration: none; padding: .22rem .55rem;
-  border-radius: 7px; border: 1px solid var(--line2); color: var(--cyan); background: rgba(86,212,221,.06); }
-.linkchip:hover { border-color: var(--cyan); color: #fff; }
-.linkchip.rc { color: var(--blue); background: rgba(88,166,255,.08); }
-.linkchip.rc:hover { border-color: var(--blue); }
-.linkchip.monitor { color: var(--violet); background: rgba(163,113,247,.08); }
-.linkchip::before { content: "↗"; margin-right: .3rem; opacity: .6; }
-.card-actions { display: flex; flex-wrap: wrap; gap: .35rem; }
-.card-foot { display: flex; align-items: center; border-top: 1px solid var(--line); padding-top: .6rem;
-  font-family: var(--mono); font-size: .76rem; color: var(--muted); }
-.card-foot .health { margin-left: auto; display: inline-flex; align-items: center; gap: .35rem; }
-.card-foot .health::before { content: "●"; font-size: .6rem; }
-.card-foot .health.running { color: var(--green); }
-.card-foot .health.stopped { color: var(--amber); }
-.card-foot .health.down { color: var(--dim); }
-.card-foot .health.unknown { color: var(--muted); }
-.card-foot .health.restarting, .card-foot .health.dead { color: var(--red); }
-.card-foot .health.paused, .card-foot .health.created { color: var(--amber); }
-/* health is coloured from HEALTH, not state (an unhealthy container is not green) */
-.card-foot .health.bad { color: var(--red); }
-.card-foot .health.warn { color: var(--amber); }
-.inline-note { color: var(--muted); font-size: .8rem; align-self: center; }
-.hint.bad { color: var(--red); }
-.spark { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .3rem .5rem; }
-/* preset notes (create-job result + detail Overview) */
-.notes { display: flex; flex-direction: column; gap: .2rem; border-left: 2px solid var(--blue);
-         padding: .5rem .75rem; background: rgba(88,166,255,.06); border-radius: 0 6px 6px 0; }
-.notes .note { font-family: var(--mono); font-size: .78rem; color: var(--fg); white-space: pre-wrap; }
 
-/* ---- detail panel ---- */
-.detail { background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+/* ---- three panes: scan · work · act ---- */
+.panes { flex: 1; display: grid; grid-template-columns: 288px minmax(0, 1fr) 244px;
+  min-height: 0; }
+.panes.no-detail { grid-template-columns: 288px minmax(0, 1fr); }
+.panes.no-detail .actpane { display: none; }
+
+.rail { background: var(--panel); border-right: 1px solid var(--line);
+  display: flex; flex-direction: column; min-height: 0; }
+.rail-head { display: flex; align-items: center; justify-content: space-between;
+  padding: .8rem .85rem .5rem; }
+.rail-title { font-size: .68rem; font-weight: 600; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--dim); }
+.rail-controls { padding: 0 .85rem .75rem; display: grid; gap: .45rem;
+  border-bottom: 1px solid var(--line); }
+.rail-two { display: flex; flex-wrap: wrap; gap: .45rem; }
+.rail-two .input { flex: 1 1 7.5rem; min-width: 0; }
+.rail-two .input { min-width: 0; }
+.btn.block { width: 100%; justify-content: center; }
+.rows { flex: 1; overflow: auto; padding: .5rem; display: grid; gap: 2px; align-content: start; }
+.rail-foot { padding: .6rem .9rem .8rem; border-top: 1px solid var(--line); }
+
+/* One row per workspace: the whole name (it is the thing you scan for), the
+   version right-aligned, and the state as a left gutter that encodes itself by
+   SHAPE as well as hue -- so it survives greyscale, which is how these end up
+   pasted into a ticket. No buttons: six repeated per card was 36 on a screen. */
+.wrow { position: relative; display: grid; gap: 3px; width: 100%; text-align: left;
+  padding: .55rem .7rem .55rem .9rem; border: 0; border-radius: 9px;
+  background: none; color: var(--ink); cursor: pointer; font: inherit; }
+.wrow::before { content: ""; position: absolute; left: .28rem; top: .7rem; bottom: .7rem;
+  width: 2px; border-radius: 2px; background: var(--line2); }
+.wrow[data-state="running"]::before { background: var(--green); }
+.wrow[data-state="stopped"]::before,
+.wrow[data-state="paused"]::before, .wrow[data-state="created"]::before { background: var(--amber); }
+.wrow[data-state="restarting"]::before, .wrow[data-state="dead"]::before { background: var(--red); }
+.wrow[data-state="down"]::before, .wrow[data-state="unknown"]::before {
+  background: transparent; box-shadow: inset 0 0 0 1px var(--dim); }
+.wrow[data-state="working"]::before { background: var(--blue); }
+.wrow:hover { background: var(--panel2); }
+.wrow[aria-current="true"] { background: var(--panel2); box-shadow: inset 0 0 0 1px var(--line2); }
+.wrow .r1 { display: flex; align-items: baseline; gap: .45rem; min-width: 0; }
+.wrow .nm { flex: 1; min-width: 0; font-weight: 600; font-size: .84rem;
+  overflow-wrap: break-word; }
+.wrow .ver { flex: 0 0 auto; font-family: var(--mono); font-size: .76rem; font-weight: 600;
+  color: var(--muted); }
+.wrow[aria-current="true"] .ver { color: var(--ink); }
+.wrow .star { flex: 0 0 auto; font-size: .62rem; color: var(--dim); }
+.wrow .meta { font-family: var(--mono); font-size: .7rem; color: var(--dim);
+  overflow-wrap: break-word; }
+.wrow .r3 { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+.wstate { display: inline-flex; align-items: center; gap: .3rem; font-size: .6rem;
+  font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.wstate::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.wstate.running { color: var(--green); }
+.wstate.stopped, .wstate.paused, .wstate.created { color: var(--amber); }
+.wstate.down, .wstate.unknown { color: var(--dim); }
+.wstate.down::before, .wstate.unknown::before { background: transparent; box-shadow: inset 0 0 0 1px currentColor; }
+.wstate.restarting, .wstate.dead { color: var(--red); }
+.wstate.working { color: var(--blue); }
+.wage { font-family: var(--mono); font-size: .64rem; color: var(--dim); }
+
+.stage { overflow: auto; min-height: 0; }
+
+/* ---- the action pane ---- */
+/* Persistent, not a dropdown: the grouping is the teaching. "Put data in it"
+   explains what Seed does to somebody who never read the CLI's help -- but only
+   if they can SEE it. Equal 30px rows and single-line labels are most of what
+   makes a list look composed; the destructive action is pinned to the bottom
+   rather than trailing the last group, because it is not the eleventh item on a
+   menu. */
+.actpane { background: var(--panel); border-left: 1px solid var(--line);
+  overflow: auto; display: flex; flex-direction: column; padding-bottom: 1.1rem; }
+.apgroup { display: flex; align-items: center; gap: .6rem; padding: 1.05rem .95rem .35rem;
+  font-size: .62rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--dim); }
+.apgroup::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.aplist { display: grid; }
+.aplist button { display: flex; align-items: center; height: 30px; padding: 0 .95rem;
+  font: inherit; font-size: .8rem; color: var(--ink); background: none; border: 0;
+  text-align: left; cursor: pointer; white-space: nowrap; }
+.aplist button::before { content: ""; width: 3px; height: 3px; border-radius: 50%;
+  background: var(--line2); margin-right: .6rem; flex: 0 0 auto; }
+.aplist button:hover { background: var(--panel2); color: var(--blue); }
+.aplist button:hover::before { background: var(--blue); }
+.aplist button:disabled { color: var(--dim); cursor: default; }
+.aplist button:disabled:hover { background: none; color: var(--dim); }
+.aplist button:disabled:hover::before { background: var(--line2); }
+.apnote { padding: .6rem .95rem 0; font-size: .7rem; line-height: 1.5; color: var(--dim); }
+.apdanger { margin-top: auto; padding: .8rem .95rem 0; border-top: 1px solid var(--line); }
+.apdanger button { display: flex; align-items: center; justify-content: center; width: 100%;
+  height: 30px; border: 1px solid var(--line2); border-radius: 9px; background: none;
+  font: inherit; font-size: .74rem; font-weight: 600; color: var(--red); cursor: pointer; }
+.apdanger button:hover { background: rgba(217,45,32,.08); border-color: var(--red); }
+.apdanger p { margin: .5rem 0 0; font-size: .66rem; line-height: 1.5; color: var(--dim); }
+
+.detail, .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
   padding: 1.1rem 1.3rem; position: sticky; top: 5rem; min-height: 60vh; }
 .detail .placeholder { color: var(--dim); text-align: center; padding: 4rem 1rem; font-family: var(--mono); }
 .d-head { display: flex; align-items: center; gap: .6rem; }
 .d-head .dot { color: var(--dim); font-size: .7rem; } .d-head .dot.running { color: var(--green); } .d-head .dot.stopped { color: var(--amber); }
-.d-head .name { font-family: var(--mono); font-weight: 700; font-size: 1.15rem; }
+.d-head .name { font-weight: 700; font-size: 1.35rem; letter-spacing: -.02em; }
 .d-head .close { margin-left: auto; background: none; border: none; color: var(--muted); font-size: 1.3rem; cursor: pointer; line-height: 1; }
-.d-head .close:hover { color: #fff; }
+.d-head .close:hover { color: var(--ink); }
 .tabs { display: flex; gap: 1.2rem; border-bottom: 1px solid var(--line); margin: 1rem 0; }
-.tab { font-family: var(--mono); font-size: .85rem; color: var(--muted); background: none; border: none;
+.tab { font-size: .7rem; font-weight: 600; letter-spacing: .09em;
+  text-transform: uppercase; color: var(--dim); background: none; border: none;
   padding: .5rem 0; cursor: pointer; border-bottom: 2px solid transparent; }
 .tab:hover { color: var(--ink); }
 .tab.active { color: var(--blue); border-bottom-color: var(--blue); }
 .d-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: 1.1rem; }
-.kv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line);
-  border-radius: 10px; overflow: hidden; margin-bottom: 1.2rem; }
-.kv { background: var(--panel); padding: .7rem .9rem; }
-.kv .k { font-family: var(--mono); font-size: .72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
-.kv .v { font-family: var(--mono); font-size: .95rem; margin-top: .2rem; }
+/* Three columns, and exactly six facts fill them — the seventh used to be the
+   owner, which now reads as part of the identity line above. Cells carry their
+   own right/bottom rule and the third in each row drops the right one, so a rare
+   seventh fact adds a row instead of a hole. */
+.kv-grid { display: grid; grid-template-columns: repeat(3, 1fr);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  overflow: hidden; margin-bottom: 1.3rem; }
+.kv { padding: .85rem 1.05rem .95rem; border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line); }
+.kv:nth-child(3n) { border-right: 0; }
+.kv:nth-last-child(-n+3) { border-bottom: 0; }
+
+/* The identity line: the pairing this product exists to get right, then what
+   kind of workspace it is and whose. */
+.d-sub { display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem;
+  font-family: var(--mono); font-size: .76rem; color: var(--muted);
+  margin: .45rem 0 0; }
+.d-sub b { font-size: .92rem; font-weight: 700; color: var(--ink); letter-spacing: -.02em; }
+.d-sub i { font-style: normal; color: var(--line2); }
+.d-sub .bad { color: var(--red); }
+.kv .k { font-size: .64rem; font-weight: 600; color: var(--dim);
+  text-transform: uppercase; letter-spacing: .1em; }
+.kv .v { font-family: var(--mono); font-size: 1.15rem; font-weight: 600;
+  letter-spacing: -.02em; margin-top: .28rem; }
 .kv .v.green { color: var(--green); }
 .kv .v.bad { color: var(--red); }
 .kv .v.warn { color: var(--amber); }
-.section-label { font-family: var(--mono); font-size: .78rem; color: var(--muted); margin: 1.1rem 0 .5rem; }
-.chart-box { border: 1px solid var(--line); border-radius: 10px; padding: .8rem; background: var(--bg); }
+.section-label { font-size: .64rem; font-weight: 600; color: var(--dim);
+  text-transform: uppercase; letter-spacing: .1em; margin: 1.4rem 0 .55rem; }
+.chart-box { border: 1px solid var(--line); border-radius: 12px; padding: .8rem; background: var(--bg); }
 .chart-legend { display: flex; gap: 1.2rem; font-family: var(--mono); font-size: .74rem; color: var(--muted); margin-top: .4rem; justify-content: center; }
 .chart-legend .sw { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: .35rem; }
-.urlbox { border: 1px solid var(--line); border-radius: 10px; padding: .8rem .9rem; background: var(--bg); display: flex; align-items: center; margin-top: 1.2rem; }
+.urlbox { border: 1px solid var(--line); border-radius: 12px; padding: .8rem .9rem; background: var(--bg); display: flex; align-items: center; margin-top: 1.2rem; }
 .urlbox .k { font-family: var(--mono); font-size: .72rem; color: var(--muted); }
 .urlbox a { font-family: var(--mono); color: var(--blue); text-decoration: none; display: block; margin-top: .2rem; }
 /* A urlbox value that is text, not a link (admin login, workspace path). */
 .urlbox .flat { font-family: var(--mono); color: var(--ink); margin-top: .2rem; word-break: break-all; }
 .urlbox + .urlbox { margin-top: .5rem; }
-.banner { font-size: .84rem; border-radius: 8px; padding: .6rem .7rem; margin: .8rem 0 0;
+.banner { font-size: .84rem; border-radius: 9px; padding: .6rem .7rem; margin: .8rem 0 0;
   border: 1px solid var(--line2); background: var(--panel2); color: var(--ink); }
 .banner.bad { border-color: rgba(248,81,73,.45); background: rgba(248,81,73,.08); }
 .urlbox .copy { margin-left: auto; background: none; border: 1px solid var(--line2); color: var(--muted); border-radius: 7px; padding: .3rem .5rem; cursor: pointer; }
-.urlbox .copy:hover { color: #fff; border-color: var(--blue); }
+.urlbox .copy:hover { color: var(--blue); border-color: var(--blue); }
 /* Env-vars tab: a Rocket.Chat SETTING and a plain env var are not interchangeable,
    so the row says which. `.pill` carries a ● bullet, which reads as a status here —
    suppress it for this inline label. */
@@ -252,7 +330,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 .logctl { display: flex; gap: .5rem; align-items: center; margin-bottom: .6rem; flex-wrap: wrap; }
 .logctl .input { padding: .3rem .5rem; font-size: .78rem; }
 .logfollow { display: inline-flex; align-items: center; gap: .3rem; font-family: var(--mono); font-size: .78rem; color: var(--muted); }
-.logview { background: #05070b; border: 1px solid var(--line); border-radius: 8px; padding: .5rem;
+.logview { background: #05070b; border: 1px solid var(--line); border-radius: 9px; padding: .5rem;
   max-height: 56vh; overflow: auto; font-family: var(--mono); font-size: .78rem; line-height: 1.5; }
 .logrow { display: flex; gap: .6rem; padding: .05rem 0; white-space: pre-wrap; word-break: break-word; }
 .logrow .lt { color: var(--dim); flex: 0 0 auto; }
@@ -268,7 +346,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 .card.new { align-items: center; justify-content: center; text-align: center; border: 1.5px dashed var(--line2);
   border-left: 1.5px dashed var(--line2); background: transparent; cursor: pointer; min-height: 150px; gap: .3rem; }
 .card.new:hover { border-color: var(--blue); background: rgba(88,166,255,.04); }
-.card.new .plus { font-size: 1.8rem; color: var(--muted); border: 1px solid var(--line2); border-radius: 10px;
+.card.new .plus { font-size: 1.8rem; color: var(--muted); border: 1px solid var(--line2); border-radius: 12px;
   width: 46px; height: 46px; display: grid; place-items: center; margin-bottom: .3rem; }
 .card.new .t { font-family: var(--mono); font-weight: 700; }
 .card.new .s { font-size: .8rem; color: var(--muted); }
@@ -278,18 +356,30 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 .statusbar { display: flex; gap: 1.4rem; align-items: center; padding: .55rem 1.4rem;
   border-top: 1px solid var(--line); background: var(--panel); font-family: var(--mono);
   font-size: .74rem; color: var(--muted);
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; }
+  z-index: 20; }
+/* Scoped to the app shell: app.css is served to the sign-in page too, and that
+   one is a normal document that must be free to scroll. */
+body.shell { height: 100vh; min-height: 0; overflow: hidden; }
+body.shell .statusbar { flex: 0 0 auto; }
 .statusbar .sb-right { margin-left: auto; }
 
 /* ---- dialogs ---- */
-dialog { border: 1px solid var(--line2); border-radius: 14px; background: var(--panel); color: var(--ink);
-  width: min(600px, 94vw); padding: 1.3rem; }
-dialog::backdrop { background: rgba(0,0,0,.55); backdrop-filter: blur(2px); }
-dialog h2 { margin: 0 0 1rem; font-family: var(--mono); font-size: 1.05rem; }
+/* A card that floats, not a box that appears. The shadow does the lifting the
+   border was being asked to do, and a softer backdrop keeps the page behind
+   legible as context rather than blacking it out. */
+dialog { border: 1px solid var(--line); border-radius: 16px; background: var(--panel);
+  color: var(--ink); width: min(620px, 94vw); padding: 1.45rem 1.55rem 1.25rem;
+  box-shadow: 0 2px 6px rgba(20,23,28,.06), 0 26px 60px rgba(20,23,28,.18); }
+[data-theme="dark"] dialog { box-shadow: 0 26px 70px rgba(0,0,0,.62); }
+dialog::backdrop { background: rgba(20,23,28,.32); backdrop-filter: blur(3px); }
+[data-theme="dark"] dialog::backdrop { background: rgba(4,6,9,.6); }
+dialog menu { display: flex; justify-content: flex-end; gap: .5rem; margin: 1.35rem 0 0;
+  padding: .95rem 0 0; border-top: 1px solid var(--line); }
+dialog h2 { margin: 0 0 .35rem; font-size: 1.02rem; font-weight: 700; letter-spacing: -.01em; }
 form label { display: block; margin: .6rem 0; font-size: .88rem; color: var(--muted); }
 form input, form select, form textarea { width: 100%; margin-top: .28rem; padding: .5rem .65rem;
   border: 1px solid var(--line2);
-  border-radius: 8px; background: var(--bg); color: var(--ink); font: inherit; }
+  border-radius: 9px; background: var(--bg); color: var(--ink); font: inherit; }
 /* A JSON request body is code: proportional text made braces and indentation
    unreadable, and `font: inherit` above would otherwise hand it the sans stack. */
 form textarea { font-family: var(--mono); font-size: .8rem; resize: vertical; }
@@ -299,15 +389,17 @@ form textarea { font-family: var(--mono); font-size: .8rem; resize: vertical; }
 /* An HTTP method needs ~7rem, not half the row, so the path gets the rest. */
 .row2 label.narrow { flex: 0 0 7.5rem; }
 .adv { margin-top: .8rem; border-top: 1px solid var(--line); padding-top: .6rem; }
-.adv summary { font-family: var(--mono); font-size: .82rem; color: var(--muted); cursor: pointer; }
+.adv summary { font-size: .8rem; font-weight: 500; color: var(--muted);
+  cursor: pointer; padding: .1rem 0; }
+.adv summary:hover { color: var(--ink); }
 .adv summary:hover { color: var(--ink); }
 form menu { display: flex; justify-content: flex-end; gap: .5rem; padding: 0; margin: 1.1rem 0 0; }
 .hint { color: var(--muted); font-size: .82rem; margin: .1rem 0 .4rem; }
 .log { background: #05070b; color: #c9d1d9; font-family: var(--mono); font-size: .8rem; line-height: 1.45;
-  padding: .8rem; border-radius: 8px; max-height: 52vh; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  padding: .8rem; border-radius: 9px; max-height: 52vh; overflow: auto; white-space: pre-wrap; word-break: break-word;
   border: 1px solid var(--line); }
 .log .warn { color: var(--amber); } .log .error { color: var(--red); } .log .done { color: var(--green); }
-.plan { margin: .5rem 0; padding: .6rem .7rem; border: 1px solid var(--line2); border-radius: 8px; background: var(--bg);
+.plan { margin: .5rem 0; padding: .6rem .7rem; border: 1px solid var(--line2); border-radius: 9px; background: var(--bg);
   font-size: .82rem; max-height: 34vh; overflow: auto; }
 /* Activity rows: a button so the whole row is clickable and keyboard-reachable. */
 .jobrow { display: flex; align-items: center; gap: .6rem; width: 100%; text-align: left;
@@ -330,13 +422,13 @@ form menu { display: flex; justify-content: flex-end; gap: .5rem; padding: 0; ma
 .plan .kv code { color: var(--blue); } .plan .warn { color: var(--amber); }
 .result { color: #c9d1d9; font-size: .82rem; line-height: 1.5; margin-top: .4rem; }
 .result .ok { color: var(--green); font-weight: 700; } .result .bad { color: var(--red); font-weight: 700; }
-.grafana-embed { width: 100%; height: 320px; border: 1px solid var(--line); border-radius: 8px; margin-top: .5rem; background: #fff; }
+.grafana-embed { width: 100%; height: 320px; border: 1px solid var(--line); border-radius: 9px; margin-top: .5rem; background: #fff; }
 /* Toast stack: one fixed container, newest at the bottom. Individually-positioned
    toasts used to overlay each other exactly when a failure repeated. */
 .toasts { position: fixed; bottom: 3rem; left: 50%; transform: translateX(-50%);
           display: flex; flex-direction: column; gap: .4rem; align-items: center;
           z-index: 60; pointer-events: none; max-width: min(90vw, 40rem); }
-.toast { background: var(--red); color: #fff; padding: .55rem 1rem; border-radius: 8px;
+.toast { background: var(--red); color: var(--on-accent); padding: .55rem 1rem; border-radius: 9px;
          font-size: .85rem; box-shadow: 0 6px 20px rgba(0,0,0,.45); text-align: center; }
 .toast.ok { background: var(--green); color: #06210d; }
 .toast.info { background: var(--blue); color: #04162e; }
@@ -344,11 +436,11 @@ form menu { display: flex; justify-content: flex-end; gap: .5rem; padding: 0; ma
 /* Responsive: the layout's first track had a hard 360px floor, so with a repro
    selected the page scrolled horizontally below ~465px and the detail column was
    squeezed to nothing between there and ~800px. There were no @media rules at all. */
+@media (max-width: 1100px) { .kv-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 900px) {
   .layout { grid-template-columns: 1fr; }
   .detail { position: static; max-height: none; }
   .statusbar { flex-wrap: wrap; gap: .5rem 1rem; }
-  .kv-grid { grid-template-columns: 1fr; }
   .grafana-embed { height: 240px; }
 }
 @media (max-width: 560px) {
@@ -364,3 +456,282 @@ body { overflow-x: hidden; }
    accounts; in token mode there is nobody to name. */
 .jactor { color: var(--muted); font-size: 12px; }
 .jactor::before { content: "by "; opacity: .6; }
+
+/* ---- home ---- */
+/* Shown when nothing is selected. It leads with capacity because that is the
+   constraint that actually bites: `up` refuses without headroom, and "room for
+   about 2 more" is the sentence that decides what you do next. */
+.home-head { padding: 1.3rem 1.6rem .2rem; }
+.home-head h1 { margin: 0; font-size: 1.35rem; letter-spacing: -.02em; }
+.home-head p { margin: .35rem 0 0; font-family: var(--mono); font-size: .78rem; color: var(--muted); }
+.home-body { padding: 1.1rem 1.6rem 2rem; display: grid; gap: 1rem; max-width: 68rem; }
+.capcard { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 1rem 1.1rem 1.1rem; }
+.caphead { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+.caproom { font-size: .82rem; font-weight: 600; color: var(--green); }
+.caproom.tight { color: var(--amber); }
+.capnum { font-family: var(--mono); font-size: 1.6rem; font-weight: 700; letter-spacing: -.03em;
+  margin-top: .35rem; }
+.capnum small { font-family: var(--sans); font-size: .84rem; font-weight: 400;
+  color: var(--muted); margin-left: .45rem; }
+.capbar { display: flex; height: 10px; border-radius: 6px; overflow: hidden;
+  background: var(--panel2); box-shadow: inset 0 0 0 1px var(--line);
+  margin-top: .75rem; }
+.capbar i { display: block; height: 100%; }
+.capbar .used { background: var(--muted); }
+.capbar .reserved { background: var(--line2); }
+.caplegend { display: flex; gap: 1.1rem; flex-wrap: wrap; margin-top: .5rem;
+  font-size: .72rem; color: var(--muted); }
+.caplegend .k { display: inline-block; width: 9px; height: 9px; border-radius: 3px;
+  margin-right: .4rem; vertical-align: -1px; box-shadow: inset 0 0 0 1px var(--line); }
+.caplegend .k.used { background: var(--muted); }
+.caplegend .k.reserved { background: var(--line2); }
+.caplegend .k.free { background: var(--panel2); box-shadow: inset 0 0 0 1px var(--line); }
+
+.hcard { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  overflow: hidden; }
+.hcard-h { display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  padding: .7rem 1rem; border-bottom: 1px solid var(--line); }
+.att { display: flex; align-items: center; gap: .8rem; padding: .75rem 1rem;
+  border-bottom: 1px solid var(--line); }
+.att:last-child { border-bottom: 0; }
+.att-i { color: var(--amber); font-size: .8rem; }
+.att-t { flex: 1; font-size: .84rem; line-height: 1.5; }
+/* Two workspaces in a three-slot auto-fill grid leaves an empty cell painted in
+   the line colour — a grey block sitting beside your workspaces. Same hole the
+   fact grid had; same fix. */
+.mini { display: flex; flex-wrap: wrap; }
+.minicard { flex: 1 1 15rem; border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line); }
+.minicard { display: grid; gap: .2rem; padding: .8rem 1rem; background: var(--panel);
+  border: 0; text-align: left; font: inherit; color: var(--ink); cursor: pointer; }
+.minicard:hover { background: var(--panel2); }
+.minicard .n { font-weight: 600; font-size: .84rem; }
+.minicard .m { font-family: var(--mono); font-size: .7rem; color: var(--dim); }
+.minicard .m.up { color: var(--green); }
+.arow { display: flex; align-items: baseline; gap: .9rem; padding: .55rem 1rem;
+  border-bottom: 1px solid var(--line); font-size: .82rem; }
+.arow:last-child { border-bottom: 0; }
+.arow .who { width: 5.5rem; flex: 0 0 auto; font-family: var(--mono); font-size: .76rem;
+  color: var(--muted); }
+.arow .kind { width: 8rem; flex: 0 0 auto; font-family: var(--mono); font-size: .74rem;
+  color: var(--dim); }
+.arow .what { flex: 1; overflow-wrap: anywhere; }
+.arow .when { font-family: var(--mono); font-size: .7rem; color: var(--dim); }
+.arow[data-denied="true"] { background: rgba(217,45,32,.06); }
+.arow[data-denied="true"] .kind { color: var(--red); }
+
+/* ---- scenarios ---- */
+.scen-b { padding: .85rem 1rem; }
+.scen-d { margin: 0; font-size: .86rem; line-height: 1.6; color: var(--muted); max-width: 68ch; }
+/* Notes are pre-wrapped for an 80-column terminal. Re-flowing them into a narrow
+   column produces "…reaches Keycloak at the same / URL Rocket.Chat's backend
+   uses", which reads as broken text rather than as instructions. */
+.scen-n { margin: .7rem 0 0; padding: .7rem .8rem; background: var(--panel2);
+  border-radius: 9px; font-family: var(--mono); font-size: .76rem; line-height: 1.7;
+  color: var(--ink); white-space: pre; overflow-x: auto; }
+.scen-f { display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  padding: .65rem 1rem; border-top: 1px solid var(--line); font-size: .78rem;
+  color: var(--muted); flex-wrap: wrap; }
+
+/* Which page you are on. Without it Activity and Scenarios were reachable and
+   indistinguishable — you could not tell where you were, or that there was
+   anywhere else to be. */
+.toplink { font-size: .8rem; font-weight: 500; padding: .35rem .25rem; border: 0;
+  background: none; color: var(--ink); cursor: pointer; font-family: inherit; }
+.toplink:hover { color: var(--blue); }
+.toplink[aria-current] { color: var(--blue); text-decoration: underline;
+  text-underline-offset: 5px; text-decoration-thickness: 2px; }
+button.brand { border: 0; background: none; cursor: pointer; color: var(--ink); padding: 0; }
+button.brand:hover { color: var(--blue); }
+
+/* ---- account menu ---- */
+.menuwrap { position: relative; }
+.memenu { position: absolute; right: 0; top: calc(100% + .45rem); min-width: 15rem;
+  background: var(--panel); border: 1px solid var(--line2); border-radius: 12px;
+  padding: .35rem; z-index: 60;
+  box-shadow: 0 1px 2px rgba(20,23,28,.06), 0 14px 34px rgba(20,23,28,.12); }
+[data-theme="dark"] .memenu { box-shadow: 0 14px 40px rgba(0,0,0,.5); }
+.me-head { padding: .5rem .6rem .45rem; border-bottom: 1px solid var(--line);
+  margin-bottom: .35rem; }
+.me-head b { display: block; font-size: .86rem; }
+.me-head span { font-family: var(--mono); font-size: .7rem; color: var(--muted); }
+.memenu button { display: flex; align-items: center; gap: .5rem; width: 100%;
+  padding: .45rem .6rem; border: 0; border-radius: 6px; background: none; color: var(--ink);
+  font: inherit; font-size: .82rem; text-align: left; cursor: pointer; }
+.memenu button:hover { background: var(--panel2); }
+.memenu button small { margin-left: auto; font-family: var(--mono); font-size: .66rem;
+  color: var(--dim); }
+.memenu button.danger { color: var(--red); font-weight: 600; }
+.memenu button.danger:hover { background: rgba(217,45,32,.08); }
+.memenu hr { border: 0; border-top: 1px solid var(--line); margin: .35rem 0; }
+
+/* ---- preset notes ---- */
+/* A bordered block, like everything else that is content rather than chrome.
+   Loose paragraphs under a grey label read as leftovers. */
+.notes { display: grid; gap: .8rem; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.1rem; }
+.notes code.inline { font-family: var(--mono); font-size: .82em; padding: .1em .35em;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 5px; }
+.note-p { margin: 0; font-size: .84rem; line-height: 1.65; color: var(--muted);
+  max-width: 74ch; }
+.note-p a { color: var(--blue); }
+/* The line you have to type. It was one <div> among five and read as prose. */
+.note-cmd { display: flex; align-items: center; gap: .6rem; padding: .45rem .55rem;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 9px; }
+.note-cmd code { flex: 1; font-family: var(--mono); font-size: .78rem; color: var(--ink);
+  overflow-x: auto; white-space: pre; }
+.cp { font-size: .68rem; font-family: var(--sans); color: var(--muted); background: none;
+  border: 1px solid var(--line2); border-radius: 5px; padding: .18rem .45rem; cursor: pointer;
+  flex: 0 0 auto; }
+.cp:hover { color: var(--blue); border-color: var(--blue); }
+
+/* ---- where things are ---- */
+.linkrows { display: grid; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.linkrow { display: flex; align-items: baseline; gap: 1rem; padding: .6rem .9rem;
+  border-bottom: 1px solid var(--line); text-decoration: none; color: var(--ink);
+  background: var(--panel); }
+.linkrow:last-child { border-bottom: 0; }
+.linkrow:hover { background: var(--panel2); }
+.linkrow .l-n { flex: 0 0 auto; min-width: 8.5rem; white-space: nowrap;
+  font-size: .82rem; font-weight: 600; }
+.linkrow .l-u { flex: 0 1 auto; font-family: var(--mono); font-size: .76rem;
+  color: var(--blue); overflow-wrap: anywhere; }
+.linkrow .l-go { margin-left: auto; color: var(--dim); font-size: .74rem;
+  opacity: 0; transition: opacity .12s; }
+.linkrow:hover .l-go { opacity: 1; }
+.linkrow.sidecar .l-n::after { content: " · sidecar"; font-weight: 400; color: var(--dim);
+  font-size: .68rem; }
+.linkrow.monitor .l-n::after { content: " · monitoring"; font-weight: 400; color: var(--dim);
+  font-size: .68rem; }
+/* A row carries up to four things — what it is, what it is for, where, and the
+   password — plus a second line for anything the preset said about it. Wrapping
+   rather than ellipsising: the description IS the sentence, and half of one is
+   worse than a line break. */
+.linkrow { flex-wrap: wrap; row-gap: .3rem; }
+.linkrow .l-w { flex: 0 1 auto; min-width: 0; font-size: .78rem; color: var(--muted); }
+.linkrow .l-u { margin-right: auto; }
+.linkrow .l-c { flex: 0 0 auto; font-family: var(--mono); font-size: .71rem;
+  color: var(--muted); background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 5px; padding: .08rem .38rem; }
+/* Indented to the url column, so the second line reads as part of the row rather
+   than as a new one that happens to sit under it. */
+.linkrow .l-sub { flex: 0 0 100%; padding-left: 9.5rem; font-size: .78rem;
+  line-height: 1.6; color: var(--muted); max-width: 76ch; }
+.linkrow .l-sub a { color: var(--blue); }
+.linkrow .l-sub code.inline { font-family: var(--mono); font-size: .82em; padding: .1em .35em;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 5px; }
+/* A place with no reachable address (livechat's "<repro-url>/livechat") is still
+   a row — it just is not a link, and pretending otherwise gives a dead click. */
+.linkrow.static { cursor: default; }
+.linkrow.static:hover { background: var(--panel); }
+.linkrow.static .l-u { color: var(--muted); }
+/* A note-borne place standing on its own, inside the prose flow. */
+.linkrows.one { border-radius: 9px; }
+.notes .linkrows.one .linkrow { background: var(--panel2); }
+.notes .linkrows.one .linkrow:hover { background: var(--line); }
+
+/* ---- notes, read as documentation rather than a dump ---- */
+.notes { gap: .7rem; }
+/* Each remaining note is a POINT, and a marker says so. Without one, three
+   paragraphs of equal weight under a heading read as a paragraph that has been
+   broken up rather than as three separate things you are being told. */
+.note-p { position: relative; padding-left: .95rem; font-size: .86rem; line-height: 1.7;
+  color: var(--ink); opacity: .84; }
+.note-p::before { content: ""; position: absolute; left: .1rem; top: .68em;
+  width: 4px; height: 4px; border-radius: 50%; background: var(--dim); }
+.note-cmd { border-radius: 10px; padding: .55rem .65rem; }
+.note-cmd code { font-size: .8rem; }
+/* The scenario card: a document, not a form. */
+.scen-b { padding: 1rem 1.15rem 1.15rem; }
+.scen-d { font-size: .88rem; line-height: 1.7; color: var(--ink); opacity: .8; max-width: 72ch; }
+.scen-f { padding: .8rem 1.15rem; font-size: .74rem; }
+.hcard, .capcard { border-radius: 14px; }
+.hcard-h { padding: .8rem 1.1rem; }
+.home-head h1 { font-size: 1.5rem; font-weight: 700; }
+.home-body { gap: 1.15rem; }
+.lbl, .hcard-h .lbl { font-size: .64rem; font-weight: 600; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--dim); }
+.minicard { padding: .9rem 1.1rem; }
+.att { padding: .85rem 1.1rem; }
+.capcard { padding: 1.15rem 1.25rem 1.25rem; }
+.capnum { font-size: 1.85rem; }
+/* Inputs and buttons: proportional, so a form reads as a form. */
+.input { font-family: var(--sans); font-size: .84rem; padding: .48rem .7rem; }
+.btn { font-size: .82rem; font-weight: 500; padding: .45rem .85rem; }
+.btn.small { font-size: .76rem; padding: .3rem .62rem; }
+form label { font-size: .82rem; margin: .85rem 0; }
+form input, form select { padding: .55rem .7rem; font-family: var(--sans); }
+.hint { line-height: 1.65; }
+
+/* ---- the one button you are meant to press ---- */
+.btn.solid { background: var(--ink); color: var(--bg); border-color: var(--ink);
+  font-weight: 600; }
+.btn.solid:hover { background: var(--ink); border-color: var(--ink); opacity: .86; }
+
+/* ---- a card with a header, used by the scenario and the chart ---- */
+.panelcard { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  overflow: hidden; margin: 1.4rem 0; }
+.panelcard-h { display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; padding: .7rem 1rem; border-bottom: 1px solid var(--line); }
+.panelcard-b { padding: .95rem 1rem 1.05rem; }
+.panelcard-b .notes { border: 0; padding: 0; background: none; }
+/* The notes ARE the card's body here, so they take its padding and none of the
+   standalone block's own frame — a border inside a border reads as a mistake. */
+.panelcard-b.notes { border: 0; border-radius: 0; background: none;
+  padding: .95rem 1rem 1.05rem; }
+.panelcard-b.notes .linkrows.one { border: 1px solid var(--line); border-radius: 9px; }
+.panelcard-b.notes .linkrows.one .linkrow { border-radius: 0; }
+.panelcard-b.notes .linkrows.one .linkrow:last-child { border-bottom: 0; }
+.section-label.flat { margin: 0; }
+.linkbtn { background: none; border: 0; padding: 0; cursor: pointer; font: inherit;
+  font-size: .74rem; color: var(--blue); }
+.linkbtn:hover { text-decoration: underline; }
+.panelcard .linkrow { border-bottom: 1px solid var(--line); border-radius: 0; }
+.panelcard .linkrow:last-child { border-bottom: 0; }
+
+/* A setup step that BLOCKS the scenario. Amber, because it is the one thing here
+   that will stop you, and only for a command that is not simply a url to open. */
+.setup { display: flex; align-items: flex-start; gap: .8rem; padding: .9rem 1rem;
+  background: rgba(180,83,9,.08); border-bottom: 1px solid var(--line); }
+[data-theme="dark"] .setup { background: rgba(240,180,41,.09); }
+.setup-i { color: var(--amber); font-size: .8rem; line-height: 1.5; }
+.setup-t { flex: 1; font-size: .84rem; line-height: 1.6; }
+.setup-t b { display: block; }
+.setup-w { display: block; color: var(--muted); }
+.setup-t code { display: inline-block; margin-top: .5rem; font-family: var(--mono);
+  font-size: .8rem; background: var(--panel); border: 1px solid var(--line2);
+  border-radius: 7px; padding: .28rem .55rem; }
+
+/* ---- the chart, in its card ---- */
+.chart-box { border: 0; border-radius: 0; background: var(--bg); padding: .7rem .85rem; }
+.chart-legend { display: flex; gap: 1rem; font-family: var(--mono); font-size: .68rem;
+  color: var(--muted); margin: 0; }
+.chart-legend .sw { display: inline-block; width: 13px; height: 2px; border-radius: 2px;
+  vertical-align: middle; margin-right: .35rem; }
+
+/* ---- the Grafana / sidecar chips lost every rule in the layout swap ---- */
+.linkchip { display: inline-flex; align-items: center; gap: .35rem; font-size: .74rem;
+  color: var(--blue); text-decoration: none; border: 1px solid var(--line2);
+  border-radius: 999px; padding: .22rem .65rem; background: var(--panel); }
+.linkchip:hover { border-color: var(--blue); background: var(--panel2); }
+.linkchip::after { content: "↗"; font-size: .68rem; color: var(--dim); }
+.card-links { display: flex; flex-wrap: wrap; gap: .45rem; margin: .5rem 0 0; }
+
+/* ---- home: a card you can tell you are hovering ---- */
+.minicard:hover { background: var(--panel2); box-shadow: inset 0 0 0 1px var(--line2); }
+[data-theme="dark"] .minicard:hover { background: #1F2530; }
+
+/* ---- rail search and filters ---- */
+.rail-controls .input { height: 2.1rem; border-radius: 9px; border-color: var(--line);
+  background: var(--bg); }
+.rail-controls .input:hover { border-color: var(--line2); }
+.rail-controls .input:focus { outline: none; border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(59,91,219,.14); }
+#filter { background-image: none; }
+.rail-two select.input { -webkit-appearance: none; appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--dim) 50%),
+                    linear-gradient(135deg, var(--dim) 50%, transparent 50%);
+  background-position: right 0.85rem center, right 0.6rem center;
+  background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;
+  padding-right: 1.6rem; }

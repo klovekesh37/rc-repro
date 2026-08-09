@@ -1847,7 +1847,12 @@ def test_webui_handles_every_state_the_backend_can_report():
     html = webui.joinpath("index.html").read_text(encoding="utf-8")
 
     for state in ("running", "stopped", "down", "unknown") + lc.TRANSIENT_STATES:
-        assert re.search(rf"\.card\.st-{state}\b", css), f"no card accent for state {state!r}"
+        # The rail row's left gutter, and the word under it. Cards became rows in
+        # the v4 redesign; the property this test protects did not change — a state
+        # the interface does not know about renders with no colour at all.
+        assert re.search(rf'\.wrow\[data-state="{state}"\]', css), \
+            f"no rail accent for state {state!r}"
+        assert re.search(rf"\.wstate\.{state}\b", css), f"no state colour for {state!r}"
         assert re.search(rf"\.pill\.{state}\b", css), f"no pill colour for state {state!r}"
     # …and each real one is reachable from the status filter.
     for state in lc.TRANSIENT_STATES:

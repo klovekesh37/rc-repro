@@ -415,6 +415,48 @@ def test_doctor_endpoint_returns_the_same_report_the_cli_renders(monkeypatch):
     assert body["checks"][0]["status"] == "fail"
 
 
+def test_the_browser_report_drops_what_the_browser_already_shows(monkeypatch):
+    """A row tagged `elsewhere` names a place the GUI shows the same fact
+    permanently — the edge chip, the People page, the New workspace form. In the
+    browser those made a diagnostic mostly a summary of the window around it.
+
+    The CLI keeps them: a terminal has no chip, no user list and no rail, so
+    `rc-repro doctor` is the only place they are ever said. That asymmetry is the
+    whole point, so it is asserted from both ends.
+    """
+    from rc_repro.services import doctor as doctorsvc
+    full = {
+        "checks": [
+            {"status": "ok", "message": "Docker daemon running"},
+            {"status": "ok", "message": "3 GUI account(s), admin: lovekesh",
+             "elsewhere": "the People page"},
+            {"status": "fail", "message": "No admin account"},
+        ],
+        "counts": {"ok": 2, "warn": 0, "fail": 1}, "verdict": "fail", "repros": None,
+    }
+    monkeypatch.setattr(doctorsvc, "run_checks", lambda: dict(full))
+    msgs = [c["message"] for c in client().get("/api/doctor", headers=H).json()["checks"]]
+    assert "3 GUI account(s), admin: lovekesh" not in msgs
+    assert "Docker daemon running" in msgs
+    # Never a row that reports a PROBLEM, even about the same subject.
+    assert "No admin account" in msgs
+    # and the counts still describe every check that ran, so the verdict holds
+    assert client().get("/api/doctor", headers=H).json()["counts"]["ok"] == 2
+
+
+def test_the_cli_report_keeps_every_row(monkeypatch, capsys):
+    from typer.testing import CliRunner
+
+    from rc_repro import cli
+    from rc_repro.services import doctor as doctorsvc
+    monkeypatch.setattr(doctorsvc, "run_checks", lambda: {
+        "checks": [{"status": "ok", "message": "3 GUI account(s), admin: lovekesh",
+                    "elsewhere": "the People page"}],
+        "counts": {"ok": 1, "warn": 0, "fail": 0}, "verdict": "ok", "repros": None})
+    out = CliRunner().invoke(cli.app, ["doctor"]).output
+    assert "3 GUI account(s)" in out, "the only place a terminal user learns this"
+
+
 def test_doctor_endpoint_needs_a_session():
     assert client(sign_in=False).get("/api/doctor").status_code == 401
 

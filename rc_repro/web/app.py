@@ -120,6 +120,7 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("POST", "/api/backups/compatibility"): _READ,   # a question, not a change
     ("GET", "/api/doctor"): _READ,
     ("GET", "/api/edge"): _READ,
+    ("GET", "/api/machine"): _READ,
     ("GET", "/api/presets"): _READ,
     ("GET", "/api/settings"): _READ,
     ("GET", "/api/versions/{version}"): _READ,
@@ -1070,9 +1071,18 @@ def create_app(allow_hosts: list[str] | None = None, *,
         The dashboard's docker badge could only say up/down; when it said down,
         every card reported "docker unavailable — actions disabled" and offered no
         diagnosis. This is the click-through.
+
+        MINUS the rows that carry an `elsewhere`: facts the browser already shows
+        permanently — the edge chip, the People page, the fields the New workspace
+        form offers. A terminal has none of those, so they stay in `rc-repro
+        doctor`; here they made a diagnostic mostly a summary of the window around
+        it. Only `ok` rows are ever tagged, so nothing that reports a PROBLEM is
+        dropped, and the counts still cover every check that ran.
         """
         from rc_repro.services import doctor as doctorsvc
-        return doctorsvc.run_checks()
+        report = doctorsvc.run_checks()
+        report["checks"] = [c for c in report["checks"] if not c.get("elsewhere")]
+        return report
 
     @app.get("/api/repros/{name}")
     def describe(name: str):
@@ -1096,11 +1106,32 @@ def create_app(allow_hosts: list[str] | None = None, *,
                     getattr(request.state, "actor", "") or ""),
                 "privileged_fields": list(lc.PRIVILEGED_CREATE_FIELDS)}
 
+    @app.get("/api/machine")
+    def machine():
+        """What the home page leads with: how much room this box has left.
+
+        `/api/machine`, not `/api/capacity` -- "capacity" already means the load
+        test that searches for a workspace's breaking point
+        (POST /api/repros/{name}/capacity). One word for two unrelated things in
+        the same API is how somebody ends up calling the wrong one.
+
+        Cheap on purpose: one read of /proc/meminfo and no docker, because this is
+        fetched on every visit, unlike /api/doctor which shells out twice.
+        """
+        return lc.capacity()
+
     @app.get("/api/presets")
     def list_presets():
         return {"presets": [
             {"name": p.name, "description": p.description, "params_help": p.params_help,
-             "requires_license": p.requires_license} for p in presets_mod.list_presets()]}
+             "requires_license": p.requires_license,
+             # `notes` were printed by `up` and `info` and shown NOWHERE in the
+             # browser. For `oidc` that is not cosmetic: the scenario does not work
+             # until `127.0.0.1  keycloak` is in /etc/hosts, and a GUI-only user had
+             # no way to learn it. Same for s3_minio in presigned mode.
+             "notes": list(p.notes or []),
+             "ports": list(config.PRESET_PORTS.get(p.name, ()))}
+            for p in presets_mod.list_presets()]}
 
     @app.get("/api/versions/{version}")
     def resolve_version(version: str, offline: bool = False):

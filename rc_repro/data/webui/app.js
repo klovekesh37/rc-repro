@@ -83,6 +83,32 @@ async function api(path, opts = {}) {
 // ---- repro list (master) ----------------------------------------------------
 let ALL_REPROS = [];
 let SELECTED = null;
+// What the stage is showing: "home" when nothing is picked, "workspace" for
+// the selected one, "activity" for the box-wide log. The rail selection and
+// the view are separate on purpose -- opening Activity must not silently
+// deselect the workspace you were working on.
+let VIEW = "home";
+// Every view change goes through here, so "what is on the stage" and "what the
+// top bar says is current" cannot disagree. They did: Activity and Scenarios were
+// reachable and nothing led back, because the brand was a <div> and no link was
+// ever marked.
+function setView(v) {
+  VIEW = v;
+  for (const [id, name] of [["#btn-home", "home"], ["#btn-jobs", "activity"],
+                            ["#btn-scenarios", "scenarios"]]) {
+    const b = $(id);
+    if (b) b.toggleAttribute("aria-current", VIEW === name);
+  }
+}
+function goHome() {
+  SELECTED = null;
+  closeLogs();
+  if (dstate.statsTimer) { clearInterval(dstate.statsTimer); dstate.statsTimer = null; }
+  dstate.detail = null;
+  setView("home");
+  renderHome();
+  render();
+}
 const view = { filter: "", status: "", sort: "name",
                scope: localStorage.getItem("rc_scope") || "all" };
 // lifecycle.list_repros() reports "?" when docker is down, which is not a usable
@@ -90,6 +116,7 @@ const view = { filter: "", status: "", sort: "name",
 const stateClass = (s) => (s === "?" ? "unknown" : s);
 // Colour the health badge from HEALTH, not state: "Up 2 minutes (unhealthy)" is
 // state=running + health=unhealthy, and colouring by state painted it GREEN.
+const HEALTH_TONE = { running: "green", bad: "bad", warn: "warn", stopped: "warn" };
 function healthClass(r) {
   const h = (r.health || "").toLowerCase();
   if (h.includes("unhealthy")) return "bad";
@@ -137,12 +164,14 @@ async function loadRepros() {
     const who = $("#whoami");
     who.textContent = ME + (MY_ROLE && MY_ROLE !== "admin" ? ` · ${MY_ROLE}` : "");
     who.hidden = !ME;
+    DOCKER_OK = !!health.docker;
     const dockerTxt = "docker: " + (health.docker ? "up" : "down");
     const badge = $("#docker-badge");
     badge.textContent = dockerTxt; badge.className = "chip " + (health.docker ? "up" : "down");
     $("#sb-docker").textContent = dockerTxt;
     if (SELECTED && !ALL_REPROS.find((r) => r.name === SELECTED)) closeDetail();
     render();
+    refreshHome();
   } catch (e) { toast(e.message); }
 }
 
@@ -152,6 +181,10 @@ async function loadRepros() {
 // for everyone, and something invisible that can take every name down at once is
 // worse than one more chip.
 let EDGE = null;
+// Docker's last known state, so the home page can lead with it being down —
+// nothing can start, stop or report while it is, and that outranks every other
+// thing the page might say.
+let DOCKER_OK = true;
 
 async function refreshEdgeBadge() {
   const badge = $("#edge-badge");
@@ -217,8 +250,14 @@ function render() {
   $("#sb-count").textContent = `${ALL_REPROS.length} repro(s) · ` +
     (unknown ? "state unknown (docker unavailable)" : `${running} running`);
   $("#sb-refreshed").textContent = "Last refreshed: " + new Date().toLocaleTimeString();
-  $(".layout").classList.toggle("no-detail", !SELECTED);
-  if (!SELECTED) $("#detail").innerHTML = `<div class="placeholder">Select a workspace to see details, logs, containers and live stats.</div>`;
+  $(".panes").classList.toggle("no-detail", VIEW !== "workspace" || !SELECTED);
+  // render() runs on the four-second poll, so it must redraw the RAIL without
+  // touching a stage it does not own. Activity and Scenarios paint themselves and
+  // then stay put; anything else here reset them to home within four seconds of
+  // opening, which is how the Scenarios page shipped in v0.40.0 and vanished
+  // while you were reading it.
+  if (VIEW === "home" && !SELECTED) renderHome();
+  if (VIEW !== "workspace") $("#actpane").innerHTML = "";
 
   let list = ALL_REPROS.filter((r) =>
     (!view.filter || r.name.toLowerCase().includes(view.filter)) &&
@@ -228,110 +267,39 @@ function render() {
   list.sort((a, b) => key === "port" ? a.host_port - b.host_port
     : String(a[key]).localeCompare(String(b[key])));
 
-  if (!ALL_REPROS.length) grid.append(el("p", { class: "empty" }, "No repros yet. Click “+ New repro”."));
-  else if (!list.length) grid.append(el("p", { class: "empty" }, "No repros match this filter."));
+  if (!ALL_REPROS.length) grid.append(el("p", { class: "empty" }, "No workspaces yet. Start with “+ New workspace”."));
+  else if (!list.length) grid.append(el("p", { class: "empty" }, "Nothing matches this filter."));
   for (const r of list) grid.append(card(r));
-  if (canWrite()) grid.append(el("div", { class: "card new", onclick: openCreate },
-    el("div", { class: "plus" }, "+"),
-    el("div", { class: "t" }, "New repro"),
-    el("div", { class: "s" }, "Spin up a fresh RC + Mongo sandbox")));
 }
 
 function card(r) {
-  const busyLabel = pendingOn(r.name);
-  const head = el("div", { class: "card-head" }, el("span", { class: "name" }, r.name));
-  if (r.default) head.append(el("span", { class: "pill default" }, "default"));
-  // While an action is in flight the pill reports it rather than the now-stale
-  // server state: "stopping" is the honest answer between the click and the reply.
-  head.append(busyLabel
-    ? el("span", { class: "pill working" }, (BUSY_VERB[busyLabel] || busyLabel).toLowerCase() + "…")
-    : el("span", { class: "pill " + stateClass(r.state) }, r.state));
-  head.append(el("span", { class: "chev" }, "›"));
-
-  const meta = el("div", { class: "card-meta" },
-    `RC ${r.rc_version} · Mongo ${r.mongo_tag} · :${r.host_port} · ${r.preset}`
-    + (r.monitoring ? " · monitored" : ""));
-  if (r.created_by) {
-    meta.append(" ");
-    meta.append(el("span", { class: "owner" + (r.created_by === ME ? " me" : "") },
-                   r.created_by));
-  }
-
-  const actions = el("div", { class: "card-actions" });
-  // "?" means docker could not be asked, so EVERY action below would fail -- the
-  // card used to offer three buttons that all produced a red toast.
-  const dockerOk = r.state !== "?";
-  if (!canWrite()) {
-    // Open RC still works: it is a link to the workspace, not an action on it.
-    if (dockerOk) {
-      actions.append(stop(el("a", { href: localUrl(r.root_url), target: "_blank", style: "text-decoration:none" },
-        el("button", { class: "btn small primary" }, "Open RC"))));
-    }
-    actions.append(el("span", { class: "inline-note", title: READONLY_WHY }, "readonly"));
-    const foot0 = el("div", { class: "card-foot" },
-      el("span", {}, "Uptime: " + (r.uptime || "—")),
-      el("span", { class: "health " + healthClass(r) }, r.health || r.state));
-    const c0 = el("div", {
-      class: "card st-" + stateClass(r.state) + (r.name === SELECTED ? " selected" : ""),
-      role: "button", tabindex: "0", "aria-label": `${r.name} — ${r.state}`,
-      onclick: () => selectRepro(r.name),
-      onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectRepro(r.name); } },
-    }, head, meta, actions, foot0);
-    return c0;
-  }
-  if (dockerOk) {
-    actions.append(stop(el("a", { href: localUrl(r.root_url), target: "_blank", style: "text-decoration:none" },
-      el("button", { class: "btn small primary" }, "Open RC"))));
-  }
-  if (r.state === "running") {
-    actions.append(actBtn("Stop", () => doState(r.name, "stop"), "", busyLabel));
-    actions.append(actBtn("Restart", () => doState(r.name, "restart"), "", busyLabel));
-    actions.append(actBtn("Seed", () => openSeed(r.name), "", busyLabel));
-  } else if (r.state === "stopped") {
-    actions.append(actBtn("Start", () => doState(r.name, "start"), "", busyLabel));
-  } else if (r.state === "down") {
-    // `down` removed the containers (the data volume and record survive), so
-    // `compose start` cannot revive it -- recreate from the stored metadata.
-    // Without this a "keep the data" Down left the card with no way back up.
-    actions.append(actBtn("Bring up", () => doBringUp(r.name), "primary", busyLabel));
-  } else if (!dockerOk) {
-    actions.append(el("span", { class: "inline-note" }, "docker unavailable"));
-  } else {
-    // restarting / created / paused / dead -- compose reports these verbatim and
-    // they used to get no lifecycle control at all.
-    actions.append(actBtn("Stop", () => doState(r.name, "stop"), "", busyLabel));
-    actions.append(actBtn("Restart", () => doState(r.name, "restart"), "", busyLabel));
-  }
-  // `docker compose logs` needs containers; a down repro returned an empty pane.
-  if (r.state === "running" || r.state === "stopped") {
-    actions.append(actBtn("Logs", () => showLogs(r.name), "", busyLabel));
-  }
-  if (dockerOk) actions.append(actBtn("Down", () => doDown(r.name), "danger", busyLabel));
-
-  const foot = el("div", { class: "card-foot" },
-    el("span", {}, "Uptime: " + (r.uptime || "—")),
-    el("span", { class: "health " + healthClass(r) }, r.health || r.state));
-
-  // A plain div with onclick was unreachable by keyboard, and every inner button
-  // stopPropagation()s -- so the whole detail panel (logs, env, load test) had no
-  // keyboard path at all.
-  const c = el("div", {
-    class: "card st-" + stateClass(r.state) + (r.name === SELECTED ? " selected" : ""),
-    role: "button", tabindex: "0", "aria-label": `${r.name} — ${r.state}`,
+  // A row, not a card. The old one was 130px tall and carried six buttons; six
+  // workspaces meant 36 buttons on screen and 4.5 of them visible. This is 52px,
+  // has no buttons at all, and shows the whole name -- which is the thing anyone
+  // is actually scanning for. Everything you can DO lives in the stage, next to
+  // the workspace it acts on.
+  const busy = pendingOn(r.name);
+  const state = busy ? "working" : stateClass(r.state || "?");
+  const row = el("button", {
+    class: "wrow",
+    "data-state": state,
+    "aria-current": r.name === SELECTED ? "true" : "false",
+    title: r.name,
     onclick: () => selectRepro(r.name),
-    onkeydown: (e) => {
-      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectRepro(r.name); }
-    },
-  }, head, meta, actions, foot);
-  return c;
+  });
+  const r1 = el("span", { class: "r1" }, el("span", { class: "nm" }, r.name));
+  if (r.default) r1.append(el("span", { class: "star", title: "used by CLI commands with no --name" }, "★"));
+  r1.append(el("span", { class: "ver" }, r.rc_version || "?"));
+  const bits = [r.preset, ":" + r.host_port, r.created_by].filter(Boolean);
+  if (r.monitoring) bits.push("monitored");
+  row.append(r1, el("span", { class: "meta" }, bits.join(" · ")));
+  row.append(el("span", { class: "r3" },
+    el("span", { class: "wstate " + (busy ? "working" : stateClass(r.state)) },
+      busy ? (BUSY_VERB[busy] || busy) : (r.state === "?" ? "state unknown" : r.state)),
+    el("span", { class: "wage" }, r.uptime || "")));
+  return row;
 }
 
-function stop(node) { node.addEventListener("click", (e) => e.stopPropagation()); return node; }
-
-// Which repros have a slow synchronous action in flight, name -> the action's
-// button label. This has to live outside the DOM: the 4s poll rebuilds the whole
-// card grid, so feedback parked on the button node vanished within 4s of the
-// click and left a still-running Stop looking clickable again.
 const PENDING = new Map();
 const BUSY_VERB = {
   Stop: "Stopping", Start: "Starting", Restart: "Restarting", Down: "Removing",
@@ -372,8 +340,333 @@ async function runAction(name, label, fn) {
   }
 }
 
+
+// The action pane: everything you can do TO this workspace, grouped by intent.
+//
+// It used to be thirteen buttons in one row of the panel, in one weight -- "Open
+// RC", which you press ninety times out of a hundred, sat next to "Capacity",
+// which takes forty minutes, next to "Down", which destroys a customer
+// reproduction. The row was read every single time because nothing in it was
+// ranked.
+//
+// The grouping is not decoration, it is the teaching: "put data in it" explains
+// what Seed does to somebody who never read the CLI's help. That only works if
+// they can SEE it, which is why this is a pane and not a menu.
+function renderActionPane(d, busyLabel) {
+  const pane = $("#actpane");
+  pane.innerHTML = "";
+  if (!canWrite()) {
+    pane.append(el("p", { class: "apnote", title: READONLY_WHY },
+      "You have the readonly role, so nothing here is available to you. "
+      + "Opening the workspace and reading this panel are."));
+    return;
+  }
+  const running = d.state === "running";
+  const groups = [
+    ["Put data in it", [
+      ["Add sample data", () => openSeed(d.name), running],
+      ["Import settings", () => openImport(d.name), running],
+    ]],
+    ["Measure it", [
+      ["Run a load test", () => openPerf(d.name, d.monitoring), running],
+      ["Find capacity", () => openCap(d.name), running],
+      // Named for the thing rather than for one of its parts: it attaches
+      // Prometheus, Grafana, Loki and the exporters, and "stream to Grafana"
+      // described the last hop of it.
+      [d.monitoring ? "Detach monitoring" : "Attach monitoring",
+       () => doMonitor(d.name, !!d.monitoring), running],
+    ]],
+    ["Connect to it", [
+      ["PAT and Token", () => doPat(d.name), running],
+      ["Send an API call", () => openCall(d.name), running],
+    ]],
+    ["Keep or move it", [
+      ["Back up now", () => doBackup(d.name), running],
+      ["Upgrade version", () => openUpgrade(d.name, d.rc_version), running],
+      ["Check the certificate", () => doTlsStatus(d.name), running && !!d.public_url],
+      ["Use for CLI commands", () => doDefault(d.name), !d.is_default],
+    ]],
+  ];
+  for (const [title, items] of groups) {
+    const usable = items.filter(([, , ok]) => ok !== false || running);
+    if (!usable.length) continue;
+    pane.append(el("div", { class: "apgroup" }, title));
+    const listEl = el("div", { class: "aplist" });
+    for (const [label, fn, ok] of items) {
+      const b = el("button", { onclick: fn }, label);
+      if (!ok || busyLabel) b.disabled = true;
+      listEl.append(b);
+    }
+    pane.append(listEl);
+  }
+  if (!running) {
+    pane.append(el("p", { class: "apnote" },
+      `Most of these need the workspace running. It is ${d.state === "?" ? "unreachable" : d.state}.`));
+  }
+  // Pinned to the bottom, not trailing the last group: it is not the eleventh
+  // item on a menu, it is the thing you have to travel to.
+  const danger = el("div", { class: "apdanger" });
+  const btn = el("button", { onclick: () => doDown(d.name) }, "Take this workspace down");
+  if (busyLabel) btn.disabled = true;
+  danger.append(btn, el("p", {},
+    "Removes its containers. You are asked separately before any data is deleted."));
+  pane.append(danger);
+}
+
+
+// ---- home ------------------------------------------------------------------
+// What the stage shows when nothing is selected. It used to say "Select a
+// workspace", which answers a question nobody asked.
+//
+// It leads with CAPACITY because that is what actually limits this tool: `up`
+// refuses without headroom, and seven concurrent stacks once OOM-killed a 10 GB
+// host with every individual create having succeeded. "Room for about 2 more" is
+// the sentence that decides what you do next; a row of totals would look like a
+// dashboard and say nothing.
+let HOME = { cap: null, audit: [], at: 0 };
+const HOME_EVERY = 15000;
+
+async function refreshHome(force) {
+  if (!force && Date.now() - HOME.at < HOME_EVERY) return;
+  HOME.at = Date.now();
+  const [cap, audit] = await Promise.all([
+    api("/api/machine").catch(() => null),
+    api("/api/audit?limit=6").catch(() => ({ lines: [] })),
+  ]);
+  if (cap) HOME.cap = cap;
+  HOME.audit = (audit && audit.lines) || [];
+  if (!SELECTED) renderHome();
+}
+
+function capacityCard(cap) {
+  const box = el("div", { class: "capcard" });
+  if (!cap || !cap.known) {
+    box.append(el("div", { class: "caphead" }, el("span", { class: "lbl" }, "Memory on this machine")),
+      el("p", { class: "apnote", style: "padding:0" },
+        "rc-repro reads /proc/meminfo, which this machine does not have — so it "
+        + "cannot say how much room is left, and `up` will not refuse on memory here."));
+    return box;
+  }
+  const usedMb = Math.max(0, cap.total_mb - cap.available_mb);
+  const pct = (n) => Math.max(0, Math.min(100, (n / cap.total_mb) * 100));
+  const gb = (mb) => (mb / 1024).toFixed(1);
+  const head = el("div", { class: "caphead" },
+    el("span", { class: "lbl" }, "Memory on this machine"));
+  // Speak up only when the answer is nearly no. "room for about 6 more" is a
+  // number you read past; the bar below already shows how full the machine is,
+  // and this line exists to catch the moment it stops being fine.
+  if (cap.room <= 1) {
+    head.append(el("span", { class: "caproom" + (cap.room < 1 ? " tight" : "") },
+      cap.room >= 1 ? `room for about ${cap.room} more` : "not enough for another workspace"));
+  }
+  box.append(head);
+  box.append(el("div", { class: "capnum" }, `${gb(usedMb)} GB`,
+    el("small", {}, ` of ${gb(cap.total_mb)} GB in use`)));
+  box.append(el("div", { class: "capbar" },
+    el("i", { class: "used", style: `width:${pct(usedMb)}%` }),
+    el("i", { class: "reserved", style: `width:${pct(cap.reserve_mb)}%`,
+              title: "kept back for the machine itself" })));
+  box.append(el("div", { class: "caplegend" },
+    el("span", {}, el("i", { class: "k used" }), `in use ${gb(usedMb)} GB`),
+    el("span", {}, el("i", { class: "k reserved" }), `held back ${gb(cap.reserve_mb)} GB`),
+    el("span", {}, el("i", { class: "k free" }),
+      `free ${gb(Math.max(0, cap.available_mb - cap.reserve_mb))} GB`)));
+  return box;
+}
+
+function attentionItems() {
+  const out = [];
+  if (!DOCKER_OK) {
+    out.push(["Docker is not answering",
+      "Nothing can start, stop or report state until it is back.", openDoctor, "Check"]);
+  }
+  const broken = ((EDGE && EDGE.routes) || []).filter((r) => !r.reachable);
+  for (const r of broken) {
+    out.push([`The edge cannot reach ${r.name}`,
+      "Its https name answers 502 rather than erroring, so it looks like a broken "
+      + "workspace instead of a broken route.", openEdge, "Look"]);
+  }
+  for (const r of ALL_REPROS.filter((x) => x.state === "down")) {
+    out.push([`${r.name} is down`,
+      `It still holds port :${r.host_port} and its data volume.`,
+      () => selectRepro(r.name), "Review"]);
+  }
+  return out;
+}
+
+function renderHome() {
+  const panel = $("#detail");
+  panel.innerHTML = "";
+  const running = ALL_REPROS.filter((r) => r.state === "running");
+  const hour = new Date().getHours();
+  const part = hour < 12 ? "morning" : hour < 18 ? "afternoon" : "evening";
+  const head = el("div", { class: "home-head" },
+    el("h1", {}, ME ? `Good ${part}, ${ME}` : "Your workspaces"),
+    el("p", {}, `${ALL_REPROS.length} workspace(s) · ${running.length} running`
+      + (DOCKER_OK ? "" : " · docker is not answering")));
+  const body = el("div", { class: "home-body" });
+  const items = attentionItems();
+  if (items.length) {
+    const card = el("div", { class: "hcard" },
+      el("div", { class: "hcard-h" }, el("span", { class: "lbl" }, "Needs you"),
+        el("span", { class: "lbl" }, String(items.length))));
+    for (const [title, why, fn, label] of items) {
+      card.append(el("div", { class: "att" },
+        el("span", { class: "att-i" }, "▲"),
+        el("span", { class: "att-t" }, el("b", {}, title), " — " + why),
+        el("button", { class: "btn small", onclick: fn }, label)));
+    }
+    body.append(card);
+  }
+
+  const rcard = el("div", { class: "hcard" },
+    el("div", { class: "hcard-h" }, el("span", { class: "lbl" }, "Running now")));
+  if (running.length) {
+    const grid = el("div", { class: "mini" });
+    for (const r of running) {
+      grid.append(el("button", { class: "minicard", onclick: () => selectRepro(r.name) },
+        el("span", { class: "n" }, r.name),
+        el("span", { class: "m" }, `${r.rc_version} · ${r.preset} · :${r.host_port}`),
+        el("span", { class: "m up" }, r.uptime || "")));
+    }
+    rcard.append(grid);
+  } else {
+    rcard.append(el("p", { class: "empty" }, canWrite()
+      ? "Nothing is running. Start one from the list, or create a workspace."
+      : "Nothing is running."));
+  }
+  body.append(rcard);
+  body.append(capacityCard(HOME.cap));
+
+  const acard = el("div", { class: "hcard" },
+    el("div", { class: "hcard-h" }, el("span", { class: "lbl" }, "Recent activity"),
+      el("button", { class: "btn small", onclick: () => openJobs("history") }, "All activity")));
+  if (HOME.audit.length) {
+    for (const a of HOME.audit) {
+      acard.append(el("div", { class: "arow", "data-denied": String(a.outcome === "denied") },
+        el("span", { class: "who" }, a.actor || "—"),
+        el("span", { class: "kind" }, a.kind),
+        el("span", { class: "what" }, a.label || ""),
+        el("span", { class: "when" }, (a.ts || "").replace("T", " ").slice(5, 16))));
+    }
+  } else {
+    acard.append(el("p", { class: "empty" }, "Nothing recorded yet."));
+  }
+  body.append(acard);
+  panel.append(head, body);
+}
+
+
+// ---- scenarios --------------------------------------------------------------
+// Where a preset's notes finally live. They were printed by `up` and `info` and
+// shown nowhere in the browser -- which for `oidc` means a GUI-only user could
+// not discover that the scenario does not work at all until an /etc/hosts line
+// exists. The notes are pre-wrapped for an 80-column terminal, so they are set
+// in a <pre> and allowed to scroll rather than re-flowed into a narrow column.
+async function openScenarios() {
+  setView("scenarios");
+  $(".panes").classList.add("no-detail");
+  $("#actpane").innerHTML = "";
+  const panel = $("#detail");
+  panel.innerHTML = "";
+  const head = el("div", { class: "home-head" }, el("h1", {}, "Scenarios"),
+    el("p", {}, "What each one adds to a plain Rocket.Chat, and what you have to do to use it."));
+  const body = el("div", { class: "home-body" });
+  body.append(el("p", { class: "empty" }, "loading…"));
+  panel.append(head, body);
+  let list;
+  try { list = (await api("/api/presets")).presets || []; }
+  catch (e) { body.innerHTML = ""; body.append(el("p", { class: "empty" }, e.message)); return; }
+  if (VIEW !== "scenarios") return;                 // a newer view won the race
+  body.innerHTML = "";
+  for (const s of list) {
+    const card = el("div", { class: "hcard scen" });
+    const h = el("div", { class: "hcard-h" }, el("b", {}, s.name));
+    if (s.requires_license) h.append(el("span", { class: "pill small" }, "needs a licence"));
+    card.append(h);
+    const inner = el("div", { class: "scen-b" });
+    if (s.description) inner.append(el("p", { class: "scen-d" }, s.description));
+    if (s.notes && s.notes.length) {
+      inner.append(el("div", { class: "section-label" }, "Using this scenario"));
+      inner.append(noteBlock(s.notes));
+    }
+    card.append(inner);
+    const foot = el("div", { class: "scen-f" },
+      el("span", {}, s.ports && s.ports.length
+        ? "Extra ports: " + s.ports.join(", ") : "No extra ports"));
+    if (canWrite()) {
+      foot.append(el("button", { class: "btn small", onclick: () => openCreate(s.name) },
+        "Create a workspace with this"));
+    }
+    card.append(foot);
+    body.append(card);
+  }
+}
+
+
+// The Scenario card: what this workspace adds beyond a plain Rocket.Chat, where
+// those things are, and what you have to do to use them — in one block instead of
+// a "Where things are" list and a "Using this scenario" list that never referred
+// to each other.
+function scenarioCard(d) {
+  const card = el("div", { class: "panelcard" });
+  // Title it by what is actually IN it. A plain workspace with monitoring
+  // attached has links and notes but no scenario, and calling that block
+  // "Scenario · default" described the preset field rather than the contents.
+  const scenario = d.preset && d.preset !== "default" ? d.preset : "";
+  const head = el("div", { class: "panelcard-h" },
+    el("span", { class: "section-label flat" },
+      scenario ? "Scenario · " + scenario : "What is in this workspace"));
+  if (scenario) {
+    head.append(el("button", { class: "linkbtn", onclick: openScenarios },
+      "About this scenario ↗"));
+  }
+  card.append(head);
+
+  // A command that is NOT a url is something you must set up before the scenario
+  // works at all -- `oidc` is broken until 127.0.0.1 keycloak is in /etc/hosts.
+  // A command that IS a url is just a place to go, and colouring that as a warning
+  // would be crying wolf.
+  const items = parseNotes(d.notes);
+  const setup = items.find((i) => i.kind === "cmd" && !/^https?:\/\//.test(i.value));
+  if (setup) {
+    card.append(el("div", { class: "setup" },
+      el("span", { class: "setup-i" }, "▲"),
+      el("span", { class: "setup-t" },
+        el("b", {}, "Do this once, on your machine"),
+        el("span", { class: "setup-w" },
+          "This scenario cannot work until the line below exists. Needs sudo."),
+        el("code", {}, setup.value)),
+      el("button", { class: "cp", onclick: () => copy(setup.value) }, "Copy")));
+  }
+
+  // A note that names a place the link table ALREADY lists is not a second place,
+  // it is the rest of what is known about that one. Monitoring is the plain case:
+  // the links say where Grafana is, and the notes say the same thing again plus
+  // the password — which is how the same three urls came to be on screen twice,
+  // once as rows and once as prose.
+  const key = (u) => String(u || "").replace(/\/+$/, "");
+  const byUrl = new Map();
+  for (const it of items) if (it.kind === "place") byUrl.set(key(it.url), it);
+  const shown = new Set();
+  for (const l of d.links || []) {
+    const note = byUrl.get(key(l.url));
+    if (note) shown.add(note);
+    card.append(placeRow({ label: l.label, url: l.url, kind: l.kind,
+                           what: note ? note.what : "", creds: note ? note.creds : "",
+                           sub: note ? note.sub : "" }));
+  }
+
+  const rest = items.filter((i) => i !== setup && !shown.has(i));
+  if (rest.length) {
+    card.append(renderNoteItems(el("div", { class: "panelcard-b notes" }), rest));
+  }
+  return card;
+}
+
 // ---- detail panel -----------------------------------------------------------
 async function selectRepro(name) {
+  setView("workspace");
   SELECTED = name; dstate.tab = "overview"; dstate.points = [];
   // Tear the PREVIOUS repro's panel down first. Leaving it up meant that while the
   // fetch was in flight -- and permanently if it failed -- the list highlighted B
@@ -398,6 +691,7 @@ async function selectRepro(name) {
   renderDetail();
 }
 function closeDetail() {
+  setView("home");
   SELECTED = null; dstate.detail = null;
   if (dstate.statsTimer) { clearInterval(dstate.statsTimer); dstate.statsTimer = null; }
   closeLogs();
@@ -421,6 +715,21 @@ function renderDetail() {
       ? el("span", { class: "pill working" }, (BUSY_VERB[busyLabel] || busyLabel).toLowerCase() + "…")
       : el("span", { class: "pill " + stateClass(d.state) }, d.state),
     el("button", { class: "close", onclick: closeDetail }, "×"));
+  const sub = el("div", { class: "d-sub" },
+    el("b", {}, d.rc_version || "?"), el("i", {}, "/"), `mongo ${d.mongo_tag || "?"}`);
+  if (d.preset) sub.append(el("i", {}, "·"), d.preset);
+  sub.append(el("i", {}, "·"), ":" + d.host_port);
+  if (d.created_by) {
+    sub.append(el("i", {}, "·"), d.created_by + (d.created_by === ME ? " (you)" : ""));
+  }
+  if (d.public_url) {
+    const route = (EDGE && EDGE.routes || []).find((r) => r.name === d.name);
+    sub.append(el("i", {}, "·"),
+      el("span", { class: route && route.reachable === false ? "bad" : "" },
+        route && route.reachable === false
+          ? "https — unreachable, answers 502"
+          : (TLS_LABEL[d.tls] || "https")));
+  }
   const tabs = el("div", { class: "tabs" });
   for (const t of ["overview", "logs", "containers", "env vars", "backups"]) {
     const key = t === "env vars" ? "env" : t;
@@ -442,40 +751,6 @@ function renderDetail() {
   } else if (d.state === "running") {
     actions.append(dBtn("Stop", () => doState(d.name, "stop")));
     actions.append(dBtn("Restart", () => doState(d.name, "restart")));
-    actions.append(dBtn("Seed", () => openSeed(d.name)));
-    actions.append(dBtn("Config", () => openImport(d.name)));
-    actions.append(dBtn("Load test", () => openPerf(d.name, d.monitoring)));
-    actions.append(dBtn("Capacity", () => openCap(d.name)));
-    // The endpoint existed and nothing called it, so "Stream to Grafana" was
-    // permanently greyed out for any repro not created with the monitor checkbox.
-    actions.append(dBtn(d.monitoring ? "Monitoring off" : "Monitoring on",
-      () => doMonitor(d.name, !!d.monitoring)));
-    // A PAT is what you need to drive this workspace's API from curl/Postman;
-    // the CLI could mint one and the GUI could not.
-    actions.append(dBtn("API token", () => doPat(d.name), "",
-      "Mint a Personal Access Token for this workspace and show the "
-      + "X-Auth-Token / X-User-Id headers to use with curl or Postman."));
-    actions.append(dBtn("API call", () => openCall(d.name), "",
-      "Send an authenticated REST call to this workspace and see the response "
-      + "— the same request `rc-repro api` makes."));
-    actions.append(dBtn("Back up", () => doBackup(d.name), "",
-      "Dump this workspace's database into a restorable bundle. Rocket.Chat is "
-      + "stopped for the dump and started again; MongoDB keeps its data."));
-    // Only on a RUNNING workspace: the pre-upgrade backup needs MongoDB up, and
-    // Rocket.Chat's migrations only run when it boots. Offering this on a stopped
-    // repro would be offering an action that cannot work. The server agrees --
-    // upgrade.require_running() refuses it there too.
-    actions.append(dBtn("Upgrade", () => openUpgrade(d.name, d.rc_version), "",
-      "Move this workspace to another Rocket.Chat version and let it run its "
-      + "migrations. A pre-upgrade backup is taken automatically."));
-    // `up --wait` only proves RC booted (it polls the internal http port). Traefik
-    // gets its certificate in the background afterwards and falls back to a dummy
-    // when ACME fails, so HTTPS needs its own check.
-    if (d.public_url) {
-      actions.append(dBtn("Check TLS", () => doTlsStatus(d.name), "",
-        "Make a real TLS connection and report the certificate actually being "
-        + "served — the same check as `rc-repro tls-status`."));
-    }
   } else if (d.state === "stopped") {
     actions.append(dBtn("Start", () => doState(d.name, "start")));
   } else if (d.state === "down") {
@@ -483,35 +758,12 @@ function renderDetail() {
   } else if (d.state === "?") {
     actions.append(el("span", { class: "inline-note" }, "docker unavailable — actions disabled"));
   } else {
-    // restarting / created / paused / dead. These only started reaching the panel
-    // once repro_state() stopped flattening them to "stopped"; before that this
-    // branch did not exist, so the panel would have offered no lifecycle control
-    // at all. The card has always had the same pair.
+    // restarting / created / paused / dead
     actions.append(dBtn("Stop", () => doState(d.name, "stop")));
     actions.append(dBtn("Restart", () => doState(d.name, "restart")));
   }
-  // Both of these sit AFTER the canWrite() chain above, and both used to render
-  // for everybody -- so a readonly user was shown "readonly — you can look, but
-  // not change anything here" and then, directly beneath it, a Make default button
-  // and a red Down button. The card renderer got this right by returning early;
-  // the panel appended them past the branch and nobody noticed.
-  //
-  // Found in the audit trail rather than by reading, which is what it is for:
-  //   dheeraj  denied  POST /api/repros/{name}/default needs member
-  // A readonly user clicked a button the interface offered and got a 403, which
-  // is exactly how somebody concludes roles are broken.
-  if (canWrite()) {
-    // The `default` pill was displayed but unmovable from the GUI -- the create
-    // dialog's Pin checkbox was the only way to set it.
-    if (!d.is_default) {
-      actions.append(dBtn("Make default", () => doDefault(d.name), "",
-        "Use this repro for name-less CLI commands (rc-repro use)."));
-    }
-    if (d.state !== "?") {
-      actions.append(dBtn("Down", () => doDown(d.name), "danger"));
-    }
-  }
-  panel.append(head, tabs, actions, el("div", { class: "d-body", id: "d-body" }));
+  renderActionPane(d, busyLabel);
+  panel.append(head, sub, tabs, actions, el("div", { class: "d-body", id: "d-body" }));
   renderTab();
 }
 
@@ -527,31 +779,23 @@ function renderTab() {
   body.innerHTML = "";
   if (dstate.tab === "overview") {
     const kv = (k, v, cls = "") => el("div", { class: "kv" }, el("div", { class: "k" }, k), el("div", { class: "v " + cls }, v));
+    // Exactly six, exactly like v4: three columns, two full rows, no hole. The
+    // owner, the port and the scenario moved into the identity line above, which
+    // is where they read as a sentence rather than as three more boxes.
     const grid = el("div", { class: "kv-grid" },
       kv("RC Version", d.rc_version), kv("MongoDB", d.mongo_tag),
-      kv("Port", ":" + d.host_port), kv("Uptime", d.uptime || "—", d.uptime ? "green" : ""),
-      kv("Preset", d.preset), kv("Health", d.health || "—", d.health === "healthy" ? "green" : ""));
-    if (d.created_by) grid.append(kv("Owner", d.created_by + (d.created_by === ME ? " (you)" : "")));
+      kv("Uptime", d.uptime || "—", d.uptime ? "green" : ""),
+      kv("Port", ":" + d.host_port), kv("Scenario", d.preset || "default"),
+      // healthClass() knows unhealthy/starting/healthy; the kv only understood the
+      // literal string "healthy", so a container reporting "running" rendered plain.
+      kv("Health", d.health || d.state || "—", HEALTH_TONE[healthClass(d)] || ""));
+
     // Where its https name is actually served from. Without this the panel shows
     // a workspace with no TLS port and no Traefik, which now looks like HTTPS is
     // simply missing rather than handled one layer up.
-    if (d.public_url) {
-      const route = (EDGE && EDGE.routes || []).find((r) => r.name === d.name);
-      const reachable = route ? route.reachable : null;
-      grid.append(kv("Served by", "the edge" + (
-        reachable === false ? " — unreachable, answers 502" : ""),
-        reachable === false ? "bad" : ""));
-    }
     // A climbing restart count separates "slow to boot" from "crash-looping".
-    // The backend has always been able to read it (wait_serving warns on it
-    // during a create); nothing ever showed it afterwards.
     if (typeof d.restarts === "number" && d.restarts > 0) {
       grid.append(kv("RC restarts", String(d.restarts), d.restarts >= 2 ? "bad" : "warn"));
-    }
-    // With --https the external URL differs from the port above, and which kind of
-    // certificate it is decides whether a browser will trust it — so say both.
-    if (d.public_url) {
-      grid.append(kv("HTTPS", TLS_LABEL[d.tls] || "on", "green"));
     }
     body.append(grid);
     if (d.state === "restarting" || (d.restarts || 0) >= 2) {
@@ -559,20 +803,18 @@ function renderTab() {
         `Rocket.Chat has restarted ${d.restarts || 0}× — usually resource pressure `
         + `(free some repros, or raise Docker's CPU/RAM) or a boot error. Check the Logs tab.`));
     }
-    if (d.links && d.links.length) {
-      body.append(el("div", { class: "section-label" }, "Links"));
-      const links = el("div", { class: "card-links" });
-      for (const l of d.links) links.append(el("a", { class: "linkchip " + (l.kind || ""), href: localUrl(l.url), target: "_blank" }, l.label));
-      body.append(links);
+    if ((d.links && d.links.length) || (d.notes && d.notes.length)) {
+      body.append(scenarioCard(d));
     }
-    appendNotes(body, d.notes);
     if (d.state === "running") {
-      body.append(el("div", { class: "section-label" }, "Resource usage (live · CPU % / Mem MB)"));
-      const box = el("div", { class: "chart-box" }, el("div", { id: "chart" }),
-        el("div", { class: "chart-legend" },
-          el("span", {}, el("span", { class: "sw", style: "background:#58a6ff" }), "CPU %"),
-          el("span", {}, el("span", { class: "sw", style: "background:#3fb950" }), "Mem MB")));
-      body.append(box);
+      const card = el("div", { class: "panelcard" },
+        el("div", { class: "panelcard-h" },
+          el("span", { class: "section-label flat" }, "Resource usage (live)"),
+          el("span", { class: "chart-legend" },
+            el("span", {}, el("span", { class: "sw", style: "background:var(--blue)" }), "CPU % (left)"),
+            el("span", {}, el("span", { class: "sw", style: "background:var(--green)" }), "Mem MB (right)"))),
+        el("div", { class: "chart-box" }, el("div", { id: "chart" })));
+      body.append(card);
       startStats();
     }
     const url = el("div", { class: "urlbox" },
@@ -1003,7 +1245,8 @@ function drawChart() {
   const n = pts.length;
   const px = (i) => n < 2 ? x1 : x0 + (i / (n - 1)) * (x1 - x0);
   const py = (v, max) => y1 - (v / max) * (y1 - y0);
-  const MUT = "#7d8697", GRID = "#232b3a", CPU = "#58a6ff", MEM = "#3fb950";
+  // var(), not literals: the chart has to follow the theme like everything else.
+  const MUT = "var(--muted)", GRID = "var(--line)", CPU = "var(--blue)", MEM = "var(--green)";
 
   let g = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="height:auto;display:block" font-family="ui-monospace, Menlo, monospace" font-size="10">`;
   // 3 horizontal levels: 0, mid, top — left labels = CPU, right labels = Mem
@@ -1033,7 +1276,7 @@ function drawChart() {
     };
     g += series("mem", memMax, MEM) + series("cpu", cpuMax, CPU);
   } else {
-    g += `<text x="${(x0 + x1) / 2}" y="${(y0 + y1) / 2}" fill="#5a6474" text-anchor="middle">collecting…</text>`;
+    g += `<text x="${(x0 + x1) / 2}" y="${(y0 + y1) / 2}" fill="var(--dim)" text-anchor="middle">collecting…</text>`;
   }
   box.innerHTML = g + `</svg>`;
 }
@@ -1371,12 +1614,163 @@ function renderCreateResult(r) {
 // Preset notes carry the things you cannot guess: the Keycloak console URL and
 // realm, the /etc/hosts line oidc and presigned s3_minio need, where Mailpit is.
 // The CLI prints them after `up` and from `info`; the GUI showed them nowhere.
+// A preset's notes are free prose written for a terminal, and dumping them into
+// a <div> per line (or a <pre>) makes the one line that MATTERS -- the /etc/hosts
+// entry `oidc` does not work without -- look exactly like the sentence beside it.
+//
+// Three shapes are actually in the data, and none of them are invented:
+//   * an INDENTED line is a thing to type or paste: "    127.0.0.1  keycloak",
+//     "    http://localhost:8081/admin/...". It gets a code box and a Copy button.
+//   * a line CONTAINING a url is a place to go. The url becomes a link.
+//   * everything else is prose, and consecutive prose lines are one paragraph --
+//     they were wrapped for an 80-column terminal, not written as separate points.
+// Urls become links and `backticked` spans become code. Both are already in the
+// notes as plain text -- a preset that says "pass --reg-token" or "`loadtest
+// --live`" is naming something you type, and leaving the backticks on screen is
+// showing the reader the markup instead of the meaning.
+const TOKEN_RE = /`([^`]+)`|\bhttps?:\/\/[^\s)]+/;
+
+function linkify(line) {
+  const out = el("span", {});
+  // "Status -> Targets", "Container logs -> Loki", "Admin → Email": the ASCII
+  // spelling is there because a terminal cannot render the arrow, and a browser
+  // can. Same character the presets already use where they were free to.
+  let rest = String(line).replace(/ -> /g, " → ");
+  for (;;) {
+    const m = TOKEN_RE.exec(rest);
+    if (!m) { out.append(rest); return out; }
+    out.append(rest.slice(0, m.index));
+    if (m[1]) out.append(el("code", { class: "inline" }, m[1]));
+    else out.append(el("a", { href: localUrl(m[0]), target: "_blank", rel: "noreferrer" }, m[0]));
+    rest = rest.slice(m.index + m[0].length);
+  }
+}
+
+// A note line that names a PLACE. Every preset that has one writes it the same
+// way, because a human wrote it for a human:
+//     Keycloak admin console: http://localhost:8081  (admin / admin)
+//     Mailpit (EVERY email RC sends, for ALL users, lands here): http://localhost:8025
+//     Grafana:    http://localhost:5050  (admin/admin; anonymous view enabled)
+// That is a NAME, optionally what it is FOR, a URL, and sometimes the CREDENTIALS
+// — the same four things the link rows above already show — and setting it as a
+// grey paragraph buried the two facts you came for. The url must START the value:
+// "Container logs -> Loki: open the 'Rocket.Chat Logs' dashboard in Grafana (…)"
+// mentions a url inside a sentence, and it is a sentence, not a location.
+const PLACE_RE = /^([^:()]{2,40}?)(?:\s*\(([^)]*)\))?:[ \t]+((?:https?:\/\/|<)\S*)[ \t]*(?:\(([^)]*)\))?[ \t]*\.?$/;
+// "admin/admin; anonymous view enabled" is a password AND a remark; "Status ->
+// Targets: rocketchat, …" is only a remark. Only the a/b shape is a credential.
+const CREDS_RE = /^([\w.@+-]+ ?\/ ?[\w.@+-]+)(?:[;,]\s*(.*))?$/;
+// Past this, a description stops being a column and becomes a second line —
+// rather than ellipsising it away, which loses the half of it that matters.
+const WHAT_MAX = 34;
+
+// Read a preset's notes into the shapes that are in them. Indentation carries
+// most of the structure, and every preset already uses it:
+//   4+ spaces  something to type or paste  ("    127.0.0.1  keycloak")
+//   2 spaces   a rider on the line above ("  — one shared inbox; …")
+//   column 0   a new point — UNLESS the line before it did not finish a
+//              sentence, in which case it is just terminal wrapping
+//              ("…can reach Keycloak at the" / "same URL RC's backend uses.")
+// Joining every consecutive prose line instead, as a first pass did, turned the
+// email preset's five separate points into one unreadable wall.
+function parseNotes(notes) {
+  const items = [];
+  let para = null, place = null, prev = "";
+  for (const raw of notes || []) {
+    const line = String(raw);
+    if (!line.trim()) { para = null; place = null; prev = ""; continue; }
+    if (/^\s{4,}\S/.test(line)) {
+      items.push({ kind: "cmd", value: line.trim() });
+      // The paste box ENDS the row above it. saml's last line is a remark about
+      // the Keycloak console, but hanging it back on that row prints it above the
+      // url the sentence before it promised ("…or open Users directly:").
+      para = null; place = null; prev = line.trim();
+      continue;
+    }
+    const indented = /^\s{1,3}\S/.test(line);
+    const m = indented ? null : PLACE_RE.exec(line.trim());
+    if (m) {
+      const paren = (m[4] || "").trim();
+      const creds = CREDS_RE.exec(paren);
+      place = { kind: "place", label: m[1].trim(), what: (m[2] || "").trim(),
+                url: m[3], creds: creds ? creds[1] : "",
+                sub: creds ? (creds[2] || "").trim() : paren };
+      if (place.what.length > WHAT_MAX) {
+        place.sub = place.sub ? place.what + " · " + place.sub : place.what;
+        place.what = "";
+      }
+      items.push(place); para = null; prev = line;
+      continue;
+    }
+    if (place && indented) {                    // a rider on the row above
+      place.sub = place.sub ? place.sub + " " + line.trim() : line.trim();
+      prev = line;
+      continue;
+    }
+    // A column-0 line continues the one above ONLY if that one broke mid-sentence,
+    // and the reliable signal is what it ENDS with. Ending punctuation is not
+    // enough on its own: livechat has two separate points that each end in a url,
+    // and one that starts with a lowercase username. A line that trails off in a
+    // plain lowercase word ("…can reach Keycloak at the") was wrapped; one ending
+    // in a url, a path, a number or punctuation was finished.
+    const tail = prev.trim();
+    const wrapped = para && /[a-z][a-z'’]*$/.test(tail) && !/\/\S*$/.test(tail);
+    if (!para || !(indented || wrapped)) {
+      para = { kind: "prose", lines: [] };
+      items.push(para);
+    }
+    para.lines.push(line.trim());
+    place = null; prev = line;
+  }
+  return items;
+}
+
+// One row shape for "a thing, and where it is", used by the links the server
+// reports AND by the note lines that name one, so a scenario's console does not
+// appear once as a row and again as a sentence three lines below it.
+function placeRow(p) {
+  const real = !String(p.url || "").startsWith("<");
+  const row = real
+    ? el("a", { class: "linkrow " + (p.kind || ""), href: localUrl(p.url),
+                target: "_blank", rel: "noreferrer" })
+    : el("div", { class: "linkrow static " + (p.kind || "") });
+  row.append(el("span", { class: "l-n" }, p.label));
+  if (p.what) row.append(el("span", { class: "l-w" }, p.what));
+  row.append(el("span", { class: "l-u" }, p.url));
+  if (p.creds) row.append(el("span", { class: "l-c" }, p.creds));
+  if (real) row.append(el("span", { class: "l-go" }, "↗"));
+  if (p.sub) row.append(el("span", { class: "l-sub" }, linkify(p.sub)));
+  return row;
+}
+
+function renderNoteItems(box, items) {
+  let group = null;                       // consecutive places are one table
+  for (const it of items) {
+    if (it.kind !== "place") group = null;
+    if (it.kind === "cmd") {
+      box.append(el("div", { class: "note-cmd" },
+        el("code", {}, it.value),
+        el("button", { class: "cp", onclick: () => copy(it.value) }, "Copy")));
+    } else if (it.kind === "place") {
+      if (!group) { group = el("div", { class: "linkrows one" }); box.append(group); }
+      group.append(placeRow(it));
+    } else {
+      const para = el("p", { class: "note-p" });
+      it.lines.forEach((l, i) => { if (i) para.append(" "); para.append(linkify(l)); });
+      box.append(para);
+    }
+  }
+  return box;
+}
+
+function noteBlock(notes) {
+  return renderNoteItems(el("div", { class: "notes" }), parseNotes(notes));
+}
+
 function appendNotes(parent, notes) {
   if (!notes || !notes.length) return;
-  parent.append(el("div", { class: "section-label" }, "Preset notes"));
-  const box = el("div", { class: "notes" });
-  for (const n of notes) box.append(el("div", { class: "note" }, n));
-  parent.append(box);
+  parent.append(el("div", { class: "section-label" }, "Using this scenario"));
+  parent.append(noteBlock(notes));
 }
 
 function renderPerfResult(r) {
@@ -1428,14 +1822,14 @@ function timelineSvg(tl) {
   const y = (v) => H - 18 - (v / max) * (H - 26);
   const line = b.map((x_, i) => `${x(i).toFixed(1)},${y(x_.p95).toFixed(1)}`).join(" ");
   const marks = b.map((x_, i) => x_.errors
-    ? `<rect x="${(x(i) - 1.5).toFixed(1)}" y="${H - 14}" width="3" height="8" fill="#f85149"/>` : "").join("");
+    ? `<rect x="${(x(i) - 1.5).toFixed(1)}" y="${H - 14}" width="3" height="8" fill="var(--red)"/>` : "").join("");
   const wrap = el("div", { class: "spark" });
   wrap.innerHTML =
     `<svg viewBox="0 0 ${W} ${H}" width="100%" style="height:auto;display:block" font-size="9">` +
-    `<polyline points="${line}" fill="none" stroke="#58a6ff" stroke-width="1.6"/>${marks}` +
-    `<text x="${pad}" y="${H - 3}" fill="#7d8697">0s</text>` +
-    `<text x="${W - pad}" y="${H - 3}" fill="#7d8697" text-anchor="end">${Math.round(tl.span_s || 0)}s</text>` +
-    `<text x="${pad}" y="9" fill="#7d8697">peak p95 ${Math.round(max)}ms</text></svg>`;
+    `<polyline points="${line}" fill="none" stroke="var(--blue)" stroke-width="1.6"/>${marks}` +
+    `<text x="${pad}" y="${H - 3}" fill="var(--muted)">0s</text>` +
+    `<text x="${W - pad}" y="${H - 3}" fill="var(--muted)" text-anchor="end">${Math.round(tl.span_s || 0)}s</text>` +
+    `<text x="${pad}" y="9" fill="var(--muted)">peak p95 ${Math.round(max)}ms</text></svg>`;
   return wrap;
 }
 
@@ -1576,7 +1970,7 @@ function doPat(name) {
   return runAction(name, "API token", async () => {
     const r = await api(`/api/repros/${name}/pat`, { method: "POST", body: JSON.stringify({}) });
     PAT_HEADERS = `-H "X-Auth-Token: ${r.token}" -H "X-User-Id: ${r.user_id}"`;
-    $("#pat-title").textContent = `API token: ${name}`;
+    $("#pat-title").textContent = `PAT and Token: ${name}`;
     $("#pat-body").textContent =
       `# ${r.root_url}  (label: ${r.label}, bypass_2fa: ${r.bypass_2fa})\n`
       + `X-Auth-Token: ${r.token}\nX-User-Id: ${r.user_id}\n\n`
@@ -1674,10 +2068,9 @@ async function openDoctor() {
       el("span", { class: "dmark" }, DOCTOR_MARK[c.status] || "·"),
       el("span", {}, c.message)));
   }
-  if (rep.repros) {
-    body.append(el("div", { class: "kv" },
-      `repros: ${rep.repros.total} total, ${rep.repros.running} running`));
-  }
+  // No repro tally. `rc-repro doctor` prints one because a terminal has nowhere
+  // else to say it; here the rail lists every workspace by name and the status bar
+  // counts them, both of them permanently and both of them behind this dialog.
   const [cls, text] = DOCTOR_VERDICT[rep.verdict] || DOCTOR_VERDICT.warn;
   body.append(el("p", { class: "banner " + cls }, text));
 }
@@ -1704,18 +2097,41 @@ let ACT_TAB = "running";
 
 async function openJobs(tab) {
   if (tab) ACT_TAB = tab;
-  $("#act-tab-running").className = "tab" + (ACT_TAB === "running" ? " active" : "");
-  $("#act-tab-history").className = "tab" + (ACT_TAB === "history" ? " active" : "");
-  $("#jobs-filter").hidden = ACT_TAB !== "history";
-  $("#jobs-hint").textContent = ACT_TAB === "running"
-    ? "Jobs keep running on the server after their dialog is closed — including across a page refresh. Click one to reopen its output."
+  setView("activity");
+  $(".panes").classList.add("no-detail");
+  $("#actpane").innerHTML = "";
+  const panel = $("#detail");
+  panel.innerHTML = "";
+  const head = el("div", { class: "home-head" }, el("h1", {}, "Activity"),
+    el("p", {}, "What is running right now, and everything that has happened on this box."));
+  const tabs = el("div", { class: "tabs", id: "act-tabs" },
+    el("button", { class: "tab" + (ACT_TAB === "running" ? " active" : ""), id: "act-tab-running",
+                   onclick: () => openJobs("running") }, "In progress"),
+    el("button", { class: "tab" + (ACT_TAB === "history" ? " active" : ""), id: "act-tab-history",
+                   onclick: () => openJobs("history") }, "History"));
+  head.append(tabs);
+  const body = el("div", { class: "home-body" });
+  const card = el("div", { class: "hcard" });
+  card.append(el("p", { class: "hint", id: "jobs-hint" }, ACT_TAB === "running"
+    ? "Jobs keep running on the server after you leave this page — including across "
+      + "a refresh. Click one to reopen its output."
     : (canAdmin()
         ? "Everything anyone has done on this box. Refusals are recorded too."
-        : "Everything you have done on this box. Admins see everyone's.");
-  const box = $("#jobs-list");
-  box.innerHTML = "";
+        : "Everything you have done on this box. Admins see everyone's.")));
+  const filter = el("div", { id: "jobs-filter", class: "row2" },
+    el("input", { id: "act-grep", class: "input", placeholder: "filter by action or target…",
+                  "aria-label": "filter activity",
+                  oninput: () => { if (ACT_TAB === "history") renderHistory($("#jobs-list")); } }),
+    el("label", { class: "logfollow" },
+      el("input", { type: "checkbox", id: "act-denied",
+                    onchange: () => { if (ACT_TAB === "history") renderHistory($("#jobs-list")); } }),
+      " refusals only"));
+  filter.hidden = ACT_TAB !== "history";
+  const box = el("div", { id: "jobs-list", class: "plan" });
   box.append(el("p", { class: "empty" }, "loading…"));
-  if (!$("#jobs-dialog").open) $("#jobs-dialog").showModal();
+  card.append(filter, box);
+  body.append(card);
+  panel.append(head, body);
   if (ACT_TAB === "running") return renderRunning(box);
   return renderHistory(box);
 }
@@ -1729,7 +2145,7 @@ async function renderRunning(box) {
   for (const j of rows) {
     const row = el("button", {
       class: "jobrow", type: "button",
-      onclick: () => { $("#jobs-dialog").close(); reopenJob(j); },
+      onclick: () => reopenJob(j),
     },
       el("span", { class: "jstatus " + j.status }, j.status),
       el("span", { class: "jkind" }, jobTitle(j)));
@@ -1784,7 +2200,7 @@ let ACME_EMAIL_REMEMBERED = false;
 let MAY_SET_PRIVILEGED = false;
 let PRIVILEGED_FIELDS = ["rc_image", "reg_token", "bind"];
 
-async function openCreate() {
+async function openCreate(preset) {
   try { PRESETS = (await api("/api/presets")).presets; } catch (e) { toast(e.message); return; }
   // Whether `config set acme.email` has been run. The email field is optional only
   // if it has -- and the GUI cannot set it, so a first-time user must be told to
@@ -1801,7 +2217,7 @@ async function openCreate() {
   const sel = $("#preset-select");
   sel.innerHTML = "";
   for (const p of PRESETS) sel.append(el("option", { value: p.name }, p.name + (p.requires_license ? " (license)" : "")));
-  sel.value = "default";
+  sel.value = preset && PRESETS.some((p) => p.name === preset) ? preset : "default";
   renderPresetParams();
   $("#create-form").existing.value = "reuse";
   syncCreateSeed();
@@ -1968,10 +2384,7 @@ const fmtWhen = (epoch) => {
 };
 
 async function openSessions() {
-  $("#session-title").textContent = `Signed in as ${ME}` + (MY_ROLE ? ` · ${MY_ROLE}` : "");
-  // People lives behind the account menu rather than in the top bar: it is an
-  // admin-only, rarely-used screen, and the top bar is for the work.
-  $("#session-people").hidden = MY_ROLE !== "admin";
+  $("#session-title").textContent = `Your sessions`;
   const body = $("#session-body");
   body.innerHTML = "";
   body.append(el("p", { class: "empty" }, "loading…"));
@@ -2110,19 +2523,106 @@ async function removePerson(name) {
 }
 
 // ---- wiring -----------------------------------------------------------------
-$("#session-people").addEventListener("click", () => {
-  $("#session-dialog").close(); openPeople();
-});
 $("#people-close").addEventListener("click", () => $("#people-dialog").close());
 $("#people-add-btn").addEventListener("click", addPerson);
-$("#whoami").addEventListener("click", openSessions);
+// ---- account menu ----------------------------------------------------------
+function closeMe() {
+  $("#me-menu").hidden = true;
+  $("#whoami").setAttribute("aria-expanded", "false");
+}
+$("#whoami").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const m = $("#me-menu");
+  const open = m.hidden;
+  m.hidden = !open;
+  $("#whoami").setAttribute("aria-expanded", String(open));
+  if (open) {
+    $("#me-name").textContent = ME;
+    $("#me-role").textContent = MY_ROLE || "";
+    $("#me-people").hidden = MY_ROLE !== "admin";
+    $("#me-sessions-n").textContent = "";
+    // Fetched when the menu opens rather than on every poll: it is one line of
+    // context, and nobody needs it four seconds fresh.
+    api("/api/sessions").then((r) => {
+      const n = (r.sessions || []).length;
+      $("#me-sessions-n").textContent = n ? `${n} active` : "";
+    }).catch(() => {});
+  }
+});
+document.addEventListener("click", closeMe);
+$("#me-menu").addEventListener("click", (e) => e.stopPropagation());
+$("#me-sessions").addEventListener("click", () => { closeMe(); openSessions(); });
+$("#me-people").addEventListener("click", () => { closeMe(); openPeople(); });
+$("#me-passwd").addEventListener("click", () => { closeMe(); openPasswd(); });
+$("#me-out").addEventListener("click", () => { closeMe(); signOut(false); });
 $("#session-close").addEventListener("click", () => $("#session-dialog").close());
-$("#session-out").addEventListener("click", () => signOut(false));
+// ---- change your own password ----------------------------------------------
+function openPasswd() {
+  const f = $("#passwd-form");
+  f.old.value = ""; f.new.value = "";
+  $("#passwd-err").hidden = true;
+  $("#passwd-dialog").showModal();
+  f.old.focus();
+}
+$("#passwd-cancel").addEventListener("click", () => $("#passwd-dialog").close());
+$("#passwd-go").addEventListener("click", async () => {
+  const f = $("#passwd-form");
+  const err = $("#passwd-err");
+  err.hidden = true;
+  if (!f.old.value || !f.new.value) {
+    err.textContent = "Both fields are needed."; err.hidden = false; return;
+  }
+  try {
+    // The endpoint ends every OTHER session and re-issues this one, so there is
+    // nothing to do here but say so -- no reload, no re-login.
+    const r = await api("/api/me/password", {
+      method: "POST",
+      body: JSON.stringify({ old: f.old.value, new: f.new.value }),
+    });
+    $("#passwd-dialog").close();
+    const n = r.sessions_ended || 0;
+    toast(n ? `Password changed. ${n} other session(s) signed out.` : "Password changed.", "ok");
+  } catch (e) {
+    err.textContent = e.message; err.hidden = false;
+  }
+});
 $("#session-all").addEventListener("click", () => {
   if (confirm("Sign out of every browser you have signed in from?")) signOut(true);
 });
-$("#btn-new").addEventListener("click", openCreate);
+$("#btn-new").addEventListener("click", () => openCreate());
+$("#btn-scenarios").addEventListener("click", openScenarios);
+$("#btn-home").addEventListener("click", goHome);
+$(".brand").addEventListener("click", goHome);
 $("#btn-refresh").addEventListener("click", loadRepros);
+
+// ---- theme ------------------------------------------------------------------
+// Stored per browser, not per account: it is a property of the screen you are
+// sitting at, and the same person on a projector and a laptop wants different
+// answers. First visit follows the OS rather than picking for them.
+const THEME_KEY = "rc-repro-theme";
+function applyTheme(name) {
+  document.documentElement.dataset.theme = name === "dark" ? "dark" : "light";
+  const b = $("#theme-toggle");
+  if (b) {
+    b.textContent = name === "dark" ? "light" : "dark";
+    b.setAttribute("aria-label", `Switch to the ${name === "dark" ? "light" : "dark"} theme`);
+  }
+}
+function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem(THEME_KEY); } catch (_) { /* private mode */ }
+  applyTheme(saved || (window.matchMedia
+    && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
+}
+$("#theme-toggle").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  applyTheme(next);
+  try { localStorage.setItem(THEME_KEY, next); } catch (_) { /* private mode */ }
+});
+initTheme();
+// The initial VIEW is an assignment, not a setView() call, so nothing had
+// marked the top bar on first load — you arrived on Home with no link lit.
+setView(VIEW);
 $("#btn-prune").addEventListener("click", doPrune);
 $("#filter").addEventListener("input", (e) => { view.filter = e.target.value.trim().toLowerCase(); render(); });
 $("#status-filter").addEventListener("change", (e) => { view.status = e.target.value; render(); });
@@ -2183,11 +2683,6 @@ $("#perf-cancel").addEventListener("click", () => $("#perf-dialog").close());
 $("#perf-submit").addEventListener("click", submitPerf);
 $("#btn-bench").addEventListener("click", openBench);
 $("#btn-jobs").addEventListener("click", () => openJobs("running"));
-$("#act-tab-running").addEventListener("click", () => openJobs("running"));
-$("#act-tab-history").addEventListener("click", () => openJobs("history"));
-$("#act-grep").addEventListener("input", () => { if (ACT_TAB === "history") renderHistory($("#jobs-list")); });
-$("#act-denied").addEventListener("change", () => { if (ACT_TAB === "history") renderHistory($("#jobs-list")); });
-$("#jobs-close").addEventListener("click", () => $("#jobs-dialog").close());
 $("#pat-close").addEventListener("click", () => $("#pat-dialog").close());
 $("#pat-copy").addEventListener("click", () => copy(PAT_HEADERS));
 // A live admin credential should not outlive the dialog showing it. Bound to

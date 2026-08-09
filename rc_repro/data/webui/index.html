@@ -6,70 +6,84 @@
   <title>rc-repro</title>
   <link rel="stylesheet" href="app.css">
 </head>
-<body>
+<body class="shell">
   <header class="topbar">
-    <div class="brand"><span class="dollar">$</span> rc-repro</div>
-    <!-- A button, not a span: when this says "down" the diagnosis is what you want next. -->
+    <button class="brand" title="Back to this machine"><span class="dollar">$</span> rc-repro</button>
+    <!-- Status on the left, account on the right. Both badges keep the position
+         they have always had; only the ground under them changed. -->
     <button id="docker-badge" class="chip" title="Run the environment check">docker: ?</button>
-    <!-- Hidden until a login is actually in force; a single-user box has nobody
-         to distinguish from. A button, not a span: it is now the way out, and
-         HTTP Basic's lack of one was the whole complaint. -->
-    <button id="whoami" class="whoami" hidden
-            title="Your account, sessions and sign out"></button>
-    <!-- Hidden until an edge exists. It is not a workspace, so it never appears
-         in the card grid -- but something holding :443 and routing every https
-         name has to be visible somewhere, and this is it. -->
     <button id="edge-badge" class="chip" title="The shared Traefik serving every https name" hidden></button>
     <div class="topbar-actions">
-      <button id="btn-new" class="btn primary">+ New repro</button>
-      <button id="btn-bench" class="btn">Benchmark</button>
-      <button id="btn-jobs" class="btn">Activity</button>
-      <button id="btn-refresh" class="btn">Refresh</button>
-      <button id="btn-prune" class="btn danger">Prune down</button>
+      <button id="btn-home" class="toplink">Home</button>
+      <button id="btn-jobs" class="toplink">Activity</button>
+      <button id="btn-scenarios" class="toplink">Scenarios</button>
+      <button id="btn-bench" class="toplink">Benchmark</button>
+      <button id="btn-refresh" class="toplink">Refresh</button>
+      <button id="theme-toggle" class="chip" title="Switch between the light and dark theme">theme</button>
+      <!-- The account menu. Clicking the name used to open the sessions DIALOG,
+           which meant "sign out" and "change your password" were behind a modal
+           about something else. A menu is what a name in a corner is for. -->
+      <div class="menuwrap">
+        <button id="whoami" class="whoami" hidden aria-haspopup="menu"
+                aria-expanded="false" title="Your account"></button>
+        <div id="me-menu" class="memenu" role="menu" hidden>
+          <div class="me-head"><b id="me-name"></b><span id="me-role"></span></div>
+          <button type="button" id="me-sessions" role="menuitem">Your sessions
+            <small id="me-sessions-n"></small></button>
+          <button type="button" id="me-people" role="menuitem" hidden>People &amp; roles
+            <small>admin</small></button>
+          <button type="button" id="me-passwd" role="menuitem">Change your password</button>
+          <hr>
+          <button type="button" id="me-out" role="menuitem" class="danger">Sign out</button>
+        </div>
+      </div>
     </div>
   </header>
 
-  <main class="layout">
-    <section class="list">
-      <div class="toolbar">
-        <div class="toolbar-title">
-          <h1>Workspaces</h1>
-          <span id="running-pill" class="pill running">0 running</span>
+  <div class="panes">
+    <!-- The rail is for SCANNING: one row per workspace, whole name, no buttons.
+         Six used to need 780px of cards; the same six are 300px of rows, and forty
+         would still fit. Actions moved to the stage, where the thing they act on
+         is actually on screen. -->
+    <nav class="rail" aria-label="Workspaces">
+      <div class="rail-head">
+        <span class="rail-title">Workspaces</span>
+        <span id="running-pill" class="pill running">0 running</span>
+      </div>
+      <div class="rail-controls">
+        <button id="btn-new" class="btn solid block">+ New workspace</button>
+        <input id="filter" class="input" placeholder="Filter by ticket or version…" aria-label="Filter repros by name">
+        <div class="rail-two">
+          <select id="scope-filter" class="input" aria-label="Whose workspaces" hidden>
+            <option value="all">Everyone</option>
+            <option value="mine">Mine</option>
+          </select>
+          <select id="status-filter" class="input" aria-label="Filter by status">
+            <option value="">All statuses</option>
+            <option value="running">Running</option>
+            <option value="stopped">Stopped</option>
+            <option value="down">Down</option>
+            <option value="restarting">Restarting</option>
+            <option value="paused">Paused</option>
+            <option value="created">Created</option>
+            <option value="dead">Dead</option>
+            <option value="?">Unknown (docker down)</option>
+          </select>
+          <select id="sort-by" class="input" aria-label="Sort repros">
+            <option value="name">Sort: name</option>
+            <option value="state">Sort: state</option>
+            <option value="port">Sort: port</option>
+          </select>
         </div>
       </div>
-      <div class="toolbar-controls">
-        <input id="filter" class="input" placeholder="Filter repros..." aria-label="Filter repros by name">
-        <select id="status-filter" class="input" aria-label="Filter by status">
-          <option value="">All statuses</option>
-          <option value="running">Running</option>
-          <option value="stopped">Stopped</option>
-          <option value="down">Down</option>
-          <!-- docker reports these verbatim; repro_state() passes them through -->
-          <option value="restarting">Restarting</option>
-          <option value="paused">Paused</option>
-          <option value="created">Created</option>
-          <option value="dead">Dead</option>
-          <option value="?">Unknown (docker down)</option>
-        </select>
-        <!-- A client-side filter, deliberately NOT a server-side visibility
-             rule: `check_capacity` refuses your create because of RAM somebody
-             else's workspace is holding and names those workspaces in the
-             refusal, so hiding them makes the tool lie at the moment you need
-             it honest. -->
-        <select id="scope-filter" class="input" aria-label="Whose workspaces" hidden>
-          <option value="all">Everyone</option>
-          <option value="mine">Mine</option>
-        </select>
-        <select id="sort-by" class="input" aria-label="Sort repros">
-          <option value="name">Sort: name</option>
-          <option value="state">Sort: state</option>
-          <option value="port">Sort: port</option>
-        </select>
+      <section id="repros" class="rows"></section>
+      <div class="rail-foot">
+        <button id="btn-prune" class="btn danger block small">Prune down repros</button>
       </div>
-      <section id="repros" class="cards"></section>
-    </section>
-    <aside id="detail" class="detail"></aside>
-  </main>
+    </nav>
+    <main id="detail" class="stage"></main>
+    <aside id="actpane" class="actpane" aria-label="Actions for this workspace"></aside>
+  </div>
 
   <footer class="statusbar">
     <span id="sb-count">—</span>
@@ -80,7 +94,7 @@
   <!-- Create dialog -->
   <dialog id="create-dialog">
     <form id="create-form" method="dialog">
-      <h2>New repro</h2>
+      <h2>New workspace</h2>
       <label>Rocket.Chat version <input name="version" placeholder="8.5.1" required></label>
       <p id="version-hint" class="hint"></p>
       <label>Preset <select name="preset" id="preset-select"></select></label>
@@ -372,22 +386,9 @@
   </dialog>
 
   <!-- Activity: running + recent jobs, reopenable -->
-  <dialog id="jobs-dialog">
-    <h2>Activity</h2>
-    <div class="tabs" id="act-tabs">
-      <button class="tab active" id="act-tab-running" type="button">Running</button>
-      <button class="tab" id="act-tab-history" type="button">History</button>
-    </div>
-    <p class="hint" id="jobs-hint">Jobs keep running on the server after their dialog is
-      closed — including across a page refresh. Click one to reopen its output.</p>
-    <div id="jobs-filter" class="row2" hidden>
-      <input id="act-grep" class="input" placeholder="filter by action or target…"
-             aria-label="filter activity">
-      <label class="logfollow"><input type="checkbox" id="act-denied"> refusals only</label>
-    </div>
-    <div id="jobs-list" class="plan"></div>
-    <menu><button type="button" id="jobs-close" class="btn">Close</button></menu>
-  </dialog>
+  <!-- Activity used to live in a dialog. It is a stage view now (see openJobs);
+       only the per-job OUTPUT stays modal, because that one is a live stream you
+       open, watch and dismiss. -->
 
   <!-- People: who may sign in, and what they may do. Admin only -- a member
        gets a 403 from every endpoint behind it, so the button is not rendered. -->
@@ -415,16 +416,35 @@
   <!-- Your account: the sessions you have open, and the way out. Server-side
        sessions are what make "sign out" and "sign out everywhere" possible at
        all -- HTTP Basic had neither. -->
+  <!-- Changing your own password. POST /api/me/password has existed since
+       v0.23.0 -- role-gated, throttled like a login, ends every other session and
+       keeps this one -- and NOTHING in the browser called it. It was built and
+       unreachable; this is the two fields it was missing. -->
+  <dialog id="passwd-dialog">
+    <h2>Change your password</h2>
+    <p class="hint">Every other session you are signed in on ends. This one stays,
+      so you are not signed out of the tab you changed it in.</p>
+    <form id="passwd-form" method="dialog">
+      <label>Current password <input name="old" type="password" autocomplete="current-password" required></label>
+      <label>New password <input name="new" type="password" autocomplete="new-password" required></label>
+      <p class="hint">At least 12 characters. rc-repro keeps only a scrypt hash, so
+        nobody — including an admin — can read it back.</p>
+      <p id="passwd-err" class="banner bad" hidden></p>
+      <menu>
+        <button type="button" id="passwd-cancel" class="btn">Cancel</button>
+        <button type="button" id="passwd-go" class="btn primary">Change password</button>
+      </menu>
+    </form>
+  </dialog>
+
   <dialog id="session-dialog">
-    <h2 id="session-title">Signed in</h2>
+    <h2 id="session-title">Your sessions</h2>
     <p class="hint">Each row is a browser you have signed in from. Revoking one
       ends it immediately on the server, not just in that browser.</p>
     <div id="session-body" class="plan"></div>
     <menu>
-      <button type="button" id="session-close" class="btn">Close</button>
-      <button type="button" id="session-people" class="btn" hidden>People…</button>
       <button type="button" id="session-all" class="btn danger">Sign out everywhere</button>
-      <button type="button" id="session-out" class="btn primary">Sign out</button>
+      <button type="button" id="session-close" class="btn primary">Close</button>
     </menu>
   </dialog>
 

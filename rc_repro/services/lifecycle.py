@@ -120,6 +120,30 @@ def host_reserve_mb(total_mb: int) -> int:
     return max(1024, total_mb // 5)
 
 
+def capacity() -> dict:
+    """How much room this machine has left, in workspaces.
+
+    ONE formula, three consumers: `check_capacity` refuses a create with it,
+    `rc-repro doctor` reports it, and the GUI's home page leads with it. They used
+    to agree by coincidence -- doctor carried its own copy of the arithmetic -- and
+    a home page that says "room for 2 more" while the create is refused is worse
+    than one that says nothing.
+
+    Megabytes are not the answer to the question anybody is asking. "3.2 GB
+    available" does not tell you whether you can start another workspace; `room`
+    does. Written after seven concurrent stacks OOM-killed a 10 GB host.
+    """
+    mem = runner.host_memory()
+    if mem is None:                      # not Linux: say so rather than guess
+        return {"known": False}
+    total_mb, avail_mb, swap_mb = mem
+    reserve = host_reserve_mb(total_mb)
+    return {"known": True, "total_mb": total_mb, "available_mb": avail_mb,
+            "reserve_mb": reserve, "swap_mb": swap_mb,
+            "workspace_mb": WORKSPACE_MB,
+            "room": max(0, avail_mb - reserve) // WORKSPACE_MB}
+
+
 def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_emit) -> None:
     """Refuse to create a workspace the host cannot hold.
 
