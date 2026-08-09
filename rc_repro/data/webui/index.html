@@ -12,8 +12,10 @@
     <!-- A button, not a span: when this says "down" the diagnosis is what you want next. -->
     <button id="docker-badge" class="chip" title="Run the environment check">docker: ?</button>
     <!-- Hidden until a login is actually in force; a single-user box has nobody
-         to distinguish from. -->
-    <span id="whoami" class="whoami" hidden></span>
+         to distinguish from. A button, not a span: it is now the way out, and
+         HTTP Basic's lack of one was the whole complaint. -->
+    <button id="whoami" class="whoami" hidden
+            title="Your account, sessions and sign out"></button>
     <!-- Hidden until an edge exists. It is not a workspace, so it never appears
          in the card grid -- but something holding :443 and routing every https
          name has to be visible somewhere, and this is it. -->
@@ -367,6 +369,21 @@
       across a page refresh. Click one to reopen its output.</p>
     <div id="jobs-list" class="plan"></div>
     <menu><button type="button" id="jobs-close" class="btn">Close</button></menu>
+  </dialog>
+
+  <!-- Your account: the sessions you have open, and the way out. Server-side
+       sessions are what make "sign out" and "sign out everywhere" possible at
+       all -- HTTP Basic had neither. -->
+  <dialog id="session-dialog">
+    <h2 id="session-title">Signed in</h2>
+    <p class="hint">Each row is a browser you have signed in from. Revoking one
+      ends it immediately on the server, not just in that browser.</p>
+    <div id="session-body" class="plan"></div>
+    <menu>
+      <button type="button" id="session-close" class="btn">Close</button>
+      <button type="button" id="session-all" class="btn danger">Sign out everywhere</button>
+      <button type="button" id="session-out" class="btn primary">Sign out</button>
+    </menu>
   </dialog>
 
   <!-- Job/progress + logs dialog -->

@@ -72,8 +72,41 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
    Owned-by-you is the accent; everyone else is quiet, because muting the majority
    is what makes the few stand out. */
 .whoami { font-family: var(--mono); font-size: .74rem; color: var(--muted);
-  border: 1px solid var(--line); border-radius: 999px; padding: .18rem .6rem; }
+  border: 1px solid var(--line); border-radius: 999px; padding: .18rem .6rem;
+  background: none; cursor: pointer; }
+.whoami:hover { border-color: var(--blue); color: var(--ink); }
 .whoami::before { content: "@"; color: var(--dim); }
+.whoami::after { content: " ▾"; color: var(--dim); }
+
+/* ---- sign-in page (server-rendered; see web/signin.py) ----
+   Its own document rather than a state inside the SPA, so these rules are the
+   only ones it uses. app.js never loads there. */
+.signin-body { display: grid; place-items: center; padding: 2rem 1rem; }
+.signin { width: min(24rem, 100%); }
+.signin .brand { font-family: var(--mono); font-weight: 700; font-size: 1.3rem;
+  text-align: center; margin-bottom: 1.6rem; }
+.signin-form { background: var(--panel); border: 1px solid var(--line);
+  border-radius: 14px; padding: 1.4rem 1.5rem; }
+.signin-form label { display: block; margin: 0 0 .3rem; font-size: .8rem;
+  color: var(--muted); }
+.signin-form input { width: 100%; margin-bottom: 1rem; padding: .55rem .7rem;
+  border: 1px solid var(--line2); border-radius: 8px; background: var(--bg);
+  color: var(--ink); font: inherit; }
+.signin-form input:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+.signin-form button { width: 100%; padding: .55rem; margin-top: .2rem; }
+/* Banners carry the ?e= state and the transport warning. Colour is the only
+   difference between them, so each one names its own severity. */
+.signin-banner { font-size: .84rem; border-radius: 8px; padding: .6rem .75rem;
+  margin: 0 0 1rem; border: 1px solid var(--line2); background: var(--panel2); }
+.signin-banner.bad { border-color: rgba(248,81,73,.45); background: rgba(248,81,73,.09);
+  color: #ffb4b0; }
+.signin-banner.warn { border-color: rgba(210,153,34,.45); background: rgba(210,153,34,.09);
+  color: #e8c76a; }
+.signin-banner.ok { border-color: rgba(63,185,80,.45); background: rgba(63,185,80,.09);
+  color: #86e29b; }
+.signin-foot { color: var(--dim); font-size: .76rem; text-align: center;
+  margin: 1rem 0 0; line-height: 1.6; }
+.signin-foot code { font-family: var(--mono); color: var(--muted); }
 .owner { font-family: var(--mono); font-size: .7rem; color: var(--muted);
   border: 1px solid var(--line2); border-radius: 999px; padding: .05rem .45rem; }
 .owner::before { content: "@"; color: var(--dim); }

@@ -591,6 +591,7 @@ def users_cmd(
     Passwords are prompted for, never taken as an argument — `ps` shows command
     lines to every user on the machine.
     """
+    from rc_repro.services import sessions as sessionsvc
     from rc_repro.services import users as usersvc
 
     if action == "list":
@@ -609,13 +610,18 @@ def users_cmd(
     if action == "remove":
         try:
             usersvc.remove(name)
-            usersvc.forget(name)      # a removed account must not survive the cache
+            # A removed account must not keep working through a session that
+            # outlived it -- revocation has to reach the credential the browser
+            # actually carries, not just the one in the file.
+            sessionsvc.revoke_user(name)
+
         except errors.ReproError as exc:
             _err(str(exc))
         ui.ok(f"✓ user {name!r} removed.")
         return
 
     if action in ("add", "passwd"):
+        ended = 0
         try:
             usersvc.require_valid_name(name)
         except errors.ReproError as exc:
@@ -629,10 +635,16 @@ def users_cmd(
                 usersvc.add(name, pw)
             else:
                 usersvc.set_password(name, pw)
-                usersvc.forget(name)   # the old password must stop working now
+                # Every session minted with the OLD password ends here. Without
+                # this, changing a compromised password leaves the intruder
+                # signed in for up to seven days.
+                ended = sessionsvc.revoke_user(name)
+
         except errors.ReproError as exc:
             _err(str(exc))
         ui.ok(f"✓ user {name!r} {'added' if action == 'add' else 'password changed'}.")
+        if action == "passwd" and ended:
+            ui.hint(f"  {ended} active session(s) signed out.")
         if action == "add" and len(usersvc.list_users()) == 1:
             ui.hint("  `rc-repro serve` will now ask for a login instead of using a token.")
         return
@@ -2479,13 +2491,24 @@ def serve(
                 "person a login that survives restarts.")
         if not loopback or allow:
             ui.hint(f"  via a proxy? open the proxy URL with the token appended: ...<proxy-url>/?t={token}")
-    app_obj = create_app(token=token, allow_hosts=allow, basic_auth=basic)
+    # public_https is a server-side FACT, not a guess from a header: with --domain
+    # rc-repro arranged the TLS itself, so it knows the browser hop is https even
+    # though the request reaches uvicorn as plain http over the docker bridge. It
+    # decides the session cookie's Secure flag and __Host- prefix.
+    app_obj = create_app(token=token, allow_hosts=allow, accounts=basic,
+                         public_https=bool(domain))
     if not no_open and loopback:
         try:
             webbrowser.open(url)
         except Exception:  # noqa: BLE001 - headless / no browser is fine
             pass
-    uvicorn.run(app_obj, host=bind, port=port, log_level="warning")
+    # proxy_headers=False: uvicorn trusts X-Forwarded-For/-Proto from 127.0.0.1 by
+    # DEFAULT, so on the default bind any other local user could rewrite the client
+    # address and the scheme. Both now feed security decisions -- the sign-in
+    # throttle key and the cookie's Secure flag -- so a client must not choose
+    # them. Trusting a real proxy is `--trust-proxy`, deliberately still absent.
+    uvicorn.run(app_obj, host=bind, port=port, log_level="warning",
+                proxy_headers=False)
 
 
 if __name__ == "__main__":

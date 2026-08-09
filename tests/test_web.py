@@ -901,52 +901,179 @@ def test_settings_needs_a_token():
 # With accounts present the GUI is behind a login, and every request carries it.
 # Without accounts nothing changes: the session token still works exactly as before.
 
-import base64 as _b64  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 
-def _auth(user, password):
-    raw = _b64.b64encode(f"{user}:{password}".encode()).decode()
-    return {"Authorization": f"Basic {raw}", "Host": "localhost"}
+def _auth(user=None, password=None):
+    """Kept as the way every test names the Host it is talking to.
+
+    It used to build an Authorization header; Basic is gone, and the session
+    cookie the `signed_in` fixture holds is what authenticates now. Callers did
+    not have to change.
+    """
+    return {"Host": "localhost"}
+
+
+def _reset_auth_state():
+    from rc_repro.services import sessions as sessionsvc
+    from rc_repro.services import users as usersvc
+    usersvc._failures.clear()
+    sessionsvc._cache.clear()
+    sessionsvc._stamp = (-1, -1)
+    sessionsvc._flushed.clear()
+    from rc_repro.web import app as webapp
+    webapp._signin_fails.clear()
 
 
 @pytest.fixture
-def basic_client(tmp_path, monkeypatch):
+def anon_client(tmp_path, monkeypatch):
+    """An accounts-mode app with nobody signed in."""
     from rc_repro.services import users as usersvc
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    usersvc.forget()
-    usersvc._failures.clear()
+    _reset_auth_state()
     usersvc.add("alice", "correct-horse-battery")
-    app = create_app(basic_auth=True)
-    yield TestClient(app, base_url="http://localhost")
-    usersvc.forget()
-    usersvc._failures.clear()
+    yield TestClient(create_app(accounts=True), base_url="http://localhost")
+    _reset_auth_state()
 
 
-def test_basic_auth_challenges_an_anonymous_request(basic_client):
-    """The WWW-Authenticate header is what makes the browser show a login box."""
-    r = basic_client.get("/api/repros", headers={"Host": "localhost"})
+@pytest.fixture
+def basic_client(anon_client):
+    """Signed in as alice. TestClient keeps the cookie jar, so every later
+    request in a test carries the session exactly as a browser would."""
+    r = anon_client.post("/signin", data={"user": "alice",
+                                          "password": "correct-horse-battery"},
+                         follow_redirects=False)
+    assert r.status_code == 303, r.text
+    return anon_client
+
+
+def test_an_anonymous_api_call_is_401_with_no_browser_dialog(anon_client):
+    """WWW-Authenticate is what summoned the browser's own grey password box.
+
+    Dropping it is precisely what makes a real sign-in page possible: as long as
+    the header is sent, the browser prompts before the page can.
+    """
+    r = anon_client.get("/api/repros", headers={"Host": "localhost"})
     assert r.status_code == 401
-    assert r.headers["www-authenticate"].startswith("Basic ")
+    assert "www-authenticate" not in r.headers
+    assert r.json()["kind"] == "Unauthorized"
 
 
-def test_the_spa_itself_is_behind_the_login(basic_client):
-    """Not just /api/ — rendering a dashboard for someone who cannot use it is
-    a worse experience than asking them to sign in first."""
-    assert basic_client.get("/", headers={"Host": "localhost"}).status_code == 401
+def test_an_anonymous_page_is_sent_to_the_sign_in_page(anon_client):
+    """A browser navigating to the app gets the page that fixes the problem,
+    carrying where it was going. Answering an HTML navigation with JSON is how
+    the old design ended up with no login screen at all."""
+    r = anon_client.get("/", headers={"Host": "localhost"}, follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/signin?e=required")
 
 
-def test_correct_credentials_are_accepted(basic_client, monkeypatch):
-    monkeypatch.setattr(lc, "list_repros", lambda: [])
-    r = basic_client.get("/api/repros", headers=_auth("alice", "correct-horse-battery"))
+def test_the_sign_in_page_and_its_stylesheet_are_reachable_signed_out(anon_client):
+    """Otherwise the login is an unstyled wall of text -- or worse, itself a
+    redirect loop."""
+    r = anon_client.get("/signin", headers={"Host": "localhost"})
     assert r.status_code == 200
+    assert "<form method=\"post\" action=\"/signin\"" in r.text
+    assert anon_client.get("/app.css", headers={"Host": "localhost"}).status_code == 200
 
 
-def test_a_wrong_password_or_unknown_user_is_refused(basic_client):
-    assert basic_client.get("/api/repros",
-                            headers=_auth("alice", "wrong-x-x-x-x")).status_code == 401
-    assert basic_client.get("/api/repros",
-                            headers=_auth("ghost", "correct-horse-battery")).status_code == 401
+def test_signing_in_sets_a_session_cookie_and_admits(anon_client, monkeypatch):
+    monkeypatch.setattr(lc, "list_repros", lambda: [])
+    r = anon_client.post("/signin", follow_redirects=False,
+                         data={"user": "alice", "password": "correct-horse-battery"})
+    assert r.status_code == 303 and r.headers["location"] == "/"
+    cookie = r.headers["set-cookie"]
+    assert "rc_repro_session=" in cookie
+    assert "HttpOnly" in cookie and "SameSite=lax" in cookie.replace("samesite", "SameSite")
+    assert anon_client.get("/api/repros", headers=_auth()).status_code == 200
+
+
+def test_the_cookie_is_host_prefixed_and_secure_only_when_the_browser_hop_is_https(tmp_path, monkeypatch):
+    """__Host- requires Secure, and http://localhost cannot have it -- so the name
+    is decided by the transport, and exactly one name is live per scheme."""
+    from rc_repro.services import users as usersvc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    _reset_auth_state()
+    usersvc.add("alice", "correct-horse-battery")
+    c = TestClient(create_app(accounts=True, public_https=True),
+                   base_url="http://localhost")
+    r = c.post("/signin", follow_redirects=False,
+               data={"user": "alice", "password": "correct-horse-battery"})
+    assert r.status_code == 303
+    assert "__Host-rc_repro_session=" in r.headers["set-cookie"]
+    assert "Secure" in r.headers["set-cookie"]
+    _reset_auth_state()
+
+
+def test_a_wrong_password_or_unknown_user_is_refused(anon_client):
+    for user, pw in (("alice", "wrong-x-x-x-x"), ("ghost", "correct-horse-battery")):
+        r = anon_client.post("/signin", data={"user": user, "password": pw},
+                             follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"].startswith("/signin?e=bad")
+        assert "set-cookie" not in r.headers, "a failed sign-in must mint nothing"
+
+
+def test_signing_out_ends_the_session_on_the_server(basic_client, monkeypatch):
+    """Not just a cleared cookie: the point of a server-side session is that the
+    server can end it. Replaying the same cookie afterwards must fail."""
+    monkeypatch.setattr(lc, "list_repros", lambda: [])
+    jar = dict(basic_client.cookies)
+    assert basic_client.get("/api/repros", headers=_auth()).status_code == 200
+    r = basic_client.post("/signout", headers=_auth(), follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/signin?e=signedout"
+    basic_client.cookies.clear()
+    basic_client.cookies.update(jar)          # replay the exact cookie
+    assert basic_client.get("/api/repros", headers=_auth()).status_code == 401
+
+
+def test_a_second_sign_in_does_not_reuse_the_first_token(anon_client):
+    """Session fixation: every sign-in mints a fresh id."""
+    first = anon_client.post("/signin", follow_redirects=False,
+                             data={"user": "alice", "password": "correct-horse-battery"})
+    anon_client.cookies.clear()
+    second = anon_client.post("/signin", follow_redirects=False,
+                              data={"user": "alice", "password": "correct-horse-battery"})
+    assert first.headers["set-cookie"] != second.headers["set-cookie"]
+
+
+def test_who_am_i_replaces_the_actor_field_on_health(basic_client):
+    """/api/health stopped reading credentials: an endpoint left open for uptime
+    checks should not be in the identity business."""
+    assert "actor" not in basic_client.get("/api/health", headers=_auth()).json()
+    me = basic_client.get("/api/session", headers=_auth()).json()
+    assert me["user"] == "alice" and me["accounts"] is True
+
+
+def test_your_sessions_can_be_listed_and_revoked_individually(basic_client):
+    """The answer to "I signed in on the customer's laptop", which only exists
+    because the session lives on the server."""
+    rows = basic_client.get("/api/sessions", headers=_auth()).json()["sessions"]
+    assert len(rows) == 1 and rows[0]["current"] is True
+    assert len(rows[0]["sid"]) == 8, "the full verifier must never be handed out"
+    r = basic_client.delete(f"/api/sessions?sid={rows[0]['sid']}", headers=_auth())
+    assert r.status_code == 200
+    assert basic_client.get("/api/sessions", headers=_auth()).status_code == 401
+
+
+def test_a_malformed_session_cookie_does_not_crash(anon_client):
+    for bad in ("", "!!!", "x" * 5000, "a.b.c"):
+        anon_client.cookies.set("rc_repro_session", bad)
+        r = anon_client.get("/api/repros", headers={"Host": "localhost"})
+        assert r.status_code == 401, bad
+    anon_client.cookies.clear()
+
+
+def test_a_password_change_ends_every_session_it_minted(basic_client, monkeypatch):
+    """Changing a compromised password must not leave the intruder signed in for
+    the next seven days."""
+    from rc_repro.services import sessions as sessionsvc
+    from rc_repro.services import users as usersvc
+    monkeypatch.setattr(lc, "list_repros", lambda: [])
+    assert basic_client.get("/api/repros", headers=_auth()).status_code == 200
+    usersvc.set_password("alice", "a-brand-new-password")
+    assert sessionsvc.revoke_user("alice") == 1
+    assert basic_client.get("/api/repros", headers=_auth()).status_code == 401
 
 
 def test_health_stays_open_for_uptime_checks(basic_client):
@@ -954,19 +1081,27 @@ def test_health_stays_open_for_uptime_checks(basic_client):
                             headers={"Host": "localhost"}).status_code == 200
 
 
-def test_a_malformed_authorization_header_does_not_crash(basic_client):
-    for bad in ("", "Basic", "Basic !!!notbase64", "Bearer abc", "Basic " + _b64.b64encode(b"\xff\xfe").decode()):
-        r = basic_client.get("/api/repros", headers={"Authorization": bad, "Host": "localhost"})
-        assert r.status_code == 401, bad
+def test_the_sign_in_endpoint_is_throttled_per_address(anon_client, monkeypatch):
+    """scrypt now runs on exactly ONE endpoint, which is what finally makes a
+    guessing bound possible: services/users.py cannot refuse on a counter without
+    refusing correct passwords too (that was B2), but a login endpoint can decline
+    to spend the CPU at all. Keyed on the ADDRESS, so nobody can throttle a
+    colleague by guessing at their name."""
+    from rc_repro.web import app as webapp
+    for _ in range(webapp.SIGNIN_MAX_FAILURES):
+        anon_client.post("/signin", data={"user": "alice", "password": "nope-nope-nope"},
+                         follow_redirects=False)
+    r = anon_client.post("/api/session", json={"user": "alice", "password": "nope-nope-nope"})
+    assert r.status_code == 429
 
-
-def test_repeated_failures_report_a_lockout(basic_client):
-    from rc_repro.services import users as usersvc
-    for _ in range(usersvc._LOCKOUT_AFTER):
-        basic_client.get("/api/repros", headers=_auth("alice", "wrong-x-x-x-x"))
-    r = basic_client.get("/api/repros", headers=_auth("alice", "correct-horse-battery"))
-    assert r.status_code == 401
-    assert "too many failed attempts" in r.json()["error"]
+    # ...and the throttle is on the ADDRESS, not on alice: a different client
+    # signs her in normally while the attacker is still blocked.
+    monkeypatch.setattr(lc, "list_repros", lambda: [])
+    other = TestClient(anon_client.app, base_url="http://localhost")
+    webapp._signin_fails.pop("testclient", None)
+    ok = other.post("/api/session", json={"user": "alice",
+                                          "password": "correct-horse-battery"})
+    assert ok.status_code == 200 and ok.json()["user"] == "alice"
 
 
 def test_the_token_path_is_untouched_when_there_are_no_users(monkeypatch):
@@ -1034,56 +1169,21 @@ def test_the_actor_comes_from_the_session_not_the_body(basic_client, monkeypatch
     assert seen["actor"] == "alice", "the body's actor must be ignored"
 
 
-def test_health_reports_who_is_signed_in(basic_client):
-    """Caught live: /api/health is exempt from the login, and the exemption also
-    skipped reading the header -- so the dashboard could never learn its own
-    identity and every card rendered as unowned.
-
-    It reads the header but never DERIVES from it (see the test below), so the
-    name appears once the session is established. A browser always gets there:
-    the SPA itself is behind the login, so loading the page authenticates before
-    app.js polls anything.
-    """
-    anon = basic_client.get("/api/health").json()
-    assert anon["ok"] is True and anon["actor"] == ""
-
-    creds = _auth("alice", "correct-horse-battery")
-    basic_client.get("/", headers=creds)          # what the browser does first
-    assert basic_client.get("/api/health", headers=creds).json()["actor"] == "alice"
+def test_health_says_nothing_about_identity(anon_client):
+    """It used to carry an `actor` field, which existed only because there was
+    nowhere else to ask who was signed in. `GET /api/session` is that place now,
+    and an endpoint left open for uptime checks has no business reading
+    credentials -- deriving there let an anonymous caller spend scrypt per request
+    just by attaching a header."""
+    body = anon_client.get("/api/health", headers={"Host": "localhost"}).json()
+    assert body["ok"] is True
+    assert "actor" not in body
 
 
-def test_health_never_derives_a_password_for_an_anonymous_caller(basic_client, monkeypatch):
-    """The open endpoint must not be a CPU amplifier: deriving there let anyone
-    who can reach the port spend ~50ms of scrypt (and 34MB) per request just by
-    attaching an Authorization header, and varying the name dodged the lockout."""
-    from rc_repro.services import users as usersvc
-
-    monkeypatch.setattr(usersvc, "verify", lambda *a, **k: (_ for _ in ()).throw(
-        AssertionError("scrypt derivation on the open endpoint")))
-    for i in range(5):
-        r = basic_client.get("/api/health", headers=_auth(f"nobody{i}", "guess"))
-        assert r.status_code == 200, "and it must stay open for uptime checks"
-
-
-def test_the_failure_map_cannot_grow_without_limit():
-    """Keyed by name, so a name-varying flood both dodges the lockout and leaks
-    memory for as long as the server runs."""
-    from rc_repro.services import users as usersvc
-
-    usersvc._failures.clear()
-    try:
-        for i in range(usersvc._FAILURES_MAX + 500):
-            usersvc._record_failure(f"nobody{i}")
-        assert len(usersvc._failures) <= usersvc._FAILURES_MAX
-    finally:
-        usersvc._failures.clear()
-
-
-def test_health_stays_open_with_bad_credentials(basic_client):
-    """An uptime check must not start failing because somebody typo'd a password."""
-    r = basic_client.get("/api/health", headers=_auth("alice", "wrong-wrong-wrong"))
-    assert r.status_code == 200
-    assert r.json()["actor"] == "", "and it must not claim they are signed in"
+def test_who_am_i_is_answerable_without_being_signed_in(anon_client):
+    """So the page can tell "signed out" from "this server has no accounts"."""
+    me = anon_client.get("/api/session", headers={"Host": "localhost"}).json()
+    assert me == {"user": "", "accounts": True}
 
 
 # --- CSRF (F2) ------------------------------------------------------------------
@@ -1129,10 +1229,65 @@ def test_non_browser_clients_are_unaffected(basic_client):
     assert r.status_code != 403
 
 
-def test_reads_are_never_refused_as_cross_site(basic_client):
-    r = basic_client.get("/api/repros",
-                         headers={**_auth("alice", "correct-horse-battery"), **_CROSS})
+def test_a_cross_site_read_is_refused_too(basic_client):
+    """Reads used to be waved through as the milder case. They are not.
+
+    `GET /api/repros/{name}/logs` hands over a workspace's container log, which
+    carries LDAP bind passwords and OAuth client secrets, and `/api/repros`
+    discloses every ticket number on the box. The guard therefore covers every
+    /api/ path, not just the state-changing methods.
+    """
+    creds = _auth("alice", "correct-horse-battery")
+    for path in ("/api/repros", "/api/repros/x/logs", "/api/repros/x/detail",
+                 "/api/jobs"):
+        r = basic_client.get(path, headers={**creds, **_CROSS})
+        assert r.status_code == 403, f"{path} -> {r.status_code}"
+
+
+def test_the_spa_itself_is_still_reachable_cross_site(basic_client):
+    """Only /api/ is guarded. A link to the GUI from a wiki or a chat message has
+    to keep working -- refusing the document would break every bookmark."""
+    r = basic_client.get("/", headers={**_auth("alice", "correct-horse-battery"),
+                                       **_CROSS})
     assert r.status_code == 200
+
+
+# --- B1: the logs WebSocket (confirmed exploitable before this) ------------------
+
+def _ws_headers(**over):
+    h = {"Host": "localhost"}
+    h.update(over)
+    return h
+
+
+def test_a_cross_site_websocket_is_refused_before_it_is_accepted(basic_client):
+    """The confirmed exploit. A WebSocket handshake is exempt from CORS, so the
+    browser makes it cross-origin and attaches the cached Basic credential itself
+    -- and this handler re-implemented `guard`'s checks while omitting the
+    cross-site one. Measured before the fix: a forged Origin was refused 403 on a
+    POST and ACCEPTED here, then streamed the workspace's log.
+    """
+    from starlette.websockets import WebSocketDisconnect
+    creds = _auth("alice", "correct-horse-battery")
+    with pytest.raises(WebSocketDisconnect):
+        with basic_client.websocket_connect(
+                "/api/repros/w1/logs/stream",
+                headers={**creds, **_ws_headers(**{"Origin": "https://evil.example",
+                                                   "Sec-Fetch-Site": "cross-site"})}):
+            pass
+
+
+def test_a_websocket_with_no_origin_is_refused_when_the_credential_is_ambient(basic_client):
+    """A browser ALWAYS sends Origin on a WS upgrade, so an absent one cannot be
+    read as same-origin the way it can for a plain fetch. With Basic in play the
+    credential is attached by the browser, so the handshake has to prove it came
+    from us."""
+    from starlette.websockets import WebSocketDisconnect
+    creds = _auth("alice", "correct-horse-battery")
+    with pytest.raises(WebSocketDisconnect):
+        with basic_client.websocket_connect("/api/repros/w1/logs/stream",
+                                            headers={**creds, **_ws_headers()}):
+            pass
 
 
 # --- backup `out` is confined over HTTP (F9) ------------------------------------

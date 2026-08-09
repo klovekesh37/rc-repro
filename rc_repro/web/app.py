@@ -8,7 +8,6 @@ jobs.py) streamed to the browser over SSE.
 
 from __future__ import annotations
 
-import base64
 import asyncio
 import sys
 from contextlib import asynccontextmanager
@@ -18,13 +17,15 @@ import time
 import uuid
 from importlib import resources
 from pathlib import Path
+from urllib.parse import quote
 
 import subprocess
 import threading
 
 from fastapi import (Body, FastAPI, File, Form, Request, UploadFile, WebSocket,
                      WebSocketDisconnect)
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
+                               StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 
 from rc_repro import config
@@ -33,8 +34,45 @@ from rc_repro import runner
 from rc_repro.errors import NotReadyError, ReproError, ValidationError
 from rc_repro.services import data as datasvc
 from rc_repro.services import lifecycle as lc
+from rc_repro.services import sessions
 from rc_repro.web import jobs as jobs_mod
+from rc_repro.web import signin as signin_page
 from rc_repro.web.jobs import JobManager
+
+# Failed sign-ins per client address, for the one endpoint that derives scrypt.
+# This is where a guessing bound BELONGS: services/users.py cannot refuse on a
+# counter without refusing correct passwords too (that was B2), but a login
+# endpoint can refuse to spend the CPU at all. Keyed on the address, so nobody can
+# throttle a colleague by guessing at their name.
+SIGNIN_MAX_FAILURES = 10
+SIGNIN_WINDOW = 60.0
+_signin_fails: dict[str, list[float]] = {}
+_signin_lock = threading.Lock()
+
+
+def _signin_retry_after(source: str) -> int:
+    """Seconds this address must wait, or 0. Sliding window, so it recovers."""
+    now = time.monotonic()
+    with _signin_lock:
+        hits = [t for t in _signin_fails.get(source, []) if now - t < SIGNIN_WINDOW]
+        _signin_fails[source] = hits
+        if len(hits) < SIGNIN_MAX_FAILURES:
+            return 0
+        return max(1, int(SIGNIN_WINDOW - (now - hits[0])) + 1)
+
+
+def _signin_failed(source: str) -> None:
+    now = time.monotonic()
+    with _signin_lock:
+        # Bounded: an address-varying flood must not grow this without limit.
+        if len(_signin_fails) > 4096:
+            _signin_fails.clear()
+        _signin_fails.setdefault(source, []).append(now)
+
+
+def _signin_ok(source: str) -> None:
+    with _signin_lock:
+        _signin_fails.pop(source, None)
 
 # `docker compose logs --tail N` is buffered in memory server-side, so a
 # caller-supplied N needs a ceiling.
@@ -115,7 +153,12 @@ def _read_upload(file: UploadFile) -> bytes:
 
 
 def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
-               basic_auth: bool = False) -> FastAPI:
+               basic_auth: bool = False, accounts: bool = False,
+               public_https: bool = False) -> FastAPI:
+    # `accounts` replaces `basic_auth`: same meaning (named accounts exist, so the
+    # login is enforced), different mechanism behind it. The old name is still
+    # accepted so nothing outside has to change in the same commit.
+    accounts = accounts or basic_auth
     # openapi_url=None as well as the doc UIs: the schema path does not start
     # with /api/, so `guard` below would hand it out without a token.
     jobs = JobManager()
@@ -139,11 +182,17 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
                   lifespan=lifespan)
     app.state.token = token
     app.state.jobs = jobs
-    # Whether the login is enforced. Whether the TRANSPORT is safe is not decided
-    # here and cannot be: behind a TLS-terminating proxy every request arrives as
-    # plain http regardless. `serve` weighs that at bind time, where the interface
-    # is known. (An `insecure` flag was carried in here and never read.)
-    app.state.basic_auth = basic_auth
+    # Whether the login is enforced.
+    app.state.basic_auth = accounts      # legacy name, still read by tests
+    app.state.accounts = accounts
+    # Whether the BROWSER's hop is https. Not derived from the request: behind the
+    # edge every request arrives as plain http on the docker bridge, and
+    # X-Forwarded-Proto is a client claim until `--trust-proxy` exists to say whose
+    # claim to believe. `serve --domain` knows the answer as a server-side fact --
+    # rc-repro arranged the TLS itself -- so it passes it in. Decides the cookie's
+    # `Secure` and `__Host-` prefix, so guessing here would be guessing about a
+    # security attribute.
+    app.state.public_https = public_https
 
     # Host allow-list (DNS-rebind/CSRF guard). Loopback always allowed; extra
     # hosts (e.g. a reverse-proxy domain like *.iximiuz.com) opt in via
@@ -171,6 +220,35 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
         return any_host or _hostname(hdr) in allowed
     app.state.host_ok = host_ok
 
+    def _cross_site(headers, *, require_origin: bool = False) -> bool:
+        """Whether this request was made from another site.
+
+        ONE implementation, because the duplication was the defect. `guard` had
+        this check and the WebSocket handler re-implemented the Host and
+        credential checks around it while omitting this one -- and a WebSocket
+        handshake is exempt from CORS, so the browser makes it cross-origin and
+        attaches the cached credential itself. Confirmed before this existed: a
+        forged `Origin: https://evil.example` was refused 403 on a POST and
+        ACCEPTED on `/api/repros/{name}/logs/stream`, which then streamed the
+        workspace's container log -- where LDAP bind passwords and OAuth client
+        secrets live.
+
+        `require_origin` is for the WebSocket handshake alone. There an absent
+        `Origin` cannot be read as "same-origin", because the browser always
+        sends one on a WS upgrade; anything without it is a non-browser client.
+        It must NOT be set for SSE: a same-origin `EventSource` sends no `Origin`
+        at all, so requiring one would refuse the SPA's own job stream. SSE is
+        covered instead by being subject to CORS, plus `Sec-Fetch-Site` below.
+        """
+        site = headers.get("sec-fetch-site", "")
+        origin = headers.get("origin", "")
+        if site not in ("", "same-origin", "none"):
+            return True
+        if origin:
+            return not host_ok(origin.split("://", 1)[-1])
+        return require_origin
+    app.state.cross_site = _cross_site
+
     # Defence in depth for the SPA. script-src 'self' blocks inline handlers, so an
     # injected `<img onerror=...>` cannot run even if a renderer forgets to escape.
     # Styles need 'unsafe-inline' because the UI sets style ATTRIBUTES; frame-src
@@ -181,40 +259,45 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
            "img-src 'self' data:; "
            "connect-src 'self' ws: wss:; "
            f"frame-src 'self' http://localhost:{config.MONITOR_PORTS[1]}; "
-           "base-uri 'none'; form-action 'none'; object-src 'none'")
+           # 'self', not 'none': /signin is a real <form method="post">, and the
+           # whole point of it is being a page rather than the browser's own
+           # credential dialog. 'self' still blocks posting this page's fields
+           # anywhere off-origin.
+           "base-uri 'none'; form-action 'self'; object-src 'none'")
 
-    def _basic_actor(header: str | None, *, derive: bool = True) -> tuple[str, str]:
-        """(authenticated_user, attempted_name) from an Authorization header.
+    # `__Host-` is not decoration. team-server.md §3.6 puts workspaces on sibling
+    # names (t1234.support.example.com) beside the GUI (support.example.com), and
+    # §8 says every workspace runs admin/admin123 -- so without the prefix a
+    # workspace can set a Domain-scoped cookie of the same name that the GUI cannot
+    # tell from its own. The prefix requires Secure, which http://localhost cannot
+    # have, so there are two names and exactly ONE is live per scheme: honouring
+    # the plain name over https would hand back everything the prefix bought.
+    COOKIE_SECURE = "__Host-rc_repro_session"
+    COOKIE_PLAIN = "rc_repro_session"
 
-        The attempted name comes back even on failure, so the caller can report a
-        lockout without decoding the header a second time.
+    def cookie_name() -> str:
+        return COOKIE_SECURE if app.state.public_https else COOKIE_PLAIN
 
-        Verification is off-loaded to services.users, which caches successes: the
-        browser attaches this header to EVERY request, and re-deriving scrypt each
-        time would saturate the threadpool.
+    def _session_token(headers_cookies) -> str:
+        return headers_cookies.get(cookie_name(), "")
 
-        `derive=False` consults ONLY that cache. It exists for the open endpoint:
-        anything reachable without credentials must not be able to spend ~50 ms of
-        scrypt (and 34 MB) per request on behalf of an anonymous caller, which is
-        what happens the moment it decodes an attacker-supplied header.
-        """
-        from rc_repro.services import users as usersvc
+    def _set_session_cookie(response, token: str) -> None:
+        secure = bool(app.state.public_https)
+        response.set_cookie(
+            cookie_name(), token,
+            max_age=sessions.ABSOLUTE_SECONDS, path="/", httponly=True,
+            secure=secure,
+            # Lax, not Strict: pasting a workspace link into chat and following it
+            # is the support workflow, and Strict blanks the first load. Lax still
+            # withholds the cookie from cross-site POSTs and from subresource
+            # requests, which includes the WebSocket and EventSource handshakes.
+            samesite="lax")
 
-        scheme, _, encoded = (header or "").partition(" ")
-        if scheme.lower() != "basic" or not encoded:
-            return "", ""
-        try:
-            name, _, password = base64.b64decode(encoded).decode("utf-8").partition(":")
-        except (ValueError, UnicodeDecodeError):
-            return "", ""
-        check = usersvc.verify if derive else usersvc.verify_cached
-        return (name if check(name, password) else ""), name
-
-    def _challenge(detail: str = "") -> JSONResponse:
-        return JSONResponse(
-            {"error": detail or "sign in to use rc-repro", "kind": "Unauthorized"},
-            status_code=401,
-            headers={"WWW-Authenticate": 'Basic realm="rc-repro", charset="UTF-8"'})
+    def _clear_session_cookie(response) -> None:
+        # Both names, so switching a box between http and https cannot strand a
+        # cookie the new scheme will not overwrite.
+        for name in (COOKIE_SECURE, COOKIE_PLAIN):
+            response.delete_cookie(name, path="/")
 
     # --- security: Host allow-list, then Basic Auth or the session token
     @app.middleware("http")
@@ -222,46 +305,54 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
         if not host_ok(request.headers.get("host")):
             return JSONResponse({"error": "host not allowed (use serve --allow-host)"}, status_code=403)
         path = request.url.path
-        # Cross-site state change. In TOKEN mode the unguessable ?t= doubles as a
-        # CSRF token, but a Basic credential is attached by the BROWSER on every
+        # Cross-site request. In TOKEN mode the unguessable ?t= doubles as a CSRF
+        # token, but a Basic credential is attached by the BROWSER on every
         # request and `Host:` is whatever this server answers to -- so the host
         # allow-list waves a forged request straight through, and Basic is not a
         # cookie so SameSite never applies. Confirmed reachable: a body-less POST
         # to /upgrade/rollback (which drops the database) from any origin.
-        # Sec-Fetch-Site is sent by every current browser; Origin backstops the
-        # rest. Non-browser clients (curl, CI) send neither and are unaffected.
-        if request.method not in ("GET", "HEAD", "OPTIONS"):
-            site = request.headers.get("sec-fetch-site", "")
-            origin = request.headers.get("origin", "")
-            cross = site not in ("", "same-origin", "none")
-            if not cross and origin:
-                cross = not host_ok(origin.split("://", 1)[-1])
-            if cross:
+        #
+        # Every /api/ path, not just the state-changing methods it used to cover.
+        # A cross-site READ of /api/repros/{name}/logs hands over LDAP bind
+        # passwords and OAuth secrets, so it was never the milder case. The SPA
+        # itself is same-origin; non-browser clients (curl, CI) send neither
+        # header and are unaffected, so nothing scripted changes.
+        if request.method not in ("GET", "HEAD", "OPTIONS") or path.startswith("/api/"):
+            if _cross_site(request.headers):
                 return JSONResponse(
                     {"error": "cross-site request refused", "kind": "Forbidden"},
                     status_code=403)
         actor = ""
-        if app.state.basic_auth:
+        if app.state.accounts:
             # Everything is behind the login, not just /api/ -- the SPA itself
-            # should not render for someone who cannot use it. /api/health stays
-            # open so an uptime check needs no credential -- but its credentials
-            # are still READ, so it can tell the dashboard who is signed in.
-            #
-            # On that open path the read is CACHE-ONLY: deriving there let any
-            # anonymous caller spend ~50 ms of scrypt per request just by sending
-            # an Authorization header, on the one route that must stay cheap. A
-            # miss costs the dashboard nothing -- its very next authenticated
-            # request populates the cache.
-            open_path = path == "/api/health"
-            actor, attempted = _basic_actor(request.headers.get("authorization"),
-                                            derive=not open_path)
+            # should not render for someone who cannot use it. The open set is
+            # exactly what a signed-OUT browser needs to render the sign-in page,
+            # plus the uptime check:
+            #   /signin, /signout  the login itself
+            #   /api/session       its JSON twin -- signing in cannot require
+            #                      being signed in, and GET answers {"user": ""}
+            #                      for a caller who is not
+            #   /app.css           or the sign-in page is unstyled
+            #   /api/health        so a monitor needs no credential
+            open_path = path in ("/signin", "/signout", "/api/session",
+                                 "/app.css", "/api/health")
+            sess = sessions.verify(request.cookies.get(cookie_name(), ""))
+            actor = sess.user if sess else ""
             if not open_path and not actor:
-                from rc_repro.services import users as usersvc
-                wait = usersvc.locked_out(attempted) if attempted else 0.0
-                if wait:
-                    return _challenge(
-                        f"too many failed attempts; try again in {int(wait) + 1}s")
-                return _challenge()
+                # An API caller gets a machine-readable 401 it can act on; a
+                # BROWSER gets sent to the page that fixes the problem, carrying
+                # where it was going. Answering an HTML navigation with JSON is
+                # how the old design ended up with no login screen at all.
+                if path.startswith("/api/"):
+                    return JSONResponse(
+                        {"error": "sign in to use rc-repro", "kind": "Unauthorized"},
+                        status_code=401)
+                nxt = request.url.path
+                if request.url.query:
+                    nxt += "?" + request.url.query
+                return RedirectResponse(
+                    f"/signin?e=required&next={quote(nxt, safe='/?=&')}",
+                    status_code=303)
         elif token and path.startswith("/api/") and path != "/api/health":
             given = request.headers.get("x-rc-repro-token") or request.query_params.get("t")
             if given != token:
@@ -295,14 +386,156 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
         return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
                             status_code=exc.http_status)
 
+    # --- the session: sign in, sign out, who am I -----------------------------
+    def _client(request: Request) -> str:
+        return request.client.host if request.client else ""
+
+    def _do_signin(user: str, password: str, source: str, agent: str):
+        """Shared by the form post and the JSON twin. Returns (token, error).
+
+        scrypt runs HERE and nowhere else, which is what makes a guessing bound
+        possible at all: one endpoint to throttle, instead of every door in the
+        app re-deriving whatever Authorization header it was handed.
+        """
+        from rc_repro.services import users as usersvc
+
+        if not usersvc.any_users():
+            return "", "nouser"
+        if _signin_retry_after(source):
+            return "", "rate"
+        if not usersvc.verify(user, password, source=source):
+            _signin_failed(source)
+            return "", "bad"
+        _signin_ok(source)
+        return sessions.create(user, label=sessions.describe_agent(agent)), ""
+
+    @app.get("/signin")
+    def signin_form(request: Request, e: str = "", next: str = "/"):
+        # Already signed in? Nobody needs to see this page. Straight through to
+        # where they were going, so a stale /signin bookmark is not a dead end.
+        if sessions.verify(request.cookies.get(cookie_name(), "")):
+            return RedirectResponse(signin_page.safe_next(next), status_code=303)
+        # The "not encrypted" warning is about the password crossing a NETWORK.
+        # On a loopback connection it does not, so showing it there is a false
+        # alarm on the most common install -- and a red banner that is wrong on a
+        # laptop is how people learn to ignore red banners.
+        local = _client(request) in ("127.0.0.1", "::1", "localhost")
+        html = signin_page.page(
+            error=e, next_url=next,
+            server=(request.headers.get("host") or "").split(":")[0],
+            secure=bool(app.state.public_https) or local,
+            retry_after=_signin_retry_after(_client(request)))
+        return HTMLResponse(html, status_code=401 if e in ("bad", "rate") else 200)
+
+    @app.post("/signin")
+    def signin_submit(request: Request, user: str = Form(""),
+                      password: str = Form(""), next: str = Form("/")):
+        source = _client(request)
+        token, err = _do_signin(user, password, source,
+                                request.headers.get("user-agent", ""))
+        target = signin_page.safe_next(next)
+        if err:
+            # The name is deliberately NOT echoed back into the form. It would be
+            # reflected input on an unauthenticated page, and the browser's own
+            # autofill restores it anyway.
+            return RedirectResponse(f"/signin?e={err}&next={quote(target, safe='/?=&')}",
+                                    status_code=303)
+        # 303 so the POST is not in history and a refresh cannot resubmit it.
+        resp = RedirectResponse(target, status_code=303)
+        _set_session_cookie(resp, token)
+        return resp
+
+    @app.post("/api/session")
+    def session_create(request: Request, body: dict = Body(default={})):
+        """The JSON twin of POST /signin, for scripts and for the SPA."""
+        source = _client(request)
+        token, err = _do_signin(str(body.get("user") or ""),
+                                str(body.get("password") or ""), source,
+                                request.headers.get("user-agent", ""))
+        if err:
+            detail = {"bad": "that name or password is not right",
+                      "rate": "too many attempts from this address",
+                      "nouser": "there are no accounts on this server yet"}[err]
+            return JSONResponse({"error": detail, "kind": "Unauthorized"},
+                                status_code=429 if err == "rate" else 401)
+        sess = sessions.verify(token)
+        resp = JSONResponse({"user": sess.user, "expires_at": sess.expires_at})
+        _set_session_cookie(resp, token)
+        return resp
+
+    @app.get("/api/session")
+    def session_whoami(request: Request):
+        """Who am I. Replaces the `actor` field bolted onto /api/health, which
+        only existed because there was nowhere else to ask."""
+        sess = sessions.verify(request.cookies.get(cookie_name(), ""))
+        if not sess:
+            return {"user": "", "accounts": bool(app.state.accounts)}
+        return {"user": sess.user, "accounts": True, "origin": sess.origin,
+                "expires_at": sess.expires_at, "label": sess.label}
+
+    @app.delete("/api/session")
+    def session_end(request: Request):
+        """Sign out — a logout that actually ends something on the server."""
+        raw = request.cookies.get(cookie_name(), "")
+        ended = sessions.revoke(raw) if raw else False
+        resp = JSONResponse({"ok": True, "ended": ended})
+        _clear_session_cookie(resp)
+        return resp
+
+    @app.post("/signout")
+    def signout_form(request: Request):
+        raw = request.cookies.get(cookie_name(), "")
+        if raw:
+            sessions.revoke(raw)
+        # No goodbye page: what you want next is to walk away or to sign back in,
+        # and /signin?e=signedout is both, with the name field focused.
+        resp = RedirectResponse("/signin?e=signedout", status_code=303)
+        _clear_session_cookie(resp)
+        return resp
+
+    @app.get("/api/sessions")
+    def sessions_list(request: Request):
+        """Your own live sessions. The answer to "I signed in on the customer's
+        laptop", which no cookie attribute gives you and which only exists
+        because sessions are server-side."""
+        sess = sessions.verify(request.cookies.get(cookie_name(), ""))
+        if not sess:
+            return {"sessions": []}
+        here = sess.sid[:8]
+        return {"sessions": [{**s.public(), "current": s.sid[:8] == here}
+                             for s in sessions.list_for(sess.user)]}
+
+    @app.delete("/api/sessions")
+    def sessions_revoke(request: Request, all: bool = False, sid: str = ""):
+        sess = sessions.verify(request.cookies.get(cookie_name(), ""))
+        if not sess:
+            return JSONResponse({"error": "not signed in", "kind": "Unauthorized"},
+                                status_code=401)
+        if all:
+            n = sessions.revoke_user(sess.user)
+            resp = JSONResponse({"ok": True, "ended": n})
+            _clear_session_cookie(resp)
+            return resp
+        # By sid PREFIX, because that is all the listing hands out -- the full
+        # value is a verifier and a page that shows it gives away every session
+        # it lists. Scoped to your own sessions, so a prefix collision with
+        # somebody else's cannot revoke theirs.
+        target = next((s for s in sessions.list_for(sess.user)
+                       if s.sid[:8] == sid), None)
+        if not target:
+            return JSONResponse({"error": "no such session", "kind": "NotFoundError"},
+                                status_code=404)
+        sessions.revoke_sid(target.sid)
+        return {"ok": True, "ended": 1}
+
     # --- read (blocking -> def -> threadpool) ---------------------------------
     @app.get("/api/health")
     def health(request: Request):
-        # `actor` echoes back the caller's OWN credentials, so an open /api/health
-        # gives away nothing: unauthenticated callers get "". The dashboard polls
-        # this anyway, which keeps the name fresh without a second endpoint.
-        return {"ok": True, "docker": runner.docker_available(),
-                "actor": getattr(request.state, "actor", "") or ""}
+        # Deliberately says nothing about identity any more. `actor` lived here
+        # only because there was nowhere else to ask who was signed in; that is
+        # `GET /api/session` now, and an endpoint left open for uptime checks
+        # should not be reading credentials at all.
+        return {"ok": True, "docker": runner.docker_available()}
 
     @app.get("/api/repros")
     def list_repros():
@@ -423,14 +656,24 @@ def create_app(token: str = "", allow_hosts: list[str] | None = None, *,
 
     @app.websocket("/api/repros/{name}/logs/stream")
     async def logs_stream(ws: WebSocket, name: str, tail: int = 300):
-        # WS bypasses the http middleware, so the same checks run here.
+        # WS bypasses the http middleware, so the same checks run here -- and the
+        # cross-site one now runs from the SAME helper `guard` uses, because
+        # having a second, shorter copy of this list is exactly how the Origin
+        # check went missing here while being present three lines away.
         if not app.state.host_ok(ws.headers.get("host")):
             await ws.close(code=1008); return
-        if app.state.basic_auth:
-            # A browser cannot set headers on a WebSocket from JS -- which is why
-            # the token rides in ?t=. It DOES attach cached Basic credentials to
-            # the upgrade request automatically, so the same header is here.
-            if not _basic_actor(ws.headers.get("authorization"))[0]:
+        # Before accept(), and before any credential is read. `require_origin` is
+        # on only when the credential is ambient: a Basic header is attached by
+        # the browser itself, so an absent Origin cannot be trusted. In token mode
+        # the ?t= value is the proof and no browser can supply it cross-site, so a
+        # header-less client (curl, CI, the tests) still connects.
+        if _cross_site(ws.headers, require_origin=app.state.accounts):
+            await ws.close(code=1008); return
+        if app.state.accounts:
+            # The cookie rides along on the upgrade automatically, which is what
+            # finally takes the credential out of the query string: `?t=` was only
+            # ever there because a browser cannot set headers on a WebSocket.
+            if not sessions.verify(ws.cookies.get(cookie_name(), "")):
                 await ws.close(code=1008); return
         elif token and ws.query_params.get("t") != token:
             await ws.close(code=1008); return

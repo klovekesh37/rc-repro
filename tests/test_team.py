@@ -25,10 +25,8 @@ GOOD = "correct-horse-battery"
 def _fresh(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     monkeypatch.delenv("RC_REPRO_USER", raising=False)
-    users.forget()
     users._failures.clear()
     yield
-    users.forget()
     users._failures.clear()
 
 
@@ -178,7 +176,7 @@ def served(monkeypatch):
 
     seen: dict = {}
     fake = types.ModuleType("uvicorn")
-    fake.run = lambda app, host="", port=0, log_level="": seen.update(host=host, port=port)
+    fake.run = lambda app, host="", port=0, **kw: seen.update(host=host, port=port, **kw)
     monkeypatch.setitem(sys.modules, "uvicorn", fake)
     from rc_repro.web import app as webapp
     monkeypatch.setattr(webapp, "create_app", lambda **kw: seen.update(kw) or object())
@@ -202,7 +200,7 @@ def test_insecure_serves_the_login_on_a_reachable_interface(served):
         "--allow-host", "*", "--insecure", "--no-open"])
     assert r.exit_code == 0, r.output
     assert served["host"] == "0.0.0.0" and served["port"] == 9944
-    assert served["basic_auth"] is True
+    assert served["accounts"] is True
     assert served["token"] == "", "accounts replace the session token"
 
 
@@ -210,7 +208,7 @@ def test_loopback_needs_no_flag(served):
     users.add("alice", GOOD)
     r = cli_runner.invoke(cli.app, ["serve", "--no-open"])
     assert r.exit_code == 0, r.output
-    assert served["basic_auth"] is True
+    assert served["accounts"] is True
 
 
 def test_without_accounts_a_reachable_bind_is_still_allowed(served):
@@ -218,7 +216,7 @@ def test_without_accounts_a_reachable_bind_is_still_allowed(served):
     that would break every existing lab/Codespaces setup."""
     r = cli_runner.invoke(cli.app, ["serve", "--bind", "0.0.0.0", "--no-open"])
     assert r.exit_code == 0, r.output
-    assert served["basic_auth"] is False
+    assert served["accounts"] is False
     assert served["token"], "token mode still mints one"
 
 
@@ -416,7 +414,7 @@ def test_no_token_stays_available_for_an_ephemeral_lab(served):
     r = cli_runner.invoke(cli.app, [
         "serve", "--bind", "0.0.0.0", "--no-token", "--insecure", "--no-open"])
     assert r.exit_code == 0, r.output
-    assert served["token"] == "" and served["basic_auth"] is False
+    assert served["token"] == "" and served["accounts"] is False
 
 
 def test_no_token_on_loopback_is_untouched(served):

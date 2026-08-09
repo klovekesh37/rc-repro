@@ -206,22 +206,33 @@ def remove(name: str) -> None:
 
 # --- verification ------------------------------------------------------------------
 
-#: A successful verification is cached, because the browser sends Authorization on
-#: EVERY request -- the dashboard poll, each SSE reconnect, every log fetch. At
-#: ~100 ms per scrypt derivation that is a self-inflicted denial of service: a few
-#: open tabs would saturate the threadpool. Keyed by (name, sha256(password)) so the
-#: password itself is never held, and bounded so it cannot grow without limit.
-_CACHE_TTL = 300.0
-_CACHE_MAX = 256
-_cache: dict[tuple[str, bytes], float] = {}
-_cache_lock = threading.Lock()
+#: There is deliberately NO verification cache here any more.
+#:
+#: One existed because HTTP Basic re-sent the password on EVERY request -- the
+#: four-second dashboard poll, each SSE reconnect, every log fetch -- and ~100 ms
+#: of scrypt per request would have saturated the threadpool. It cost a
+#: password-derived value sitting in process memory for five minutes per session,
+#: plus a stat() on every call to notice revocation, plus a whole invalidation
+#: path that had to be right.
+#:
+#: With server-side sessions (services/sessions.py) verify() runs exactly once per
+#: SIGN-IN, so the cache had nothing left to save. Removing it is the fix for that
+#: memory exposure, and it is the kind of fix that cannot itself be buggy.
 
-#: Failed attempts per user, for backoff. A 128-bit token is not guessable; a human
-#: password is, so repeated failures have to cost something.
+#: Failed attempts, for backoff. A 128-bit token is not guessable; a human password
+#: is, so repeated failures have to cost something.
+#:
+#: Keyed on (name, source) -- the name ALONE was a denial of service against a
+#: colleague. Names are not secret: `serve` prints "sign in as: alice, bob" at
+#: startup and the dashboard renders an owner chip on every card, so five wrong
+#: guesses from anyone who could reach the port locked a named person out. Keyed
+#: on the pair, an attacker burns a counter belonging to their own address and
+#: the real user is untouched. `source` is the resolved client address; "" for
+#: the CLI, which has no client.
 _LOCKOUT_AFTER = 5
 _LOCKOUT_BASE = 2.0
 _LOCKOUT_MAX = 300.0
-_failures: dict[str, tuple[int, float]] = {}
+_failures: dict[tuple[str, str], tuple[int, float]] = {}
 #: Ceiling on the failure map. Far above any real workspace's user count, so a
 #: legitimate lockout is never evicted; low enough that a name-varying flood
 #: cannot grow it unboundedly.
@@ -229,47 +240,17 @@ _FAILURES_MAX = 4096
 _fail_lock = threading.Lock()
 
 
-def _cache_key(name: str, password: str) -> tuple[str, bytes]:
-    return name, hashlib.sha256(password.encode("utf-8")).digest()
+def locked_out(name: str, source: str = "") -> float:
+    """Seconds of backoff earned by failures for `name` from `source`, or 0.
 
-
-#: The users file as it looked when the cache was filled.
-_cache_stamp: tuple[int, int] = (0, 0)
-
-
-def _file_stamp() -> tuple[int, int]:
-    try:
-        st = users_file().stat()
-        return (st.st_mtime_ns, st.st_size)
-    except OSError:
-        return (0, 0)
-
-
-def _drop_cache_if_file_changed() -> None:
-    """Discard cached verifications when the users file has been touched.
-
-    `rc-repro users remove alice` calls forget() -- in the CLI process, whose cache
-    is empty. The long-lived `serve` process keeps its own, and only re-reads the
-    file on a cache MISS, so a removed account (or the old password after a reset)
-    went on working against the running GUI for up to five minutes with no signal
-    that the documented remediation had not taken effect.
-
-    Cheap enough to do on every verify: one stat() against ~50 ms of scrypt. mtime
-    AND size, because a same-size rewrite inside the mtime granularity is exactly
-    what a password change looks like.
+    ADVISORY ONLY. This reports how long a client that keeps guessing has been
+    asked to wait; it does not decide whether a credential is accepted. See
+    verify(), where consulting this BEFORE checking the password meant a correct
+    password was refused -- so the documented remedy for a compromised account
+    (change the password) was itself what locked the owner out.
     """
-    global _cache_stamp
-    stamp = _file_stamp()
-    with _cache_lock:
-        if stamp != _cache_stamp:
-            _cache.clear()
-            _cache_stamp = stamp
-
-
-def locked_out(name: str) -> float:
-    """Seconds remaining before `name` may try again, or 0."""
     with _fail_lock:
-        count, last = _failures.get(name, (0, 0.0))
+        count, last = _failures.get((name, source), (0, 0.0))
     if count < _LOCKOUT_AFTER:
         return 0.0
     delay = min(_LOCKOUT_BASE ** (count - _LOCKOUT_AFTER + 1), _LOCKOUT_MAX)
@@ -277,90 +258,61 @@ def locked_out(name: str) -> float:
     return max(0.0, remaining)
 
 
-def _record_failure(name: str) -> None:
+def _record_failure(name: str, source: str = "") -> None:
     with _fail_lock:
         now = time.monotonic()
-        # Keyed by NAME, so an attacker who varies the name never trips the
-        # lockout AND grows this dict without limit -- a slow memory leak driven
-        # by anyone who can reach the port. Drop entries that can no longer
-        # produce a lockout, then cap: the backoff is what this is for, and a
-        # bounded map still delivers it for the names actually being attacked.
+        # An attacker who varies the name never trips the lockout AND grows this
+        # dict without limit -- a slow memory leak driven by anyone who can reach
+        # the port. Drop entries that can no longer produce a lockout, then cap:
+        # the backoff is what this is for, and a bounded map still delivers it
+        # for the pairs actually being attacked.
         if len(_failures) >= _FAILURES_MAX:
             stale = [k for k, (_c, t) in _failures.items() if now - t > _LOCKOUT_MAX]
             for k in stale:
                 del _failures[k]
             if len(_failures) >= _FAILURES_MAX:
                 _failures.clear()
-        count, _last = _failures.get(name, (0, 0.0))
-        _failures[name] = (count + 1, now)
+        count, _last = _failures.get((name, source), (0, 0.0))
+        _failures[(name, source)] = (count + 1, now)
 
 
-def _clear_failures(name: str) -> None:
+def _clear_failures(name: str, source: str = "") -> None:
     with _fail_lock:
-        _failures.pop(name, None)
+        _failures.pop((name, source), None)
 
 
-def verify(name: str, password: str) -> bool:
-    """Whether these credentials are valid. Constant-time, cached, rate-limited.
+def verify(name: str, password: str, *, source: str = "") -> bool:
+    """Whether these credentials are valid. Constant-time; never cached.
 
     An unknown user still performs a full derivation: returning early would make
     the response time reveal which names exist.
+
+    THE PASSWORD IS CHECKED FIRST, and a correct one is never refused because of a
+    counter. The previous order -- lockout, then password -- had two reachable
+    consequences. Anyone who could reach the port could lock out a named colleague
+    with five wrong guesses. And after `rc-repro users passwd alice`, any browser
+    tab still open re-sent the OLD credential on its four-second dashboard poll;
+    each poll was a fresh failure that slid the window forward, so the account
+    stayed locked indefinitely and the correct new password was refused with it.
+    Measured before this change: after twenty minutes of one polling tab,
+    locked_out() read 232s and the right password did not work.
+
+    `source` is the resolved client address, so failures are counted per (name,
+    address) -- see the note on _failures.
     """
     if not name or password is None:
         return False
-    if locked_out(name):
-        return False
-
-    _drop_cache_if_file_changed()
-    key = _cache_key(name, password)
-    now = time.monotonic()
-    with _cache_lock:
-        seen = _cache.get(key)
-        if seen is not None and seen > now:
-            return True
 
     users = _read()
     stored = users.get(name)
     if stored is None:
         # Burn the same work as a real check so timing does not enumerate users.
         _check(password, hash_password("dummy-not-a-real-password"))
-        _record_failure(name)
+        _record_failure(name, source)
         return False
     if not _check(password, stored[0]):
-        _record_failure(name)
+        _record_failure(name, source)
         return False
 
-    _clear_failures(name)
-    with _cache_lock:
-        if len(_cache) >= _CACHE_MAX:
-            _cache.clear()          # crude, but bounded and never stale-serves
-        _cache[key] = now + _CACHE_TTL
+    _clear_failures(name, source)
     return True
-
-
-def verify_cached(name: str, password: str) -> bool:
-    """Whether these credentials are ALREADY known good. Never derives.
-
-    For endpoints that are deliberately open, where a full verify() would hand an
-    unauthenticated caller a ~50 ms scrypt derivation (and 34 MB) per request just
-    by attaching an Authorization header -- a CPU and memory amplifier on the one
-    route that exists to be cheap. A cache miss here simply means "no actor", not
-    "wrong password", so nothing is refused on the strength of it.
-    """
-    if not name or password is None:
-        return False
-    _drop_cache_if_file_changed()
-    with _cache_lock:
-        seen = _cache.get(_cache_key(name, password))
-        return seen is not None and seen > time.monotonic()
-
-
-def forget(name: str = "") -> None:
-    """Drop cached verifications — for one user, or all. Called after a password
-    change or removal, so a revoked credential cannot survive the cache TTL."""
-    with _cache_lock:
-        if not name:
-            _cache.clear()
-        else:
-            for key in [k for k in _cache if k[0] == name]:
-                del _cache[key]

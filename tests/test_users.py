@@ -1,8 +1,9 @@
 """Unit tests for GUI accounts (services/users.py).
 
 These lock in the properties that make a shared deployment safe: passwords are
-never recoverable from the file, verification is constant-time-ish and cached,
-repeated failures cost something, and revoking a credential takes effect at once.
+never recoverable from the file, verification is constant-time-ish, repeated
+failures cost something without ever refusing a correct password, and revoking a
+credential takes effect at once.
 """
 
 from __future__ import annotations
@@ -18,10 +19,8 @@ from rc_repro.services import users
 @pytest.fixture(autouse=True)
 def _fresh(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    users.forget()
     users._failures.clear()
     yield
-    users.forget()
     users._failures.clear()
 
 
@@ -124,17 +123,11 @@ def test_an_unknown_user_still_does_the_work():
     assert unknown > 0.005, f"unknown-user check returned in {unknown*1000:.1f}ms"
 
 
-def test_a_successful_check_is_cached():
-    """The browser sends Authorization on EVERY request — the 4s poll, each SSE
-    reconnect. At ~100ms per derivation that is a self-inflicted denial of service."""
-    users.add("alice", GOOD)
-    t0 = time.monotonic(); users.verify("alice", GOOD); first = time.monotonic() - t0
-    t0 = time.monotonic(); users.verify("alice", GOOD); cached = time.monotonic() - t0
-    assert cached < first / 5, f"first {first*1000:.0f}ms, cached {cached*1000:.0f}ms"
-
-
-def test_the_cache_is_keyed_on_the_password_too():
-    """A cached success must not let a WRONG password through afterwards."""
+def test_a_wrong_password_is_refused_after_a_correct_one(tmp_path, monkeypatch):
+    """There is no verification cache any more (sessions replaced it), so this is
+    now just "verify does what it says" -- but the property it protects is the one
+    a cache would have broken: a success must never make a later wrong password
+    succeed."""
     users.add("alice", GOOD)
     assert users.verify("alice", GOOD) is True
     assert users.verify("alice", "wrong-password-x") is False
@@ -142,30 +135,56 @@ def test_the_cache_is_keyed_on_the_password_too():
 
 def test_changing_a_password_invalidates_the_old_one_immediately():
     users.add("alice", GOOD)
-    assert users.verify("alice", GOOD) is True      # now cached
+    assert users.verify("alice", GOOD) is True
     users.set_password("alice", "a-brand-new-password")
-    users.forget("alice")
     assert users.verify("alice", GOOD) is False, "the old password still worked"
     assert users.verify("alice", "a-brand-new-password") is True
 
 
-def test_removing_a_user_invalidates_the_cache():
+def test_removing_a_user_takes_effect_at_once():
     users.add("alice", GOOD)
     assert users.verify("alice", GOOD) is True
     users.remove("alice")
-    users.forget("alice")
     assert users.verify("alice", GOOD) is False
 
 
-def test_repeated_failures_lock_the_account_out():
-    """A 128-bit token is not guessable; a human password is."""
+def test_repeated_failures_earn_a_backoff():
+    """A 128-bit token is not guessable; a human password is, so failures count."""
     users.add("alice", GOOD)
     assert users.locked_out("alice") == 0
     for _ in range(users._LOCKOUT_AFTER):
         users.verify("alice", "wrong-password-x")
     assert users.locked_out("alice") > 0
-    # Even the CORRECT password is refused while locked out.
-    assert users.verify("alice", GOOD) is False
+
+
+def test_a_correct_password_is_never_refused_because_of_a_lockout():
+    """The counter is advisory. It reports; it does not decide.
+
+    Consulting it BEFORE checking the password made the documented remedy for a
+    compromised account the thing that locked its owner out: after `users passwd`,
+    every still-open tab replayed the OLD credential on its four-second dashboard
+    poll, each poll slid the window forward, and the new password was refused with
+    it. Measured at the time: 232s of lockout after twenty minutes of one tab, and
+    the right password did not work.
+    """
+    users.add("alice", GOOD)
+    for _ in range(users._LOCKOUT_AFTER * 4):
+        users.verify("alice", "the-old-password-x")
+    assert users.locked_out("alice") > 0, "the backoff should still be reported"
+    assert users.verify("alice", GOOD) is True
+    assert users.locked_out("alice") == 0, "success clears the count"
+
+
+def test_one_client_cannot_lock_out_another():
+    """Names are not secret -- `serve` prints them at startup and the dashboard
+    renders an owner chip on every card. Keyed on the name alone, five wrong
+    guesses from anyone who could reach the port denied service to a colleague."""
+    users.add("alice", GOOD)
+    for _ in range(50):
+        users.verify("alice", "guess-guess-guess", source="203.0.113.9")
+    assert users.locked_out("alice", "203.0.113.9") > 0, "the attacker is throttled"
+    assert users.locked_out("alice", "10.0.0.4") == 0, "alice's own address is clean"
+    assert users.verify("alice", GOOD, source="10.0.0.4") is True
 
 
 def test_a_success_clears_the_failure_count():
@@ -181,18 +200,6 @@ def test_empty_credentials_are_refused_without_touching_the_file():
     assert users.verify("", GOOD) is False
     assert users.verify("alice", "") is False
 
-
-def test_the_cache_is_bounded():
-    """It is keyed by (user, password-digest); an attacker trying many passwords
-    must not be able to grow it without limit."""
-    users.add("alice", GOOD)
-    for i in range(users._CACHE_MAX + 10):
-        users._cache[(f"u{i}", b"x")] = time.monotonic() + 60
-    users.verify("alice", GOOD)
-    assert len(users._cache) <= users._CACHE_MAX + 1
-
-
-# --- hashing ---------------------------------------------------------------------------
 
 def test_the_same_password_hashes_differently_each_time():
     """Per-user salt: identical passwords must not produce identical lines."""
@@ -215,67 +222,53 @@ def test_a_corrupt_hash_verifies_false_rather_than_raising():
 
 
 # --- revocation must not lag (F12) ----------------------------------------------
-# Verifications are cached for 5 minutes in a MODULE-LEVEL dict. `users remove`
-# calls forget() -- in the CLI process, whose cache is empty. The long-lived
-# `serve` process kept its own and only re-read the file on a MISS, so a removed
-# account went on working against the running GUI for up to five minutes, with no
-# signal that the documented remediation had not taken effect.
+# Verifications USED to be cached for five minutes in a module-level dict. `users
+# remove` called forget() -- in the CLI process, whose cache was empty. The
+# long-lived `serve` process kept its own and only re-read the file on a MISS, so
+# a removed account went on working against the running GUI for up to five
+# minutes, with no signal that the documented remediation had not taken effect.
+#
+# The cache is gone (sessions replaced its reason for existing), so the lag cannot
+# recur -- but the PROPERTY is what mattered, so it is still asserted, and now
+# also for the credential the browser actually carries: the session.
 
-def _other_process_removes(name: str) -> None:
-    """Edit the users file the way a SEPARATE process would: no forget() here."""
+def _other_process_edits(mutate) -> None:
+    """Edit the users file the way a SEPARATE process would."""
     from rc_repro.services import users as usersvc
-
-    path = usersvc.users_file()
-    kept = [ln for ln in path.read_text().splitlines()
-            if not ln.startswith(f"{name}:")]
-    path.write_text("\n".join(kept) + "\n")
+    rows = usersvc._read()
+    mutate(rows)
+    usersvc._write(rows)
 
 
 def test_removing_a_user_takes_effect_immediately_in_a_running_server(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from rc_repro.services import sessions as sessionsvc
     from rc_repro.services import users as usersvc
 
-    usersvc.forget()
     usersvc._failures.clear()
     usersvc.add("alice", "correct-horse-battery")
-    assert usersvc.verify("alice", "correct-horse-battery") is True   # now cached
+    assert usersvc.verify("alice", "correct-horse-battery") is True
+    token = sessionsvc.create("alice")
+    assert sessionsvc.verify(token) is not None
 
-    _other_process_removes("alice")
+    _other_process_edits(lambda rows: rows.pop("alice"))
     assert usersvc.verify("alice", "correct-horse-battery") is False, \
-        "a removed account kept working until the cache expired"
+        "a removed account kept working"
+    # And the session it already had must die with it -- an account that can no
+    # longer sign in but is still signed in is not removed.
+    sessionsvc.revoke_user("alice")
+    assert sessionsvc.verify(token) is None
 
 
 def test_a_changed_password_invalidates_the_old_one_immediately(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     from rc_repro.services import users as usersvc
 
-    usersvc.forget()
     usersvc._failures.clear()
     usersvc.add("alice", "correct-horse-battery")
     assert usersvc.verify("alice", "correct-horse-battery") is True
 
-    # As another process would: rewrite the file, no forget() in THIS one.
-    usersvc._write({"alice": (usersvc.hash_password("brand-new-password"),
-                              "2026-01-01", "")})
+    _other_process_edits(lambda rows: rows.__setitem__(
+        "alice", (usersvc.hash_password("brand-new-password"), "2026-01-01", "")))
     assert usersvc.verify("alice", "correct-horse-battery") is False
     assert usersvc.verify("alice", "brand-new-password") is True
-
-
-def test_the_cache_still_works_when_the_file_is_untouched(tmp_path, monkeypatch):
-    """The invalidation must not defeat the cache it guards -- that cache is what
-    stops the browser's per-request Basic header saturating the threadpool."""
-    import time
-
-    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    from rc_repro.services import users as usersvc
-
-    usersvc.forget()
-    usersvc._failures.clear()
-    usersvc.add("alice", "correct-horse-battery")
-    usersvc.verify("alice", "correct-horse-battery")
-
-    start = time.perf_counter()
-    for _ in range(20):
-        assert usersvc.verify("alice", "correct-horse-battery") is True
-    per_call_ms = (time.perf_counter() - start) / 20 * 1000
-    assert per_call_ms < 5, f"{per_call_ms:.1f}ms per call - the cache is not being used"

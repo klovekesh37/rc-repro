@@ -25,3 +25,4 @@ env/
 # Design / internal docs (kept local)
 DESIGN.md
 docs/
+.docs/

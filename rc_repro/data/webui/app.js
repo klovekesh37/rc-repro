@@ -42,11 +42,32 @@ function localUrl(u) {
   } catch (_) { return u; }
 }
 
+// Set once the server says a login is in force. Until then every 401 is a token
+// problem, not an expired session, and bouncing to /signin would be wrong.
+let ACCOUNTS = false;
+let SIGNING_OUT = false;
+
+// A session can expire mid-session (12h idle / 7d absolute) or be revoked from
+// another browser. Both arrive as a 401 on whatever the page happened to be
+// doing -- the 4s poll, an SSE reconnect, a click. Without this the dashboard
+// just started failing silently, which is the failure mode the old
+// no-logout-no-login-page design had no answer for either.
+function toSignIn(reason) {
+  if (SIGNING_OUT) return;
+  SIGNING_OUT = true;
+  const next = encodeURIComponent(location.pathname + location.search);
+  location.assign(`/signin?e=${reason}&next=${next}`);
+}
+
 async function api(path, opts = {}) {
-  const headers = Object.assign({ "X-RC-Repro-Token": TOKEN }, opts.headers || {});
+  const headers = Object.assign({}, opts.headers || {});
+  if (TOKEN) headers["X-RC-Repro-Token"] = TOKEN;
   if (opts.body) headers["Content-Type"] = "application/json";
-  const r = await fetch(path, Object.assign({}, opts, { headers }));
+  // same-origin credentials so the session cookie rides along; it is HttpOnly,
+  // so this file can neither read nor forge it.
+  const r = await fetch(path, Object.assign({ credentials: "same-origin" }, opts, { headers }));
   const data = await r.json().catch(() => ({}));
+  if (r.status === 401 && ACCOUNTS) { toSignIn("expired"); throw new Error("signed out"); }
   if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
   return data;
 }
@@ -81,9 +102,15 @@ async function loadRepros() {
     ]);
     ALL_REPROS = repros;
     refreshEdgeBadge();          // its own request: /api/health must stay cheap
-    // Empty on a single-user box (no accounts, no login) -- in which case the
-    // chip stays hidden and every card renders exactly as it always has.
-    ME = health.actor || "";
+    // Identity comes from /api/session now, not from a field bolted onto
+    // /api/health -- an endpoint left open for uptime checks should not be
+    // reading credentials. Empty on a single-user box (no accounts, no login),
+    // in which case the chip stays hidden and every card renders as it always has.
+    try {
+      const me = await api("/api/session");
+      ACCOUNTS = !!me.accounts;
+      ME = me.user || "";
+    } catch (_) { /* signed out; api() has already redirected */ }
     const who = $("#whoami");
     who.textContent = ME; who.hidden = !ME;
     const dockerTxt = "docker: " + (health.docker ? "up" : "down");
@@ -856,7 +883,8 @@ function renderLogs(body, d) {
   body.append(ctl, box);
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/api/repros/${d.name}/logs/stream?t=${encodeURIComponent(TOKEN)}&tail=300`);
+  const q = (TOKEN ? `t=${encodeURIComponent(TOKEN)}&` : "") + "tail=300";   // the cookie carries the session; ?t= only exists for token mode
+  const ws = new WebSocket(`${proto}://${location.host}/api/repros/${d.name}/logs/stream?${q}`);
   dstate.logsWS = ws;
   ws.onmessage = (m) => {
     const e = parseLogLine(m.data);
@@ -1161,7 +1189,7 @@ function connectJob(job) {
   // `since` resumes from the last event we saw, so a reconnect cannot duplicate
   // or skip lines. The server has always accepted it; nothing used to send it.
   const es = new EventSource(
-    `/api/jobs/${job.id}/stream?since=${job.idx}&t=${encodeURIComponent(TOKEN)}`);
+    `/api/jobs/${job.id}/stream?since=${job.idx}` + (TOKEN ? `&t=${encodeURIComponent(TOKEN)}` : ""));
   job.es = es;
   es.onmessage = (m) => {
     if (JOB !== job) { es.close(); return; }      // superseded — do not write here
@@ -1772,7 +1800,72 @@ async function submitCreate() {
   catch (e) { toast(e.message); }
 }
 
+// ---- your account: sessions and the way out ---------------------------------
+// Server-side sessions are what make any of this possible. HTTP Basic had no
+// logout at all -- the browser cached the credential until the tab closed, and
+// "revocation is a file edit" was the honest description.
+const fmtWhen = (epoch) => {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - epoch));
+  if (s < 90) return "just now";
+  if (s < 5400) return `${Math.round(s / 60)}m ago`;
+  if (s < 172800) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+};
+
+async function openSessions() {
+  $("#session-title").textContent = `Signed in as ${ME}`;
+  const body = $("#session-body");
+  body.innerHTML = "";
+  body.append(el("p", { class: "empty" }, "loading…"));
+  $("#session-dialog").showModal();
+  let rows;
+  try { rows = (await api("/api/sessions")).sessions || []; }
+  catch (e) { body.innerHTML = ""; body.append(el("p", { class: "empty" }, e.message)); return; }
+  body.innerHTML = "";
+  if (!rows.length) { body.append(el("p", { class: "empty" }, "No other sessions.")); return; }
+  for (const s of rows) {
+    const row = el("div", { class: "jobrow" },
+      el("span", { class: "jstatus " + (s.current ? "done" : "queued") },
+        s.current ? "this one" : "other"),
+      el("span", { class: "jkind" }, `${s.label} · seen ${fmtWhen(s.last_seen)}`));
+    if (!s.current) {
+      row.append(el("button", {
+        class: "btn small danger", onclick: () => revokeSession(s.sid),
+      }, "Revoke"));
+    }
+    body.append(row);
+  }
+}
+
+async function revokeSession(sid) {
+  try { await api(`/api/sessions?sid=${encodeURIComponent(sid)}`, { method: "DELETE" });
+    toast("session revoked", "ok"); openSessions(); }
+  catch (e) { toast(e.message); }
+}
+
+// A real form POST, not fetch: sign-out ends with a redirect to the sign-in page,
+// and letting the browser follow it is simpler and works even if this script is
+// mid-failure. The logs socket and any SSE stream are closed first so nothing is
+// still reading from a session that no longer exists.
+function signOut(everywhere) {
+  SIGNING_OUT = true;
+  stopPolling(); closeLogs(); closeJobStream();
+  if (!everywhere) {
+    const f = el("form", { method: "post", action: "/signout" });
+    document.body.append(f); f.submit();
+    return;
+  }
+  fetch("/api/sessions?all=1", { method: "DELETE", credentials: "same-origin" })
+    .finally(() => location.assign("/signin?e=signedout"));
+}
+
 // ---- wiring -----------------------------------------------------------------
+$("#whoami").addEventListener("click", openSessions);
+$("#session-close").addEventListener("click", () => $("#session-dialog").close());
+$("#session-out").addEventListener("click", () => signOut(false));
+$("#session-all").addEventListener("click", () => {
+  if (confirm("Sign out of every browser you have signed in from?")) signOut(true);
+});
 $("#btn-new").addEventListener("click", openCreate);
 $("#btn-refresh").addEventListener("click", loadRepros);
 $("#btn-prune").addEventListener("click", doPrune);
