@@ -1283,20 +1283,31 @@ def create_app(allow_hosts: list[str] | None = None, *,
         # documented HTTP API rather than the GUI (which always sends the key).
         if not str(fields.get("version") or "").strip():
             raise ValidationError("`version` is required, e.g. {\"version\": \"8.5.1\"}")
-        # Four fields decide what CODE runs and where it listens, which is a
+        # Three fields decide what CODE runs and where it listens, which is a
         # different question from "make me a workspace". `rc_image` runs an
-        # arbitrary image as the serve user; `bind` can publish a workspace with
-        # fixed admin/admin123 credentials to the whole network. The GUI never
-        # sends them for a member -- it sends the resolved image for the version.
-        privileged = [k for k in ("rc_image", "reg_token", "bind", "port")
-                      if fields.get(k)]
+        # arbitrary image as the serve user; `reg_token` is an EE licence secret;
+        # `bind` can publish a workspace with fixed admin/admin123 credentials to
+        # the whole network.
+        #
+        # `port` USED to be in this list and should not have been. The only harm it
+        # could do was taking a privileged port -- squatting 80 or 443 out from
+        # under the edge -- and lifecycle.py:663 already refuses anything outside
+        # 1024-65535 for everybody, admin included. So the check protected nothing
+        # and cost a member the most reachable field in the dialog: "Host port" sits
+        # in the main section, not behind Advanced, and typing one failed the whole
+        # create with a message about images and interfaces.
+        privileged = [k for k in ("rc_image", "reg_token", "bind") if fields.get(k)]
         if privileged:
             from rc_repro.services import users as usersvc
             who = getattr(request.state, "actor", "") or ""
             if who and not usersvc.at_least(usersvc.role_of(who), "admin"):
+                extra = ("  Publishing every workspace on this box beyond loopback "
+                         "is a box-level decision: `rc-repro config set bind_host "
+                         "0.0.0.0`." if "bind" in privileged else "")
                 raise ValidationError(
                     f"{', '.join(privileged)} may only be set by an admin — they "
-                    "choose the image and the interface, not just the workspace")
+                    "choose the image and the interface, not just the workspace."
+                    + extra)
         creq = lc.CreateReq(**fields)
         job = jobs.submit("create", lc.create_repro, creq, stream_output=True,
                           label=creq.name or creq.version)

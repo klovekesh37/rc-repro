@@ -1566,16 +1566,21 @@ def test_changing_a_role_ends_that_users_sessions(basic_client):
 
 
 def test_only_an_admin_may_choose_the_image_or_the_interface(basic_client, monkeypatch):
-    """`rc_image` runs an arbitrary container as the serve user and `bind` can
-    publish a workspace with fixed admin/admin123 credentials to the network.
-    Those decide what code runs and where it listens, which is not the same
-    question as "make me a workspace"."""
+    """`rc_image` runs an arbitrary container as the serve user, `reg_token` is an EE
+    licence secret, and `bind` can publish a workspace with fixed admin/admin123
+    credentials to the network. Those decide what code runs and where it listens,
+    which is not the same question as "make me a workspace".
+
+    `port` was in this list and has been REMOVED — see the test below. It is the
+    counter-example: a role check that guarded nothing while costing a member the
+    most reachable field in the create dialog.
+    """
     from rc_repro.services import users as usersvc
     monkeypatch.setattr(lc, "require_docker", lambda: None)
     usersvc.add("bob", "bobs-good-password", role="member")
     _as(basic_client, "bob", "bobs-good-password")
     for field, value in (("rc_image", "evil/image"), ("bind", "0.0.0.0"),
-                         ("reg_token", "x"), ("port", 3999)):
+                         ("reg_token", "x")):
         r = basic_client.post("/api/repros", headers=_auth(),
                               json={"version": "8.5.1", field: value})
         assert r.status_code == 400, f"{field} -> {r.status_code}"
@@ -1583,6 +1588,20 @@ def test_only_an_admin_may_choose_the_image_or_the_interface(basic_client, monke
     # the ordinary body still works for a member
     assert basic_client.post("/api/repros", headers=_auth(),
                              json={"version": "8.5.1"}).status_code == 200
+
+
+def test_a_member_may_still_choose_a_host_port(basic_client, monkeypatch):
+    """The privileged range this might have guarded — 80 or 443, squatted out from
+    under the edge — is refused for EVERYBODY by lifecycle's 1024-65535 check, admin
+    included. So the role check protected nothing."""
+    from rc_repro.services import users as usersvc
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr(lc, "create_repro", lambda req, **kw: {"name": "x"})
+    usersvc.add("bob", "bobs-good-password", role="member")
+    _as(basic_client, "bob", "bobs-good-password")
+    r = basic_client.post("/api/repros", headers=_auth(),
+                          json={"version": "8.5.1", "port": 3999})
+    assert r.status_code == 200, r.text
 
 
 # --- the activity trail gets readers (H5) -----------------------------------------
@@ -2103,3 +2122,50 @@ def test_the_end_of_stream_sentinel_is_never_dropped():
     offer(None)
     items = [q.get_nowait() for _ in range(q.qsize())]
     assert items[-1] is None, "the sentinel was dropped by the overflow policy"
+
+
+def test_a_member_may_choose_a_host_port():
+    """`port` used to be admin-only alongside rc_image/reg_token/bind, and it should
+    not have been. The only harm it could do was taking a privileged port -- 80 or
+    443, out from under the edge -- and lifecycle refuses anything outside
+    1024-65535 for everybody already. So the role check protected nothing and cost
+    a member the most reachable field in the create dialog: "Host port" is in the
+    main section, not behind Advanced.
+    """
+    c = client(role="member")
+    r = c.post("/api/repros", json={"version": "8.5.1", "port": 3999}, headers=H)
+    assert r.status_code == 200, r.text
+    assert "job_id" in r.json()
+
+
+def test_a_member_may_not_choose_the_image_or_the_interface():
+    c = client(role="member")
+    for field, value in (("rc_image", "evil/registry:latest"),
+                         ("reg_token", "a-cloud-token"),
+                         ("bind", "0.0.0.0")):
+        r = c.post("/api/repros", json={"version": "8.5.1", field: value}, headers=H)
+        assert r.status_code == 400, f"{field} was accepted from a member: {r.text}"
+        assert field in r.json()["error"]
+
+
+def test_the_bind_refusal_names_the_box_level_setting():
+    """A boundary with no door on the other side is just a wall. `bind_host` was
+    read by lifecycle and mapped from RC_REPRO_BIND_HOST, but it was not a
+    `config set` key -- so a member was told "only an admin can set this" and the
+    admin had nowhere to set it either."""
+    from rc_repro.cli import _CONFIG_KEYS
+
+    assert "bind_host" in _CONFIG_KEYS, "the setting the message points at must exist"
+    c = client(role="member")
+    r = c.post("/api/repros", json={"version": "8.5.1", "bind": "0.0.0.0"}, headers=H)
+    assert r.status_code == 400
+    assert "config set bind_host" in r.json()["error"], \
+        "the refusal has to say what to do instead"
+
+
+def test_an_admin_may_still_set_all_three():
+    c = client(role="admin")
+    r = c.post("/api/repros", json={"version": "8.5.1", "bind": "0.0.0.0",
+                                    "rc_image": "registry/rocket.chat:x",
+                                    "reg_token": "tok", "port": 3999}, headers=H)
+    assert r.status_code == 200, r.text

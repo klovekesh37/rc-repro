@@ -590,6 +590,20 @@ _CONFIG_KEYS: dict[str, str] = {
     # Only needed when the variable names in dns.env do not identify the provider
     # on their own; normally it is inferred.
     "acme.dns_provider": "acme_dns_provider",
+    # Which interface every workspace on this box publishes on, unless `up --bind`
+    # overrides it. lifecycle.py has read this all along (`req.bind or
+    # cfg.get("bind_host") or DEFAULT_BIND_HOST`) and config.py maps
+    # RC_REPRO_BIND_HOST onto it -- but it was not in this table, so the only
+    # supported way to set it was an environment variable on the serve process.
+    #
+    # That mattered once `bind` became admin-only on POST /api/repros: a member was
+    # told "only an admin can set this" and the admin had nowhere to set it either.
+    # A boundary with no door on the other side is just a wall.
+    #
+    # Box-level is also the right SHAPE for this decision. Every workspace runs
+    # fixed admin/admin123 credentials, so "does this machine publish those beyond
+    # loopback?" is one answer for the box, not a checkbox on each create.
+    "bind_host": "bind_host",
 }
 
 

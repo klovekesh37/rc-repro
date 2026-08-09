@@ -1794,6 +1794,21 @@ async function openCreate() {
   $("#create-form").existing.value = "reuse";
   syncCreateSeed();
   $("#version-hint").textContent = "";
+  // These three decide what CODE runs and where it listens, and the server refuses
+  // them from a non-admin (POST /api/repros). The dialog offered them to everybody
+  // anyway, so a member could fill one in and have the whole create fail -- the
+  // same defect as the panel's "Make default" button, and app.py's comment
+  // confidently said the GUI "never sends them for a member". It did.
+  //
+  // Hidden rather than disabled: a greyed-out field invites "why can't I?", and the
+  // answer is a box-level setting they cannot make either way.
+  for (const name of ["rc_image", "reg_token", "bind"]) {
+    const input = $("#create-form")[name];
+    if (input && input.closest("label")) {
+      input.closest("label").hidden = !canAdmin();
+      if (!canAdmin()) input.value = "";
+    }
+  }
   $("#create-dialog").showModal();
 }
 function renderPresetParams() {
