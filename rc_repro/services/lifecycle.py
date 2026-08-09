@@ -330,12 +330,52 @@ def pick_host_port(port: int, pre: presets.Preset, exclude: str = "") -> int:
 
 
 def owner_of(name: str) -> str:
-    """Who created `name`, or "" for a pre-team workspace or one that is gone."""
+    """Who owns `name` NOW, or "" for a pre-team workspace or one that is gone.
+
+    `owner` wins over `created_by`, which is deliberately immutable: who made a
+    workspace is a fact about the past and stays in the record, while who is
+    responsible for it today is a thing that changes when a ticket is handed
+    over. Before this, "belongs to alice" kept warning bob about data that had
+    been his for a week -- which teaches people to click through the warning.
+    """
     try:
         meta = runner.read_meta(name)
     except Exception:
         return ""
-    return meta.extra.get("created_by", "") if isinstance(meta.extra, dict) else ""
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    return extra.get("owner") or extra.get("created_by", "")
+
+
+def set_owner(name: str, to: str, *, by: str = "") -> dict:
+    """Hand a workspace over. Returns {name, from, to}.
+
+    Ownership is a real verb because the workflow team-server.md §3.3 was written
+    around -- support engineers handing tickets to each other -- was never
+    modelled at all: the record only ever knew who typed `up`.
+    """
+    target = resolve_name(name)
+    to = (to or "").strip().lower()
+    if not to:
+        raise ValidationError("no new owner given (--to <name>)")
+    from rc_repro.services import users as usersvc
+    if usersvc.any_users() and not usersvc.role_of(to):
+        raise NotFoundError(
+            f"no account named {to!r} (see `rc-repro users list`) — a workspace "
+            "cannot be handed to somebody who cannot sign in")
+    was = owner_of(target)
+
+    def mutate(meta):
+        extra = meta.extra if isinstance(meta.extra, dict) else {}
+        history = list(extra.get("owner_history") or [])
+        history.append({"from": was, "to": to, "by": by or auditsvc.actor(),
+                        "at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+        extra["owner"] = to
+        extra["owner_history"] = history[-20:]
+        meta.extra = extra
+
+    runner.update_meta(target, mutate)
+    auditsvc.record("chown", f"{target} {was or '-'} -> {to}")
+    return {"name": target, "from": was, "to": to}
 
 
 def _derive_for(req: "CreateReq") -> str:
@@ -1111,8 +1151,10 @@ def list_repros() -> list[dict]:
         state = "?" if not docker_up else repro_state(rc_status, bool(states.get(m.project)))
         uptime, health = _uptime_health(rc_status)
         monitored = bool(isinstance(m.extra, dict) and m.extra.get("monitoring"))
-        owner = m.extra.get("created_by", "") if isinstance(m.extra, dict) else ""
+        extra_ = m.extra if isinstance(m.extra, dict) else {}
+        owner = extra_.get("owner") or extra_.get("created_by", "")
         out.append({"name": m.name, "created_by": owner,
+                    "owner": owner, "made_by": extra_.get("created_by", ""),
                     "rc_version": m.rc_version, "mongo_tag": m.mongo_tag,
                     "host_port": m.host_port, "root_url": m.root_url, "state": state,
                     # The https URL when `up --https` was used; "" otherwise. The CLI
@@ -1180,7 +1222,11 @@ def detail(name: str) -> dict:
     # The list payload has carried `default` all along; the panel needs it too, so
     # it can offer "Make default" only where that would change something.
     d["is_default"] = target == config.load_config().get("default_repro")
-    d["created_by"] = m.extra.get("created_by", "") if isinstance(m.extra, dict) else ""
+    _x = m.extra if isinstance(m.extra, dict) else {}
+    d["created_by"] = _x.get("owner") or _x.get("created_by", "")
+    d["owner"] = d["created_by"]
+    d["made_by"] = _x.get("created_by", "")
+    d["owner_history"] = list(_x.get("owner_history") or [])
     # The panel keys its HTTPS row and its "Check TLS" action off these. list_repros()
     # carried them and detail() did not, so the feature was invisible in the panel.
     d["public_url"] = m.public_url
@@ -1256,12 +1302,47 @@ def _clear_default_if(name: str) -> None:
     config.update_config(mutate)
 
 
+#: Who may DESTROY a workspace somebody else owns. `owner` is the default:
+#: §3.3's guardrail was "confirms first, naming the owner", and a confirm dialog
+#: stops being a guardrail around the twentieth time you click through it for your
+#: own workspaces -- by which point the audit log tells you who did it only after
+#: the data is gone. `anyone` restores the previous behaviour exactly, for a team
+#: that would rather have the confirm.
+#:
+#: Only DESTRUCTION is gated. Visibility is not, and neither is help: starting,
+#: stopping, seeding, load-testing and reading logs on a colleague's workspace all
+#: stay open, because covering someone's ticket is the workflow this exists for.
+DESTROY_POLICY_KEY = "gui.destroy_policy"
+
+
+def may_destroy(name: str, actor: str) -> tuple[bool, str]:
+    """(allowed, why not). Advisory for a front end, enforced by teardown()."""
+    if config.load_config().get(DESTROY_POLICY_KEY) == "anyone":
+        return True, ""
+    if not actor:                     # no accounts on this box: nothing to bound
+        return True, ""
+    from rc_repro.services import users as usersvc
+    if usersvc.role_of(actor) == "admin":
+        return True, ""
+    owner = owner_of(name)
+    if not owner or owner == actor:
+        return True, ""
+    return False, (f"{name} belongs to {owner} — ask {owner}, or an admin can "
+                   f"force it. (`rc-repro chown -n {name} --to {actor}` hands it "
+                   "over for good.)")
+
+
 def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: Emit = null_emit) -> dict:
     require_docker()
     target = resolve_name(name)
     if volumes and not confirm:
         raise ValidationError(f"deleting {target!r}'s data volume and record is irreversible - "
                               "pass confirm=true")
+    if volumes:
+        allowed, why = may_destroy(target, auditsvc.actor())
+        if not allowed:
+            auditsvc.record("down-volumes", target, outcome="denied")
+            raise ConflictError(why)
     # Recorded BEFORE the work, not after: a teardown that dies half way through
     # has still destroyed containers, and that is exactly the event someone will
     # come looking for. Auditing here rather than at the route/command covers the
@@ -1299,7 +1380,10 @@ def prunable() -> list[str]:
     states = runner.project_states()
     if states is None:
         raise DockerError("couldn't query docker compose projects - not pruning (is Docker healthy?)")
-    return [m.name for m in runner.list_meta() if not m.pinned and m.project not in states]
+    me = auditsvc.actor()
+    return [m.name for m in runner.list_meta()
+            if not m.pinned and m.project not in states
+            and may_destroy(m.name, me)[0]]
 
 
 def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:

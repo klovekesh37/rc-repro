@@ -1702,3 +1702,94 @@ def test_setup_is_closed_when_the_flow_was_never_opened(tmp_path, monkeypatch):
     assert c.get("/setup", headers=H).status_code == 404
     assert c.post("/api/session/first-run", headers=H,
                   json={"key": "x", "user": "a", "password": "b"}).status_code == 409
+
+
+# --- ownership: handover, and a destruction gate (phase 5) ------------------------
+
+def _workspace(name, owner, tmp_path):
+    """A workspace record on disk, owned by somebody."""
+    from rc_repro import runner
+    ws = runner.workspace(name)
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "docker-compose.yml").write_text("services: {}\n")
+    meta = runner.Metadata(name=name, project=f"rcrepro-{name}", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="http://localhost:3000",
+                           host_port=3000, version_source="map",
+                           extra={"created_by": owner})
+    import json as _j
+    from dataclasses import asdict
+    (ws / "repro.json").write_text(_j.dumps(asdict(meta)))
+    return meta
+
+
+def test_handing_over_moves_the_owner_and_keeps_who_made_it(basic_client, tmp_path):
+    """Who CREATED it is a fact about the past and stays; who is responsible for
+    it today is what a handover changes. Before this, "belongs to alice" kept
+    warning bob about data that had been his for a week."""
+    from rc_repro.services import users as usersvc
+    from rc_repro import runner
+    usersvc.add("bob", "bobs-good-password", role="member")
+    _workspace("t4471", "alice", tmp_path)
+    r = basic_client.post("/api/repros/t4471/owner", json={"to": "bob"}, headers=_auth())
+    assert r.status_code == 200 and r.json()["to"] == "bob"
+    extra = runner.read_meta("t4471").extra
+    assert extra["owner"] == "bob"
+    assert extra["created_by"] == "alice", "creation is immutable"
+    assert extra["owner_history"][-1]["from"] == "alice"
+    assert lc.owner_of("t4471") == "bob"
+
+
+def test_you_cannot_hand_a_workspace_to_somebody_who_cannot_sign_in(basic_client, tmp_path):
+    _workspace("t4471", "alice", tmp_path)
+    r = basic_client.post("/api/repros/t4471/owner", json={"to": "ghost"}, headers=_auth())
+    assert r.status_code == 404 and "no account" in r.json()["error"]
+
+
+def test_a_member_cannot_destroy_somebody_elses_workspace(basic_client, tmp_path, monkeypatch):
+    """§3.3's guardrail was a confirm dialog, which stops being a guardrail around
+    the twentieth time you click through it for your own workspaces."""
+    from rc_repro.services import users as usersvc
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    usersvc.add("bob", "bobs-good-password", role="member")
+    _workspace("alices-box", "alice", tmp_path)
+    _as(basic_client, "bob", "bobs-good-password")
+    r = basic_client.delete("/api/repros/alices-box?volumes=true&confirm=true",
+                            headers=_auth())
+    assert r.status_code == 409
+    assert "belongs to alice" in r.json()["error"]
+
+
+def test_help_on_a_colleagues_workspace_stays_open(basic_client, tmp_path, monkeypatch):
+    """Only DESTRUCTION is gated. Covering somebody's ticket is the workflow this
+    exists for, so start/stop/logs/seed on their workspace stay allowed."""
+    from rc_repro.services import users as usersvc
+    monkeypatch.setattr(lc, "set_state", lambda n, a: None)
+    usersvc.add("bob", "bobs-good-password", role="member")
+    _workspace("alices-box", "alice", tmp_path)
+    _as(basic_client, "bob", "bobs-good-password")
+    r = basic_client.post("/api/repros/alices-box/state", json={"action": "restart"},
+                          headers=_auth())
+    assert r.status_code == 200
+
+
+def test_an_admin_can_still_force_it(basic_client, tmp_path, monkeypatch):
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr("rc_repro.runner.down", lambda n, volumes=False: 0)
+    monkeypatch.setattr("rc_repro.runner.remove", lambda n: None)
+    _workspace("bobs-box", "bob", tmp_path)
+    allowed, _why = lc.may_destroy("bobs-box", "alice")   # alice is admin
+    assert allowed is True
+
+
+def test_the_gate_is_one_config_line_away_from_the_old_behaviour(tmp_path, monkeypatch):
+    """A team that preferred confirm-and-proceed should not have to fork."""
+    from rc_repro import config
+    from rc_repro.services import users as usersvc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    usersvc.add("alice", "correct-horse-battery", role="admin")
+    usersvc.add("bob", "bobs-good-password", role="member")
+    _workspace("alices-box", "alice", tmp_path)
+    assert lc.may_destroy("alices-box", "bob")[0] is False
+    config.update_config(lambda c: c.__setitem__(lc.DESTROY_POLICY_KEY, "anyone"))
+    assert lc.may_destroy("alices-box", "bob")[0] is True

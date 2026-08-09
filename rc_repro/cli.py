@@ -2318,6 +2318,26 @@ def audit_cmd(
                 "or --actor, or ship it somewhere with an index.)")
 
 
+@app.command(name="chown")
+def chown_cmd(
+    name: str = typer.Option("", "--name", "-n"),
+    to: str = typer.Option(..., "--to", help="the account taking it over"),
+) -> None:
+    """Hand a workspace over to somebody else.
+
+    Ticket handover is the workflow the shared box is built around, and the record
+    only ever knew who typed `up` -- so "belongs to alice" kept warning the wrong
+    person, which is how people learn to click through warnings. Who CREATED it
+    stays in the record; who owns it now is what moves.
+    """
+    try:
+        res = lcsvc.set_owner(name, to, by=_cli_actor())
+    except errors.ReproError as exc:
+        _err(str(exc))
+    ui.ok(f"✓ {res['name']!r} now belongs to {res['to']}"
+          + (f" (was {res['from']})" if res["from"] else ""))
+
+
 @app.command()
 def doctor() -> None:
     """Preflight: check Docker, Compose, disk, connectivity and ports."""

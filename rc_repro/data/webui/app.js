@@ -83,7 +83,8 @@ async function api(path, opts = {}) {
 // ---- repro list (master) ----------------------------------------------------
 let ALL_REPROS = [];
 let SELECTED = null;
-const view = { filter: "", status: "", sort: "name" };
+const view = { filter: "", status: "", sort: "name",
+               scope: localStorage.getItem("rc_scope") || "all" };
 // lifecycle.list_repros() reports "?" when docker is down, which is not a usable
 // CSS class token (and had no rule), so those cards rendered unstyled.
 const stateClass = (s) => (s === "?" ? "unknown" : s);
@@ -125,6 +126,13 @@ async function loadRepros() {
     for (const [sel, ok] of [["#btn-new", canWrite()], ["#btn-prune", canWrite()],
                              ["#btn-bench", canWrite()]]) {
       const b = $(sel); if (b) b.hidden = !ok;
+    }
+    // Only worth offering once somebody else's workspaces can appear.
+    const scope = $("#scope-filter");
+    if (scope) {
+      scope.hidden = !ME || !ALL_REPROS.some((r) => (r.owner || r.created_by) &&
+                                                    (r.owner || r.created_by) !== ME);
+      scope.value = view.scope;
     }
     const who = $("#whoami");
     who.textContent = ME + (MY_ROLE && MY_ROLE !== "admin" ? ` · ${MY_ROLE}` : "");
@@ -214,7 +222,8 @@ function render() {
 
   let list = ALL_REPROS.filter((r) =>
     (!view.filter || r.name.toLowerCase().includes(view.filter)) &&
-    (!view.status || r.state === view.status));
+    (!view.status || r.state === view.status) &&
+    (view.scope !== "mine" || !ME || (r.owner || r.created_by) === ME));
   const key = view.sort;
   list.sort((a, b) => key === "port" ? a.host_port - b.host_port
     : String(a[key]).localeCompare(String(b[key])));
@@ -1062,8 +1071,12 @@ async function doDown(name) {
   // Everyone can act on everything -- that is deliberate, support engineers cover
   // for each other. What they must not do is destroy a colleague's data without
   // being told whose it is.
-  const owner = (ALL_REPROS.find((r) => r.name === name) || {}).created_by || "";
-  const whose = owner && owner !== ME ? `\n\nThis workspace belongs to ${owner}, not you.` : "";
+  const owner = (ALL_REPROS.find((r) => r.name === name) || {}).owner
+              || (ALL_REPROS.find((r) => r.name === name) || {}).created_by || "";
+  const whose = owner && owner !== ME
+    ? `\n\nThis workspace belongs to ${owner}, not you — the server will refuse `
+      + `unless you are an admin.\nHand it over first:  rc-repro chown -n ${name} --to ${ME}`
+    : "";
   const vol = confirm(
     `Also DELETE ${name}'s data volume and record?${whose}\n\n` +
     `OK = delete everything (irreversible).\nCancel = keep the data.`);
@@ -2066,6 +2079,9 @@ $("#btn-prune").addEventListener("click", doPrune);
 $("#filter").addEventListener("input", (e) => { view.filter = e.target.value.trim().toLowerCase(); render(); });
 $("#status-filter").addEventListener("change", (e) => { view.status = e.target.value; render(); });
 $("#sort-by").addEventListener("change", (e) => { view.sort = e.target.value; render(); });
+$("#scope-filter").addEventListener("change", (e) => {
+  view.scope = e.target.value; localStorage.setItem("rc_scope", view.scope); render();
+});
 $("#preset-select").addEventListener("change", renderPresetParams);
 $("#https-mode").addEventListener("change", syncHttpsFields);
 // The profile only means anything when seeding is on, so don't show it otherwise.

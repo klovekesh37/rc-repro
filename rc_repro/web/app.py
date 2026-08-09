@@ -138,6 +138,7 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("POST", "/api/repros/{name}/env"): _WRITE,
     ("POST", "/api/repros/{name}/monitor"): _WRITE,
     ("POST", "/api/repros/{name}/default"): _WRITE,
+    ("POST", "/api/repros/{name}/owner"): _WRITE,
     ("POST", "/api/repros/{name}/config-import"): _WRITE,
     ("POST", "/api/repros/{name}/config-import/plan"): _WRITE,
     ("POST", "/api/repros/{name}/backup"): _WRITE,
@@ -1556,6 +1557,13 @@ def create_app(allow_hosts: list[str] | None = None, *,
         return {"status": status, "text": text, "tag": tag,
                 "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
                 "url": f"{meta.root_url.rstrip('/')}/{path.lstrip('/')}"}
+
+    @app.post("/api/repros/{name}/owner")
+    def set_owner(request: Request, name: str, body: dict = Body(...)):
+        """Hand a workspace over. `created_by` is left alone -- who made it is a
+        fact about the past; who is responsible for it today is what changes."""
+        return lc.set_owner(name, str(body.get("to") or ""),
+                            by=getattr(request.state, "actor", "") or "")
 
     @app.delete("/api/repros/{name}")
     def teardown(name: str, volumes: bool = False, confirm: bool = False):

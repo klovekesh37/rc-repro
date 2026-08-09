@@ -51,6 +51,15 @@
           <option value="dead">Dead</option>
           <option value="?">Unknown (docker down)</option>
         </select>
+        <!-- A client-side filter, deliberately NOT a server-side visibility
+             rule: `check_capacity` refuses your create because of RAM somebody
+             else's workspace is holding and names those workspaces in the
+             refusal, so hiding them makes the tool lie at the moment you need
+             it honest. -->
+        <select id="scope-filter" class="input" aria-label="Whose workspaces" hidden>
+          <option value="all">Everyone</option>
+          <option value="mine">Mine</option>
+        </select>
         <select id="sort-by" class="input" aria-label="Sort repros">
           <option value="name">Sort: name</option>
           <option value="state">Sort: state</option>

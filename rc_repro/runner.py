@@ -167,6 +167,20 @@ def read_meta(name: str) -> Metadata:
     return Metadata(**{k: v for k, v in blob.items() if k in _META_FIELDS})
 
 
+def update_meta(name: str, mutate) -> "Metadata":
+    """Read-modify-write repro.json under the repro lock.
+
+    Every other mutator holds this lock while it rewrites the workspace, so a
+    metadata edit that skipped it could be lost by a concurrent `up --force`
+    rewriting the same file from the spec. `mutate(meta)` edits in place.
+    """
+    with repro_lock(name, timeout=60.0):
+        meta = read_meta(name)
+        mutate(meta)
+        atomic_write(workspace(name) / "repro.json", json.dumps(asdict(meta), indent=2))
+        return meta
+
+
 def read_compose(name: str) -> dict:
     """Load a repro's generated docker-compose.yml as a dict (for in-place edits
     like attaching/detaching the monitoring stack)."""
