@@ -1291,6 +1291,13 @@ async function reconcileJob(job) {
   logLine(state.status === "error"
     ? { level: "error", message: state.error || "failed" }
     : { level: "info", message: "done" });
+  // The server keeps a hundred job summaries but only the newest ten results, so
+  // an old benchmark reopened from the history has nothing left to render. Say so:
+  // an empty panel and a discarded one look identical otherwise.
+  if (state.result_dropped) {
+    logLine({ level: "warn", message: "this job finished a while ago and its full "
+      + "output is no longer held in memory — the progress above is what remains." });
+  }
   finishJob(job, state.status === "error", { result: state.result, error: state.error });
 }
 

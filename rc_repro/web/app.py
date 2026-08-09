@@ -183,12 +183,53 @@ TAIL_MAX = 5000
 # An uploaded support dump is read into memory; cap it rather than trusting it.
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 # Bounded so a chatty container plus a slow reader can't grow the queue forever.
-WS_QUEUE_MAX = 10_000
+# Bounded so a chatty container plus a slow reader can't grow the queue forever.
+#
+# 3000 matches LOG_MAX in app.js, and that is the whole reason for the number: the
+# browser keeps 3000 rows and discards the rest, so anything held beyond that can
+# never be displayed. The old 10_000 bought nothing and cost 19 MB per stream when
+# the lines were stack traces (measured; 1.95 MB for ordinary 148-byte compose
+# lines, which is why this was never a memory PROBLEM -- see below for what it
+# actually was).
+WS_QUEUE_MAX = 3_000
 # What the API-call console may send. A whitelist because `method` reaches
 # requests.request() verbatim; the CLI's own examples only use these.
 _API_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH")
 
 _UPLOAD_ID_RE = re.compile(r"^u[0-9a-f]{12}$")
+
+
+def make_log_offer(q, dropped: list):
+    """The log stream's overflow policy: drop the OLDEST line, and count it.
+
+    A named function at module scope rather than a closure inside the WebSocket
+    handler, because which END gets dropped is the entire behaviour of that screen
+    and it deserves a test that does not need a browser and a chatty container.
+
+    It used to discard the NEWEST line. Once a busy container filled the queue,
+    everything arriving from then on was thrown away while the viewer sat rendering
+    a window from minutes ago — on a panel with a "follow" checkbox ticked.
+    Dropping the oldest keeps a live tail live, which is what somebody watching a
+    log during an incident is asking for.
+
+    The end-of-stream sentinel (`None`) is never dropped: it is what closes the
+    socket, and losing it leaves the browser waiting on a stream that has ended.
+
+    One producer (the pump thread, marshalled onto the event loop) and one consumer,
+    so the get_nowait() that frees a slot is always followed by a put that takes it.
+    """
+    def offer(line: str | None) -> None:
+        while True:
+            try:
+                q.put_nowait(line)
+                return
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                    dropped[0] += 1
+                except asyncio.QueueEmpty:      # pragma: no cover - see above
+                    return
+    return offer
 
 
 def _clamp_tail(tail: int) -> int:
@@ -1148,24 +1189,8 @@ def create_app(allow_hosts: list[str] | None = None, *,
             cwd=runner.workspace(target), stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, bufsize=1)
 
-        def offer(line: str | None) -> None:
-            """Enqueue on the loop thread, dropping lines when the reader falls
-            behind — but never dropping the end-of-stream sentinel."""
-            if line is not None:
-                try:
-                    q.put_nowait(line)
-                except asyncio.QueueFull:
-                    pass
-                return
-            while True:
-                try:
-                    q.put_nowait(None)
-                    return
-                except asyncio.QueueFull:
-                    try:
-                        q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        return
+        dropped = [0]
+        offer = make_log_offer(q, dropped)
 
         def pump():
             for line in proc.stdout or []:
@@ -1200,6 +1225,17 @@ def create_app(allow_hosts: list[str] | None = None, *,
                 line = getter.result()
                 if line is None:
                     break
+                if dropped[0]:
+                    # Say so. A log with a silent gap in it looks complete, and the
+                    # whole value of this panel is that what it shows is what
+                    # happened. Sent out of band rather than queued, so the notice
+                    # never competes for the slot it is reporting on, and coalesced
+                    # so a burst is one line rather than thousands.
+                    skipped, dropped[0] = dropped[0], 0
+                    await ws.send_text(
+                        f"... {skipped} line(s) skipped: this container is logging "
+                        "faster than the browser is reading. Narrow the service or "
+                        "level filter, or use `rc-repro logs`.")
                 await ws.send_text(line)
         except WebSocketDisconnect:
             pass
@@ -1691,6 +1727,9 @@ def create_app(allow_hosts: list[str] | None = None, *,
             return JSONResponse({"error": "no such job"}, status_code=404)
         return {"id": job.id, "kind": job.kind, "status": job.status,
                 "result": job.result, "error": job.error, "error_kind": job.error_kind,
+                # Said out loud, because a result panel that renders nothing looks
+                # exactly like a job that produced nothing.
+                "result_dropped": job.result_dropped,
                 "n_events": job.n_events}
 
     @app.get("/api/jobs/{job_id}/stream")

@@ -1991,3 +1991,110 @@ def test_changing_your_own_password_is_throttled_like_a_login():
                headers=H)
     assert r.status_code == 429
     assert r.headers.get("Retry-After"), "a 429 that does not say when is not useful"
+
+
+def test_a_finished_job_releases_its_result_but_keeps_its_summary():
+    """A capacity result is ~118 KB of nested loadtest documents, and MAX_JOBS is a
+    hundred -- 68.8 MB held for the life of the process, measured. The Activity list
+    only ever renders summary(), which excludes the result, so a hundred summaries
+    and ten results is the right shape.
+    """
+    from rc_repro.web.jobs import KEEP_RESULTS, JobManager
+
+    jm = JobManager()
+    for i in range(KEEP_RESULTS + 5):
+        jm.submit("state", lambda emit=None, n=i: {"payload": "x" * 1000, "n": n},
+                  label=f"j{i}")
+    for jid in list(jm._jobs):
+        jm._threads[jid].join(timeout=10)
+    jm.submit("state", lambda emit=None: None, label="trigger")   # trims on submit
+
+    kept = [j for j in jm._jobs.values() if j.result is not None]
+    dropped = [j for j in jm._jobs.values() if j.result_dropped]
+    assert len(dropped) == 5, f"expected 5 released, got {len(dropped)}"
+    assert len(kept) <= KEEP_RESULTS
+
+    # Everything the list view needs survives on a job whose result went.
+    gone = dropped[0]
+    assert gone.summary()["status"] == "done"
+    assert gone.summary()["label"].startswith("j")
+    assert gone.n_events > 0, "the progress trail is not what costs memory"
+
+
+def test_releasing_a_result_drops_BOTH_references_to_it():
+    """`job.result` and the terminal event's data["result"] are the SAME object,
+    not a copy -- which is easy to misread, and clearing only one frees nothing."""
+    from rc_repro.services.events import Event
+    from rc_repro.web.jobs import Job
+
+    job = Job(id="j", kind="capacity")
+    payload = {"big": ["x"] * 100}
+    job.result = payload
+    job.status = "done"
+    job.emit(Event("done", phase="done", terminal=True, data={"result": payload}))
+    assert job.result is job.events[-1].data["result"], "premise of the test"
+
+    job.forget_result()
+    assert job.result is None
+    assert "result" not in job.events[-1].data, "the second reference still held it"
+    assert job.result_dropped is True
+
+
+def test_the_job_endpoint_says_when_a_result_was_released(monkeypatch):
+    c = client()
+    jm = c.app.state.jobs
+    job = jm.submit("state", lambda emit=None: {"ok": True}, label="x")
+    jm._threads[job.id].join(timeout=10)
+    assert c.get(f"/api/jobs/{job.id}", headers=H).json()["result"] == {"ok": True}
+
+    job.forget_result()
+    body = c.get(f"/api/jobs/{job.id}", headers=H).json()
+    assert body["result"] is None
+    assert body["result_dropped"] is True, \
+        "an empty panel and a discarded one are indistinguishable without this"
+
+
+def test_the_log_stream_drops_the_oldest_line_not_the_newest():
+    """Which end gets dropped is the whole behaviour of the log panel.
+
+    It used to discard the NEWEST: once a chatty container filled the queue, every
+    line arriving from then on was thrown away while the viewer sat rendering a
+    window from minutes ago, on a panel with "follow" ticked. And the cap was
+    10,000 against a browser (app.js LOG_MAX) that keeps 3,000 -- so 7,000 of those
+    held lines could never have been displayed even if they had survived.
+    """
+    import asyncio
+
+    from rc_repro.web.app import WS_QUEUE_MAX, make_log_offer
+
+    assert WS_QUEUE_MAX == 3_000, "keep this in step with LOG_MAX in app.js"
+
+    q = asyncio.Queue(maxsize=WS_QUEUE_MAX)
+    dropped = [0]
+    offer = make_log_offer(q, dropped)
+
+    for i in range(WS_QUEUE_MAX + 500):
+        offer(f"line-{i}")
+
+    assert q.qsize() == WS_QUEUE_MAX, "the bound still holds"
+    assert dropped[0] == 500, "and it counts what it threw away, so it can say so"
+    assert q.get_nowait() == "line-500", "the OLDEST went, not the newest"
+    rest = [q.get_nowait() for _ in range(q.qsize())]
+    assert rest[-1] == f"line-{WS_QUEUE_MAX + 499}", "the newest line survived"
+
+
+def test_the_end_of_stream_sentinel_is_never_dropped():
+    """It is what closes the socket. Losing it leaves the browser waiting on a
+    stream that has already ended."""
+    import asyncio
+
+    from rc_repro.web.app import WS_QUEUE_MAX, make_log_offer
+
+    q = asyncio.Queue(maxsize=WS_QUEUE_MAX)
+    offer = make_log_offer(q, [0])
+    for i in range(WS_QUEUE_MAX):
+        offer(f"line-{i}")
+    assert q.qsize() == WS_QUEUE_MAX, "full"
+    offer(None)
+    items = [q.get_nowait() for _ in range(q.qsize())]
+    assert items[-1] is None, "the sentinel was dropped by the overflow policy"

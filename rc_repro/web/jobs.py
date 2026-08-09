@@ -32,6 +32,20 @@ from rc_repro.services.events import Event
 MAX_JOBS = 100
 MAX_EVENTS_PER_JOB = 2000
 
+# How many FINISHED jobs keep their full result document. The registry above is a
+# hundred entries; the results hanging off them are not the same size at all.
+#
+# A capacity search returns `steps` -- one complete loadtest result per VU level,
+# each with its summary, SLO table, verdict, resource samples and (with --diag) a
+# Mongo slow-query dump and a timeline. Measured: ~118 KB each, so a hundred of
+# them is 68.8 MB held for the life of the process, on a box this file's own
+# comments describe as hitting RAM before anything else.
+#
+# The Activity LIST only ever renders summary(), which excludes the result. The
+# result is needed when somebody reopens a job, and the job people reopen is a
+# recent one. So keep a hundred summaries and ten results.
+KEEP_RESULTS = 10
+
 # Job RETENTION was bounded; concurrency was not. submit() started a bare thread
 # per job, so ten teammates each starting a capacity search meant ten k6
 # containers, ten metrics samplers and ten resource monitors against one Docker
@@ -114,6 +128,27 @@ class Job:
     def n_events(self) -> int:
         return self._emitted
 
+    #: Whether the result document was released to reclaim memory. Reported by
+    #: GET /api/jobs/{id}, because a panel that renders nothing is indistinguishable
+    #: from a job that produced nothing.
+    result_dropped: bool = False
+
+    def forget_result(self) -> None:
+        """Release the result document, keeping everything the list view shows.
+
+        BOTH references have to go. `job.result` and the terminal event's
+        `data["result"]` are the SAME object -- not a copy, which is easy to
+        misread -- so clearing one of them frees nothing at all.
+        """
+        if self.result is None and not self.result_dropped:
+            return
+        with self._lock:
+            self.result = None
+            self.result_dropped = True
+            for ev in self.events:
+                if ev.terminal and isinstance(ev.data, dict):
+                    ev.data.pop("result", None)
+
     def summary(self) -> dict:
         """One row for the activity list: no event bodies and no `result`, which
         for a benchmark or capacity search is a large nested document."""
@@ -179,6 +214,17 @@ class JobManager:
         with self._lock:
             return [j.summary() for j in reversed(list(self._jobs.values()))]
 
+    def _trim_results_locked(self) -> None:
+        """Keep the full result only for the newest KEEP_RESULTS finished jobs.
+
+        dicts preserve insertion order and submit() only appends, so `finished` is
+        oldest-first. Running jobs are never touched -- theirs is not written yet.
+        """
+        finished = [j for j in self._jobs.values()
+                    if j.status not in ACTIVE_STATUSES]
+        for job in finished[:-KEEP_RESULTS] if KEEP_RESULTS else finished:
+            job.forget_result()
+
     def _evict_locked(self) -> None:
         """Drop the oldest FINISHED jobs once past MAX_JOBS. dicts preserve
         insertion order, so the oldest come first; running jobs are never
@@ -229,6 +275,11 @@ class JobManager:
         with self._lock:
             self._jobs[job.id] = job
             self._evict_locked()
+            # Here rather than on completion: submit() is what grows the registry,
+            # so trimming here bounds the peak. A hundred jobs that all finish
+            # without another submit hold their results, but they are also not
+            # adding any.
+            self._trim_results_locked()
 
         def run() -> None:
             # Re-establish the request's identity on this thread (see above).
