@@ -175,17 +175,22 @@ Once a repro is pinned (or set with `rc-repro use <name>`), commands with no
 you'd rather click than type. Needs the `gui` extra (see [Install](#install)).
 
 ```bash
-rc-repro serve            # prints a http://localhost:7070/?t=... URL and opens it
+rc-repro serve            # prints http://localhost:7070/ and opens it
 rc-repro serve --port 8080 --no-open
 ```
 
-It binds **loopback only** by default and prints a one-time session token in the
-URL (repros run weak fixed credentials, so the control plane must not be exposed
-to your network — `--bind 0.0.0.0` requires an explicit opt-in and warns).
+It binds **loopback only** by default (repros run weak fixed credentials, so the
+control plane must not be exposed to your network — `--bind 0.0.0.0` requires an
+explicit opt-in and warns).
 
-Sharing one `serve` with a team? Add accounts and it asks for a login instead of
-handing everyone the same token, records who ran what, and can serve itself and
-every workspace over HTTPS on one port — see [Shared server](#shared-server).
+The first run prints a one-time `/setup#k=…` link that creates the first account —
+open the **whole** URL including the part after `#`, which never reaches the server
+and so cannot appear in a log. After that it is a normal sign-in page. Prefer a
+terminal? `rc-repro users add <name>`, then start `serve`.
+
+Sharing one `serve` with a team? Every action is recorded against the account that
+took it, and it can serve itself and every workspace over HTTPS on one port — see
+[Shared server](#shared-server).
 
 What you can do from it:
 
@@ -878,8 +883,8 @@ if any rule fails, so it drops straight into CI. `--stats` adds the CPU/RAM cost
 Everything above assumes one person on a laptop. Put `rc-repro serve` on a box the
 team shares and three things break at once:
 
-- the session token is **one secret handed to everybody**, and it changes on every
-  restart, so a shared URL dies whenever the service does;
+- a single shared secret is **one secret handed to everybody**, and anything
+  regenerated on restart kills every bookmark the team saved;
 - nothing can answer **"who tore down TICKET-1234?"**;
 - two people running `up -v 8.5.1` both get `rc8-5-1`, and **the second silently
   reuses the first one's data**.
@@ -906,6 +911,24 @@ lines to every user on the machine.
 
 Stored in `~/.rc-repro/users`, mode `0600`, hashed with `hashlib.scrypt` from the
 standard library (no new dependency).
+
+Two box-level policies decide how much the middle tier may do, because the right
+answer differs by deployment:
+
+```bash
+rc-repro config set gui.create_policy anyone    # members may set --rc-image,
+                                                # --reg-token and --bind
+rc-repro config set gui.destroy_policy anyone   # members may delete anyone's
+                                                # workspace, not just their own
+rc-repro config set bind_host 0.0.0.0           # every workspace on this box,
+                                                # one decision instead of per-create
+```
+
+Both default to the strict reading. On a support team's shared box, where every
+account is a colleague who can already create workspaces and tear them down with
+their data, `anyone` is usually what you want — "you may destroy Maria's customer
+repro but not choose which interface your own listens on" is not a boundary, it is
+an inconsistent ladder.
 
 Once **any** account exists, `rc-repro serve` asks the browser to sign in. Ten
 failed attempts from one address in sixty seconds and the login refuses to spend
@@ -1064,10 +1087,18 @@ every restart minted a new one and killed every bookmark.
 
 ## What this is not
 
-- **No roles.** Everyone who can sign in can do everything. The users file leaves
-  room for a role column, so `readonly` can be added without a migration.
-- **No MFA, and no clean logout** — browsers cache Basic credentials until the tab
-  closes. Revoking is `users remove`. SSO in front is the upgrade if those matter.
+- **Three roles, not a permission system.** `admin` manages people, `member` is
+  everyday use, `readonly` may look but not touch — and specifically may not read
+  logs or env, because those carry LDAP bind passwords and OAuth client secrets.
+  Anything finer than that is not modelled. Two box-level policies widen the middle
+  tier (`gui.create_policy`, `gui.destroy_policy`); see [Accounts](#accounts).
+- **The CLI has no roles at all.** Anyone with a shell on the box is already in the
+  docker group, so a `readonly` account with an ssh key is not readonly. The roles
+  bound the GUI, which is the surface people reach remotely.
+- **No MFA.** Sessions are server-side and revocable — sign-out ends them, changing
+  or removing an account ends every session it minted, and `rc-repro audit` records
+  failed sign-ins — but a second factor is not modelled. SSO in front is the upgrade
+  if that matters.
 - **Every workspace still runs `admin`/`admin123`.** The GUI login is the only
   boundary; the workspaces behind it are not individually protected.
 - **Shared fate.** The edge going down takes every https name with it. It only

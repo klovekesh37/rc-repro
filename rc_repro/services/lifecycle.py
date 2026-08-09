@@ -1314,6 +1314,49 @@ def _clear_default_if(name: str) -> None:
 #: stay open, because covering someone's ticket is the workflow this exists for.
 DESTROY_POLICY_KEY = "gui.destroy_policy"
 
+#: Who may set the create fields that decide what CODE runs and where it LISTENS:
+#: `rc_image`, `reg_token`, `bind`. Default admin; `anyone` means any account that
+#: may create at all, which is member and up.
+#:
+#: A policy rather than a fixed rule, because the right answer genuinely differs by
+#: deployment and the strict one does not survive contact with the case this product
+#: was built for. On a support team's shared box everybody with an account is a
+#: colleague who can already create workspaces and tear them down WITH their data --
+#: so "you may destroy Maria's customer repro but not choose which interface your own
+#: listens on" is not a security boundary, it is an inconsistent ladder. A member who
+#: needs `--reg-token` to reproduce an Enterprise bug, or `--bind` because the whole
+#: point of the box is that teammates reach it, is doing the job.
+#:
+#: The strict default stays for the deployment where an account is not the same thing
+#: as trust. What each field actually costs, so the choice is informed:
+#:
+#:   rc_image   the sharpest. An arbitrary image runs as the user running `serve`.
+#:              Anyone with a shell on this box can already do it -- the CLI has no
+#:              roles -- so this only binds people who ONLY have the GUI.
+#:   reg_token  an EE licence the caller SUPPLIES. Not a secret they extract: the env
+#:              tab masks anything key-named like a credential, REG_TOKEN included.
+#:   bind       publishes a workspace running fixed admin/admin123. Prefer setting
+#:              `bind_host` once for the box; this is the per-workspace override.
+CREATE_POLICY_KEY = "gui.create_policy"
+
+#: The fields CREATE_POLICY_KEY governs. Named here rather than inline in web/app.py
+#: so the check and the message cannot drift apart.
+PRIVILEGED_CREATE_FIELDS = ("rc_image", "reg_token", "bind")
+
+
+def may_set_privileged_fields(actor: str) -> bool:
+    """Whether `actor` may set rc_image / reg_token / bind on a create.
+
+    Same shape as may_destroy(): the policy opens it, an empty actor means this box
+    has no accounts and therefore nothing to bound, and otherwise it is admin.
+    """
+    if config.load_config().get(CREATE_POLICY_KEY) == "anyone":
+        return True
+    if not actor:                     # no accounts on this box: nothing to bound
+        return True
+    from rc_repro.services import users as usersvc
+    return usersvc.at_least(usersvc.role_of(actor), "admin")
+
 
 def may_destroy(name: str, actor: str) -> tuple[bool, str]:
     """(allowed, why not). Advisory for a front end, enforced by teardown()."""

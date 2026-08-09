@@ -564,3 +564,16 @@ def test_both_front_ends_mint_the_same_shape_of_password():
     assert minted != usersvc.mint_password()
     # and it clears the policy the service enforces on typed ones
     usersvc.require_valid_password(minted)
+
+
+def test_a_policy_typo_is_refused_rather_than_silently_meaning_strict():
+    """A misspelt policy falls back to the strict reading, which is safe but silent
+    — somebody who typed `anyonr` would believe they had opened the box."""
+    bad = cli_runner.invoke(cli.app, ["config", "set", "gui.create_policy", "anyonr"])
+    assert bad.exit_code != 0
+    assert "takes 'anyone'" in bad.output
+
+    ok = cli_runner.invoke(cli.app, ["config", "set", "gui.create_policy", "anyone"])
+    assert ok.exit_code == 0, ok.output
+    from rc_repro.services import lifecycle as lc
+    assert lc.may_set_privileged_fields("nobody-in-particular") is True

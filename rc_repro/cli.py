@@ -604,6 +604,17 @@ _CONFIG_KEYS: dict[str, str] = {
     # fixed admin/admin123 credentials, so "does this machine publish those beyond
     # loopback?" is one answer for the box, not a checkbox on each create.
     "bind_host": "bind_host",
+    # Both GUI policies. Neither was in this table: lifecycle.py documented
+    # `gui.destroy_policy` as the way to loosen who may delete somebody else's
+    # workspace, and there was no supported way to write it -- the same missing door
+    # as bind_host above, in the same file, unnoticed for the same reason. A policy
+    # nobody can set is a comment.
+    #
+    #   gui.create_policy   admin (default) | anyone   -- rc_image, reg_token, bind
+    #   gui.destroy_policy  owner (default) | anyone   -- `down --volumes` on
+    #                                                     somebody else's workspace
+    "gui.create_policy": "gui.create_policy",
+    "gui.destroy_policy": "gui.destroy_policy",
 }
 
 
@@ -821,7 +832,14 @@ def config_cmd(
 ) -> None:
     """Read or write remembered settings, so they need not be retyped every run.
 
-    Keys: acme.email, acme.dns_provider. Stored in ~/.rc-repro/config.yaml.
+    Keys: acme.email, acme.staging, acme.dns_provider, bind_host,
+    gui.create_policy, gui.destroy_policy. Stored in ~/.rc-repro/config.yaml.
+
+    \b
+    On a box where every account is a colleague:
+        rc-repro config set gui.create_policy anyone   # members may set
+                                                       # --rc-image/--reg-token/--bind
+        rc-repro config set bind_host 0.0.0.0          # every workspace, one decision
     """
     if action == "list":
         cfg = config.load_config()
@@ -841,6 +859,12 @@ def config_cmd(
     if action == "set":
         if not value:
             _err(f"`config set {key}` needs a value")
+        # A misspelt policy falls back to the strict reading, which is safe but
+        # silent -- and somebody who typed `anyonr` would believe they had opened it.
+        if key in ("gui.create_policy", "gui.destroy_policy"):
+            strict = "admin" if key == "gui.create_policy" else "owner"
+            if value not in ("anyone", strict):
+                _err(f"{key} takes 'anyone' or '{strict}' (got {value!r})")
         config.update_config(lambda c: c.__setitem__(stored, value))
         ui.ok(f"✓ {key} = {value}")
         return

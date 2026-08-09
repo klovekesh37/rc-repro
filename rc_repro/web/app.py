@@ -1079,7 +1079,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
         return lc.describe(name)
 
     @app.get("/api/settings")
-    def settings():
+    def settings(request: Request):
         """Remembered settings the create dialog needs to behave correctly.
 
         Only whether a Let's Encrypt contact email exists, never the address: the
@@ -1088,7 +1088,13 @@ def create_app(allow_hosts: list[str] | None = None, *,
         else -- and the GUI has no way to set it. A blank field then produced a job
         that failed on a required value the form had called optional.
         """
-        return {"acme_email_remembered": bool(config.load_config().get("acme_email"))}
+        return {"acme_email_remembered": bool(config.load_config().get("acme_email")),
+                # So the dialog can offer the privileged fields to exactly the people
+                # the server would accept them from, rather than rendering them for
+                # everybody and failing the create.
+                "may_set_privileged": lc.may_set_privileged_fields(
+                    getattr(request.state, "actor", "") or ""),
+                "privileged_fields": list(lc.PRIVILEGED_CREATE_FIELDS)}
 
     @app.get("/api/presets")
     def list_presets():
@@ -1296,18 +1302,18 @@ def create_app(allow_hosts: list[str] | None = None, *,
         # and cost a member the most reachable field in the dialog: "Host port" sits
         # in the main section, not behind Advanced, and typing one failed the whole
         # create with a message about images and interfaces.
-        privileged = [k for k in ("rc_image", "reg_token", "bind") if fields.get(k)]
+        privileged = [k for k in lc.PRIVILEGED_CREATE_FIELDS if fields.get(k)]
         if privileged:
-            from rc_repro.services import users as usersvc
             who = getattr(request.state, "actor", "") or ""
-            if who and not usersvc.at_least(usersvc.role_of(who), "admin"):
-                extra = ("  Publishing every workspace on this box beyond loopback "
-                         "is a box-level decision: `rc-repro config set bind_host "
-                         "0.0.0.0`." if "bind" in privileged else "")
+            if not lc.may_set_privileged_fields(who):
+                extra = ("  For a workspace everyone on this box should reach, "
+                         "`rc-repro config set bind_host 0.0.0.0` sets it once for "
+                         "the box." if "bind" in privileged else "")
                 raise ValidationError(
-                    f"{', '.join(privileged)} may only be set by an admin — they "
-                    "choose the image and the interface, not just the workspace."
-                    + extra)
+                    f"{', '.join(privileged)} may only be set by an admin here — "
+                    "they decide what code runs and where it listens. On a box "
+                    "where every account is a colleague, open it with "
+                    "`rc-repro config set gui.create_policy anyone`." + extra)
         creq = lc.CreateReq(**fields)
         job = jobs.submit("create", lc.create_repro, creq, stream_output=True,
                           label=creq.name or creq.version)

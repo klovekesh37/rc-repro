@@ -1777,14 +1777,26 @@ function reopenJob(j) { streamJob(j.id, jobTitle(j), JOB_RESULT_RENDERER[j.kind]
 // ---- create dialog ----------------------------------------------------------
 let PRESETS = [];
 let ACME_EMAIL_REMEMBERED = false;
+// Who may set rc_image / reg_token / bind, and which fields those are -- both from
+// the server, which owns the policy (gui.create_policy). Defaulting to false means
+// a failed /api/settings hides them rather than offering fields the create would
+// reject.
+let MAY_SET_PRIVILEGED = false;
+let PRIVILEGED_FIELDS = ["rc_image", "reg_token", "bind"];
 
 async function openCreate() {
   try { PRESETS = (await api("/api/presets")).presets; } catch (e) { toast(e.message); return; }
   // Whether `config set acme.email` has been run. The email field is optional only
   // if it has -- and the GUI cannot set it, so a first-time user must be told to
   // type one rather than discovering it from a failed job.
-  try { ACME_EMAIL_REMEMBERED = (await api("/api/settings")).acme_email_remembered; }
-  catch (_) { ACME_EMAIL_REMEMBERED = false; }
+  try {
+    const s = await api("/api/settings");
+    ACME_EMAIL_REMEMBERED = s.acme_email_remembered;
+    MAY_SET_PRIVILEGED = !!s.may_set_privileged;
+    if (Array.isArray(s.privileged_fields) && s.privileged_fields.length) {
+      PRIVILEGED_FIELDS = s.privileged_fields;
+    }
+  } catch (_) { ACME_EMAIL_REMEMBERED = false; MAY_SET_PRIVILEGED = false; }
   syncHttpsFields();
   const sel = $("#preset-select");
   sel.innerHTML = "";
@@ -1794,19 +1806,21 @@ async function openCreate() {
   $("#create-form").existing.value = "reuse";
   syncCreateSeed();
   $("#version-hint").textContent = "";
-  // These three decide what CODE runs and where it listens, and the server refuses
-  // them from a non-admin (POST /api/repros). The dialog offered them to everybody
-  // anyway, so a member could fill one in and have the whole create fail -- the
-  // same defect as the panel's "Make default" button, and app.py's comment
-  // confidently said the GUI "never sends them for a member". It did.
+  // These decide what CODE runs and where it listens, and the server refuses them
+  // from whoever `gui.create_policy` says (admin by default, `anyone` on a box
+  // where every account is a colleague). Ask the SERVER who that is rather than
+  // deciding from the role here: two places computing the same permission is how
+  // the dialog ends up offering a field the API rejects, which is exactly what it
+  // did -- app.py's comment claimed the GUI "never sends them for a member", and
+  // it sent all three for everybody.
   //
-  // Hidden rather than disabled: a greyed-out field invites "why can't I?", and the
-  // answer is a box-level setting they cannot make either way.
-  for (const name of ["rc_image", "reg_token", "bind"]) {
+  // Hidden rather than disabled: a greyed-out field invites "why can't I?", and on
+  // a box that has opened the policy there is nothing to explain.
+  for (const name of PRIVILEGED_FIELDS) {
     const input = $("#create-form")[name];
     if (input && input.closest("label")) {
-      input.closest("label").hidden = !canAdmin();
-      if (!canAdmin()) input.value = "";
+      input.closest("label").hidden = !MAY_SET_PRIVILEGED;
+      if (!MAY_SET_PRIVILEGED) input.value = "";
     }
   }
   $("#create-dialog").showModal();

@@ -533,27 +533,54 @@ def test_a_readonly_user_is_offered_nothing_in_the_detail_panel_either(serve, pa
         assert page.errors == [], page.errors
 
 
-def test_the_create_dialog_hides_what_a_member_may_not_set(serve, page, monkeypatch):
-    """rc_image / reg_token / bind are refused from a non-admin by POST /api/repros,
-    and the dialog offered all three to everybody -- so a member could fill one in
-    and have the whole create fail. app.py's comment claimed the GUI "never sends
-    them for a member"; it did.
+def test_the_create_dialog_follows_the_box_policy_not_the_role(serve, page,
+                                                               monkeypatch):
+    """The dialog offered rc_image / reg_token / bind to everybody while the API
+    refused them from a non-admin, so a member could fill one in and have the whole
+    create fail -- app.py's comment claimed the GUI "never sends them for a member".
 
-    `port` is deliberately still offered: it is not admin-only any more, because the
-    privileged-port range it might have guarded is refused for everyone anyway.
+    It asks the SERVER now (GET /api/settings -> may_set_privileged), so opening
+    `gui.create_policy` reaches the interface too. Two places computing one
+    permission is what produced the mismatch in the first place.
+
+    `port` is deliberately always offered: it is not privileged any more, because
+    the privileged-port range it might have guarded is refused for everyone anyway.
     """
+    from rc_repro import config as cfgmod
+    from rc_repro.services import lifecycle as lcmod
+
     _stub_lifecycle(monkeypatch)
     usersvc.add("alice", PASSWORD, role="admin")
     usersvc.add("mem", "members-good-password", role="member")
 
+    def open_dialog():
+        page.click("#btn-new")
+        page.wait_for_selector("#create-dialog[open]")
+        # These fields live inside <details class="adv">, which is COLLAPSED. Without
+        # expanding it every one of them is invisible whatever the policy says, and
+        # an is_hidden() assertion passes for the wrong reason -- the first version
+        # of this test did exactly that and would have passed against the bug.
+        page.eval_on_selector_all(
+            "#create-dialog details.adv", "ds => ds.forEach(d => d.open = true)")
+        page.wait_for_selector("#create-form [name=mongo]", state="visible")
+
     with serve() as s:
         _sign_in(page, s.url, user="mem", password="members-good-password")
         page.wait_for_selector("#btn-new")
-        page.click("#btn-new")
-        page.wait_for_selector("#create-dialog[open]")
-        for name in ("rc_image", "reg_token", "bind"):
+        open_dialog()
+        for name in lcmod.PRIVILEGED_CREATE_FIELDS:
             assert page.is_hidden(f"#create-form [name={name}]"), \
                 f"a member is offered {name!r}, which the server refuses"
         assert page.is_visible("#create-form [name=port]"), \
             "a host port is a member's to choose"
+        page.click("#create-cancel")
+        page.wait_for_function("() => !document.querySelector('#create-dialog').open")
+
+        # ...and the box opens the policy: the same member, same session.
+        cfgmod.update_config(
+            lambda c: c.__setitem__(lcmod.CREATE_POLICY_KEY, "anyone"))
+        open_dialog()
+        for name in lcmod.PRIVILEGED_CREATE_FIELDS:
+            assert page.is_visible(f"#create-form [name={name}]"), \
+                f"gui.create_policy=anyone did not reach the dialog for {name!r}"
         assert page.errors == [], page.errors

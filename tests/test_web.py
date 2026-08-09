@@ -910,11 +910,16 @@ def test_settings_says_whether_an_email_is_remembered_without_leaking_it(monkeyp
     from rc_repro import config as cfgmod
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     c = client()
-    assert c.get("/api/settings", headers=H).json() == {"acme_email_remembered": False}
+    body = c.get("/api/settings", headers=H).json()
+    # The point of this test is the ABSENCE of the address, so assert that rather
+    # than the exact shape -- it used to compare the whole dict, which made adding a
+    # field to the response a failing test about email leakage.
+    assert body["acme_email_remembered"] is False
+    assert not any("@" in str(v) for v in body.values())
 
     cfgmod.update_config(lambda cfg: cfg.__setitem__("acme_email", "ops@rocket.chat"))
     r = c.get("/api/settings", headers=H)
-    assert r.json() == {"acme_email_remembered": True}
+    assert r.json()["acme_email_remembered"] is True
     assert "ops@rocket.chat" not in r.text, "the address itself must never be returned"
 
 
@@ -2169,3 +2174,66 @@ def test_an_admin_may_still_set_all_three():
                                     "rc_image": "registry/rocket.chat:x",
                                     "reg_token": "tok", "port": 3999}, headers=H)
     assert r.status_code == 200, r.text
+
+
+# --- gui.create_policy: whose box is it? -------------------------------------------
+
+def test_a_member_may_set_the_image_and_bind_once_the_box_says_so(basic_client,
+                                                                  monkeypatch):
+    """`gui.create_policy anyone` is for the deployment this product was built for:
+    a support team's shared box where every account is a colleague who can already
+    create workspaces and tear them down WITH their data. "You may destroy Maria's
+    customer repro but not choose which interface your own listens on" is not a
+    security boundary, it is an inconsistent ladder.
+    """
+    from rc_repro import config as cfgmod
+    from rc_repro.services import users as usersvc
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr(lc, "create_repro", lambda req, **kw: {"name": "x"})
+    usersvc.add("bob", "bobs-good-password", role="member")
+    _as(basic_client, "bob", "bobs-good-password")
+
+    # strict by default
+    assert basic_client.post("/api/repros", headers=_auth(),
+                             json={"version": "8.5.1", "bind": "0.0.0.0"}
+                             ).status_code == 400
+
+    cfgmod.update_config(lambda c: c.__setitem__(lc.CREATE_POLICY_KEY, "anyone"))
+    for field, value in (("bind", "0.0.0.0"), ("rc_image", "registry/rc:x"),
+                         ("reg_token", "an-ee-licence")):
+        r = basic_client.post("/api/repros", headers=_auth(),
+                              json={"version": "8.5.1", field: value})
+        assert r.status_code == 200, f"{field} still refused: {r.text}"
+
+
+def test_the_refusal_names_the_setting_that_opens_it(basic_client, monkeypatch):
+    """A boundary with no door on the other side is just a wall — the lesson from
+    bind_host, which lifecycle read and `config set` would not write."""
+    from rc_repro.cli import _CONFIG_KEYS
+    from rc_repro.services import users as usersvc
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    usersvc.add("bob", "bobs-good-password", role="member")
+    _as(basic_client, "bob", "bobs-good-password")
+    r = basic_client.post("/api/repros", headers=_auth(),
+                          json={"version": "8.5.1", "bind": "0.0.0.0"})
+    assert "gui.create_policy anyone" in r.json()["error"]
+    assert "config set bind_host" in r.json()["error"]
+    for key in ("gui.create_policy", "gui.destroy_policy", "bind_host"):
+        assert key in _CONFIG_KEYS, f"{key} is documented policy with no way to set it"
+
+
+def test_settings_tells_the_dialog_who_may_set_the_privileged_fields(basic_client,
+                                                                    monkeypatch):
+    """The dialog must ask rather than recompute the rule: two places deciding one
+    permission is how it ended up offering fields the API rejects."""
+    from rc_repro import config as cfgmod
+    from rc_repro.services import users as usersvc
+    usersvc.add("bob", "bobs-good-password", role="member")
+    _as(basic_client, "bob", "bobs-good-password")
+    body = basic_client.get("/api/settings", headers=_auth()).json()
+    assert body["may_set_privileged"] is False
+    assert body["privileged_fields"] == list(lc.PRIVILEGED_CREATE_FIELDS)
+
+    cfgmod.update_config(lambda c: c.__setitem__(lc.CREATE_POLICY_KEY, "anyone"))
+    assert basic_client.get("/api/settings",
+                            headers=_auth()).json()["may_set_privileged"] is True
