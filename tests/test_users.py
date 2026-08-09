@@ -1,9 +1,9 @@
 """Unit tests for GUI accounts (services/users.py).
 
 These lock in the properties that make a shared deployment safe: passwords are
-never recoverable from the file, verification is constant-time-ish, repeated
-failures cost something without ever refusing a correct password, and revoking a
-credential takes effect at once.
+never recoverable from the file, an unknown name costs the same work as a known
+one, a correct password is never refused by a counter, failed attempts are
+recorded, and revoking a credential takes effect at once.
 """
 
 from __future__ import annotations
@@ -19,9 +19,7 @@ from rc_repro.services import users
 @pytest.fixture(autouse=True)
 def _fresh(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    users._failures.clear()
     yield
-    users._failures.clear()
 
 
 GOOD = "correct-horse-battery"
@@ -210,51 +208,74 @@ def test_role_of_an_unknown_user_is_empty_not_admin():
     assert users.role_of("ghost") == ""
 
 
-def test_repeated_failures_earn_a_backoff():
-    """A 128-bit token is not guessable; a human password is, so failures count."""
-    users.add("alice", GOOD)
-    assert users.locked_out("alice") == 0
-    for _ in range(users._LOCKOUT_AFTER):
-        users.verify("alice", "wrong-password-x")
-    assert users.locked_out("alice") > 0
+def test_a_correct_password_is_never_refused_by_a_counter():
+    """No amount of guessing may lock the real owner out.
 
+    An earlier version consulted a lockout counter BEFORE checking the password,
+    which made the documented remedy for a compromised account the thing that
+    locked its owner out: after `users passwd`, every still-open tab replayed the
+    OLD credential on its four-second poll, each poll slid the window forward, and
+    the new password was refused with it. Measured at the time: 232s of lockout
+    after twenty minutes of one tab.
 
-def test_a_correct_password_is_never_refused_because_of_a_lockout():
-    """The counter is advisory. It reports; it does not decide.
-
-    Consulting it BEFORE checking the password made the documented remedy for a
-    compromised account the thing that locked its owner out: after `users passwd`,
-    every still-open tab replayed the OLD credential on its four-second dashboard
-    poll, each poll slid the window forward, and the new password was refused with
-    it. Measured at the time: 232s of lockout after twenty minutes of one tab, and
-    the right password did not work.
+    The counter is gone now, so this is cheap to guarantee -- and worth keeping as
+    a test, because it is the property that made it wrong.
     """
     users.add("alice", GOOD)
-    for _ in range(users._LOCKOUT_AFTER * 4):
-        users.verify("alice", "the-old-password-x")
-    assert users.locked_out("alice") > 0, "the backoff should still be reported"
-    assert users.verify("alice", GOOD) is True
-    assert users.locked_out("alice") == 0, "success clears the count"
-
-
-def test_one_client_cannot_lock_out_another():
-    """Names are not secret -- `serve` prints them at startup and the dashboard
-    renders an owner chip on every card. Keyed on the name alone, five wrong
-    guesses from anyone who could reach the port denied service to a colleague."""
-    users.add("alice", GOOD)
-    for _ in range(50):
-        users.verify("alice", "guess-guess-guess", source="203.0.113.9")
-    assert users.locked_out("alice", "203.0.113.9") > 0, "the attacker is throttled"
-    assert users.locked_out("alice", "10.0.0.4") == 0, "alice's own address is clean"
+    for _ in range(40):
+        users.verify("alice", "the-old-password-x", source="203.0.113.9")
     assert users.verify("alice", GOOD, source="10.0.0.4") is True
+    assert users.verify("alice", GOOD, source="203.0.113.9") is True, \
+        "even from the address that did the guessing"
 
 
-def test_a_success_clears_the_failure_count():
+def test_a_failed_sign_in_is_recorded():
+    """Prevention stops at the per-address throttle in web/app.py; this is the
+    detection that replaces the per-account counter nothing ever read.
+
+    `attempt`, not `session`: the name on a failed sign-in is whatever the caller
+    typed and belongs to nobody, so the log must not read as "alice did something".
+    """
+    from rc_repro.services import audit as auditsvc
+
     users.add("alice", GOOD)
-    for _ in range(users._LOCKOUT_AFTER - 1):
-        users.verify("alice", "wrong-password-x")
-    assert users.verify("alice", GOOD) is True
-    assert users.locked_out("alice") == 0
+    users.verify("alice", "wrong-password-x", source="203.0.113.9")
+    users.verify("no-such-person", "wrong-password-x", source="203.0.113.9")
+
+    lines = auditsvc.read(kind="signin")["lines"]
+    assert len(lines) == 2, lines
+    assert {ln["actor"] for ln in lines} == {"alice", "no-such-person"}
+    for ln in lines:
+        assert ln["outcome"] == "denied"
+        assert ln["origin"] == "attempt", "a guessed-at name is not an actor"
+        assert ln["label"] == "203.0.113.9", "the address is what you act on"
+
+
+def test_a_successful_sign_in_records_nothing():
+    """Only failures. A line per successful verify would double every sign-in and
+    bury the ones worth seeing."""
+    from rc_repro.services import audit as auditsvc
+
+    users.add("alice", GOOD)
+    users.verify("alice", GOOD, source="10.0.0.4")
+    assert auditsvc.read(kind="signin")["lines"] == []
+
+
+def test_a_hostile_user_name_cannot_forge_an_audit_line():
+    """The name reaches the log before any validation -- deliberately, because an
+    invalid name is exactly the traffic worth seeing. So the FIELD has to be safe:
+    a tab forges a column and a newline forges a whole line, in the one file whose
+    entire job is to say who did what."""
+    from rc_repro.services import audit as auditsvc
+
+    users.verify("evil\tadmin\tuser-add\tbackdoor\tsession\tok\nnext-line",
+                 "wrong-password-x", source="203.0.113.9")
+    text = auditsvc.audit_path().read_text(encoding="utf-8")
+    assert text.count("\n") == 1, "the injected newline created a second line"
+    lines = auditsvc.read(kind="signin")["lines"]
+    assert len(lines) == 1
+    assert "\t" not in lines[0]["actor"]
+    assert lines[0]["outcome"] == "denied" and lines[0]["origin"] == "attempt"
 
 
 def test_empty_credentials_are_refused_without_touching_the_file():
@@ -307,7 +328,6 @@ def test_removing_a_user_takes_effect_immediately_in_a_running_server(tmp_path, 
     from rc_repro.services import sessions as sessionsvc
     from rc_repro.services import users as usersvc
 
-    usersvc._failures.clear()
     usersvc.add("alice", "correct-horse-battery")
     assert usersvc.verify("alice", "correct-horse-battery") is True
     token = sessionsvc.create("alice")
@@ -326,7 +346,6 @@ def test_a_changed_password_invalidates_the_old_one_immediately(tmp_path, monkey
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     from rc_repro.services import users as usersvc
 
-    usersvc._failures.clear()
     usersvc.add("alice", "correct-horse-battery")
     assert usersvc.verify("alice", "correct-horse-battery") is True
 
@@ -444,3 +463,69 @@ def test_a_new_account_never_becomes_an_implicit_admin():
     assert second.role == "member"
     assert users.implicit_admins() == [], "neither line has a blank role column"
     assert users.role_of("bob") == "member"
+
+
+# --- session bookkeeping (services/sessions.py) ------------------------------------
+
+def test_the_flush_map_shrinks_with_the_sessions_file():
+    """`_flushed` gates the once-a-minute last_seen write-back, and entries were
+    only ever popped on an EXPLICIT revoke. A session normally ends by expiring, or
+    by being dropped by the _MAX_SESSIONS cap -- neither goes through revoke_sid()
+    -- so the file was bounded two ways while the map shadowing it grew for the
+    life of the process. Slow for a human team; fast for anything scripted against
+    POST /api/session, which mints a session per call.
+    """
+    import time as _t
+
+    from rc_repro.services import sessions as sessionsvc
+
+    for i in range(30):
+        token = sessionsvc.create("alice", label=f"tab-{i}")
+        sessionsvc._flushed[sessionsvc._digest(token)] = 0.0   # force the flush
+        sessionsvc.verify(token)
+    assert len(sessionsvc._flushed) == 30
+
+    # Time passes: every session ages past the absolute bound, the way real ones go.
+    old = int(_t.time()) - sessionsvc.ABSOLUTE_SECONDS - 10
+    rows = {sid: sessionsvc.Session(sid=s.sid, user=s.user, created=old,
+                                    last_seen=old, label=s.label, origin=s.origin)
+            for sid, s in sessionsvc._load(force=True).items()}
+    sessionsvc._write(rows)
+
+    assert sessionsvc._load(force=True) == {}, "the file drops what expired"
+    assert sessionsvc._flushed == {}, "and the map that mirrors it has to follow"
+
+
+def test_listing_sessions_survives_the_cache_being_rebuilt_underneath(monkeypatch):
+    """_load() hands back the module-level _cache itself, not a copy, and both
+    _load(force=True) and _write() clear it. list_for() used to build a generator
+    and let sorted() consume it AFTER releasing the lock, so a concurrent request
+    rebuilding the cache mid-iteration raised RuntimeError -- a 500 in the browser.
+    GET /api/users calls this once per account, so an admin opening People rolled
+    that dice once per person on the server.
+
+    Forced deterministically here: the first alive() check does what a REVOCATION
+    landing at that moment does. It has to be a revocation rather than a plain
+    reload -- _load() clears and repopulates to the same size, and CPython only
+    raises when the size differs from when the iteration began, so a same-size
+    rebuild slips past the very guard this is about.
+    """
+    from rc_repro.services import sessions as sessionsvc
+
+    for i in range(20):
+        sessionsvc.create("alice", label=f"tab-{i}")
+
+    real_alive, state = sessionsvc.Session.alive, {"n": 0}
+
+    def alive(self, now=None):
+        state["n"] += 1
+        if state["n"] == 1:
+            # somebody else signs out half their devices, mid-listing
+            keep = dict(list(sessionsvc._load().items())[:10])
+            sessionsvc._write(keep)
+        return real_alive(self, now)
+
+    monkeypatch.setattr(sessionsvc.Session, "alive", alive)
+    out = sessionsvc.list_for("alice")        # must not raise
+    assert len(out) == 20
+    assert state["n"] >= 1, "the interleaving actually happened"

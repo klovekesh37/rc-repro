@@ -20,7 +20,6 @@ import os
 import re
 import secrets
 import threading
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -422,66 +421,48 @@ def set_role(name: str, role: str) -> User:
 #: SIGN-IN, so the cache had nothing left to save. Removing it is the fix for that
 #: memory exposure, and it is the kind of fix that cannot itself be buggy.
 
-#: Failed attempts, for backoff. A 128-bit token is not guessable; a human password
-#: is, so repeated failures have to cost something.
+#: There is deliberately no per-account lockout here any more either.
 #:
-#: Keyed on (name, source) -- the name ALONE was a denial of service against a
-#: colleague. Names are not secret: `serve` prints "sign in as: alice, bob" at
-#: startup and the dashboard renders an owner chip on every card, so five wrong
-#: guesses from anyone who could reach the port locked a named person out. Keyed
-#: on the pair, an attacker burns a counter belonging to their own address and
-#: the real user is untouched. `source` is the resolved client address; "" for
-#: the CLI, which has no client.
-_LOCKOUT_AFTER = 5
-_LOCKOUT_BASE = 2.0
-_LOCKOUT_MAX = 300.0
-_failures: dict[tuple[str, str], tuple[int, float]] = {}
-#: Ceiling on the failure map. Far above any real workspace's user count, so a
-#: legitimate lockout is never evicted; low enough that a name-varying flood
-#: cannot grow it unboundedly.
-_FAILURES_MAX = 4096
-_fail_lock = threading.Lock()
+#: One existed, keyed on `(name, source)`, and nothing ever read it -- `locked_out()`
+#: had no caller outside its own tests. Before deleting it the question was worth
+#: asking properly: should it be wired in instead? No, and the reason is structural
+#: rather than a matter of taste.
+#:
+#: The live throttle is web/app.py's `_signin_fails`, keyed on the client ADDRESS:
+#: ten failures in sixty seconds and the endpoint refuses before spending any
+#: scrypt. A counter keyed on `(name, address)` cannot catch anything that one
+#: misses, because it keys on the same address -- so both survive or both fall to
+#: the same evasion, and the address counter additionally catches the attack the
+#: pair-keyed one is blind to: one address walking the whole user list, one or two
+#: guesses per name, never reaching any per-account threshold. The per-account map
+#: was not merely dead, it was strictly dominated.
+#:
+#: Keying on the NAME alone would catch a distributed attack -- and would hand
+#: anyone who can reach the port a way to lock out a named colleague, which is the
+#: denial of service the pair-keying was introduced to fix. Names are not secret:
+#: `serve` prints "sign in as: alice, bob" at startup and the dashboard renders an
+#: owner chip on every card. There is no third keying that avoids both.
+#:
+#: So prevention stops at the address throttle, and what replaces the intent is
+#: DETECTION, which costs nothing and was entirely missing: a failed credential
+#: check now writes an audit line. `rc-repro audit --kind signin` shows an attack
+#: in progress, names the addresses it comes from, and survives a restart -- none
+#: of which an in-memory counter nobody read could do.
 
 
-def locked_out(name: str, source: str = "") -> float:
-    """Seconds of backoff earned by failures for `name` from `source`, or 0.
+def _audit_failure(name: str, source: str) -> None:
+    """Record a failed credential check.
 
-    ADVISORY ONLY. This reports how long a client that keeps guessing has been
-    asked to wait; it does not decide whether a credential is accepted. See
-    verify(), where consulting this BEFORE checking the password meant a correct
-    password was refused -- so the documented remedy for a compromised account
-    (change the password) was itself what locked the owner out.
+    Written with origin `attempt`, never `session`: the name here is whatever the
+    caller typed and belongs to nobody. It may not even be an account. Recording it
+    as an ordinary line would make the log say "alice did something" when alice is
+    the name that was guessed AT.
+
+    The name is not validated first, on purpose -- an invalid one is exactly the
+    traffic worth seeing. audit._field() is what makes that safe to write down.
     """
-    with _fail_lock:
-        count, last = _failures.get((name, source), (0, 0.0))
-    if count < _LOCKOUT_AFTER:
-        return 0.0
-    delay = min(_LOCKOUT_BASE ** (count - _LOCKOUT_AFTER + 1), _LOCKOUT_MAX)
-    remaining = (last + delay) - time.monotonic()
-    return max(0.0, remaining)
-
-
-def _record_failure(name: str, source: str = "") -> None:
-    with _fail_lock:
-        now = time.monotonic()
-        # An attacker who varies the name never trips the lockout AND grows this
-        # dict without limit -- a slow memory leak driven by anyone who can reach
-        # the port. Drop entries that can no longer produce a lockout, then cap:
-        # the backoff is what this is for, and a bounded map still delivers it
-        # for the pairs actually being attacked.
-        if len(_failures) >= _FAILURES_MAX:
-            stale = [k for k, (_c, t) in _failures.items() if now - t > _LOCKOUT_MAX]
-            for k in stale:
-                del _failures[k]
-            if len(_failures) >= _FAILURES_MAX:
-                _failures.clear()
-        count, _last = _failures.get((name, source), (0, 0.0))
-        _failures[(name, source)] = (count + 1, now)
-
-
-def _clear_failures(name: str, source: str = "") -> None:
-    with _fail_lock:
-        _failures.pop((name, source), None)
+    auditsvc.audit(name or "-", "signin", source or "local",
+                   origin_="attempt", outcome="denied")
 
 
 def verify(name: str, password: str, *, source: str = "") -> bool:
@@ -490,18 +471,17 @@ def verify(name: str, password: str, *, source: str = "") -> bool:
     An unknown user still performs a full derivation: returning early would make
     the response time reveal which names exist.
 
-    THE PASSWORD IS CHECKED FIRST, and a correct one is never refused because of a
-    counter. The previous order -- lockout, then password -- had two reachable
-    consequences. Anyone who could reach the port could lock out a named colleague
-    with five wrong guesses. And after `rc-repro users passwd alice`, any browser
-    tab still open re-sent the OLD credential on its four-second dashboard poll;
-    each poll was a fresh failure that slid the window forward, so the account
-    stayed locked indefinitely and the correct new password was refused with it.
-    Measured before this change: after twenty minutes of one polling tab,
-    locked_out() read 232s and the right password did not work.
+    NOTHING HERE REFUSES A CORRECT PASSWORD. An earlier version consulted a lockout
+    counter before checking, which had two reachable consequences: anyone who could
+    reach the port could lock out a named colleague with five wrong guesses, and
+    after `rc-repro users passwd alice` every still-open tab replayed the OLD
+    credential on its four-second poll, each poll sliding the window forward, so the
+    account stayed locked and the correct NEW password was refused with it. That
+    counter is gone entirely -- see the note above for why wiring it in was the
+    wrong answer and detection was the right one.
 
-    `source` is the resolved client address, so failures are counted per (name,
-    address) -- see the note on _failures.
+    Failures are AUDITED, in both front ends, because this is the one place both
+    reach. `source` is the resolved client address, or "" for the CLI.
     """
     if not name or password is None:
         return False
@@ -513,11 +493,9 @@ def verify(name: str, password: str, *, source: str = "") -> bool:
         # ONE derivation, exactly like the branch below -- see _DUMMY_HASH for the
         # version of this line that burned two.
         _check(password, _DUMMY_HASH)
-        _record_failure(name, source)
+        _audit_failure(name, source)
         return False
     if not _check(password, stored[0]):
-        _record_failure(name, source)
+        _audit_failure(name, source)
         return False
-
-    _clear_failures(name, source)
     return True

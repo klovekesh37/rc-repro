@@ -199,6 +199,15 @@ def _write(rows: dict[str, Session]) -> None:
         Path(tmp).unlink(missing_ok=True)
     _cache.clear()
     _cache.update({s.sid: s for s in keep})
+    # `_flushed` mirrors this file, so it has to shrink with it. Entries were only
+    # ever popped on an explicit revoke -- and a session normally ends by EXPIRING,
+    # or by being dropped by the _MAX_SESSIONS cap, neither of which went through
+    # revoke_sid(). So the file was bounded two ways while the map that shadows it
+    # grew for the life of the process. Slow for a human team; fast for anything
+    # scripted against POST /api/session, which mints a session per call.
+    live = {s.sid for s in keep}
+    for sid in [k for k in _flushed if k not in live]:
+        del _flushed[sid]
     _stamp = _file_stamp()
 
 
@@ -298,8 +307,15 @@ def list_for(user: str) -> list[Session]:
     """A user's own live sessions, newest activity first."""
     now = time.time()
     with _lock:
-        rows = _load()
-    return sorted((s for s in rows.values() if s.user == user and s.alive(now)),
+        # SNAPSHOT inside the lock. _load() returns the module-level _cache itself,
+        # not a copy, and both _load(force=True) and _write() clear it -- so a lazy
+        # generator consumed by sorted() AFTER the lock released could be iterating
+        # the dict while another request rebuilt it. Reproduced: RuntimeError,
+        # "dictionary changed size during iteration", which reaches the browser as
+        # a 500. GET /api/users calls this once per account, so an admin opening
+        # People rolled that dice once for every person on the server.
+        rows = list(_load().values())
+    return sorted((s for s in rows if s.user == user and s.alive(now)),
                   key=lambda s: s.last_seen, reverse=True)
 
 

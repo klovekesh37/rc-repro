@@ -25,9 +25,7 @@ GOOD = "correct-horse-battery"
 def _fresh(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     monkeypatch.delenv("RC_REPRO_USER", raising=False)
-    users._failures.clear()
     yield
-    users._failures.clear()
 
 
 # --- who the CLI thinks you are -------------------------------------------------

@@ -51,6 +51,19 @@ _HEAVY_KINDS = frozenset({"create", "restore", "upgrade", "backup", "scale"})
 _measure_slots = threading.BoundedSemaphore(1)
 _heavy_slots = threading.BoundedSemaphore(max(2, (os.cpu_count() or 4) // 2))
 
+# ...and the QUEUE needs a ceiling too, which is a different thing from the pools
+# above. Those bound how many run at once; they are acquired INSIDE the worker
+# thread, so the thread already exists by the time it waits. Measured: 40 capacity
+# submissions against a measurement pool of size 1 produced 40 live OS threads and
+# 40 retained Job objects, and _evict_locked() will not drop them because a queued
+# job is correctly counted as active. So the bound on concurrency was not a bound
+# on resources at all -- any member+ could hold as many threads as they cared to
+# click for, on a box this file's own comments describe as hitting RAM first.
+#
+# Refusing at SUBMIT is the fix: a person who queues a 33rd load test wants a
+# message, not a silent thread. Generous enough that no honest workflow reaches it.
+MAX_QUEUED_PER_KIND = 32
+
 
 #: A job that has not reached a terminal state. "queued" belongs here: it has not
 #: finished, it has not even started. Anything testing `status != "running"` to
@@ -198,6 +211,14 @@ class JobManager:
         # of those lines would have been written with no actor at all.
         origin = CURRENT_ORIGIN.get("")
         slots = _slots_for(kind)
+        if slots is not None:
+            with self._lock:
+                waiting = sum(1 for j in self._jobs.values()
+                              if j.kind == kind and j.status == "queued")
+            if waiting >= MAX_QUEUED_PER_KIND:
+                raise ConflictError(
+                    f"{waiting} {kind} job(s) are already waiting for a free slot. "
+                    "Let those finish first — see the Activity list.")
         job = Job(id="job_" + uuid.uuid4().hex[:10], kind=kind, label=label,
                   actor=actor,
                   # Shown as "waiting for a slot" rather than looking hung. A job

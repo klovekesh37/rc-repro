@@ -908,8 +908,21 @@ def create_app(allow_hosts: list[str] | None = None, *,
         from rc_repro.services import users as usersvc
         me = getattr(request.state, "actor", "") or ""
         old, new = str(body.get("old") or ""), str(body.get("new") or "")
-        if not usersvc.verify(me, old, source=_client(request)):
+        # Throttled like the login, because it is one. _do_signin claims "scrypt
+        # runs HERE and nowhere else, which is what makes a guessing bound possible
+        # at all" -- and this endpoint quietly made that false. It takes a password,
+        # derives scrypt on it, and had no bound, so any signed-in account,
+        # readonly included, could spend the threadpool on it indefinitely.
+        source = _client(request)
+        wait = _signin_retry_after(source)
+        if wait:
+            return JSONResponse({"error": "too many attempts from this address",
+                                 "kind": "Unauthorized"}, status_code=429,
+                                headers={"Retry-After": str(wait)})
+        if not usersvc.verify(me, old, source=source):
+            _signin_failed(source)
             raise ValidationError("that is not your current password")
+        _signin_ok(source)
         usersvc.require_valid_password(new)
         usersvc.set_password(me, new)
         _addr, https = _peer(request)

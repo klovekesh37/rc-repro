@@ -92,7 +92,6 @@ def page(browser):
 def serve(tmp_path, monkeypatch):
     """A server factory bound to an isolated home."""
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    usersvc._failures.clear()
 
     def _start(**kw):
         return _Server(create_app(allow_hosts=["127.0.0.1"], **kw), _free_port())

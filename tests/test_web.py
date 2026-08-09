@@ -25,8 +25,6 @@ PASSWORD = "correct-horse-battery"
 
 def _fresh_auth_state():
     from rc_repro.services import sessions as sessionsvc
-    from rc_repro.services import users as usersvc
-    usersvc._failures.clear()
     sessionsvc._cache.clear()
     sessionsvc._stamp = (-1, -1)
     sessionsvc._flushed.clear()
@@ -944,8 +942,6 @@ def _auth(user=None, password=None):
 
 def _reset_auth_state():
     from rc_repro.services import sessions as sessionsvc
-    from rc_repro.services import users as usersvc
-    usersvc._failures.clear()
     sessionsvc._cache.clear()
     sessionsvc._stamp = (-1, -1)
     sessionsvc._flushed.clear()
@@ -1935,3 +1931,63 @@ def test_a_cidr_is_accepted_and_a_typo_simply_trusts_nothing():
     assert len(parse_trusted(["10.0.0.0/8", "127.0.0.1"])) == 2
     assert parse_trusted(["not-an-address", ""]) == [], \
         "a typo must mean 'not trusted', not a server that will not start"
+
+
+def test_the_job_queue_is_bounded_at_submit_not_at_the_slot():
+    """The measurement and heavy pools bound how many jobs RUN at once, and they
+    are acquired inside the worker thread -- so the thread already exists by the
+    time it waits. Measured before this: 40 capacity submissions against a pool of
+    size 1 produced 40 live OS threads and 40 retained Job objects, which
+    _evict_locked() will not drop because a queued job is correctly active.
+    """
+    import threading
+
+    from rc_repro.errors import ConflictError
+    from rc_repro.web.jobs import MAX_QUEUED_PER_KIND, JobManager
+
+    jm = JobManager()
+    gate = threading.Event()
+    before = threading.active_count()
+
+    def slow(emit=None):
+        gate.wait(timeout=30)
+        return {"ok": True}
+
+    try:
+        for _ in range(MAX_QUEUED_PER_KIND + 1):     # +1 is the one that runs
+            jm.submit("capacity", slow, label="q")
+        with pytest.raises(ConflictError, match="waiting for a free slot"):
+            jm.submit("capacity", slow, label="one-too-many")
+        grew = threading.active_count() - before
+        assert grew <= MAX_QUEUED_PER_KIND + 1, \
+            f"threads are still unbounded: {grew} new ones"
+    finally:
+        gate.set()
+
+    # An UNPOOLED kind is untouched -- reads and state changes were never the
+    # problem and must not start refusing.
+    jm2 = JobManager()
+    for _ in range(MAX_QUEUED_PER_KIND + 5):
+        jm2.submit("state", lambda emit=None: None, label="s")
+
+
+def test_changing_your_own_password_is_throttled_like_a_login():
+    """It takes a password and derives scrypt on it, so it is a login endpoint
+    whatever it is called. _do_signin claims "scrypt runs HERE and nowhere else,
+    which is what makes a guessing bound possible at all" -- this endpoint quietly
+    made that false, and any signed-in account, readonly included, could spend the
+    threadpool on it without limit.
+    """
+    from rc_repro.web import app as webapp
+
+    c = client()
+    for _ in range(webapp.SIGNIN_MAX_FAILURES):
+        r = c.post("/api/me/password",
+                   json={"old": "not-my-password", "new": "a-brand-new-password"},
+                   headers=H)
+        assert r.status_code == 400, r.text        # ValidationError, still counted
+    r = c.post("/api/me/password",
+               json={"old": "not-my-password", "new": "a-brand-new-password"},
+               headers=H)
+    assert r.status_code == 429
+    assert r.headers.get("Retry-After"), "a 429 that does not say when is not useful"

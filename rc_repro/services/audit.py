@@ -57,6 +57,10 @@ def audit_path():
 #:             honours it even for an unknown name, so this is a CLAIM.
 #:   setup     the one-time first-run key, spent creating the first account.
 #:   system    rc-repro acting on its own behalf (rotation, startup).
+#:   attempt   a credential check that FAILED. The name is whatever the caller
+#:             typed and belongs to nobody -- it may not even be an account. It is
+#:             its own origin precisely so nothing reads these lines as "alice did
+#:             something": alice is the name that was GUESSED AT, not the actor.
 #:
 #: A log that cannot say which of its lines are trustworthy is not much better
 #: than one with no names at all.
@@ -65,7 +69,7 @@ def audit_path():
 #: from it does not raise -- it just writes "-" and looks like a legacy line.
 #: `setup` was omitted at first and did exactly that, on the first two lines of
 #: every new install.
-ORIGINS = ("session", "local", "asserted", "setup", "system")
+ORIGINS = ("session", "local", "asserted", "setup", "system", "attempt")
 
 #: Who is making the current request, and HOW that was established. Set by the
 #: web guard per request and by the CLI at startup, beside CURRENT_ACTOR.
@@ -104,6 +108,24 @@ def _rotate_if_needed(path) -> None:
         pass
 
 
+def _field(value: str, limit: int = 200) -> str:
+    """One stored field, unable to break the record or the line separator.
+
+    Nothing sanitised these while every field came from rc-repro itself. Recording
+    FAILED sign-ins changed that: the name on a failed sign-in is whatever the
+    caller typed, and it reaches here before any validation, because refusing to
+    log an invalid name would blind the log to exactly the traffic worth seeing.
+
+    A tab forges a column. A newline forges a whole line -- and in a file whose
+    only job is to say who did what, a forged line is the difference between
+    evidence and fiction. `isprintable()` is False for tab, newline, carriage
+    return and the rest of the control range, so this is one test, not a list of
+    characters somebody has to remember to extend.
+    """
+    return "".join(c for c in (value or "")
+                   if c.isprintable() and c != "\t")[:limit]
+
+
 def audit(actor_name: str, kind: str, label: str, *,
           origin_: str = "", outcome: str = "ok") -> None:
     """Append one line: timestamp, actor, kind, label, origin, outcome.
@@ -117,7 +139,8 @@ def audit(actor_name: str, kind: str, label: str, *,
     """
     try:
         line = (f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}\t"
-                f"{actor_name or '-'}\t{kind}\t{label or '-'}\t"
+                f"{_field(actor_name) or '-'}\t{_field(kind) or '-'}\t"
+                f"{_field(label) or '-'}\t"
                 f"{origin_ or origin() or '-'}\t{outcome or 'ok'}\n")
         path = audit_path()
         path.parent.mkdir(parents=True, exist_ok=True)
