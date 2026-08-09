@@ -351,10 +351,26 @@ def create_app(allow_hosts: list[str] | None = None, *,
         covered instead by being subject to CORS, plus `Sec-Fetch-Site` below.
         """
         site = headers.get("sec-fetch-site", "")
+        if site:
+            # AUTHORITATIVE when present. The browser sets it, it is a forbidden
+            # header name so page script cannot forge it, and it answers exactly
+            # the question being asked. Consulting `Origin` as well -- which the
+            # first version did -- broke the sign-in form in every real browser:
+            # a same-origin form POST from a page served with
+            # `Referrer-Policy: no-referrer` arrives as
+            #     Sec-Fetch-Site: same-origin
+            #     Origin: null
+            # and "null" is not a host in the allow-list, so the login was
+            # refused as cross-site. Caught only once a browser drove it; every
+            # HTTP test passed, because TestClient sends neither header.
+            return site not in ("same-origin", "none")
         origin = headers.get("origin", "")
-        if site not in ("", "same-origin", "none"):
-            return True
+        # No Sec-Fetch-Site (a non-browser client, or a very old browser). A
+        # literal "null" is an opaque origin -- a sandboxed iframe, a data: URL --
+        # and cannot be matched against the allow-list, so it counts as cross.
         if origin:
+            if origin == "null":
+                return True
             return not host_ok(origin.split("://", 1)[-1])
         return require_origin
     app.state.cross_site = _cross_site

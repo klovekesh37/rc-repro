@@ -18,6 +18,11 @@ jobs:
       # dev+gui: the web/API tests need fastapi + python-multipart, which live in
       # the `gui` extra. With only [dev], tests/test_web.py importorskips itself
       # and CI reports a green "1 skipped" while web/app.py goes untested.
-      - run: pip install -e ".[dev,gui]"
+      - run: pip install -e ".[dev,gui,browser]"
+      # The browser itself, plus the shared libraries Chromium needs. Without
+      # this step tests/test_browser.py skips silently and CI reports green for
+      # a GUI nobody rendered -- which is the state that let a same-origin form
+      # POST stay broken in every real browser while 570 HTTP tests passed.
+      - run: python -m playwright install --with-deps chromium --only-shell
       - run: ruff check .
       - run: pytest -q

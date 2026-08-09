@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rc-repro"
-version = "0.27.0"
+version = "0.27.1"
 description = "Launch version-matched Rocket.Chat reproduction environments"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,6 +18,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7", "httpx>=0.27", "ruff>=0.6"]
 gui = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9", "websockets>=12"]
+# Browser smoke tests only. Its own extra because it pulls a ~100 MB browser,
+# and tests/test_browser.py importorskips itself when it is absent -- so a
+# machine without it still reports a green suite.
+browser = ["playwright>=1.44"]
 
 [project.scripts]
 rc-repro = "rc_repro.cli:app"

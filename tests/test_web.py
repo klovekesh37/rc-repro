@@ -1793,3 +1793,27 @@ def test_the_gate_is_one_config_line_away_from_the_old_behaviour(tmp_path, monke
     assert lc.may_destroy("alices-box", "bob")[0] is False
     config.update_config(lambda c: c.__setitem__(lc.DESTROY_POLICY_KEY, "anyone"))
     assert lc.may_destroy("alices-box", "bob")[0] is True
+
+
+def test_a_same_origin_form_post_with_a_null_origin_is_allowed(anon_client):
+    """The regression that only a real browser found.
+
+    A same-origin form POST from a page served with `Referrer-Policy: no-referrer`
+    arrives as `Sec-Fetch-Site: same-origin` with `Origin: null`. Treating that
+    "null" as a foreign host refused the sign-in form in every real browser, while
+    every HTTP test passed because TestClient sends neither header.
+    """
+    r = anon_client.post("/signin", follow_redirects=False,
+                         data={"user": "alice", "password": "correct-horse-battery"},
+                         headers={"Host": "localhost", "Origin": "null",
+                                  "Sec-Fetch-Site": "same-origin"})
+    assert r.status_code == 303 and r.headers["location"] == "/"
+
+
+def test_a_null_origin_without_sec_fetch_site_is_still_refused(basic_client):
+    """An opaque origin -- a sandboxed iframe, a data: URL -- cannot be matched
+    against the allow-list, so with no Sec-Fetch-Site to appeal to it counts as
+    cross-site."""
+    r = basic_client.post("/api/repros/x/state", json={"action": "stop"},
+                          headers={"Host": "localhost", "Origin": "null"})
+    assert r.status_code == 403
