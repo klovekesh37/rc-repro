@@ -49,8 +49,7 @@ amd64-only and runs emulated, so those boots are slower. Everything else is nati
 **Podman** works via the `docker.sock` helper (`podman-mac-helper`). Two traps:
 
 - **Kernel ≥ 6.19 cannot run MongoDB 8.0**
-  ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)), which recent RC
-  versions require — common on fresh Podman machines and Fedora CoreOS. `doctor`
+  ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)). `doctor`
   warns when it sees this; use an engine on kernel < 6.19 until MongoDB ships a fix.
 - **Docker Hub anonymous pull limits** (`registry.rocket.chat` counts against Hub
   too) — run `docker login`.
@@ -85,8 +84,7 @@ rc-repro down --name test --volumes
   maps repros to your work.
 - Every repro creates the same admin: **`admin` / `admin123`**.
 
-> **Local by default.** Published ports bind `127.0.0.1`; MongoDB and NATS are never
-> published at all. `--bind 0.0.0.0` exposes Rocket.Chat **and every sidecar**
+> **Local by default.** Published ports bind `127.0.0.1`. `--bind 0.0.0.0` exposes Rocket.Chat **and every sidecar**
 > (Keycloak, Mailpit, MinIO — all with known credentials) to your whole network.
 > This is a reproduction tool, never a deployment.
 
@@ -131,7 +129,7 @@ when you would rather click than type, and the way a team shares one box.
 rc-repro serve                    # http://localhost:7070/
 ```
 
-It binds **loopback only**. That is not a formality: the GUI can create and delete
+It binds **loopback only** — the GUI can create and delete
 containers and their volumes and mint admin tokens, so the port is docker control.
 Binding anything else needs a deliberate flag, and rc-repro refuses the unsafe
 combinations rather than warning about them.
@@ -160,15 +158,10 @@ rc-repro users passwd alice       # new password, ends alice's sessions
 rc-repro users remove alice       # and every session it minted
 ```
 
-The **first** account is an admin, because somebody has to be able to add everyone
-else; every one after it is a `member` until you say otherwise.
+The **first** account is an admin; every one after it is a `member` until you say otherwise.
 
-The password is generated rather than typed, for two reasons. An admin who types a
-colleague's password also knows it, which makes every audit line signed with that
-name deniable; and a generated one is ~96 bits where a typed one clears a
-12-character minimum and is otherwise whatever somebody thought of. Either way it
-is never an *argument* — `ps` shows command lines to every user on the box.
-
+The password is generated rather than typed unless --ask-password; and a generated one is ~96 bits where a typed one clears a
+12-character minimum with scrypt.
 Stored in `~/.rc-repro/users`, mode `0600`, hashed with `hashlib.scrypt`.
 
 **Three roles, not a permission system:**
@@ -179,10 +172,7 @@ Stored in `~/.rc-repro/users`, mode `0600`, hashed with `hashlib.scrypt`.
 | `member` | everyday use — create, seed, load-test, tear down |
 | `readonly` | look, but not touch — and **not** read logs or env vars, which carry LDAP bind passwords and OAuth client secrets |
 
-A `member` may set `--rc-image`, `--reg-token` and `--bind`: they can already create
-and destroy workspaces, so withholding the interface their own listens on would be
-an inconsistent ladder rather than a boundary. Two box-level policies change that
-where an account is not the same thing as trust:
+A `member` may set `--rc-image`, `--reg-token` and `--bind`:
 
 ```bash
 rc-repro config set gui.create_policy admin      # only admins may set those three
@@ -190,19 +180,9 @@ rc-repro config set gui.destroy_policy anyone    # members may delete anyone's w
 rc-repro config set bind_host 0.0.0.0            # one decision instead of per-create
 ```
 
-They default opposite ways on purpose: a create field only affects the workspace
-being created, while destroying someone else's loses a colleague's work.
-
-**Signing in** is throttled by address — ten failures in sixty seconds and the login
-stops spending CPU on that address. There is deliberately no per-*account* lockout:
-anyone who can reach the port could then lock out a named colleague, and names are
-not secret here. Failures are recorded instead (`rc-repro audit --kind signin`). An
-unknown username performs the same hash derivation as a known one, so response time
-cannot be used to enumerate who exists.
-
 Sessions are server-side and revocable: sign-out ends one, changing or removing an
 account ends every session it minted, and each person can see their own from the
-account menu. There is no MFA — SSO in front is the upgrade if that matters.
+account menu. 
 
 ## Reaching it from somewhere else
 
@@ -223,56 +203,18 @@ Two flags do the work, and they answer different questions:
 
 - **`--allow-host`** is a **DNS-rebinding guard**: whatever you type in the address
   bar has to be named here, or the request is a 403. Repeatable; `*` accepts any
-  host, which is fine on a throwaway network and nowhere else. This is the one
-  people miss when a proxy forwards its own `Host` and every request 403s.
+  host. This is the one people miss when a proxy forwards its own `Host` and every request 403s.
 - **`--trust-proxy <address-or-CIDR>`** says *this peer terminates TLS, believe its
   `X-Forwarded-Proto`/`-For`*. Without it rc-repro cannot tell the browser's hop is
   https, so it will not mark the session cookie `Secure` and the sign-in page warns
   about a connection that is actually encrypted. Name the proxy's address, not
   `0.0.0.0`, unless nothing else can reach the port.
 
-`--insecure` only asserts that somebody, somewhere, is handling it. It is
-**deprecated**: it silences the refusal and nothing else — the cookie stays
-non-`Secure` and the false warning stays on the page. Prefer `--trust-proxy`
-whenever something in front really is doing TLS.
+> Run `rc-repro users add <name>` first. The one-time setup link is offered on a loopback bind only.
 
-> **No accounts + a reachable interface = refused.** rc-repro will not hand out a
-> bootstrap credential over the network. Run `rc-repro users add <name>` first. The
-> one-time setup link is offered on a loopback bind only.
-
-## What is on screen
-
-- A **rail** down the left listing every workspace — version, port, owner, state —
-  with filter, status and sort.
-- A **stage** in the middle: **Home** (what needs you, what is running, how much
-  memory is left, recent activity), or a workspace with **Overview / Logs /
-  Containers / Env vars / Backups**, a live CPU/RAM chart, and links to Rocket.Chat
-  and every sidecar.
-- An **action pane** on the right, grouped by intent: put data in it (seed, import
-  a customer's settings), measure it (load test, capacity, attach monitoring),
-  connect to it (PAT and Token, an API console), keep or move it (back up, upgrade,
-  hand over, delete).
-- **Activity** — long jobs keep running when you navigate away and are reachable
-  again from here, with who ran each one. **Scenarios** — what each preset adds and
-  what you must do to use it. **Environment check** behind the docker chip.
 
 Everything the GUI does is a CLI command underneath, and every action is recorded
-against the account that took it.
-
-## Who did what
-
-```
-2026-08-07T09:12:44+00:00<TAB>alice<TAB>up<TAB>alice-rc8-5-1<TAB>session<TAB>ok
-```
-
-Appended to `~/.rc-repro/audit.log` — a file, because on a shared box "who did
-this" has to survive a restart. Read it with `rc-repro audit`.
-
-**The CLI's idea of who you are is not authenticated**: it uses your login name if
-it matches an account, or `RC_REPRO_USER`. That is enough for attribution among
-colleagues; it is not a boundary, and the log mixes a verified GUI identity with an
-asserted CLI one. Anyone with a shell on the box is already in the docker group, so
-the roles bound the GUI — the surface people reach remotely — and nothing else.
+against the account that took it and appended to `~/.rc-repro/audit.log` — a file. Read it with `rc-repro audit`.
 
 ## Your own workspaces
 
@@ -285,12 +227,6 @@ NAME                 OWNER        RC        MONGO   PORT   STATE      URL
 *alice-rc8-5-1       alice        8.5.1     8.0     3000   running    …
  bob-rc8-5-1         bob          8.5.1     8.0     3001   running    …
 ```
-
-The OWNER column appears only when a workspace has one, so single-user output is
-unchanged. **Everyone can see and act on everything** — support engineers hand
-tickets over and cover for each other. The guardrail is that destroying someone
-else's data names them first, in the CLI prompt and the GUI confirm, and still says
-so under `--yes`.
 
 ## Keeping it running
 
@@ -395,7 +331,7 @@ project, so it never ingests your others.
 workspace that needs one.
 
 ```bash
-# A real name, with a Let's Encrypt certificate
+# A domain name, with a Let's Encrypt certificate
 rc-repro up -v 8.5.1 --domain t1234.example.com --email you@example.com
 
 # No domain, no internet: rc-repro's own CA
@@ -404,14 +340,8 @@ rc-repro up -v 8.5.1 --https            # https://<name>.rcrepro.localhost
 ```
 
 The email is remembered (`rc-repro config set acme.email …`). Rocket.Chat's
-`ROOT_URL` becomes the https URL, which is what makes OAuth/SAML redirects, `Secure`
-cookies and mixed-content cases behave like a customer's workspace. Add **one
-wildcard DNS record** (`*.example.com` → the box) and no workspace needs a record
-again.
+`ROOT_URL` becomes the https URL, which is what makes OAuth/SAML redirects.
 
-**What it costs.** HTTPS is a runtime property: gaining or losing a name writes or
-deletes a route file and **no container is rebuilt**. Workspaces still cannot reach
-each other — the edge joins each private network rather than merging them. But
 **shared fate is real**: while the edge is down, every https name on the box is
 unreachable, which is why `doctor` calls a stopped edge a failure rather than a
 warning.
@@ -425,18 +355,6 @@ rc-repro edge stop       # frees :80 and :443
 workspace — a route it cannot reach answers **502** rather than erroring, and
 nothing else would tell you.
 
-## Before it can work
-
-You provide a domain that already resolves here with **TCP/443 reachable from the
-internet**; rc-repro provides the certificate. It does not check your DNS or
-routing — it cannot see a tunnel or a firewall from inside the process.
-
-Let's Encrypt validates by **connecting to your domain on 443**, so if anything else
-on the path terminates 443 (Cloudflare's orange cloud, a managed lab, a PaaS front
-end) the challenge never arrives and Traefik keeps serving its own self-signed
-certificate. `rc-repro tls-status --name X` makes a real connection and reports what
-is actually being served.
-
 <details>
 <summary><b>dns-01 — the way round all of that, and what unlocks a wildcard</b></summary>
 
@@ -448,41 +366,6 @@ mkdir -p ~/.rc-repro/acme && chmod 700 ~/.rc-repro/acme
 printf 'CF_DNS_API_TOKEN=%s\n' "$TOKEN" > ~/.rc-repro/acme/dns.env
 chmod 600 ~/.rc-repro/acme/dns.env
 ```
-
-The provider is inferred from the variable names (`CF_*`, `AWS_*`, `DO_AUTH_TOKEN`,
-`HETZNER_*`, …); any of [lego's providers](https://go-acme.github.io/lego/dns/)
-works, or name one with `rc-repro config set acme.dns_provider <name>`. Credentials
-are mounted as an `env_file`, never passed on a command line, and never printed.
-
-The same token lets the edge obtain **one `*.example.com` certificate** instead of
-one per name — worth it against Let's Encrypt's limit of 50 per registered domain
-per 7 days, which rc-repro counts and warns as you approach. A wildcard covers
-exactly one label.
-
-**Rehearsing:** `rc-repro config set acme.staging true` uses the staging CA (5
-certificates per hostname per 7 days is easy to burn while getting DNS right). A
-browser warning on a staging certificate *is* the success signal. ACME state lives
-in `~/.rc-repro/acme/`, outside any workspace, so `down --volumes` can never force
-a re-issue.
-</details>
-
-**Good to know.** `up --wait` only proves Rocket.Chat booted — the certificate is
-requested afterwards, so `tls-status` is the check. Internal calls (`api`, seeding,
-load tests) still use the plain port and need no CA. Workspaces stay bound to
-loopback, including `--domain` ones; only the edge is published. `--https` names do
-not work on phones (no CA, no `.localhost`). And **repros run `admin`/`admin123`** —
-do not leave a publicly reachable one running, since the hostname appears in public
-certificate-transparency logs within minutes.
-
-## A preset console behind somebody else's HTTPS
-
-Preset consoles are published on plain http ports. Put a TLS-terminating proxy in
-front of one and only **Keycloak** (`oidc`, `saml`) has trouble: it builds
-*absolute* URLs, so an https page requests http resources and the browser blocks
-them. rc-repro sets `KC_PROXY_HEADERS=xforwarded` so Keycloak believes the proxy's
-`X-Forwarded-Proto`/`-Host`. Nothing is needed from you — but the proxy **must**
-send those headers; a bare TCP forward (`kubectl port-forward`, `ssh -L`) does not.
-MinIO and Mailpit use relative URLs and are unaffected.
 
 ---
 
@@ -559,17 +442,17 @@ Bulk documents bypass RC's hooks: bulk users are **credential-less** and message
 fire no notifications or threading. Use `--scale` for scale behaviour and the REST
 seed for feature behaviour.
 
-## A customer's configuration
+## support dump configuration
 
 ```bash
 rc-repro config-import ./support-dump/8.5.0-settings.json --name test --dry-run
 rc-repro config-import ./8.5.0-settings.json --name test --only Livechat,LDAP
 ```
 
-Applies the settings the customer actually changed. Deliberately skips **redacted
+Applies the settings from the suport dump. Deliberately skips **redacted
 secrets** (listing them so you can set them by hand) and **identity settings** that
 would break or pollute a local repro (`Site_Url`, `Enterprise_License`, `Assets_*`,
-cloud registration). Custom OAuth providers are pre-created so their settings apply.
+cloud registration).
 
 ## Backup, restore, upgrade
 
