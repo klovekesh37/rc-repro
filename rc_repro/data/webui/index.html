@@ -19,7 +19,7 @@
       <button id="btn-scenarios" class="toplink">Scenarios</button>
       <button id="btn-bench" class="toplink">Benchmark</button>
       <button id="btn-refresh" class="toplink">Refresh</button>
-      <button id="theme-toggle" class="chip" title="Switch between the light and dark theme">theme</button>
+      <button id="theme-toggle" class="chip iconbtn" title="Switch between the light and dark theme"></button>
       <!-- The account menu. Clicking the name used to open the sessions DIALOG,
            which meant "sign out" and "change your password" were behind a modal
            about something else. A menu is what a name in a corner is for. -->
@@ -114,31 +114,6 @@
         <label><input type="checkbox" name="wait" checked> Wait until ready</label>
       </div>
 
-      <!-- HTTPS. A flag, not a preset: --preset is single-valued, so a tls preset
-           would exclude oidc/saml/livechat, which are the ones that need it. -->
-      <details class="adv" id="create-https-block">
-        <summary>HTTPS (serve over TLS)</summary>
-        <label>Certificate
-          <select name="https_mode" id="https-mode">
-            <option value="">Off — plain http://localhost:PORT</option>
-            <option value="acme">Let's Encrypt — a domain that already points here</option>
-            <option value="local">Local certificate — offline, no domain (run `rc-repro trust-ca` once)</option>
-          </select>
-        </label>
-        <p class="hint" id="https-mode-hint"></p>
-
-        <label class="https-acme" hidden>Domain
-          <input name="domain" placeholder="rc1.example.com"></label>
-        <label class="https-acme" hidden>Contact email for Let's Encrypt
-          <input name="acme_email" type="email" placeholder="you@example.com"></label>
-        <p class="hint https-acme" hidden>The same two values the official
-          Rocket.Chat compose asks for (<code>DOMAIN</code> and
-          <code>LETSENCRYPT_EMAIL</code>). Traefik requests the certificate in the
-          background; check it with <b>Check TLS</b> once the workspace is up.<br>
-          The domain has to resolve to this host with port 443 reachable — Let's
-          Encrypt validates by connecting to it. How you arrange that is up to you.</p>
-      </details>
-
       <details class="adv">
         <summary>Advanced options</summary>
         <label>Name (blank = derived) <input name="name" placeholder="e.g. rc8-5-1-ldap"></label>
@@ -161,6 +136,33 @@
           <label><input type="checkbox" name="pin"> Pin (persistent + set as default)</label>
           <label><input type="checkbox" name="offline"> Offline (skip live version lookup)</label>
           <label><input type="checkbox" name="no_pull"> Don't pull images first</label>
+        </div>
+
+        <!-- HTTPS lives here rather than in a disclosure of its own. It is one more
+             thing about how the workspace is built, and two sibling twisties made
+             the form look like it had two Advanced sections. A flag, not a preset:
+             --preset is single-valued, so a tls preset would exclude oidc/saml/
+             livechat, which are the ones that need it. -->
+        <div class="fgroup" id="create-https-block">
+          <span class="fgroup-t">HTTPS</span>
+          <label>Certificate
+            <select name="https_mode" id="https-mode">
+              <option value="">Off — plain http://localhost:PORT</option>
+              <option value="acme">Let's Encrypt — a domain that already points here</option>
+              <option value="local">Local certificate — offline, no domain (run `rc-repro trust-ca` once)</option>
+            </select>
+          </label>
+          <p class="hint" id="https-mode-hint"></p>
+          <label class="https-acme" hidden>Domain
+            <input name="domain" placeholder="rc1.example.com"></label>
+          <label class="https-acme" hidden>Contact email for Let's Encrypt
+            <input name="acme_email" type="email" placeholder="you@example.com"></label>
+          <p class="hint https-acme" hidden>The same two values the official
+            Rocket.Chat compose asks for (<code>DOMAIN</code> and
+            <code>LETSENCRYPT_EMAIL</code>). Traefik requests the certificate in the
+            background; check it with <b>Check TLS</b> once the workspace is up.<br>
+            The domain has to resolve to this host with port 443 reachable — Let's
+            Encrypt validates by connecting to it. How you arrange that is up to you.</p>
         </div>
       </details>
       <menu>
@@ -397,7 +399,7 @@
     <p class="hint">Everyone here can sign in to this server. Roles bound the
       <b>GUI</b> only — anyone with a shell on this box is already in the docker
       group, so a readonly user with an ssh key is not readonly.</p>
-    <div id="people-body" class="plan"></div>
+    <div id="people-body" class="people"></div>
     <div class="row2" id="people-add">
       <input id="new-user" class="input" placeholder="name" aria-label="new user name">
       <select id="new-role" class="input" aria-label="role">

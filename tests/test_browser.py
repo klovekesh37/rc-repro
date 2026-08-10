@@ -625,6 +625,22 @@ def test_the_theme_is_light_by_default_and_the_choice_survives_a_reload(serve, p
         page.reload()
         page.wait_for_selector("#repros")
         assert page.get_attribute("html", "data-theme") == "dark", "the choice was forgotten"
+
+        # The control is a drawn mark now, and it shows where the click GOES rather
+        # than where you are: on a dark page it is a sun. Since it has no text, the
+        # accessible name is the only name it has — so that is asserted, not the art.
+        btn = page.locator("#theme-toggle")
+        assert btn.inner_text().strip() == "", "the toggle went back to a word"
+        assert btn.locator("svg").count() == 1
+        assert btn.get_attribute("aria-label") == "Switch to the light theme"
+        assert btn.locator("circle").count() == 1, "a dark page should offer the sun"
+        page.click("#theme-toggle")
+        assert btn.get_attribute("aria-label") == "Switch to the dark theme"
+        assert btn.locator("circle").count() == 0, "a light page should offer the moon"
+        # and the mark follows the theme's ink rather than carrying its own colour
+        assert page.eval_on_selector(
+            "#theme-toggle svg", "e => getComputedStyle(e).stroke") == \
+            page.eval_on_selector("#theme-toggle", "e => getComputedStyle(e).color")
         assert page.errors == [], page.errors
 
 
@@ -711,6 +727,103 @@ def test_a_down_workspace_is_something_home_asks_you_about(serve, page, monkeypa
         assert page.errors == [], page.errors
 
 
+def test_people_rows_have_their_own_shape_not_activitys(serve, page, monkeypatch):
+    """People borrowed `.jobrow`, which is four fixed cells for Activity — and a
+    person needs six. Every row landed out of step with the one above it the
+    moment Activity's grid was tightened.
+
+    Also: no role PILL beside the role SELECT. The select already says which role
+    this is, and saying it twice is not emphasis.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    usersvc.add("bob", PASSWORD, role="member")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#whoami:not([hidden])")
+        page.click("#whoami")
+        page.wait_for_selector("#me-menu:not([hidden])")
+        page.click("#me-people")
+        page.wait_for_selector("#people-dialog[open]")
+        page.wait_for_function("() => document.querySelectorAll('.prow').length >= 2")
+
+        assert page.locator("#people-dialog .jobrow").count() == 0, \
+            "People is wearing Activity's row again"
+        assert page.locator("#people-dialog .jstatus").count() == 0, \
+            "the role is shown twice — once as a pill and once as the select"
+        row = page.locator(".prow", has_text="bob").first
+        assert row.locator("select").input_value() == "member"
+        assert row.locator("button", has_text="reset").count() == 1
+        assert row.locator("button", has_text="remove").count() == 1
+        # every row has the same number of cells, which is what lets them line up
+        counts = page.eval_on_selector_all(
+            ".prow", "rs => rs.map(r => r.children.length)")
+        assert len(set(counts)) == 1, counts
+        assert page.errors == [], page.errors
+
+
+def test_https_is_part_of_advanced_options_not_a_section_beside_it(serve, page,
+                                                                   monkeypatch):
+    """Two sibling twisties made the create form look like it had two Advanced
+    sections. HTTPS is one more thing about how the workspace gets built, so it is
+    a titled group inside Advanced options — and its fields still work, which is
+    the half a move like this quietly breaks.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#btn-new")
+        page.click("#btn-new")
+        page.wait_for_selector("#create-dialog[open]")
+
+        assert page.locator("#create-dialog details.adv").count() == 1, \
+            "the form has more than one Advanced disclosure again"
+        assert page.eval_on_selector(
+            "#create-https-block", "el => !!el.closest('details.adv')"), \
+            "the HTTPS group is not inside Advanced options"
+        # collapsed by default, so it is not in anybody's way
+        assert page.eval_on_selector("#create-dialog details.adv", "d => d.open") is False
+
+        page.eval_on_selector("#create-dialog details.adv", "d => { d.open = true; }")
+        # and the mode selector still drives the Let's Encrypt fields
+        assert page.locator("input[name=domain]").is_hidden()
+        page.select_option("#https-mode", "acme")
+        assert page.locator("input[name=domain]").is_visible()
+        assert page.locator("input[name=acme_email]").is_visible()
+        page.select_option("#https-mode", "local")
+        assert page.locator("input[name=domain]").is_hidden()
+        assert page.text_content("#https-mode-hint").strip() != ""
+        assert page.errors == [], page.errors
+
+
+def test_a_background_poll_does_not_navigate_the_page_for_you(serve, page,
+                                                              monkeypatch):
+    """refreshHome() repainted the stage whenever no workspace was SELECTED — and
+    Activity and Scenarios are stage views with nothing selected. So the timer
+    dropped Home on top of whatever you were reading, seconds after you opened it:
+    the page appearing to navigate itself.
+
+    `!SELECTED` was never the same question as "is Home on screen". render() has
+    always asked the right one; this is the same fix, in the place that missed it.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#whoami:not([hidden])")
+        for opener, marker in (("#btn-jobs", "#act-tabs"), ("#btn-scenarios", ".hcard.scen")):
+            page.click(opener)
+            page.wait_for_selector(marker)
+            page.evaluate("() => refreshHome(true)")
+            page.wait_for_timeout(400)
+            assert page.locator(marker).count() >= 1, \
+                f"a background poll replaced {opener} with Home"
+            assert "Good " not in page.text_content(".home-head h1"), \
+                "the greeting is on screen — Home won"
+        assert page.errors == [], page.errors
+
+
 def test_activity_and_a_workspace_are_different_views_of_the_stage(serve, page,
                                                                    monkeypatch):
     """Opening Activity must not silently deselect the workspace you were on, and
@@ -737,6 +850,215 @@ def test_activity_and_a_workspace_are_different_views_of_the_stage(serve, page,
         page.wait_for_selector("#d-body")
         assert page.locator("#act-tabs").count() == 0, "picking a workspace leaves Activity"
         assert page.errors == [], page.errors
+
+
+def test_the_one_button_a_screen_is_asking_for_carries_the_accent(serve, page,
+                                                                  monkeypatch):
+    """This stylesheet's own rule is that colour is a signal — green = running,
+    blue = you can click it — and the primary button was `--ink`: in dark, a white
+    slab, the brightest thing on the page and the only thing on it saying nothing.
+
+    Asserted as "the accent, and specifically not the text colour", because the
+    failure mode is someone reaching for maximum contrast again.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#btn-new")
+        got = page.eval_on_selector("#btn-new", """el => {
+            const cs = getComputedStyle(el), root = getComputedStyle(document.documentElement);
+            const swatch = (v) => { const d = document.createElement('div');
+              d.style.color = v.trim(); document.body.append(d);
+              const c = getComputedStyle(d).color; d.remove(); return c; };
+            return { bg: cs.backgroundColor,
+                     accent: swatch(root.getPropertyValue('--accent-fill')),
+                     ink: swatch(root.getPropertyValue('--ink')),
+                     shadow: cs.boxShadow };
+        }""")
+        assert got["bg"] == got["accent"], f"primary button is {got['bg']}, not the accent"
+        assert got["bg"] != got["ink"], "the primary button is raw luminance again"
+        assert got["shadow"] != "none", "and it does not sit above the page"
+        assert page.errors == [], page.errors
+
+
+def test_a_burst_of_log_lines_costs_one_layout_not_one_per_line(serve, page,
+                                                                monkeypatch):
+    """Every arriving line used to rescan the whole 3000-entry buffer to rebuild
+    the service dropdown, append a row, and then READ scrollHeight to follow —
+    which forces a synchronous layout. The stream opens with tail=300, so that was
+    300 forced reflows back to back before a chatty container had even started.
+    That is the one-to-two second freeze, and the scroll thrashing with it.
+
+    Driven through the page's own handler with a burst of 400 lines, and asserted
+    on the thing that actually caused it: how many times the DOM was touched.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click(".wrow")
+        page.wait_for_selector("#d-body")
+        page.locator(".tab", has_text="Logs").click()
+        page.wait_for_selector("#logview")
+
+        got = page.evaluate("""async () => {
+            const box = document.querySelector('#logview');
+            let appends = 0;
+            const real = box.append.bind(box);
+            box.append = (...a) => { appends++; return real(...a); };
+            const t0 = performance.now();
+            for (let i = 0; i < 400; i++) {
+              logv.buf.push({ ts: '12:00:00', level: 'info',
+                              service: 'rocketchat', msg: 'line ' + i });
+              queueLog(logv.buf[logv.buf.length - 1]);
+            }
+            const queued = performance.now() - t0;
+            await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+            return { appends, queued, rows: box.childElementCount };
+        }""")
+        assert got["rows"] >= 400, "the lines did not reach the view"
+        # One insertion for the whole burst, not four hundred.
+        assert got["appends"] <= 2, f"{got['appends']} DOM insertions for 400 lines"
+        assert page.errors == [], page.errors
+
+
+def test_scrolling_up_in_the_logs_offers_one_press_back_to_the_latest(serve, page,
+                                                                      monkeypatch):
+    """Scrolling up detaches you from the stream — otherwise it drags you back
+    mid-sentence — so there has to be one press that returns. It counts what
+    arrived while you were reading, which is the thing you want to know before
+    deciding to go back at all.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click(".wrow")
+        page.wait_for_selector("#d-body")
+        page.locator(".tab", has_text="Logs").click()
+        page.wait_for_selector("#logview")
+        feed = """(n) => new Promise(r => {
+            for (let i = 0; i < n; i++) {
+              const e = { ts: '12:00:00', level: 'info', service: 'rocketchat',
+                          msg: 'line ' + i };
+              logv.buf.push(e); queueLog(e);
+            }
+            requestAnimationFrame(() => requestAnimationFrame(r));
+        })"""
+        page.evaluate(feed, 200)
+        # at the bottom, following: nothing to offer
+        assert page.locator("#log-jump").is_hidden()
+
+        page.evaluate("() => { document.querySelector('#logview').scrollTop = 0; }")
+        page.wait_for_selector("#log-jump:not([hidden])")
+        assert page.evaluate("() => logv.follow") is False, \
+            "the stream is still dragging the reader back"
+        page.evaluate(feed, 5)
+        assert page.locator("#log-jump").inner_text() == "↓ 5 new"
+
+        page.click("#log-jump")
+        page.wait_for_selector("#log-jump", state="hidden")
+        assert page.evaluate("() => logv.follow") is True, "one press did not re-attach"
+        assert page.evaluate(
+            "() => { const b = document.querySelector('#logview');"
+            "        return b.scrollHeight - b.scrollTop - b.clientHeight < 24; }")
+        assert page.errors == [], page.errors
+
+
+def test_a_running_workspace_on_home_offers_both_places_it_could_mean(serve, page,
+                                                                      monkeypatch):
+    """Two destinations live in this row and they are genuinely different: the row
+    opens the WORKSPACE (rc-repro's page about it) and Open goes to Rocket.Chat
+    itself. The old row only did the first, which made reaching the actual chat
+    server — the thing everybody is here for — a two-step.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector(".wsrow")
+        row = page.locator(".wsrow").first
+        assert "t1234" in row.locator(".wsrow-t b").inner_text()
+        assert row.locator(".wsrow-m").inner_text() == "7.4.1 · base · :3001"
+        assert "2h" in row.locator(".wsrow-up").inner_text()
+
+        # Open leaves for Rocket.Chat, in a new tab
+        opener = row.locator("a", has_text="Open")
+        assert opener.get_attribute("target") == "_blank"
+        assert opener.get_attribute("href").endswith(":3001/"), \
+            opener.get_attribute("href")
+
+        # and the row itself stays inside rc-repro
+        row.locator(".wsrow-main").click()
+        page.wait_for_selector("#d-body")
+        assert "t1234" in page.text_content(".d-head")
+        assert page.errors == [], page.errors
+
+
+def test_a_card_is_not_the_same_colour_as_the_thing_it_stands_on(serve, page,
+                                                                 monkeypatch):
+    """The stage carried `--panel` and so does every card on it, which made a card
+    an outline drawn on a field of its own colour — and left 242px below the last
+    one reading as a hole in the panel rather than as page.
+
+    The stage is ground now. The property is simply that the two differ, which is
+    what "in a box" has to mean.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_function(
+            "() => document.querySelector('#detail .hcard') !== null")
+        got = page.evaluate("""() => {
+            const seen = (el) => {           // the first ancestor that paints
+              for (let n = el; n; n = n.parentElement) {
+                const c = getComputedStyle(n).backgroundColor;
+                if (c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent') return c;
+              }
+              return null;
+            };
+            const card = document.querySelector('#detail .hcard');
+            return { card: getComputedStyle(card).backgroundColor,
+                     ground: seen(document.querySelector('#detail')),
+                     rail: getComputedStyle(document.querySelector('.rail')).backgroundColor };
+        }""")
+        assert got["card"] != got["ground"], \
+            f"card and its ground are both {got['card']} — the box is only a border"
+        # the rail stays a surface; it is the well between the panes that is ground
+        assert got["rail"] == got["card"], "the rail stopped agreeing with the cards"
+        assert page.errors == [], page.errors
+
+
+def test_reduced_motion_keeps_every_state_and_removes_the_travel(serve, browser,
+                                                                 monkeypatch):
+    """The polish pass put a transition on everything you can touch. A person who
+    has asked their OS for less motion must still get every hover and press state —
+    just instantly. Durations rather than `none`, so `transitionend` still fires.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    ctx = browser.new_context(reduced_motion="reduce")
+    pg = ctx.new_page()
+    pg.errors = []
+    pg.on("pageerror", lambda e: pg.errors.append(str(e)))
+    try:
+        with serve() as s:
+            _sign_in(pg, s.url)
+            pg.wait_for_selector("#btn-new")
+            dur = pg.eval_on_selector("#btn-new",
+                                      "el => getComputedStyle(el).transitionDuration")
+            # every declared duration collapses; Chromium prints 1e-05s for .01ms
+            assert all(float(d.strip().rstrip("s")) <= 0.001 for d in dur.split(",")), dur
+            # the state itself is untouched — still the accent, still raised
+            assert pg.eval_on_selector(
+                "#btn-new", "el => getComputedStyle(el).boxShadow") != "none"
+            assert pg.errors == [], pg.errors
+    finally:
+        ctx.close()
 
 
 def test_the_action_pane_names_the_thing_not_one_of_its_parts(serve, page, monkeypatch):

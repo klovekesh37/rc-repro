@@ -435,7 +435,46 @@ async function refreshHome(force) {
   ]);
   if (cap) HOME.cap = cap;
   HOME.audit = (audit && audit.lines) || [];
-  if (!SELECTED) renderHome();
+  // `!SELECTED` is not the same question as "is Home on screen". Activity and
+  // Scenarios are stage views with no workspace selected, so this timer repainted
+  // the stage with Home underneath whatever you were reading -- the page appearing
+  // to navigate itself, seconds after you opened it. render() has always asked the
+  // right question (VIEW === "home"); this never got the same fix.
+  if (VIEW === "home" && !SELECTED) renderHome();
+}
+
+// One running workspace, on Home. Two destinations live in this row and they are
+// genuinely different places: the row opens the WORKSPACE (this tool's page about
+// it), and Open goes to Rocket.Chat itself. A row that only did the first made
+// getting to the actual chat server a two-step, which is the one thing everybody
+// is here for.
+//
+// The status tile is not decoration in a list where everything is running: the
+// dot is the HEALTH, so a container that is up but failing its healthcheck is
+// amber here rather than looking identical to a good one.
+function runningRow(r) {
+  const health = String(r.health || "").toLowerCase();
+  const bad = health && !["healthy", "running", "starting"].includes(health);
+  const row = el("div", { class: "wsrow" });
+  row.append(el("button", {
+    class: "wsrow-main", onclick: () => selectRepro(r.name),
+    title: `Open ${r.name} in rc-repro`,
+  },
+    el("span", { class: "wsrow-tile" + (bad ? " bad" : "") }),
+    el("span", { class: "wsrow-t" },
+      el("b", {}, r.name),
+      el("span", { class: "wsrow-m" },
+        `${r.rc_version} · ${r.preset || "default"} · :${r.host_port}`))));
+  const right = el("div", { class: "wsrow-r" });
+  if (r.uptime) {
+    right.append(el("span", { class: "wsrow-up" + (bad ? " bad" : "") },
+      r.uptime, el("i", {}, bad ? health : "uptime")));
+  }
+  right.append(el("a", { class: "btn small", href: localUrl(r.public_url || r.root_url),
+                         target: "_blank", rel: "noreferrer",
+                         title: "Open Rocket.Chat itself, in a new tab" }, "Open"));
+  row.append(right);
+  return row;
 }
 
 function capacityCard(cap) {
@@ -520,15 +559,11 @@ function renderHome() {
   }
 
   const rcard = el("div", { class: "hcard" },
-    el("div", { class: "hcard-h" }, el("span", { class: "lbl" }, "Running now")));
+    el("div", { class: "hcard-h" }, el("span", { class: "lbl" }, "Running now"),
+      el("span", { class: "lbl-n" }, `${running.length} of ${ALL_REPROS.length}`)));
   if (running.length) {
     const grid = el("div", { class: "mini" });
-    for (const r of running) {
-      grid.append(el("button", { class: "minicard", onclick: () => selectRepro(r.name) },
-        el("span", { class: "n" }, r.name),
-        el("span", { class: "m" }, `${r.rc_version} · ${r.preset} · :${r.host_port}`),
-        el("span", { class: "m up" }, r.uptime || "")));
-    }
+    for (const r of running) grid.append(runningRow(r));
     rcard.append(grid);
   } else {
     rcard.append(el("p", { class: "empty" }, canWrite()
@@ -810,9 +845,9 @@ function renderTab() {
       const card = el("div", { class: "panelcard" },
         el("div", { class: "panelcard-h" },
           el("span", { class: "section-label flat" }, "Resource usage (live)"),
-          el("span", { class: "chart-legend" },
-            el("span", {}, el("span", { class: "sw", style: "background:var(--blue)" }), "CPU % (left)"),
-            el("span", {}, el("span", { class: "sw", style: "background:var(--green)" }), "Mem MB (right)"))),
+          // No legend: each panel holds one series and its own title names it.
+          // A legend here would only restate the two labels already on the chart.
+          el("span", { class: "chart-note" }, `every ${STATS_INTERVAL_S}s`)),
         el("div", { class: "chart-box" }, el("div", { id: "chart" })));
       body.append(card);
       startStats();
@@ -1097,7 +1132,43 @@ const LEVELS = ["trace", "debug", "info", "warn", "error", "fatal"];
 const PINO = { 10: "trace", 20: "debug", 30: "info", 40: "warn", 50: "error", 60: "fatal" };
 const MONGOSEV = { D: "debug", I: "info", W: "warn", E: "error", F: "fatal" };
 const LOG_MAX = 3000;
-const logv = { buf: [], min: "info", svc: "", q: "", follow: true };
+const logv = { buf: [], min: "info", svc: "", q: "", follow: true,
+               pending: [], frame: 0, unseen: 0, onUnseen: null };
+
+// Lines arrive one WebSocket message at a time, and each one used to do three
+// things that cost the whole list: rescan the entire 3000-entry buffer to rebuild
+// the service dropdown, append a row, and then READ scrollHeight to follow --
+// which forces a synchronous layout. The stream opens with `tail=300`, so that is
+// 300 forced reflows back to back before a chatty container has even started, and
+// then one per line after it. That is the one-to-two second freeze, and the
+// thrash of the view jumping per line instead of settling once.
+//
+// So: parse and buffer immediately (cheap), and do the DOM once per frame.
+function flushLogs() {
+  logv.frame = 0;
+  const batch = logv.pending;
+  logv.pending = [];
+  const box = $("#logview");
+  if (!box || !batch.length) return;
+  const frag = document.createDocumentFragment();
+  for (const e of batch) if (passes(e)) frag.append(logRow(e));
+  // Once per frame rather than once per line, and still read from the buffer, so
+  // a service that has aged out of it still stops being offered.
+  refreshServiceOptions();
+  if (!frag.childElementCount) return;
+  const added = frag.childElementCount;
+  box.append(frag);
+  // The buffer is capped and the DOM has to be capped with it, or rows
+  // accumulate without limit on a repro that never stops talking.
+  while (box.childElementCount > LOG_MAX) box.removeChild(box.firstChild);
+  if (logv.follow) { box.scrollTop = box.scrollHeight; return; }
+  logv.unseen += added;
+  if (logv.onUnseen) logv.onUnseen();
+}
+function queueLog(e) {
+  logv.pending.push(e);
+  if (!logv.frame) logv.frame = requestAnimationFrame(flushLogs);
+}
 
 function parseLogLine(line) {
   const bar = line.indexOf("|");
@@ -1160,8 +1231,12 @@ function refreshServiceOptions() {
 
 function renderLogList() {
   const box = $("#logview"); if (!box) return;
+  // One fragment, one insertion: appending 3000 rows straight into a live node
+  // relaid the list 3000 times, which is the same defect as the stream had.
+  const frag = document.createDocumentFragment();
+  for (const e of logv.buf) if (passes(e)) frag.append(logRow(e));
   box.innerHTML = "";
-  for (const e of logv.buf) if (passes(e)) box.append(logRow(e));
+  box.append(frag);
   refreshServiceOptions();
   if (logv.follow) box.scrollTop = box.scrollHeight;
 }
@@ -1184,7 +1259,30 @@ function renderLogs(body, d) {
   ctl.append(levelSel, svcSel, search, follow, clear);
   if (d.grafana_url) ctl.append(el("a", { class: "linkchip monitor", href: localUrl(d.grafana_url) + "/d/rcrepro-logs", target: "_blank" }, "Logs in Grafana (Loki)"));
   const box = el("div", { class: "logview", id: "logview" });
-  body.append(ctl, box);
+  // The way back. Scrolling up detaches you from the stream, so there has to be
+  // one press that returns -- and it says how much arrived while you were reading,
+  // which is the thing you actually want to know before you go back.
+  const jump = el("button", { class: "logjump", id: "log-jump", hidden: true,
+    onclick: () => { box.scrollTop = box.scrollHeight; } });
+  const setJump = () => {
+    jump.textContent = logv.unseen ? `↓ ${logv.unseen} new` : "↓ Latest";
+  };
+  setJump();
+  // Following is a PLACE, not a mode you have to remember to switch off. Scroll up
+  // to read something and the stream stops dragging you back; scroll to the bottom
+  // and it picks up again. The checkbox says which, so the state is never a
+  // mystery -- and untangling that is most of what "lots of scrolling" was.
+  box.addEventListener("scroll", () => {
+    const atEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+    if (atEnd === logv.follow) return;
+    logv.follow = atEnd;
+    followCb.checked = atEnd;
+    if (atEnd) logv.unseen = 0;
+    jump.hidden = atEnd;
+    setJump();
+  }, { passive: true });
+  logv.onUnseen = setJump;
+  body.append(el("div", { class: "logbox" }, ctl, box, jump));
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
   // No credential in the URL any more: the session cookie rides along on the
@@ -1195,18 +1293,10 @@ function renderLogs(body, d) {
     const e = parseLogLine(m.data);
     logv.buf.push(e);
     if (logv.buf.length > LOG_MAX) logv.buf.shift();
-    // OUTSIDE the passes() check below, deliberately: a service that only logs at
-    // info still has to appear in the filter while the level is set to error, or
-    // you cannot select the service whose errors you are looking for.
-    refreshServiceOptions();
-    if (passes(e)) {
-      const b = $("#logview");
-      b.append(logRow(e));
-      // The buffer was capped but the DOM was not, so rows accumulated without
-      // limit on a chatty repro. Keep the node count in step with the buffer.
-      while (b.childElementCount > LOG_MAX) b.removeChild(b.firstChild);
-      if (logv.follow) b.scrollTop = b.scrollHeight;
-    }
+    // Buffered unfiltered, deliberately: a service that only logs at info still
+    // has to appear in the filter while the level is set to error, or you cannot
+    // select the service whose errors you are looking for.
+    queueLog(e);
   };
   ws.onclose = () => { if (dstate.logsWS === ws) dstate.logsWS = null; };
 }
@@ -1227,56 +1317,90 @@ function startStats() {
 }
 
 const STATS_INTERVAL_S = 3;
+// A round ceiling that does not throw away the panel. [1,2,2.5,5,10] sent a peak
+// of 1090 MB to an axis of 2000, so the line drew across the middle of an empty
+// box; the finer steps put it at 1500 and the shape is readable again.
 function niceMax(v, floor) {
   v = Math.max(v, floor);
   const pow = Math.pow(10, Math.floor(Math.log10(v)));
-  for (const m of [1, 2, 2.5, 5, 10]) if (m * pow >= v) return m * pow;
+  for (const m of [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10]) if (m * pow >= v) return m * pow;
   return 10 * pow;
 }
-function fmtAgo(s) { return s <= 0 ? "now" : (s >= 60 ? `-${Math.round(s / 60)}m` : `-${s}s`); }
+// Seconds, always. The buffer holds 60 samples at STATS_INTERVAL_S, so this axis
+// can never span more than three minutes -- and switching units inside that range
+// produced "-2m -1m -59s", where the third label is larger than the second it
+// sits to the right of. Fractional minutes ("-1.9m") were no better.
+function fmtAgo(s) { return s <= 0 ? "now" : `-${s}s`; }
 
+/* CPU and memory, as two panels rather than two lines on one plot.
+
+   It was a DUAL-AXIS chart: CPU % scaled to the left edge, MB to the right, both
+   drawn on the same grid. Where those two lines cross, and which one looks
+   higher, is decided entirely by the two independent `niceMax` calls -- so the
+   picture invents a relationship between CPU and memory that is not in the data,
+   and changes it whenever either series happens to peak. Two measures on two
+   scales are two charts.
+
+   Each panel now has one series and one honest axis, they share the time axis at
+   the bottom, and the latest value is written at the end of its own line -- which
+   is the number you actually came for, and it was previously only inferable by
+   eye against an axis. One hue for both: a single series per panel needs no
+   colour to tell it apart from anything, and green is spoken for elsewhere in
+   this interface (green = running). */
 function drawChart() {
   const box = $("#chart"); if (!box) return;
   const pts = dstate.points;
-  const W = 600, H = 220, mL = 34, mR = 46, mT = 14, mB = 24;
-  const x0 = mL, x1 = W - mR, y0 = mT, y1 = H - mB;
-  const cpuMax = niceMax(Math.max(...pts.map((p) => p.cpu), 0), 10);
-  const memMax = niceMax(Math.max(...pts.map((p) => p.mem), 0), 100);
   const n = pts.length;
-  const px = (i) => n < 2 ? x1 : x0 + (i / (n - 1)) * (x1 - x0);
-  const py = (v, max) => y1 - (v / max) * (y1 - y0);
-  // var(), not literals: the chart has to follow the theme like everything else.
-  const MUT = "var(--muted)", GRID = "var(--line)", CPU = "var(--blue)", MEM = "var(--green)";
+  const W = 600, mL = 42, mR = 58, PH = 78, PGAP = 26, TOP = 16, XBAND = 22;
+  const H = TOP + PH + PGAP + PH + XBAND;
+  const x0 = mL, x1 = W - mR;
+  const px = (i) => (n < 2 ? x1 : x0 + (i / (n - 1)) * (x1 - x0));
+  const MUT = "var(--muted)", DIM = "var(--dim)", GRID = "var(--line)";
+  const HUE = "var(--accent-fill)", SURF = "var(--panel)";
 
-  let g = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="height:auto;display:block" font-family="ui-monospace, Menlo, monospace" font-size="10">`;
-  // 3 horizontal levels: 0, mid, top — left labels = CPU, right labels = Mem
-  for (const f of [0, 0.5, 1]) {
-    const y = y1 - f * (y1 - y0);
-    g += `<line x1="${x0}" y1="${y}" x2="${x1}" y2="${y}" stroke="${GRID}"/>`;
-    g += `<text x="${x0 - 5}" y="${y + 3}" fill="${MUT}" text-anchor="end">${(cpuMax * f).toFixed(0)}</text>`;
-    g += `<text x="${x1 + 5}" y="${y + 3}" fill="${MUT}" text-anchor="start">${(memMax * f).toFixed(0)}</text>`;
-  }
-  // vertical time gridlines + labels (5 ticks)
+  let g = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="height:auto;display:block" `
+    + `font-family="ui-monospace, Menlo, monospace" font-size="10" `
+    + `role="img" aria-label="CPU percent and memory in megabytes over the last few minutes">`;
+
+  const panel = (top, key, title, unit, floor, fmt) => {
+    const yTop = top, yBot = top + PH;
+    const max = niceMax(Math.max(...pts.map((p) => p[key]), 0), floor);
+    const py = (v) => yBot - (v / max) * (yBot - yTop);
+    let s = `<text x="${x0}" y="${yTop - 5}" fill="${MUT}">${title}</text>`;
+    // Solid hairlines. Dashed gridlines read as a threshold or a projection when
+    // they are only a grid.
+    for (const f of [0, 0.5, 1]) {
+      const y = yBot - f * (yBot - yTop);
+      s += `<line x1="${x0}" y1="${y}" x2="${x1}" y2="${y}" stroke="${GRID}"/>`;
+      s += `<text x="${x0 - 6}" y="${y + 3}" fill="${DIM}" text-anchor="end">${fmt(max * f)}</text>`;
+    }
+    if (n < 2) {
+      return s + `<text x="${(x0 + x1) / 2}" y="${(yTop + yBot) / 2}" fill="${DIM}" `
+        + `text-anchor="middle">collecting…</text>`;
+    }
+    const line = pts.map((p, i) => `${px(i).toFixed(1)},${py(p[key]).toFixed(1)}`).join(" ");
+    s += `<polygon points="${x0},${yBot} ${line} ${x1},${yBot}" fill="${HUE}" opacity=".10"/>`;
+    s += `<polyline points="${line}" fill="none" stroke="${HUE}" stroke-width="2" `
+      + `stroke-linejoin="round" stroke-linecap="round"/>`;
+    // The end of the line is where the reader looks, so it carries a marker and
+    // the current number. The ring is the surface colour, not a border.
+    const last = pts[n - 1][key], ly = py(last);
+    s += `<circle cx="${x1}" cy="${ly.toFixed(1)}" r="4" fill="${HUE}" stroke="${SURF}" stroke-width="2"/>`;
+    s += `<text x="${x1 + 9}" y="${(ly + 3.5).toFixed(1)}" fill="var(--ink)" font-weight="700">`
+      + `${fmt(last)}<tspan fill="${DIM}" font-weight="400"> ${unit}</tspan></text>`;
+    return s;
+  };
+
+  g += panel(TOP, "cpu", "CPU", "%", 10, (v) => v.toFixed(0));
+  g += panel(TOP + PH + PGAP, "mem", "Memory", "MB", 100, (v) => v.toFixed(0));
+
+  // One time axis under both, because both panels are the same window.
+  const yAx = TOP + PH + PGAP + PH;
   const span = (n - 1) * STATS_INTERVAL_S;
   for (let k = 0; k <= 4; k++) {
     const f = k / 4, x = x0 + f * (x1 - x0);
-    g += `<line x1="${x}" y1="${y0}" x2="${x}" y2="${y1}" stroke="${GRID}" stroke-dasharray="2 3"/>`;
-    g += `<text x="${x}" y="${y1 + 15}" fill="${MUT}" text-anchor="middle">${fmtAgo(Math.round((1 - f) * span))}</text>`;
-  }
-  // axis titles
-  g += `<text x="10" y="${(y0 + y1) / 2}" fill="${MUT}" text-anchor="middle" transform="rotate(-90 10 ${(y0 + y1) / 2})">CPU %</text>`;
-  g += `<text x="${W - 8}" y="${(y0 + y1) / 2}" fill="${MUT}" text-anchor="middle" transform="rotate(90 ${W - 8} ${(y0 + y1) / 2})">MB</text>`;
-
-  if (n >= 2) {
-    const series = (key, max, color) => {
-      const line = pts.map((p, i) => `${px(i).toFixed(1)},${py(p[key], max).toFixed(1)}`).join(" ");
-      const area = `${x0},${y1} ${line} ${x1},${y1}`;
-      return `<polygon points="${area}" fill="${color}" opacity="0.10"/>`
-        + `<polyline points="${line}" fill="none" stroke="${color}" stroke-width="2"/>`;
-    };
-    g += series("mem", memMax, MEM) + series("cpu", cpuMax, CPU);
-  } else {
-    g += `<text x="${(x0 + x1) / 2}" y="${(y0 + y1) / 2}" fill="var(--dim)" text-anchor="middle">collecting…</text>`;
+    g += `<text x="${x}" y="${yAx + 14}" fill="${DIM}" text-anchor="middle">`
+      + `${fmtAgo(Math.round((1 - f) * span))}</text>`;
   }
   box.innerHTML = g + `</svg>`;
 }
@@ -2112,7 +2236,8 @@ async function openJobs(tab) {
   head.append(tabs);
   const body = el("div", { class: "home-body" });
   const card = el("div", { class: "hcard" });
-  card.append(el("p", { class: "hint", id: "jobs-hint" }, ACT_TAB === "running"
+  const cardhead = el("div", { class: "jobs-head" });
+  cardhead.append(el("p", { class: "hint", id: "jobs-hint" }, ACT_TAB === "running"
     ? "Jobs keep running on the server after you leave this page — including across "
       + "a refresh. Click one to reopen its output."
     : (canAdmin()
@@ -2122,14 +2247,15 @@ async function openJobs(tab) {
     el("input", { id: "act-grep", class: "input", placeholder: "filter by action or target…",
                   "aria-label": "filter activity",
                   oninput: () => { if (ACT_TAB === "history") renderHistory($("#jobs-list")); } }),
-    el("label", { class: "logfollow" },
+    el("label", { class: "toggle" },
       el("input", { type: "checkbox", id: "act-denied",
                     onchange: () => { if (ACT_TAB === "history") renderHistory($("#jobs-list")); } }),
-      " refusals only"));
+      "refusals only"));
   filter.hidden = ACT_TAB !== "history";
-  const box = el("div", { id: "jobs-list", class: "plan" });
+  cardhead.append(filter);
+  const box = el("div", { id: "jobs-list", class: "jobs" });
   box.append(el("p", { class: "empty" }, "loading…"));
-  card.append(filter, box);
+  card.append(cardhead, box);
   body.append(card);
   panel.append(head, body);
   if (ACT_TAB === "running") return renderRunning(box);
@@ -2143,17 +2269,18 @@ async function renderRunning(box) {
   box.innerHTML = "";
   if (!rows.length) { box.append(el("div", { class: "empty" }, "No jobs yet.")); return; }
   for (const j of rows) {
-    const row = el("button", {
-      class: "jobrow", type: "button",
-      onclick: () => reopenJob(j),
-    },
-      el("span", { class: "jstatus " + j.status }, j.status),
-      el("span", { class: "jkind" }, jobTitle(j)));
     // The API has returned `actor` since accounts landed and this dropped it on
     // the floor -- which is most of why the shared box could not answer "who?".
-    if (j.actor) row.append(el("span", { class: "jactor" }, j.actor));
-    row.append(el("span", { class: "jage" }, jobAge(j)));
-    box.append(row);
+    const who = el("span", { class: "jmeta" });
+    if (j.actor) who.append(el("span", { class: "jactor" }, j.actor));
+    box.append(el("button", {
+      class: "jobrow", type: "button", onclick: () => reopenJob(j),
+      title: "Reopen this job's output",
+    },
+      el("span", { class: "jstatus " + j.status }, j.status),
+      el("span", { class: "jkind" }, jobTitle(j)),
+      who,
+      el("span", { class: "jage" }, jobAge(j))));
   }
 }
 
@@ -2167,19 +2294,21 @@ async function renderHistory(box) {
   box.innerHTML = "";
   if (!rows.length) { box.append(el("p", { class: "empty" }, "Nothing recorded yet.")); return; }
   for (const r of rows) {
-    const row = el("div", { class: "jobrow" });
-    row.append(el("span", { class: "jstatus " + (r.outcome === "denied" ? "error" : "done") },
-      r.outcome === "denied" ? "denied" : r.kind));
-    row.append(el("span", { class: "jkind" },
-      (r.outcome === "denied" ? "" : "") + r.label));
-    if (r.actor) row.append(el("span", { class: "jactor" }, r.actor));
-    // Only shown when it is NOT a checked session: that is the common, trustworthy
-    // case, and a column that says "session" on every line teaches nothing.
+    const who = el("span", { class: "jmeta" });
+    if (r.actor && r.actor !== "-") who.append(el("span", { class: "jactor" }, r.actor));
+    // Origin is only shown when it is NOT a checked session: that is the common,
+    // trustworthy case, and a column saying "session" on every line teaches
+    // nothing. It rides inside the actor cell so the row keeps four columns.
     if (r.origin && r.origin !== "session") {
-      row.append(el("span", { class: "pill small", title: "how this identity was established" }, r.origin));
+      who.append(el("span", { class: "pill small", title: "how this identity was established" },
+                    r.origin));
     }
-    row.append(el("span", { class: "jage" }, (r.ts || "").slice(0, 19).replace("T", " ")));
-    box.append(row);
+    box.append(el("div", { class: "jobrow" + (r.outcome === "denied" ? " denied" : "") },
+      el("span", { class: "jstatus " + (r.outcome === "denied" ? "error" : "done") },
+        r.outcome === "denied" ? "denied" : r.kind),
+      el("span", { class: "jkind" }, r.label),
+      who,
+      el("span", { class: "jage" }, (r.ts || "").slice(0, 19).replace("T", " "))));
   }
   if (res.truncated) {
     box.append(el("p", { class: "hint" },
@@ -2449,25 +2578,31 @@ async function openPeople() {
   catch (e) { body.innerHTML = ""; body.append(el("p", { class: "empty" }, e.message)); return; }
   body.innerHTML = "";
   for (const u of data.users) {
-    const row = el("div", { class: "jobrow" });
-    row.append(el("span", { class: "jstatus " + (u.role === "admin" ? "done" : "queued") }, u.role));
-    const label = el("span", { class: "jkind" }, u.name === ME ? `${u.name} (you)` : u.name);
+    // Its own row shape rather than Activity's: that one is four fixed cells and
+    // this is six, so borrowing it put every person out of step with the header
+    // above them. And no role PILL beside the role SELECT -- the select already
+    // says which role this is, and saying it twice is not emphasis.
+    const label = el("span", { class: "p-name" }, u.name === ME ? `${u.name} (you)` : u.name);
     // Blank role == admin is the MIGRATION for accounts made before roles existed,
     // not a default. Saying so here is what stops it looking like a mistake.
-    if (u.implicit) label.append(el("span", { class: "yours", title: "role column is blank, which means admin" }, " implicit"));
-    row.append(label);
-    row.append(el("span", { class: "jage" },
-      u.sessions ? `${u.sessions} session${u.sessions === 1 ? "" : "s"}` : "—"));
+    if (u.implicit) {
+      label.append(el("span", { class: "yours", title: "role column is blank, which means admin" },
+                     " implicit"));
+    }
     const sel = el("select", { class: "input", "aria-label": `role for ${u.name}`,
       onchange: (e) => changeRole(u.name, e.target.value) },
       ...data.roles.map((r) => el("option", { value: r, title: ROLE_HELP[r] || "" }, r)));
     sel.value = u.role;
-    row.append(sel);
-    row.append(el("button", { class: "btn small", title: "Generate a new password",
-      onclick: () => resetPassword(u.name) }, "reset"));
-    row.append(el("button", { class: "btn small danger",
-      onclick: () => removePerson(u.name) }, "remove"));
-    body.append(row);
+    body.append(el("div", { class: "prow" },
+      label,
+      el("span", { class: "p-sess", title: "signed-in sessions" },
+        u.sessions ? `${u.sessions} session${u.sessions === 1 ? "" : "s"}` : "—"),
+      sel,
+      el("span", { class: "p-act" },
+        el("button", { class: "btn small", title: "Generate a new password",
+                       onclick: () => resetPassword(u.name) }, "reset"),
+        el("button", { class: "btn small danger", title: `Remove ${u.name} and end their sessions`,
+                       onclick: () => removePerson(u.name) }, "remove"))));
   }
 }
 
@@ -2612,8 +2747,21 @@ function applyTheme(name) {
   } catch (_) { /* cookies off; prefers-color-scheme still applies */ }
   const b = $("#theme-toggle");
   if (b) {
-    b.textContent = name === "dark" ? "light" : "dark";
-    b.setAttribute("aria-label", `Switch to the ${name === "dark" ? "light" : "dark"} theme`);
+    // The mark shows WHERE THE CLICK GOES, not where you are: on a dark page it
+    // is a sun, because pressing it makes the page light. Drawn rather than an
+    // emoji -- ☀/🌙 render as full-colour pictures on some platforms and as a
+    // glyph on others, and neither follows the theme's own ink.
+    const sun = "M12 4V2m0 20v-2m8-8h2M2 12h2m13.66-5.66l1.42-1.42M4.92 19.08l1.42-1.42"
+      + "m11.32 0l1.42 1.42M4.92 4.92l1.42 1.42";
+    b.innerHTML = name === "dark"
+      ? `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/>`
+        + `<path d="${sun}"/></svg>`
+      : `<svg viewBox="0 0 24 24" aria-hidden="true">`
+        + `<path d="M21 13.2A9 9 0 1110.8 3a7 7 0 1010.2 10.2z"/></svg>`;
+    // The button has no text, so the only name it has is this one.
+    const to = name === "dark" ? "light" : "dark";
+    b.setAttribute("aria-label", `Switch to the ${to} theme`);
+    b.setAttribute("title", `Switch to the ${to} theme`);
   }
 }
 function initTheme() {

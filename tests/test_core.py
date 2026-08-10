@@ -1779,14 +1779,27 @@ def test_webui_log_service_filter_is_refreshed_by_the_stream():
     assert "function refreshServiceOptions(" in js, \
         "expected the service-option builder to be callable on its own"
 
+    # The stream no longer touches the DOM per message -- doing that meant one
+    # whole-buffer rescan and one forced reflow per line, which froze the tab for
+    # a second or two on a chatty container. It queues, and a frame later
+    # flushLogs() does the batch. So the path is onmessage -> queueLog ->
+    # flushLogs -> refreshServiceOptions, and the property is unchanged: every
+    # arriving line registers its service, whether or not it is displayed.
     handler = js[js.index("ws.onmessage"):]
     handler = handler[:handler.index("ws.onclose")]
-    assert "refreshServiceOptions()" in handler, \
-        "the log stream handler never refreshes the service filter"
-    # Before the `if (passes(e))` guard, so a below-threshold line still registers
-    # its service.
-    assert handler.index("refreshServiceOptions()") < handler.index("if (passes(e))"), \
-        "refreshServiceOptions() must run for every line, not only displayed ones"
+    assert "queueLog(e)" in handler, "the stream handler does not queue the line"
+    assert "passes(" not in handler, \
+        "the stream handler filters again — a below-threshold line must still " \
+        "register its service, which is what the queue is for"
+
+    flush = js[js.index("function flushLogs("):]
+    flush = flush[:flush.index("\nfunction ")]
+    assert "refreshServiceOptions()" in flush, \
+        "the batched flush never refreshes the service filter"
+    # Outside the per-line passes() loop, for the same reason as before.
+    assert flush.index("refreshServiceOptions()") > flush.index("for (const e of batch)"), \
+        "refreshServiceOptions() must see the whole batch, not one line's branch"
+
     # And the full re-render path keeps using it, so the two cannot drift apart.
     render = js[js.index("function renderLogList("):]
     render = render[:render.index("\n}")]
