@@ -637,10 +637,18 @@ def test_the_theme_is_light_by_default_and_the_choice_survives_a_reload(serve, p
         page.click("#theme-toggle")
         assert btn.get_attribute("aria-label") == "Switch to the dark theme"
         assert btn.locator("circle").count() == 0, "a light page should offer the moon"
-        # and the mark follows the theme's ink rather than carrying its own colour
-        assert page.eval_on_selector(
-            "#theme-toggle svg", "e => getComputedStyle(e).stroke") == \
-            page.eval_on_selector("#theme-toggle", "e => getComputedStyle(e).color")
+        # And the mark follows the theme's ink rather than carrying its own colour.
+        # BOTH reads in one evaluation, deliberately: the chip has a 140ms colour
+        # transition and the pointer is still over it after the click, so two
+        # separate eval_on_selector calls sample the same transition at different
+        # points and disagree -- `rgb(108,126,185)` vs `rgb(74,102,209)`, both of
+        # them interpolated. Sampling once compares the two properties rather
+        # than comparing one property against itself a few milliseconds later.
+        assert page.evaluate("""() => {
+            const b = document.querySelector('#theme-toggle');
+            return getComputedStyle(b.querySelector('svg')).stroke
+                 === getComputedStyle(b).color;
+        }"""), "the mark stopped following the button's ink"
         assert page.errors == [], page.errors
 
 
