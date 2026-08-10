@@ -2269,3 +2269,64 @@ def test_settings_tells_the_dialog_who_may_set_the_privileged_fields(basic_clien
     cfgmod.update_config(lambda c: c.__setitem__(lc.CREATE_POLICY_KEY, "admin"))
     assert basic_client.get("/api/settings",
                             headers=_auth()).json()["may_set_privileged"] is False
+
+
+def test_a_host_prefixed_cookie_is_accepted_on_the_websocket(monkeypatch, tmp_path):
+    """The log stream refused a signed-in browser behind a TLS-terminating proxy.
+
+    An HTTP scope and a WebSocket scope do not always carry the same `client`
+    behind a proxy, so `resolve_peer` could conclude https for the sign-in that
+    minted the cookie and plain http for the socket that reads it back. It then
+    looked up `rc_repro_session`, the browser had sent `__Host-rc_repro_session`,
+    and the handshake was refused 403 — with nothing written anywhere saying so.
+
+    `__Host-` is PROOF of the scheme: a browser will not store one without Secure
+    and will not send it over http. If it arrives, the hop is https whatever this
+    end concluded. Only ever in that direction — honouring the plain name when
+    https was resolved would give back exactly what the prefix buys.
+    """
+    import io
+    from rc_repro import runner
+    from rc_repro.web import app as webapp
+    from rc_repro.services import sessions, users as usersvc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    usersvc.add("alice", "correct-horse-battery", role="admin")
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(lc, "detail", lambda n: {"name": n})
+    # The point of this test is the handshake, so the stream behind it is a stub:
+    # otherwise it goes on to spawn `docker compose logs -f` for a workspace that
+    # was never created.
+    class _P:
+        stdout = io.StringIO("")
+        def poll(self): return 0
+        def kill(self): pass
+        def terminate(self): pass
+        def wait(self, timeout=None): return 0
+    monkeypatch.setattr(webapp, "open_log_process", lambda ws_dir, tail: _P())
+    monkeypatch.setattr(runner, "workspace", lambda n: tmp_path)
+
+    app = create_app(allow_hosts=["testserver"])
+    token = sessions.create("alice", label="test")
+    c = TestClient(app)
+
+    # No trusted proxy is configured, so the socket resolves the hop as plain
+    # http and asks for the plain name — the shape the live failure had.
+    with c.websocket_connect(
+        "/api/repros/t1/logs/stream?tail=1",
+        headers={"Origin": "http://testserver"},
+        cookies={"__Host-rc_repro_session": token},
+    ) as ws:
+        assert ws is not None       # accepted: the prefixed cookie was honoured
+
+    # The reverse is refused: a plain-named cookie must not satisfy a lookup that
+    # resolved https, or the prefix protects nothing.
+    app2 = create_app(allow_hosts=["testserver"])
+    app2.state.public_https = True
+    with pytest.raises(Exception):
+        with TestClient(app2).websocket_connect(
+            "/api/repros/t1/logs/stream?tail=1",
+            headers={"Origin": "https://testserver"},
+            cookies={"rc_repro_session": token},
+        ):
+            pass

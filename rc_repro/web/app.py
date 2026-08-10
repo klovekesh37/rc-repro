@@ -1203,7 +1203,18 @@ def create_app(allow_hosts: list[str] | None = None, *,
         # cross-site one now runs from the SAME helper `guard` uses, because
         # having a second, shorter copy of this list is exactly how the Origin
         # check went missing here while being present three lines away.
+        # Every refusal below says WHICH one it was. A rejected log stream used to
+        # be four different silent 1008s: the browser shows "handshake failed:
+        # 403" and the server wrote nothing at all, so an operator holding both
+        # ends of the connection could not tell a bad Host from a stale cookie
+        # from an insufficient role. Recorded as `attempt`, the origin the
+        # sign-in throttle already uses for a caller who has not proved anything.
+        def refuse(why: str, who: str = "") -> None:
+            auditsvc.audit(who or "-", "logs-open", f"{name} refused={why}",
+                           origin_="attempt", outcome="denied")
+
         if not app.state.host_ok(ws.headers.get("host")):
+            refuse("host")
             await ws.close(code=1008); return
         # Before accept(), and before any credential is read. `require_origin` is
         # on only when the credential is ambient: a Basic header is attached by
@@ -1211,14 +1222,39 @@ def create_app(allow_hosts: list[str] | None = None, *,
         # the ?t= value is the proof and no browser can supply it cross-site, so a
         # header-less client (curl, CI, the tests) still connects.
         if _cross_site(ws.headers, require_origin=app.state.accounts):
+            # Origin, or the absence of one. A browser always sends it on an
+            # upgrade, so "no origin" means a non-browser client -- worth telling
+            # apart from an origin that IS present and simply not allowed.
+            refuse("origin" if ws.headers.get("origin") else "no-origin")
             await ws.close(code=1008); return
         if app.state.accounts:
             # The cookie rides along on the upgrade automatically, which is what
             # finally takes the credential out of the query string: `?t=` was only
             # ever there because a browser cannot set headers on a WebSocket.
             _ws_https = resolve_peer(ws.headers, ws.client.host if ws.client else "")[1]
-            sess = sessions.verify(ws.cookies.get(cookie_name(_ws_https), ""))
+            want = cookie_name(_ws_https)
+            raw = ws.cookies.get(want, "")
+            # A `__Host-` cookie is PROOF of the scheme, not merely a consequence
+            # of it: a browser will not store one without Secure, and will not
+            # send it over http. So if it arrives, the browser's hop is https
+            # whatever this end concluded -- and this end can conclude otherwise,
+            # because a WebSocket scope and an HTTP scope do not always carry the
+            # same `client` behind a proxy, which is the whole asymmetry.
+            #
+            # Only ever in this direction. Honouring the PLAIN name when https was
+            # resolved would hand back everything the prefix buys (a sibling
+            # workspace on the same parent domain can set a Domain-scoped cookie
+            # of the plain name; it cannot set a `__Host-` one).
+            if not raw and want == COOKIE_PLAIN and COOKIE_SECURE in ws.cookies:
+                raw = ws.cookies.get(COOKIE_SECURE, "")
+                want = COOKIE_SECURE
+            sess = sessions.verify(raw)
             if not sess:
+                # Which of the two: no cookie by that name at all, or one that no
+                # longer verifies. They have different causes -- a scheme the
+                # server resolved differently from the one that minted it, versus
+                # a session that expired or was revoked -- and the same symptom.
+                refuse("no-cookie:" + want if want not in ws.cookies else "stale-session")
                 await ws.close(code=1008); return
             # The role table is consulted here too: the middleware never sees a
             # WebSocket, so a check that lives only there does not cover the one
@@ -1226,7 +1262,8 @@ def create_app(allow_hosts: list[str] | None = None, *,
             from rc_repro.services import users as usersvc
             need = route_requirement("WS", "/api/repros/{name}/logs/stream")
             if need is None or not usersvc.at_least(usersvc.role_of(sess.user), need):
-                auditsvc.audit(sess.user, "logs-open", name,
+                auditsvc.audit(sess.user, "logs-open",
+                               f"{name} refused=role need={need} have={usersvc.role_of(sess.user)}",
                                origin_="session", outcome="denied")
                 await ws.close(code=1008); return
             # This handler never passes through `guard`, so it publishes its own
