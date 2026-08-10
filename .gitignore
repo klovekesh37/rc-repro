@@ -29,3 +29,6 @@ docs/
 .claude/
 .codex/
 .agents/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
