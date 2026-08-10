@@ -524,6 +524,20 @@ input:focus, select:focus, textarea:focus {
   box-shadow: 0 0 0 3px var(--accent-ring); }
 /* Search takes the room the two fixed-width selects do not want. */
 .logctl input.input { flex: 1 1 9rem; min-width: 6rem; }
+/* What the stream is doing, in the strip that owns it. Quiet while it is working
+   and loud only when it is not, because the answer is usually "fine". */
+.logstat { display: inline-flex; align-items: center; gap: .4rem; flex: 0 0 auto;
+  font-size: .72rem; color: var(--dim); white-space: nowrap; }
+.logstat::before { content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; flex: 0 0 auto; }
+.logstat.live { color: var(--green); }
+.logstat.wait { color: var(--muted); }
+.logstat.idle { color: var(--muted); }
+.logstat.idle::before { background: transparent; box-shadow: inset 0 0 0 1px currentColor; }
+.logstat.bad { color: var(--red); font-weight: 600; }
+.logretry { font: inherit; font-size: .72rem; font-weight: 600; color: var(--accent);
+  background: none; border: 0; padding: 0 0 0 .2rem; cursor: pointer;
+  text-decoration: underline; }
 .logfollow { display: inline-flex; align-items: center; gap: .35rem; font-family: var(--mono);
   font-size: .76rem; color: var(--muted); cursor: pointer; user-select: none; }
 .logfollow input { accent-color: var(--accent-fill); cursor: pointer; }

@@ -1256,7 +1256,12 @@ function renderLogs(body, d) {
   followCb.checked = logv.follow;
   const follow = el("label", { class: "logfollow" }, followCb, " follow");
   const clear = el("button", { class: "btn small", onclick: () => { logv.buf = []; renderLogList(); } }, "Clear");
-  ctl.append(levelSel, svcSel, search, follow, clear);
+  // What the stream is DOING. Without this, "connected and the container is quiet"
+  // and "the socket was refused ten seconds ago" are the same picture: an empty
+  // box. Five minutes of that is unreadable, and it is the state you most need
+  // named, because the two have nothing in common as problems.
+  const stat = el("span", { class: "logstat", id: "log-stat" });
+  ctl.append(levelSel, svcSel, search, follow, clear, stat);
   if (d.grafana_url) ctl.append(el("a", { class: "linkchip monitor", href: localUrl(d.grafana_url) + "/d/rcrepro-logs", target: "_blank" }, "Logs in Grafana (Loki)"));
   const box = el("div", { class: "logview", id: "logview" });
   // The way back. Scrolling up detaches you from the stream, so there has to be
@@ -1287,9 +1292,31 @@ function renderLogs(body, d) {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   // No credential in the URL any more: the session cookie rides along on the
   // upgrade automatically, which is the only reason ?t= ever existed here.
+  const setStat = (kind, text, retry) => {
+    stat.className = "logstat " + kind;
+    stat.textContent = text;
+    if (retry) {
+      stat.append(el("button", { class: "logretry", onclick: () => renderDetail() }, "Retry"));
+    }
+  };
+  setStat("wait", "connecting…");
+
   const ws = new WebSocket(`${proto}://${location.host}/api/repros/${d.name}/logs/stream?tail=300`);
   dstate.logsWS = ws;
+  let opened = false, got = 0;
+  ws.onopen = () => {
+    opened = true;
+    setStat("live", "streaming");
+    // A container that has printed nothing looks exactly like a broken stream.
+    // After a few seconds of an OPEN socket with no line, say which it is.
+    setTimeout(() => {
+      if (dstate.logsWS === ws && ws.readyState === 1 && !got) {
+        setStat("idle", "connected · nothing logged yet");
+      }
+    }, 4000);
+  };
   ws.onmessage = (m) => {
+    if (!got++) setStat("live", "streaming");
     const e = parseLogLine(m.data);
     logv.buf.push(e);
     if (logv.buf.length > LOG_MAX) logv.buf.shift();
@@ -1298,7 +1325,17 @@ function renderLogs(body, d) {
     // select the service whose errors you are looking for.
     queueLog(e);
   };
-  ws.onclose = () => { if (dstate.logsWS === ws) dstate.logsWS = null; };
+  // A socket that never opened was refused or never arrived -- the server closes
+  // before accept() for a missing session or an insufficient role, and a browser
+  // reports that as a failed handshake, not as a close code worth printing. One
+  // that opened and then closed is a stream that ended, which is a different
+  // sentence and a different thing to do about it.
+  ws.onclose = () => {
+    if (dstate.logsWS !== ws) return;           // superseded by a newer stream
+    dstate.logsWS = null;
+    setStat("bad", opened ? "stream ended" : "could not connect — refused or unreachable", true);
+  };
+  ws.onerror = () => { if (dstate.logsWS === ws && !opened) setStat("bad", "could not connect", true); };
 }
 
 function startStats() {
