@@ -13,7 +13,7 @@ import time
 from dataclasses import asdict as dc_asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 import requests
 import typer
@@ -53,6 +53,18 @@ def _before_any_command() -> None:
 _err = ui.die  # error-exit (red on stderr + exit 1), kept under the local name
 
 
+def _fail(exc: errors.ReproError) -> NoReturn:
+    """Exit on a domain error with the exit code its CLASS defines.
+
+    One helper instead of a mapping at each of the 26 handlers, so errors.py
+    stays the only place an exit code is decided. Before this every failure was
+    exit 1, so a script could tell that something went wrong but never what: a
+    workspace that is still booting and one that is known dead looked identical.
+    See errors.EXIT_CODES for the published map.
+    """
+    ui.die(str(exc), exit_code=exc.exit_code)
+
+
 def _resolve_name(name: str | None) -> str:
     """Return the target repro name: explicit, else the configured default.
 
@@ -66,12 +78,21 @@ def _resolve_name(name: str | None) -> str:
     try:
         return lcsvc.resolve_name(name, actor=_cli_actor())
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
 
 
 def _require_docker() -> None:
-    if not runner.docker_available():
-        _err("Docker isn't running. Start Docker Desktop and try again.")
+    """Refuse early when the engine is down, with a code rather than a flat 1.
+
+    It used to call `_err()` directly, so the single most common failure there is
+    exited 1 -- the one value that says nothing. Delegating to the service means
+    it now carries whatever code its class defines, and the class is decided in
+    one place for both front-ends instead of here.
+    """
+    try:
+        lcsvc.require_docker()
+    except errors.ReproError as exc:
+        _fail(exc)
 
 
 def _login(meta: runner.Metadata) -> rcapi.Auth:
@@ -262,7 +283,7 @@ def up(
     try:
         result = lcsvc.create_repro(req, emit=_cli_emit, stream_output=False)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     _render_create_result(result)
     if seed:
         _run_seed(runner.read_meta(result["name"]), seed_profile, stats=stats)
@@ -300,7 +321,7 @@ def _run_scale(meta: runner.Metadata, spec_str: str) -> None:
     try:
         res = datasvc.run_scale(meta.name, spec_str, emit=null_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if "users" in res:
         ui.ok(f"✓ inserted {res['users']:,} users")
     if "messages" in res:
@@ -311,7 +332,7 @@ def _clear_scale(meta: runner.Metadata) -> None:
     try:
         res = datasvc.clear_scale(meta.name, emit=null_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok(f"✓ removed {res['users']:,} scale users and {res['messages']:,} scale messages")
 
 
@@ -398,7 +419,7 @@ def ready(
     try:
         result = lcsvc.wait_and_finalize(m, emit=_cli_emit, timeout=timeout)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok("✓ ready")
     _summary_panel(m, extra_rows=[("Booted in", _fmt_duration(result["booted_s"]))])
     ui.hint(f"  next: rc-repro logs --name {m.name} -f")
@@ -437,7 +458,7 @@ def down(
         # confirm=True: the prompt above (or --yes) already gated it.
         lcsvc.teardown(target, volumes=volumes, confirm=True)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if volumes:
         ui.ok(f"✓ {target!r} removed (containers, data volume, and record).")
     else:
@@ -470,7 +491,7 @@ def monitor(
             for line in res["notes"]:
                 ui.note(line)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
 
 
 @app.command()
@@ -481,7 +502,7 @@ def prune(
     try:
         targets = lcsvc.prunable()
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if not targets:
         typer.echo("Nothing to prune.")
         return
@@ -495,7 +516,7 @@ def prune(
     try:
         res = lcsvc.prune(confirm=True, emit=_cli_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if res["removed"]:
         ui.ok(f"✓ pruned {len(res['removed'])}: {', '.join(res['removed'])}")
     else:
@@ -508,8 +529,12 @@ def start(name: str = typer.Option("", "--name", "-n")) -> None:
     target = _resolve_name(name)
     try:
         lcsvc.set_state(target, "start")
-    except errors.ReproError:
-        _err(f"could not start {target!r} — if it was `down`ed, use `rc-repro up` to recreate it")
+    except errors.ReproError as exc:
+        # Keeps the recreate hint AND the class's code: `stop` and `restart` exit 3
+        # for this exact condition, and `start` exiting 1 made the same failure
+        # answer differently depending on which verb you reached for.
+        ui.die(f"could not start {target!r} — if it was `down`ed, use "
+               "`rc-repro up` to recreate it", exit_code=exc.exit_code)
     ui.ok(f"✓ {target!r} started.")
 
 
@@ -520,7 +545,7 @@ def stop(name: str = typer.Option("", "--name", "-n")) -> None:
     try:
         lcsvc.set_state(target, "stop")
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok(f"✓ {target!r} stopped (resume with `rc-repro start`).")
 
 
@@ -531,7 +556,7 @@ def restart(name: str = typer.Option("", "--name", "-n")) -> None:
     try:
         lcsvc.set_state(target, "restart")
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok(f"✓ {target!r} restarted.")
 
 
@@ -685,7 +710,7 @@ def users_cmd(
             u = usersvc.set_role(name, role)
             ended = sessionsvc.revoke_user(name)
         except errors.ReproError as exc:
-            _err(str(exc))
+            _fail(exc)
         ui.ok(f"✓ {u.name!r} is now {u.role}.")
         if ended:
             ui.hint(f"  {ended} active session(s) signed out, so it takes effect now.")
@@ -701,7 +726,7 @@ def users_cmd(
             # to guarantee rather than each front end's to remember.
             ended = usersvc.remove(name)
         except errors.ReproError as exc:
-            _err(str(exc))
+            _fail(exc)
         ui.ok(f"✓ user {name!r} removed.")
         if ended:
             ui.hint(f"  {ended} active session(s) signed out.")
@@ -712,7 +737,7 @@ def users_cmd(
         try:
             usersvc.require_valid_name(name)
         except errors.ReproError as exc:
-            _err(str(exc))
+            _fail(exc)
         if ask_password:
             pw = typer.prompt(f"Password for {name}", hide_input=True)
             again = typer.prompt("Repeat", hide_input=True)
@@ -733,7 +758,7 @@ def users_cmd(
                 # for seven days. Enforced in the service, not here.
                 ended = usersvc.set_password(name, pw)
         except errors.ReproError as exc:
-            _err(str(exc))
+            _fail(exc)
         ui.ok(f"✓ user {name!r} {'added' if action == 'add' else 'password changed'}.")
         if minted:
             # Printed, not logged and not stored: this is the only moment it
@@ -914,7 +939,7 @@ def env_cmd(
         result = envsvc.set_env(name, sets, list(unset or []),
                                 restart=not no_restart, emit=_cli_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     verb = "applied" if result["restarted"] else "written (not yet applied)"
     ui.ok(f"✓ env {verb} on {result['name']!r}.")
     for o in result["overrides"]:
@@ -1064,7 +1089,7 @@ def trust_ca(
     try:
         installed, how = tls_local.trust(crt, uninstall=uninstall)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if installed:
         ui.ok(f"✓ CA {'removed from' if uninstall else 'installed into'} {how}.")
         ui.hint("  Restart the browser to pick it up. Firefox keeps its own store — "
@@ -1222,7 +1247,7 @@ def config_import(
     try:
         plan = datasvc.import_plan(m.name, str(path), only=onlyset)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
 
     lines = [f"apply    {plan['counts']['apply']} customized setting(s)",
              f"skip     {plan['counts']['redacted']} redacted secret(s), "
@@ -1242,7 +1267,7 @@ def config_import(
     try:
         res = datasvc.import_apply(m.name, str(path), only=onlyset, emit=_cli_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if res["failed"]:
         ui.warn(f"  {res['failed']} setting(s) rejected: {', '.join(res['failures'][:10])}"
                 + (" ..." if res["failed"] > 10 else ""))
@@ -1280,7 +1305,7 @@ def backup_cmd(
         # service takes the note under a different name (see backup.create).
         res = backupsvc.create(name, out=out, note=label, live=live, emit=_cli_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     m = res["manifest"]
     ui.ok(f"✓ backed up {res['name']!r} ({m['rc_version']}) — {_human_bytes(res['bytes'])}")
     typer.echo(f"    {res['path']}")
@@ -1335,7 +1360,7 @@ def restore_cmd(
                                 allow_upgrade=allow_upgrade, force=force,
                                 emit=_cli_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     what = "created and restored" if res["created"] else "restored"
     ui.ok(f"✓ {what} {res['name']!r} from {Path(res['bundle']).name} "
           f"in {res['restore_seconds']}s")
@@ -1372,7 +1397,7 @@ def upgrade_cmd(
         try:
             res = upgradesvc.rollback(name, bundle=bundle, emit=_cli_emit)
         except errors.ReproError as exc:
-            _err(str(exc))
+            _fail(exc)
         ui.ok(f"✓ {res['name']!r} rolled back to {res['rolled_back_to']}")
         return
 
@@ -1381,7 +1406,7 @@ def upgrade_cmd(
     try:
         p = upgradesvc.plan(name, to, offline=offline)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
 
     ui.panel(f"upgrade: {p['name']}", [
         ("Rocket.Chat", f"{p['from_version']}  ->  {p['to_version']}"),
@@ -1406,7 +1431,7 @@ def upgrade_cmd(
                              no_backup=no_backup,
                              rollback_on_failure=not no_rollback, emit=_cli_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok(f"✓ {res['name']!r} upgraded {res['from_version']} -> {res['to_version']} "
           f"in {res['boot_seconds']}s")
     if res["running_version"]:
@@ -2408,7 +2433,7 @@ def chown_cmd(
     try:
         res = lcsvc.set_owner(name, to, by=_cli_actor())
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok(f"✓ {res['name']!r} now belongs to {res['to']}"
           + (f" (was {res['from']})" if res["from"] else ""))
 

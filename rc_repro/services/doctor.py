@@ -37,6 +37,41 @@ def _kernel_major_minor(kv: str | None) -> tuple[int, int] | None:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
+def mongo_kernel_conflict(mongo_tag: str, kernel: str | None = None) -> str:
+    """Why this MongoDB cannot start on this engine, or "" if it can.
+
+    SERVER-121912: mongod 8.0 hard-EXITS on kernel >= 6.19. Not degrades -- exits,
+    every time, with a message that reads like a volume or permission problem. So
+    there is no case where continuing works, which is what makes this a refusal
+    rather than a warning (the same reasoning as `check_capacity`).
+
+    Version-aware on purpose. `run_checks()` below can only warn generically,
+    because `doctor` does not know which release you are about to boot; by the
+    time a create has resolved its pairing, the answer is exact -- RC 8.6.1 needs
+    Mongo 8.0 and therefore cannot start here, while RC 7.4.1 needs 7.0 and can.
+
+    One implementation, three callers: the create preflight refuses with it, the
+    GUI's version lookup shows it before you press the button, and the CLI gets
+    it for free by going through the service. It was two copies with different
+    behaviour -- a generic warn here and a version-aware warn inlined in
+    web/app.py -- and neither of them stopped the pull.
+    """
+    mm = _kernel_major_minor(kernel if kernel is not None else runner.docker_kernel_version())
+    if not mm or mm < MONGO8_BAD_KERNEL:
+        return ""
+    try:
+        mongo_major = int(str(mongo_tag).split(".")[0])
+    except (ValueError, AttributeError):
+        return ""
+    if mongo_major < 8:
+        return ""
+    kv = ".".join(str(n) for n in mm)
+    return (f"MongoDB {mongo_tag} cannot start on this engine's kernel ({kv}) — "
+            "mongod 8.0 exits on kernel 6.19 and newer (SERVER-121912). Use an "
+            "engine on an older kernel, or a Rocket.Chat version that pairs with "
+            "MongoDB 7.0.")
+
+
 def run_checks() -> dict:
     """Run every preflight check and return the findings.
 

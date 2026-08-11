@@ -2348,3 +2348,68 @@ def test_multi_instance_and_https_no_longer_conflict(tmp_path, monkeypatch):
         tls=tls.TlsSpec(mode=tls.MODE_ACME, host="t1.example.com", port=443))
     doc = compose.build(spec)          # used to raise ValueError
     assert doc["services"]
+
+
+def test_a_domain_failure_exits_with_its_own_code_not_a_flat_one(monkeypatch, tmp_path):
+    """Every failure used to exit 1, so a script could tell that something went
+    wrong but never what — a workspace still booting and one that is known dead
+    were indistinguishable without parsing English.
+
+    Each error class now carries its own exit code and `errors.EXIT_CODES`
+    publishes the map. Asserted through the real CLI, because the value that
+    matters is the one the process actually returns.
+    """
+    from typer.testing import CliRunner
+
+    from rc_repro import cli, errors
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    cli_runner = CliRunner()
+
+    cases = [
+        (errors.NotFoundError("no such repro"), 4, "not_found"),
+        (errors.ValidationError("bad value"), 2, "usage"),
+        (errors.ConflictError("name taken"), 8, "conflict"),
+        (errors.NotReadyError("still booting"), 5, "not_ready"),
+        (errors.DockerError("engine is down"), 3, "preflight"),
+    ]
+    for exc, want, label in cases:
+        def boom(*_a, _exc=exc, **_kw):
+            raise _exc
+        # resolve_name is the first service call every name-taking command makes,
+        # so it is the seam that proves the handler, not the command.
+        monkeypatch.setattr(lc, "resolve_name", boom)
+        res = cli_runner.invoke(cli.app, ["info", "--name", "x"])
+        assert res.exit_code == want, (
+            f"{type(exc).__name__} exited {res.exit_code}, expected {want}")
+        assert errors.EXIT_CODES[want] == label
+
+    # The taxonomy is the only place a code is decided, and it stays published.
+    assert errors.EXIT_CODES[0] == "ok"
+    assert errors.NotFoundError.exit_code == 4
+    # ui.die keeps its old default, so every non-domain caller is unchanged.
+    from rc_repro import ui
+    import inspect
+    assert inspect.signature(ui.die).parameters["exit_code"].default == 1
+
+
+def test_the_cli_reports_a_down_engine_as_preflight_not_as_a_bug(monkeypatch, tmp_path):
+    """Eleven commands call `_require_docker()`, and it used to `_err()` directly —
+    so the single most common failure in the tool exited 1, the one value the
+    README defines as "a bug in rc-repro".
+
+    It delegates to the service now, so the class decides. The service test covers
+    the class; this covers the delegation, which is the behaviour a script sees.
+    """
+    from typer.testing import CliRunner
+
+    from rc_repro import cli, runner as runner_mod
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(runner_mod, "docker_available", lambda **_k: False)
+    res = CliRunner().invoke(cli.app, ["logs", "--name", "anything"])
+    assert res.exit_code == 3, f"engine down exited {res.exit_code}, expected 3"
+    # ...and specifically not 5, which would tell a script to keep polling for
+    # something polling cannot fix.
+    assert res.exit_code != 5

@@ -1157,18 +1157,15 @@ def create_app(allow_hosts: list[str] | None = None, *,
         out = {"rc_version": r.rc_version, "rc_image": r.rc_image, "mongo_tag": r.mongo_tag,
                "mongo_flavor": r.mongo_flavor, "mongo_shell": r.mongo_shell,
                "oplog": r.oplog, "source": r.source, "note": r.note, "kernel": ""}
-        # SERVER-121912: mongod 8.0 hard-exits on kernel >= 6.19, and the failure
-        # reads like a volume/permission problem. Say so before the pull, not after.
+        # SERVER-121912, before the pull rather than after. The rule itself lives
+        # in services/doctor.py, which is also what the create path refuses with --
+        # this was a second copy of the comparison, and it only warned.
+        from rc_repro.services import doctor as doctorsvc
         kv = runner.docker_kernel_version()
         out["kernel"] = kv or ""
-        mm = re.match(r"(\d+)\.(\d+)", kv or "")
-        try:
-            mongo_major = int(r.mongo_tag.split(".")[0])
-        except ValueError:
-            mongo_major = 0
-        if mm and mongo_major >= 8 and (int(mm.group(1)), int(mm.group(2))) >= (6, 19):
-            out["warning"] = (f"this engine's kernel ({kv}) cannot run MongoDB 8.0 "
-                              "(SERVER-121912) — mongod will exit on boot")
+        conflict = doctorsvc.mongo_kernel_conflict(r.mongo_tag, kv)
+        if conflict:
+            out["warning"] = conflict
         return out
 
     @app.get("/api/repros/{name}/detail")

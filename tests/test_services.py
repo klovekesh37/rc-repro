@@ -86,9 +86,25 @@ def test_createreq_defaults():
 
 
 def test_require_docker_raises_when_down(monkeypatch):
+    """An absent engine is a PREFLIGHT failure, not a "still coming up" one.
+
+    It used to raise NotReadyError, which is exit 5 / HTTP 409 and means "poll
+    again" -- advice that can never succeed, because polling does not start
+    Docker. The caller has to fix their environment, so ENGINE_UNAVAILABLE:
+    exit 3, HTTP 502, the dependency underneath is not there.
+
+    Asserted on all three faces of the taxonomy, because each one is consumed by
+    a different front-end and they have drifted apart before.
+    """
     monkeypatch.setattr(lc.runner, "docker_available", lambda **_k: False)
-    with pytest.raises(errors.NotReadyError):
+    with pytest.raises(errors.DockerError) as caught:
         lc.require_docker()
+    assert caught.value.code == "ENGINE_UNAVAILABLE"
+    assert caught.value.exit_code == 3          # CLI: fix it, do not retry
+    assert caught.value.http_status == 502      # web: upstream dependency is down
+    # And specifically NOT the "poll again" answer it used to give.
+    assert not isinstance(caught.value, errors.NotReadyError)
+    assert errors.NotReadyError.exit_code == 5
 
 
 def test_resolve_name_errors(monkeypatch):
@@ -1097,3 +1113,41 @@ def test_the_reserve_scales_with_the_host():
 
     assert lc.host_reserve_mb(10024) == 2004, "a fifth of a 10 GB box"
     assert lc.host_reserve_mb(2048) == 1024, "never below 1 GB on a small one"
+
+
+def test_an_impossible_mongo_kernel_pairing_is_refused_before_any_docker_work(monkeypatch):
+    """SERVER-121912: mongod 8.0 EXITS on kernel >= 6.19 — not degrades, exits,
+    with a message that reads like a volume or permission fault.
+
+    `doctor` has known the rule for a while and could only warn, because it does
+    not know which release you are about to boot. Nothing on the create path
+    checked it, so `up` would pull ~1.5 GB of images, create the containers and
+    then let mongod die, leaving `diagnose` to explain it afterwards. Now the
+    pairing is resolved first and an impossible one is refused.
+    """
+    from rc_repro.services import doctor
+
+    # The rule itself: version-aware, so it answers differently per pairing.
+    assert doctor.mongo_kernel_conflict("8.0", "6.19.7-200.fc43.aarch64")
+    assert "SERVER-121912" in doctor.mongo_kernel_conflict("8.0", "6.19.7")
+    assert doctor.mongo_kernel_conflict("7.0", "6.19.7") == ""   # 7.0 is unaffected
+    assert doctor.mongo_kernel_conflict("8.0", "6.18.0") == ""   # older kernel is fine
+    assert doctor.mongo_kernel_conflict("8.0", "") == ""         # unknown: do not guess
+    assert doctor.mongo_kernel_conflict("", "6.19.7") == ""      # unknown: do not guess
+
+    # And the create path refuses with it, before it touches docker.
+    pulled: list = []
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr(lc.runner, "docker_kernel_version", lambda: "6.19.7-200.fc43")
+    monkeypatch.setattr(lc.runner, "exists", lambda n: False)
+    monkeypatch.setattr(lc.runner, "write", lambda *a, **k: pulled.append("wrote"))
+    monkeypatch.setattr(lc.versions, "resolve",
+                        lambda v, offline=False: type("R", (), {
+                            "rc_version": v, "mongo_tag": "8.0", "rc_image": "img",
+                            "mongo_flavor": "mongodb", "mongo_shell": "mongosh",
+                            "oplog": False, "source": "test", "note": ""})())
+    with pytest.raises(errors.PreflightError) as caught:
+        lc._create_repro_locked(lc.CreateReq(version="8.6.1"))
+    assert "mongod 8.0 exits" in str(caught.value)
+    assert caught.value.exit_code == 3, "a wrong environment is a preflight failure"
+    assert not pulled, "it refused only AFTER starting work"

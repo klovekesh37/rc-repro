@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from rc_repro import compose, config, presets, rcapi, runner, versions
 from rc_repro import seed as seeder
 from rc_repro.errors import (ConflictError, DockerError, NotFoundError,
-                             NotReadyError, ValidationError)
+                             NotReadyError, PreflightError, ValidationError)
 from rc_repro.services import audit as auditsvc
 from rc_repro.services import edge as edgesvc
 from rc_repro.services import diagnose, postready
@@ -88,8 +88,21 @@ def owner_prefix(name: str, actor: str) -> str:
 # --- preconditions ------------------------------------------------------------
 
 def require_docker() -> None:
+    """Refuse when the container engine is not answering.
+
+    `DockerError`, not `NotReadyError`. The distinction is the whole point of the
+    exit-code taxonomy: `NOT_READY` (exit 5, HTTP 409) means "it is coming up,
+    poll again", and an absent engine is never that -- polling cannot start
+    Docker. It is a preflight problem the caller must fix, so `ENGINE_UNAVAILABLE`
+    (exit 3, HTTP 502): the dependency this tool sits on is not there.
+
+    It matters more once a second topology exists: "the engine is not answering"
+    will cover a missing cluster and an unreachable API server too, and those are
+    the same kind of answer -- fix your environment -- not the same kind as a
+    workspace that has not finished booting.
+    """
     if not runner.docker_available():
-        raise NotReadyError("Docker isn't running. Start Docker Desktop and try again.")
+        raise DockerError("Docker isn't running. Start Docker Desktop and try again.")
 
 
 #: Rocket.Chat settled at 670-770 MB and MongoDB at 124-184 MB per workspace on
@@ -661,6 +674,16 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
         resolved.rc_image = req.rc_image or cfg["rc_image"]
     if req.mongo:
         versions.apply_mongo_override(resolved, req.mongo)
+
+    # Before any docker work: this pairing cannot boot on this engine, and mongod
+    # says so by exiting with a message that reads like a permission fault. `doctor`
+    # has known the rule for a while and could only warn, because it does not know
+    # which version you are about to ask for; here the pairing is resolved, so the
+    # answer is exact. Imported inside the function -- doctor imports this module.
+    from rc_repro.services import doctor as doctorsvc
+    conflict = doctorsvc.mongo_kernel_conflict(resolved.mongo_tag)
+    if conflict:
+        raise PreflightError(conflict)
 
     try:
         pre = presets.load(req.preset, req.params)

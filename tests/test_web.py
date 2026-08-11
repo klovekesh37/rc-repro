@@ -2330,3 +2330,26 @@ def test_a_host_prefixed_cookie_is_accepted_on_the_websocket(monkeypatch, tmp_pa
             cookies={"rc_repro_session": token},
         ):
             pass
+
+
+def test_a_down_engine_is_502_on_the_two_routes_that_check_it(monkeypatch):
+    """`POST /pat` and `POST /call` both call `lc.require_docker()`, and every
+    existing test of them patches it to a no-op — so the engine-down branch of
+    both was never exercised in either direction.
+
+    It answers 502 now (the dependency underneath is not there) rather than 409
+    ("poll again"), matching what `/state` has always returned for the same
+    condition. Pinned on both routes because the class is shared: changing it back
+    silently would move two statuses at once.
+    """
+    from rc_repro import runner as runner_mod
+    monkeypatch.setattr(runner_mod, "docker_available", lambda **_k: False)
+    monkeypatch.setattr(lc, "resolve_name", lambda n, **kw: n)
+    c = client()
+    for path, body in (("/api/repros/x/pat", {}),
+                       ("/api/repros/x/call", {"method": "GET", "path": "/api/info"})):
+        r = c.post(path, headers=H, json=body)
+        assert r.status_code == 502, f"{path} answered {r.status_code}, expected 502"
+        assert r.json()["kind"] == "DockerError"
+    # /state already answered 502 for this on main — the point is that all three agree.
+    assert errors.DockerError.http_status == 502

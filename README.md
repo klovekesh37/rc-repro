@@ -555,6 +555,35 @@ response pretty-printed.
 
 `rc-repro <command> --help` for flags.
 
+## Exit codes
+
+A **domain** failure exits with a code that says which kind it was, so a script
+can tell "still coming up" from "fix your environment" without parsing the
+message.
+
+| Code | Meaning | Do about it |
+|---|---|---|
+| 0 | success | — |
+| 2 | usage / validation | fix the call — retrying unchanged will not help |
+| 3 | engine unavailable | Docker is not answering (`rc-repro doctor`) |
+| 4 | not found | no such repro |
+| 5 | not ready | **poll again** — it is still coming up |
+| 8 | conflict | the name or port is taken; pick another |
+| 1 | anything else | including argument errors the CLI catches before a command runs |
+
+**1 is still the common answer**, deliberately: only failures raised by the
+service layer as a typed error carry a code today. A mistyped flag, a missing
+file, an out-of-range `--vus` and similar are caught in the command itself and
+still exit 1. Branch on `$? -ne 0` for "did it fail", and on the table above only
+where you have checked the specific command returns what you expect.
+
+`rc_repro.errors.EXIT_CODES` also reserves **6** (authority gate) and **7**
+(create failed). Nothing raises them yet — they arrive with the work that needs
+them, and are listed here so the numbers are not reused for something else.
+
+> **Changed in 0.44.0.** Domain failures used to exit `1` like everything else. A
+> script testing `$? -eq 1` should test `$? -ne 0` instead.
+
 ## How version → MongoDB resolution works
 
 `rc-repro up --version X` (and `rc-repro versions X`) queries

@@ -29,9 +29,15 @@ def note(msg: str) -> None:
     typer.secho(msg, fg=typer.colors.CYAN)
 
 
-def die(msg: str) -> NoReturn:
+def die(msg: str, exit_code: int = 1) -> NoReturn:
+    """Red line on stderr, then exit.
+
+    `exit_code` defaults to 1 so every existing caller is unchanged. The domain
+    errors pass their own, so a script can tell "not ready yet" from "known dead"
+    without parsing the sentence -- see errors.EXIT_CODES.
+    """
     fail(f"error: {msg}")
-    raise typer.Exit(1)
+    raise typer.Exit(exit_code)
 
 
 def hint(msg: str) -> None:
