@@ -2540,3 +2540,35 @@ def test_every_rocketchat_instance_keeps_its_healthcheck():
         assert svcs[s].get("healthcheck"), f"{s} lost its healthcheck"
     assert "rocketchat-1" in str(svcs["rocketchat-2"].get("depends_on")), \
         "the cold-start serialisation depends on rocketchat-1 being healthy"
+def test_a_compose_only_command_refuses_cleanly_rather_than_traceback(monkeypatch, tmp_path):
+    """Found by running the command, not by the suite.
+
+    Adding the topology guard to `stats` made it the FIRST raiser of a ReproError
+    in a command that had no `except errors.ReproError` handler — every other
+    handler was wired when the taxonomy landed, but `stats` had never needed one.
+    The guard therefore escaped as a rich traceback and exit 1: a stack dump where
+    the user should see one red line, and the one exit code the README defines as
+    "a bug in rc-repro" for a condition that is entirely expected.
+
+    This is the shape the whole taxonomy exists to prevent, so it is pinned at the
+    process boundary where a script would see it.
+    """
+    from typer.testing import CliRunner
+
+    from rc_repro import cli, runner as runner_mod
+    from rc_repro.services import topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = runner_mod.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
+                            mongo_tag="8.0", mongo_flavor="official", preset="default",
+                            root_url="u", host_port=3010, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    runner_mod.write("k", "services: {}\n", m)
+    monkeypatch.setattr(runner_mod, "docker_available", lambda **_k: True)
+
+    res = CliRunner().invoke(cli.app, ["stats", "--name", "k", "--for", "1"])
+    assert res.exit_code == 2, f"a compose-only refusal exited {res.exit_code}, expected 2"
+    assert res.exception is None or isinstance(res.exception, SystemExit), (
+        "the error escaped as an exception instead of being rendered")
+    assert "kubectl top" in res.output, "the alternative is stated to the user"
+    assert "Traceback" not in res.output

@@ -18,7 +18,7 @@ from rc_repro.errors import (ConflictError, DockerError, NotFoundError,
                              NotReadyError, PreflightError, ValidationError)
 from rc_repro.services import audit as auditsvc
 from rc_repro.services import edge as edgesvc
-from rc_repro.services import diagnose, postready
+from rc_repro.services import diagnose, postready, topology
 from rc_repro.services.events import Emit, info, null_emit, warn
 
 _NAME_RE = re.compile(r"[^a-z0-9-]+")
@@ -779,6 +779,9 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
         host_port=host_port, version_source=resolved.source, pinned=req.pin,
         public_url=public,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    # Stamped on every create, compose included, so "absent" keeps meaning exactly
+    # one thing: a workspace older than the key. See services/topology.py.
+    topology.stamp(meta.extra, topology.DOCKER)
     if pre.post_ready:
         meta.extra["post_ready"] = pre.post_ready
     if pre.notes:

@@ -25,6 +25,7 @@ from rc_repro.perf.timings import fmt_ms
 from rc_repro.services import data as datasvc
 from rc_repro.services import envvars as envsvc
 from rc_repro.services import lifecycle as lcsvc
+from rc_repro.services import topology
 from rc_repro.services.events import Event, null_emit
 
 app = typer.Typer(
@@ -1486,6 +1487,11 @@ def stats(
     """Sample a repro's container CPU/RAM (peak over a window, or --watch live)."""
     _require_docker()
     m = runner.read_meta(_resolve_name(name))
+    try:
+        topology.require_compose(m.name, "stats",
+                                 instead="Install metrics-server and use `kubectl top`.")
+    except errors.ReproError as exc:
+        _fail(exc)
     if watch:
         typer.echo(f"Live stats for {m.name!r} (Ctrl-C to stop)…")
         try:

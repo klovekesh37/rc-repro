@@ -245,6 +245,34 @@ def test_detail_and_stats_endpoints(monkeypatch):
     assert r.status_code == 200 and j["cpu"] == 120.0 and j["mem_mb"] > 900
 
 
+def test_stats_refuses_a_workspace_that_has_no_compose_project(monkeypatch, tmp_path):
+    """The topology socket, proven through real HTTP rather than as a function call.
+
+    `stats` shells out to `docker stats` against a compose project. A workspace on
+    another runtime has none, so the route must refuse with 400 and say what to use
+    instead -- rather than running `docker stats` on nothing and answering 200 with
+    a plausible-looking zero, which is the failure that would be believed.
+    """
+    from rc_repro import runner as R
+    from rc_repro.services import topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = R.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
+                   mongo_tag="8.0", mongo_flavor="official", preset="default",
+                   root_url="u", host_port=3010, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    R.write("k", "services: {}\n", m)
+
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
+    monkeypatch.setattr(lc.runner, "container_ids",
+                        lambda n: pytest.fail("docker was reached for a non-compose workspace"))
+    r = client().get("/api/repros/k/stats", headers=H)
+    assert r.status_code == 400, f"expected a refusal, got {r.status_code}"
+    body = r.json()
+    assert "kubectl top" in body.get("error", ""), "the alternative is stated"
+    assert body.get("kind") == "ValidationError"
+
+
 def test_create_only_accepts_known_fields(monkeypatch):
     seen = {}
     monkeypatch.setattr(lc, "create_repro",

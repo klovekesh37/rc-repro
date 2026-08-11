@@ -38,6 +38,7 @@ from rc_repro.services import data as datasvc
 from rc_repro.services import audit as auditsvc
 from rc_repro.services import lifecycle as lc
 from rc_repro.services import sessions
+from rc_repro.services import topology
 from rc_repro.web import jobs as jobs_mod
 from rc_repro.web import signin as signin_page
 from rc_repro.web.jobs import JobManager
@@ -1317,6 +1318,8 @@ def create_app(allow_hosts: list[str] | None = None, *,
     def stats(name: str):
         from rc_repro.perf import resources as R
         target = lc.resolve_name(name)
+        topology.require_compose(target, "stats",
+                                 instead="Install metrics-server and use `kubectl top`.")
         ids = runner.container_ids(target)
         prefix = f"{config.PROJECT_PREFIX}{target}-"
         cpu = mem = 0.0

@@ -63,6 +63,12 @@ MONGO_OPLOG_URL = "mongodb://mongodb:27017/local?replicaSet=rs0"
 # rcapi.login can fetch email-2FA codes for rc-repro's own admin calls.
 EXTRA_MAILPIT_URL = "mailpit_url"
 
+# Key under Metadata.extra naming the runtime a workspace runs on. ABSENT means
+# docker -- every workspace created before this key existed is a compose one, and
+# `services/topology.py` reads a missing value as such rather than migrating
+# repro.json. See that module for why the default is silent.
+EXTRA_RUNTIME = "runtime"
+
 # RC's REST rate limiter — disabled for the duration of a load test (and the
 # seed) so the offered load isn't throttled into a false result, then restored.
 RC_RATE_LIMITER_SETTING = "API_Enable_Rate_Limiter"

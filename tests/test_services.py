@@ -1215,3 +1215,159 @@ def test_a_transitional_health_is_reported_without_dockers_string_prefix():
     # No healthcheck at all, and a stopped container, are both "no health".
     assert lc._uptime_health("Up 3 minutes") == ("3 minutes", "")
     assert lc._uptime_health("Exited (0) 1 minute ago") == ("", "")
+# --- the topology socket --------------------------------------------------------
+# Phase 1 of Kubernetes support: a workspace's runtime becomes a value that can be
+# READ, instead of a shape (`docker-compose.yml` on disk) that can only be
+# inferred. Only compose is registered, so none of this is user-visible yet -- the
+# tests below are what make the seam checkable before there is a second runtime.
+
+def test_a_workspace_with_no_runtime_key_reads_as_docker():
+    """The compatibility gate. Every workspace on every existing box predates this
+    key, and none of them is rewritten -- so an absent value must mean docker, or
+    the socket silently orphans the entire installed base."""
+    from rc_repro.services import topology
+
+    old = lc.runner.Metadata(name="r", project="p", rc_version="8.5.1", rc_image="i",
+                          mongo_tag="8.0", mongo_flavor="official", preset="default",
+                          root_url="http://localhost:3000", host_port=3000,
+                          version_source="test")
+    assert old.extra == {}, "the fixture must genuinely lack the key"
+    assert topology.of_meta(old) == topology.DOCKER
+
+
+def test_an_unknown_runtime_reads_as_docker_rather_than_raising():
+    """Forward compatibility, and the reason `of_meta` never raises: a workspace
+    written by a NEWER rc-repro naming a runtime this build has never heard of must
+    still list and still tear down. A repro the installed version cannot remove is
+    worse than one it renders imprecisely."""
+    from rc_repro.services import topology
+
+    m = lc.runner.Metadata(name="r", project="p", rc_version="8.5.1", rc_image="i",
+                        mongo_tag="8.0", mongo_flavor="official", preset="default",
+                        root_url="u", host_port=3000, version_source="t",
+                        extra={"runtime": "nomad"})
+    assert topology.of_meta(m) == topology.DOCKER
+    # And a corrupt `extra` is survivable too -- runner already defends against it.
+    broken = lc.runner.Metadata(name="r", project="p", rc_version="8.5.1", rc_image="i",
+                             mongo_tag="8.0", mongo_flavor="official", preset="default",
+                             root_url="u", host_port=3000, version_source="t")
+    broken.extra = "not-a-dict"          # type: ignore[assignment]
+    assert topology.of_meta(broken) == topology.DOCKER
+
+
+def test_the_runtime_survives_a_real_write_and_read(monkeypatch, tmp_path):
+    """Round-trip through repro.json on disk, not through a mock. `read_meta`
+    filters unknown keys, so a value living in the wrong place would be dropped
+    between writing a workspace and reading it back."""
+    from rc_repro.services import topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
+                        mongo_tag="8.0", mongo_flavor="official", preset="default",
+                        root_url="u", host_port=3010, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    lc.runner.write("k", "services: {}\n", m)
+    assert topology.of_repro("k") == topology.KUBERNETES
+    assert lc.runner.read_meta("k").extra["runtime"] == "kubernetes"
+
+
+def test_reading_the_runtime_of_a_missing_workspace_does_not_explode(tmp_path, monkeypatch):
+    """`of_repro` is called before the caller's own existence check in some paths.
+    It must not be the thing that fails, or the user gets a stat error instead of
+    'no such repro'."""
+    from rc_repro.services import topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    assert topology.of_repro("nope") == topology.DOCKER
+
+
+def test_normalize_accepts_what_people_type_and_refuses_what_they_mistype():
+    """The opposite policy to `of_meta`: this reads input a human just typed, where
+    a silent fallback would boot the wrong topology."""
+    from rc_repro.services import topology
+
+    assert topology.normalize("") == topology.DOCKER, "omitting --runtime is not an error"
+    assert topology.normalize(None) == topology.DOCKER
+    for spelling in ("docker", "compose", "docker-compose", "DOCKER"):
+        assert topology.normalize(spelling) == topology.DOCKER
+    for spelling in ("k8s", "kube", "Kubernetes", " KUBERNETES "):
+        assert topology.normalize(spelling) == topology.KUBERNETES
+    with pytest.raises(errors.ValidationError) as caught:
+        topology.normalize("nomad")
+    assert caught.value.exit_code == 2, "a typo is a usage error, not a preflight one"
+    assert "kubernetes" in str(caught.value), "the refusal lists what IS known"
+
+
+def test_a_compose_only_operation_refuses_a_kubernetes_workspace(monkeypatch, tmp_path):
+    """`stats` shells out to `docker stats` against a compose project, so it cannot
+    serve a workspace that has no compose project. The refusal must name the
+    alternative -- 'not supported' leaves the user to find what the person writing
+    the message already knew."""
+    from rc_repro.services import topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
+                        mongo_tag="8.0", mongo_flavor="official", preset="default",
+                        root_url="u", host_port=3010, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    lc.runner.write("k", "services: {}\n", m)
+
+    with pytest.raises(errors.ValidationError) as caught:
+        topology.require_compose("k", "stats", instead="Use `kubectl top`.")
+    assert "Kubernetes" in str(caught.value)
+    assert "kubectl top" in str(caught.value), "the alternative is stated"
+
+    # And it is SILENT for the runtime it is guarding -- a guard that fires on
+    # compose would break every existing user of the command.
+    topology.stamp(m.extra, topology.DOCKER)
+    lc.runner.write("k", "services: {}\n", m)
+    topology.require_compose("k", "stats")
+
+
+def test_only_compose_is_registered_so_up_cannot_yet_be_asked_for_kubernetes():
+    """`kubernetes` is a spellable canonical name with no implementation, which is
+    deliberate: the parser recognises it so the refusal can name it, rather than
+    reporting it as a typo."""
+    from rc_repro.services import topology
+
+    assert topology.REGISTERED == frozenset({topology.DOCKER})
+    assert topology.is_registered(topology.DOCKER)
+    assert not topology.is_registered(topology.KUBERNETES)
+    assert topology.normalize("k8s") == topology.KUBERNETES, "spellable but unregistered"
+
+
+def test_the_create_path_stamps_the_runtime_on_a_compose_workspace(monkeypatch, tmp_path):
+    """The stamp has to happen on the REAL create path, not just be available as a
+    helper. Compose workspaces are stamped too, deliberately: if only Kubernetes
+    ones were, 'absent' would mean two different things -- an old workspace and a
+    new compose one -- and no later reader could tell them apart.
+
+    Captured at the `runner.write` seam, which is the last thing to see the
+    metadata before it becomes repro.json.
+    """
+    from rc_repro.services import topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    written: list = []
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr(lc, "check_capacity", lambda *a, **k: None)
+    monkeypatch.setattr(lc.runner, "docker_kernel_version", lambda: "6.1.0")
+    monkeypatch.setattr(lc.runner, "exists", lambda n: False)
+    monkeypatch.setattr(lc.runner, "used_ports", lambda **k: set())
+    monkeypatch.setattr(lc.runner, "port_free", lambda *a, **k: True)
+    monkeypatch.setattr(lc.runner, "write",
+                        lambda name, yaml, meta, files=None: written.append(meta))
+    monkeypatch.setattr(lc.runner, "up", lambda *a, **k: 0)
+    monkeypatch.setattr(lc.versions, "resolve",
+                        lambda v, offline=False: type("R", (), {
+                            "rc_version": v, "mongo_tag": "8.0", "rc_image": "img",
+                            "mongo_flavor": "mongodb", "mongo_shell": "mongosh",
+                            "oplog": False, "source": "test", "note": ""})())
+    try:
+        lc._create_repro_locked(lc.CreateReq(version="8.6.1", name="stamped"))
+    except Exception:                       # noqa: BLE001
+        pass                                # whatever happens AFTER the write is not this test
+    assert written, "the create path never reached runner.write"
+    assert written[0].extra.get("runtime") == topology.DOCKER, (
+        "a workspace was written with no runtime recorded — every later reader "
+        "would have to guess, which is the ambiguity this key exists to remove")
