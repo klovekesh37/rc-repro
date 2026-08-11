@@ -271,6 +271,62 @@ def test_stats_refuses_a_workspace_that_has_no_compose_project(monkeypatch, tmp_
     body = r.json()
     assert "kubectl top" in body.get("error", ""), "the alternative is stated"
     assert body.get("kind") == "ValidationError"
+    assert body.get("code") == "VALIDATION_FAILED", "the STABLE identifier, not the class name"
+
+
+def test_an_error_payload_carries_the_stable_code_not_just_the_class_name(monkeypatch):
+    """errors.py promises `code` is "the stable identifier a machine-readable
+    payload reports, so callers branch on it rather than on prose" -- and nothing
+    kept that promise. The web layer answered only `kind`, which is the Python
+    class name: renaming a class is a refactor, renaming a `code` is a breaking
+    change, so a caller branching on `kind` was branching on the one field nobody
+    had agreed not to move.
+
+    Asserted through real HTTP for every class in the taxonomy, because the value
+    that matters is the one a client actually receives.
+    """
+    from rc_repro import errors
+
+    cases = [
+        (errors.NotFoundError("gone"), 404, "NOT_FOUND"),
+        (errors.ValidationError("bad"), 400, "VALIDATION_FAILED"),
+        (errors.ConflictError("taken"), 409, "CONFLICT"),
+        (errors.NotReadyError("booting"), 409, "NOT_READY"),
+        (errors.DockerError("engine down"), 502, "ENGINE_UNAVAILABLE"),
+        (errors.PreflightError("no room"), 409, "PREFLIGHT_FAILED"),
+        (errors.CreateFailedError("dead"), 500, "CREATE_FAILED"),
+    ]
+    for exc, status, code in cases:
+        def boom(*_a, _exc=exc, **_kw):
+            raise _exc
+        monkeypatch.setattr(lc, "detail", boom)
+        r = client().get("/api/repros/x/detail", headers=H)
+        assert r.status_code == status, f"{code} answered {r.status_code}"
+        assert r.json()["code"] == code, f"{code} was not published"
+        assert r.json()["kind"] == type(exc).__name__, "kind stays, for anything reading it"
+
+
+def test_a_gate_tells_the_caller_what_a_human_must_run(monkeypatch):
+    """`AuthorityGateError.as_gate()` was written "for a machine-readable error
+    payload" and had no caller anywhere, so `approve_with` -- the exact command for
+    a human to run, which is the entire point of a gate -- never left the process.
+    A caller could see 403 and had no way to learn what would clear it.
+    """
+    from rc_repro import errors
+
+    def boom(*_a, **_kw):
+        raise errors.AuthorityGateError(
+            "the target cluster is not an approved one", kind="cluster",
+            subject="kind-rc-repro", approve_with="rc-repro doctor --approve-cluster kind-rc-repro",
+            code="GATE_UNAPPROVED_CLUSTER")
+    monkeypatch.setattr(lc, "detail", boom)
+    r = client().get("/api/repros/x/detail", headers=H)
+    assert r.status_code == 403
+    body = r.json()
+    assert body["code"] == "GATE_UNAPPROVED_CLUSTER"
+    assert body["code"] in errors.GATE_CODES, "gates are declared, not invented at the call site"
+    assert body["gate"]["approve_with"] == "rc-repro doctor --approve-cluster kind-rc-repro"
+    assert body["gate"]["subject"] == "kind-rc-repro"
 
 
 def test_create_only_accepts_known_fields(monkeypatch):

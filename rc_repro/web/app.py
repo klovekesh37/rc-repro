@@ -33,7 +33,8 @@ from starlette.routing import Match
 from rc_repro import config
 from rc_repro import presets as presets_mod
 from rc_repro import runner
-from rc_repro.errors import NotReadyError, ReproError, ValidationError
+from rc_repro.errors import (NotReadyError, ReproError, ValidationError,
+                            as_payload as error_body)
 from rc_repro.services import data as datasvc
 from rc_repro.services import audit as auditsvc
 from rc_repro.services import lifecycle as lc
@@ -792,8 +793,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
 
     @app.exception_handler(ReproError)
     async def _repro_error(_: Request, exc: ReproError):
-        return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
-                            status_code=exc.http_status)
+        return JSONResponse(error_body(exc), status_code=exc.http_status)
 
     # --- the session: sign in, sign out, who am I -----------------------------
     def _client(request: Request) -> str:
@@ -1420,7 +1420,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
             # against the log itself.
             auditsvc.record("logs-open", target)
         except ReproError as exc:
-            await ws.send_json({"error": str(exc)}); await ws.close(); return
+            await ws.send_json(error_body(exc)); await ws.close(); return
 
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue(maxsize=WS_QUEUE_MAX)
