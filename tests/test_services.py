@@ -1371,3 +1371,113 @@ def test_the_create_path_stamps_the_runtime_on_a_compose_workspace(monkeypatch, 
     assert written[0].extra.get("runtime") == topology.DOCKER, (
         "a workspace was written with no runtime recorded — every later reader "
         "would have to guess, which is the ambiguity this key exists to remove")
+
+
+# --- the three axes -------------------------------------------------------------
+
+def test_every_cell_of_the_runtime_deployment_matrix():
+    """`--preset` used to carry two ideas at once -- the scenario AND the
+    deployment shape -- because there was one axis to put them in. Of the nine
+    presets shipped, eight are scenarios and exactly one, multi-instance, is a
+    deployment: it adds a Traefik load balancer and a NATS mesh.
+
+    Splitting them means `--preset` finally means the same thing in both runtimes.
+    Every combination is decided in one function, because a rule enforced at two
+    call sites eventually disagrees with itself.
+    """
+    from rc_repro.services import topology as T
+
+    ok = lambda **kw: T.resolve_axes(**kw)                                # noqa: E731
+
+    # Defaults: omitting --runtime is the common case, not an error.
+    assert (ok().runtime, ok().deployment, ok().replicas) == (T.DOCKER, T.MONOLITH, 1)
+    # Kubernetes defaults to microservices, matching the chart's own default.
+    k = ok(runtime="k8s")
+    assert (k.runtime, k.deployment) == (T.KUBERNETES, T.MICROSERVICES)
+    assert ok(runtime="k8s", deployment="monolith").deployment == T.MONOLITH
+    # A scenario is a scenario regardless of where it runs -- the whole point.
+    assert ok(preset="ldap").preset == "ldap"
+    assert ok(runtime="k8s", preset="ldap").preset == "ldap"
+    # multi-instance reaches the preset loader, which is how it stays compatible.
+    m = ok(deployment="multi-instance", replicas=3)
+    assert (m.preset, m.params["instances"], m.replicas) == ("multi-instance", 3, 3)
+    assert ok(deployment="multi-instance").replicas == 2, "the preset's own default"
+
+
+def test_the_refusals_name_what_to_do_instead(monkeypatch):
+    """Each refusal is about coverage or physics -- never about category
+    confusion. 'Is multi-instance a preset or a deployment?' stops being a
+    question a user can get wrong, because there is one place it can live."""
+    from rc_repro.services import topology as T
+
+    cases = [
+        (dict(runtime="docker", deployment="microservices"), "--runtime kubernetes"),
+        (dict(runtime="k8s", deployment="multi-instance"), "--runtime docker"),
+        (dict(replicas=3), "--deployment multi-instance"),
+        (dict(preset="ldap", deployment="multi-instance"), "separately"),
+        (dict(preset="multi-instance", deployment="monolith"), "two different deployments"),
+        (dict(runtime="nomad"), "Known runtimes"),
+        (dict(deployment="sharded"), "Known deployments"),
+        (dict(replicas=-1), "at least 1"),
+    ]
+    for kwargs, expect in cases:
+        with pytest.raises(errors.ValidationError) as caught:
+            T.resolve_axes(**kwargs)
+        assert expect in str(caught.value), f"{kwargs} said {caught.value!r}"
+        assert caught.value.exit_code == 2, "a bad combination is a usage error"
+
+    # An unregistered runtime is refused separately from being resolved, so a GUI
+    # can name Kubernetes as an option without failing on it.
+    assert T.resolve_axes(runtime="k8s").runtime == T.KUBERNETES
+    with pytest.raises(errors.ValidationError):
+        T.require_registered(T.KUBERNETES)
+    T.require_registered(T.DOCKER)
+
+
+def test_the_old_spellings_keep_working_and_say_what_they_are_now():
+    """Permanent aliases, not a deprecation with a deadline. They cost one dict
+    lookup each, and breaking a command line that is pasted into support tickets
+    buys nothing."""
+    from rc_repro.services import topology as T
+
+    a = T.resolve_axes(preset="multi-instance", params={"instances": "3"})
+    assert (a.deployment, a.replicas) == (T.MULTI_INSTANCE, 3)
+    assert a.params["instances"] == "3", "the original param is preserved verbatim"
+    assert any("--deployment multi-instance" in h for h in a.hints)
+    assert any("--replicas 3" in h for h in a.hints)
+
+    # #3's spelling: --deployment microservices with no --runtime means Kubernetes.
+    b = T.resolve_axes(deployment="microservices")
+    assert b.runtime == T.KUBERNETES
+    assert any("implies --runtime kubernetes" in h for h in b.hints)
+
+    # Nothing is deprecated about the NEW spelling, so it stays quiet.
+    assert T.resolve_axes(deployment="multi-instance", replicas=3).hints == []
+
+
+def test_rebuilding_a_workspace_does_not_nag_about_a_spelling_nobody_typed():
+    """`restore` and the GUI's recreate button rebuild a request from a record.
+    Both used to pass `preset=meta.preset`, which for a multi-instance workspace
+    IS the legacy spelling -- so clicking Start printed a deprecation notice at a
+    user who had typed neither flag."""
+    from rc_repro.services import topology as T
+
+    m = lc.runner.Metadata(name="r", project="p", rc_version="8.5.1", rc_image="i",
+                           mongo_tag="8.0", mongo_flavor="official",
+                           preset="multi-instance", root_url="u", host_port=3000,
+                           version_source="t",
+                           extra={"runtime": "docker", "deployment": "multi-instance",
+                                  "instances": 3})
+    kwargs = T.axes_of_meta(m)
+    assert kwargs == {"runtime": "docker", "deployment": "multi-instance",
+                      "preset": "default", "replicas": 3}
+    assert T.resolve_axes(**kwargs).hints == [], "rebuilding is not a deprecation"
+
+    # A workspace older than the deployment key is not lost: for those the
+    # deployment WAS the preset name, which is the ambiguity the split removes.
+    old = lc.runner.Metadata(name="r", project="p", rc_version="8.5.1", rc_image="i",
+                             mongo_tag="8.0", mongo_flavor="official",
+                             preset="multi-instance", root_url="u", host_port=3000,
+                             version_source="t")
+    assert T.axes_of_meta(old)["deployment"] == T.MULTI_INSTANCE
+    assert T.axes_of_meta(old)["runtime"] == T.DOCKER

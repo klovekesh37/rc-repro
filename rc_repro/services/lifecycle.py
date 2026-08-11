@@ -448,6 +448,13 @@ class CreateReq:
     force: bool = False
     monitor: bool = False
     stats: bool = False
+    # The three axes (services/topology.py). Empty/0 means "that runtime's
+    # default", never "unset but meaningful" -- resolve_axes turns them into
+    # canonical values, and writes the deployment back out as a preset + params so
+    # the rest of create is unchanged.
+    runtime: str = ""
+    deployment: str = ""
+    replicas: int = 0
     # HTTPS. Two ways in, matching the official docs' DOMAIN + LETSENCRYPT_EMAIL:
     #   --domain [+ --email]  a Let's Encrypt certificate for a public hostname
     #   --https               a certificate from rc-repro's own local CA, no domain
@@ -663,6 +670,21 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
 
 def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
                          stream_output: bool = False) -> dict:
+    # Runtime x deployment x scenario, decided before anything else looks at the
+    # request. The resolved axes are written BACK onto `req` as a preset name and
+    # `--set` params, so every reader below -- name derivation, the preset loader,
+    # capacity, repro.json -- is untouched and `--deployment multi-instance
+    # --replicas 3` reaches compose.build by the exact path `--preset
+    # multi-instance --set instances=3` always did.
+    axes = topology.resolve_axes(runtime=req.runtime, deployment=req.deployment,
+                                 replicas=req.replicas, preset=req.preset,
+                                 params=req.params)
+    topology.require_registered(axes.runtime)
+    for hint in axes.hints:
+        info(emit, hint, phase="plan")
+    req.preset, req.params = axes.preset, axes.params
+    req.runtime, req.deployment, req.replicas = (axes.runtime, axes.deployment,
+                                                 axes.replicas)
     require_docker()
     cfg = config.load_config()
 
@@ -781,7 +803,8 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     # Stamped on every create, compose included, so "absent" keeps meaning exactly
     # one thing: a workspace older than the key. See services/topology.py.
-    topology.stamp(meta.extra, topology.DOCKER)
+    topology.stamp(meta.extra, req.runtime or topology.DOCKER)
+    meta.extra[config.EXTRA_DEPLOYMENT] = req.deployment or topology.MONOLITH
     if pre.post_ready:
         meta.extra["post_ready"] = pre.post_ready
     if pre.notes:

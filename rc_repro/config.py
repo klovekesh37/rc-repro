@@ -69,6 +69,11 @@ EXTRA_MAILPIT_URL = "mailpit_url"
 # repro.json. See that module for why the default is silent.
 EXTRA_RUNTIME = "runtime"
 
+# Key under Metadata.extra naming HOW Rocket.Chat is arranged (monolith /
+# multi-instance / microservices). Absent on a workspace older than the key, where
+# the deployment can still be recovered: it WAS the preset name.
+EXTRA_DEPLOYMENT = "deployment"
+
 # RC's REST rate limiter — disabled for the duration of a load test (and the
 # seed) so the offered load isn't throttled into a false result, then restored.
 RC_RATE_LIMITER_SETTING = "API_Enable_Rate_Limiter"

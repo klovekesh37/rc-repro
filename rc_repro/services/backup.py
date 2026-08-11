@@ -41,7 +41,7 @@ from packaging.version import InvalidVersion, Version
 from rc_repro import config, runner
 from rc_repro.errors import (ConflictError, DockerError, NotFoundError,
                              NotReadyError, ReproError, ValidationError)
-from rc_repro.services import lifecycle
+from rc_repro.services import lifecycle, topology
 from rc_repro.services.events import Emit, info, null_emit, warn
 
 #: Bundle layout. `schema` is checked on read: a future rc-repro that changes the
@@ -254,6 +254,12 @@ def _create_locked(target: str, *, out: str = "", note: str = "", live: bool = F
             "mongo_flavor": meta.mongo_flavor,
             "preset": meta.preset,
             "params": (meta.extra or {}).get("params") or {},
+            # The axes, so a restore rebuilds the workspace it captured rather
+            # than inferring the deployment from the preset name. Absent in
+            # archives taken before these keys existed, where the inference is
+            # still correct -- see topology.axes_of_meta.
+            "runtime": topology.of_meta(meta),
+            "deployment": (meta.extra or {}).get(config.EXTRA_DEPLOYMENT) or "",
             "env_overrides": (meta.extra or {}).get("env") or {},
             # Named volumes other than Mongo's: their CONTENT is not captured, and
             # restore warns when this is non-empty. Recording it is what makes that
@@ -571,10 +577,17 @@ def _create_from_manifest(target: str, manifest: dict, emit: Emit) -> None:
             "--name for a different one")
     info(emit, f"creating {target!r} at Rocket.Chat {manifest.get('rc_version')} "
                f"(preset {manifest.get('preset') or 'default'})", phase="create", pct=5)
+    # An archive that recorded its axes rebuilds from them; an older one falls
+    # back to inferring them from the preset name, which is what that name meant.
+    axes = ({"runtime": str(manifest.get("runtime") or ""),
+             "deployment": str(manifest.get("deployment") or ""),
+             "preset": "default"}
+            if manifest.get("deployment") else
+            {"preset": str(manifest.get("preset") or "default")})
     req = lifecycle.CreateReq(
         version=str(manifest.get("rc_version") or ""),
-        preset=str(manifest.get("preset") or "default"),
         name=target,
+        **axes,
         mongo=str(manifest.get("mongo_tag") or ""),
         params=dict(manifest.get("params") or {}),
         env=dict(manifest.get("env_overrides") or {}),

@@ -1555,8 +1555,8 @@ def create_app(allow_hosts: list[str] | None = None, *,
         """
         target = lc.resolve_name(name)
         meta = runner.read_meta(target)
-        req = lc.CreateReq(version=meta.rc_version, preset=meta.preset,
-                           name=target, wait=True, offline=True)
+        req = lc.CreateReq(version=meta.rc_version, name=target, wait=True,
+                           offline=True, **topology.axes_of_meta(meta))
         job = jobs.submit("up", lc.create_repro, req, stream_output=True, label=target)
         return {"job_id": job.id}
 

@@ -2572,3 +2572,46 @@ def test_a_compose_only_command_refuses_cleanly_rather_than_traceback(monkeypatc
         "the error escaped as an exception instead of being rendered")
     assert "kubectl top" in res.output, "the alternative is stated to the user"
     assert "Traceback" not in res.output
+
+
+def test_both_spellings_of_multi_instance_build_the_same_compose_file():
+    """The migration gate. `multi-instance` moved out of `--preset` and into
+    `--deployment`, and the old spelling stays as a permanent alias -- so the two
+    must be the SAME stack, not merely similar ones.
+
+    Byte-identical, not "still works": a one-line difference would mean the alias
+    quietly builds a different topology than the command it claims to replace,
+    which is exactly the failure nobody would notice until a ticket reproduced
+    differently under the new flag.
+    """
+    from rc_repro import compose, presets, versions
+    from rc_repro.services import topology as T
+
+    def built(**kwargs) -> str:
+        axes = T.resolve_axes(**kwargs)
+        pre = presets.load(axes.preset, axes.params)
+        resolved = versions.resolve("8.5.1", offline=True)
+        spec = compose.Spec.from_resolved(
+            resolved, project_name="rcrepro-x", root_url="http://localhost:3000",
+            host_port=3000, reg_token=None, preset=pre, bind_host="127.0.0.1")
+        return compose.to_yaml(compose.build(spec))
+
+    old = built(preset="multi-instance", params={"instances": "3"})
+    new = built(deployment="multi-instance", replicas=3)
+    assert old == new, "the alias builds a different stack than the flag it replaces"
+
+    # The preset's own default count survives the move too.
+    assert built(preset="multi-instance") == built(deployment="multi-instance")
+
+    # A plain monolith is untouched by any of this -- the overwhelming majority of
+    # command lines in use say neither flag.
+    assert built(preset="default") == built()
+
+    # And the count actually reaches the document, so the assertion above is not
+    # comparing two identically-wrong files.
+    import yaml as _yaml
+    services = _yaml.safe_load(new)["services"]
+    rc = [s for s in services if s.startswith("rocketchat")]
+    assert len(rc) == 3, f"expected 3 Rocket.Chat services, got {rc}"
+    assert len([s for s in _yaml.safe_load(built(deployment="multi-instance"))["services"]
+                if s.startswith("rocketchat")]) == 2

@@ -266,7 +266,10 @@ def _render_create_result(result: dict) -> None:
 @app.command()
 def up(
     version: str = typer.Option(..., "--version", "-v", help="Rocket.Chat version, e.g. 6.5.3"),
-    preset: str = typer.Option("default", "--preset", "-p", help="preset to apply"),
+    preset: str = typer.Option("default", "--preset", "-p", help="scenario to apply: ldap, saml, oidc, email, s3_minio, livechat, airgapped"),
+    runtime: str = typer.Option("", "--runtime", help="where it runs: docker (default) | kubernetes"),
+    deployment: str = typer.Option("", "--deployment", help="how RC is arranged. docker: monolith (default) | multi-instance. kubernetes: microservices (default) | monolith"),
+    replicas: int = typer.Option(0, "--replicas", help="Rocket.Chat instances (needs --deployment multi-instance on docker)"),
     name: str = typer.Option("", "--name", "-n", help="repro name (default: derived)"),
     port: int = typer.Option(0, "--port", help="host port (default: first free >= 3000)"),
     root_url: str = typer.Option("", "--root-url", help="override ROOT_URL"),
@@ -302,6 +305,7 @@ def up(
         params=_parse_set_params(set_), seed=False, pin=pin,
         wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
         force=force, monitor=monitor, actor=_cli_actor(),
+        runtime=runtime, deployment=deployment, replicas=replicas,
         https=https, domain=domain, acme_email=email,
         env={**envsvc.parse_set(env or []), **envsvc.as_setting(setting or [])},
     )
