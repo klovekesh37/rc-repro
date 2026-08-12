@@ -284,6 +284,18 @@ def build(spec: Spec) -> dict:
         "restart": "always",
         "environment": _rc_environment(spec),
         "ports": [f"{spec.host_port}:{spec.container_port}"],
+        # The same probe the cloned instances have always had. Without it Docker
+        # reports no health for this service, and `detail()` then falls back to the
+        # container STATE -- which is "running" from the moment the process starts,
+        # minutes before Rocket.Chat serves anything. The panel said
+        # "Health: running" on a workspace whose /api/info was refusing the
+        # connection outright, which is the one question that field exists to
+        # answer.
+        #
+        # Informational only: nothing declares depends_on service_healthy against
+        # the single-instance service, and `_up` does not pass --wait, so this
+        # changes what is REPORTED and not what anything waits for.
+        "healthcheck": copy.deepcopy(_RC_HEALTHCHECK),
         "depends_on": (
             {"mongo-init": {"condition": "service_completed_successfully"}}
             if official

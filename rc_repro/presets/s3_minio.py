@@ -82,12 +82,39 @@ def build(params: dict) -> Preset:
     env = {
         "OVERWRITE_SETTING_FileUpload_Storage_Type": "AmazonS3",
         "OVERWRITE_SETTING_FileUpload_S3_Bucket": bucket,
-        "OVERWRITE_SETTING_FileUpload_S3_BucketURL": f"http://minio:{_S3_PORT}/{bucket}",
+        # The ENDPOINT, with no bucket on it, even though docs.rocket.chat/docs/minio
+        # spells the format as `http://[your.minio.domain/bucketname]`. Bucket is
+        # already passed separately, and with ForcePathStyle the client builds
+        # {endpoint}/{bucket}/{key} -- so a bucket in the endpoint is repeated as a
+        # key prefix. Measured on 7.13.6 by uploading a file and reading MinIO's own
+        # layout:
+        #
+        #   with the bucket   -> rcrepro-uploads/rcrepro-uploads/<instance>/uploads/...
+        #   without it        -> rcrepro-uploads/<instance>/uploads/...
+        #
+        # Both upload successfully -- MinIO is happy to treat it as a prefix -- which
+        # is why this went unnoticed. It is still every object nested one level
+        # deeper than it should be, under a directory named after its own bucket.
+        "OVERWRITE_SETTING_FileUpload_S3_BucketURL": f"http://minio:{_S3_PORT}",
         "OVERWRITE_SETTING_FileUpload_S3_AWSAccessKeyId": _USER,
         "OVERWRITE_SETTING_FileUpload_S3_AWSSecretAccessKey": _PASSWORD,
         "OVERWRITE_SETTING_FileUpload_S3_Region": "us-east-1",   # MinIO default
         "OVERWRITE_SETTING_FileUpload_S3_ForcePathStyle": "true",  # mandatory for MinIO
-        "OVERWRITE_SETTING_FileUpload_S3_SignatureVersion": "v4",
+        # v2, which is what docs.rocket.chat/docs/minio prescribes -- and NOT a
+        # cosmetic choice. RC 7.13.x bundles aws-sdk v2 (there is no @aws-sdk
+        # directory in the image at all), which honours this setting; asking it for
+        # v4 makes the very first upload-store call raise
+        #
+        #   Non-file stream objects are not supported with SigV4
+        #
+        # during startup, and Rocket.Chat then never finishes booting. Measured on
+        # 7.13.6 + s3_minio: with v4 it never served in 300s and /api/info refused
+        # the connection; with v2 it answered 200 in ~35s and the error was gone.
+        #
+        # Newer releases moved to @aws-sdk/client-s3, which always signs SigV4 and
+        # ignores this setting -- so v2 is correct on old images and inert on new
+        # ones, which is why 8.5.1 never showed the fault.
+        "OVERWRITE_SETTING_FileUpload_S3_SignatureVersion": "v2",
         # Default: stream files through RC so the browser never needs to reach
         # MinIO. Presigned mode: real presigned URLs (the faithful flow).
         "OVERWRITE_SETTING_FileUpload_S3_Proxy_Uploads": "false" if presigned else "true",

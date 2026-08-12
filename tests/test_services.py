@@ -1151,3 +1151,67 @@ def test_an_impossible_mongo_kernel_pairing_is_refused_before_any_docker_work(mo
     assert "mongod 8.0 exits" in str(caught.value)
     assert caught.value.exit_code == 3, "a wrong environment is a preflight failure"
     assert not pulled, "it refused only AFTER starting work"
+
+
+# --- readiness must not depend on DNS, a certificate, or the edge ----------------
+
+def test_root_url_in_metadata_is_always_the_local_port(monkeypatch, tmp_path):
+    """runner.Metadata's own docstring makes this a contract: root_url "stays the
+    plain http://localhost:<port> that rc-repro's own API calls (login, PAT, seeding,
+    load tests) use", and public_url carries the external name.
+
+    `--root-url` used to displace it, which put a public https name into root_url --
+    and `ready` polls exactly that. Reported from a live box: "Rocket.Chat did not
+    become ready within 300s" while `curl http://localhost:3000/api/info` answered
+    200 the whole time. Reproduced here with `up --root-url https://lab.example.com`:
+    still booting at 127s, 200 locally, and after the fix ready in 15s.
+
+    The override still reaches Rocket.Chat -- it is what RC ADVERTISES, and the
+    compose spec below keeps taking it.
+    """
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    seen = {}
+
+    monkeypatch.setattr(lc.runner, "docker_available", lambda **_k: True)
+    monkeypatch.setattr(lc.runner, "exists", lambda _n: False)
+    monkeypatch.setattr(lc, "check_capacity", lambda *a, **k: None)
+    monkeypatch.setattr(lc, "check_sidecar_ports", lambda *a, **k: None)
+    monkeypatch.setattr(lc, "pick_host_port", lambda *a, **k: 3001)
+    _real_resolve = lc.versions.resolve      # bind before patching, or it recurses
+    monkeypatch.setattr(lc.versions, "resolve",
+                        lambda v, offline=False: _real_resolve(v, offline=True))
+
+    def fake_write(name, compose_yaml, meta, files=None):
+        seen["meta"] = meta
+        seen["yaml"] = compose_yaml
+        return None
+
+    monkeypatch.setattr(lc.runner, "write", fake_write)
+    monkeypatch.setattr(lc, "_up", lambda *a, **k: 0)
+
+    lc.create_repro(lc.CreateReq(version="8.5.1", name="urlcase",
+                                 root_url="https://lab.example.com", wait=False),
+                    emit=lc.null_emit)
+
+    meta = seen.get("meta")
+    assert meta is not None, "create never wrote metadata"
+    assert meta.root_url == "http://localhost:3001", \
+        f"root_url must stay local, got {meta.root_url!r}"
+    # And RC still advertises the override, or --root-url would do nothing at all.
+    assert "ROOT_URL: https://lab.example.com" in seen["yaml"], \
+        "RC should still advertise the override — otherwise --root-url does nothing"
+
+
+def test_a_transitional_health_is_reported_without_dockers_string_prefix():
+    """Docker spells the transitional state "health: starting" inside the Status
+    string, and bare "healthy"/"unhealthy" for the settled ones.
+
+    Taken verbatim the panel rendered "Health: health: starting". The prefix belongs
+    to the string format, not to the value.
+    """
+    assert lc._uptime_health("Up 4 seconds (health: starting)") == ("4 seconds", "starting")
+    assert lc._uptime_health("Up 2 hours (healthy)") == ("2 hours", "healthy")
+    assert lc._uptime_health("Up 5 minutes (unhealthy)") == ("5 minutes", "unhealthy")
+    # No healthcheck at all, and a stopped container, are both "no health".
+    assert lc._uptime_health("Up 3 minutes") == ("3 minutes", "")
+    assert lc._uptime_health("Exited (0) 1 minute ago") == ("", "")

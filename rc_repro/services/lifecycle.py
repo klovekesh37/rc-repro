@@ -719,7 +719,20 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
     if req.monitor:
         check_monitor_ports(exclude=repro_name)
     host_port = pick_host_port(req.port, pre, exclude=repro_name)
-    root = req.root_url or f"http://localhost:{host_port}"
+    # ALWAYS the published local port, never an override. `--root-url` says what
+    # Rocket.Chat should ADVERTISE, and it still does that through the compose spec
+    # below -- but `root` is what rc-repro calls itself, and runner.Metadata's own
+    # docstring makes that a contract: root_url "stays the plain
+    # http://localhost:<port> that rc-repro's own API calls (login, PAT, seeding,
+    # load tests) use".
+    #
+    # Letting the override through broke that contract, and readiness is where it
+    # showed: `ready` polls meta.root_url, so a workspace whose root_url held a
+    # public https name reported "Rocket.Chat did not become ready within 300s"
+    # while /api/info on the local port answered 200 the whole time. Reproduced with
+    # `up --root-url https://lab.example.com`: still booting at 127s, 200 locally.
+    # Nothing about readiness should depend on DNS, a certificate, or the edge.
+    root = f"http://localhost:{host_port}"
     token = req.reg_token or cfg.get("reg_token") or ""
     bind_host = req.bind or cfg.get("bind_host") or config.DEFAULT_BIND_HOST
     tlsspec = _resolve_tls(req, repro_name, bind_host, exclude=repro_name, emit=emit)
@@ -1180,6 +1193,12 @@ def _uptime_health(status: str) -> tuple[str, str]:
         return "", ""
     mm = re.search(r"\(([^)]+)\)", status)
     health = mm.group(1) if (mm and status.startswith("Up ")) else ""
+    # Docker spells the transitional one "health: starting" inside the Status
+    # string, and a bare "healthy"/"unhealthy" for the settled ones. Taken verbatim
+    # the panel rendered "Health: health: starting". The prefix is noise from the
+    # string format, not part of the value.
+    if health.startswith("health: "):
+        health = health[len("health: "):]
     up = status[3:].split(" (")[0].strip() if status.startswith("Up ") else ""
     return up, health
 

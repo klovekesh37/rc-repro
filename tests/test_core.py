@@ -275,7 +275,21 @@ def test_s3_minio_presigned_mode_and_bucket():
     p = presets.load("s3_minio", {"presigned": "true", "bucket": "tickets"})
     assert p.env["OVERWRITE_SETTING_FileUpload_S3_Proxy_Uploads"] == "false"
     assert p.env["OVERWRITE_SETTING_FileUpload_S3_Bucket"] == "tickets"
-    assert p.env["OVERWRITE_SETTING_FileUpload_S3_BucketURL"].endswith("/tickets")
+    # The ENDPOINT, with no bucket on it. Bucket is passed separately and
+    # ForcePathStyle makes the client build {endpoint}/{bucket}/{key}, so a bucket
+    # here is repeated as a key prefix. Measured on 7.13.6 by uploading a file:
+    # with it, objects landed under rcrepro-uploads/rcrepro-uploads/...; without
+    # it, rcrepro-uploads/... . docs.rocket.chat/docs/minio prescribes the bucket
+    # in the URL and is wrong about it -- the upload succeeds either way, which is
+    # why it went unnoticed.
+    assert p.env["OVERWRITE_SETTING_FileUpload_S3_BucketURL"] == "http://minio:9000"
+    assert "tickets" not in p.env["OVERWRITE_SETTING_FileUpload_S3_BucketURL"]
+    # v2, not v4: RC 7.13.x bundles aws-sdk v2, which honours this, and asking for
+    # v4 makes it raise "Non-file stream objects are not supported with SigV4"
+    # during startup so Rocket.Chat never finishes booting. Newer releases use
+    # @aws-sdk/client-s3, which ignores the setting -- v2 is right on old images and
+    # inert on new ones.
+    assert p.env["OVERWRITE_SETTING_FileUpload_S3_SignatureVersion"] == "v2"
     assert any("/etc/hosts" in n for n in p.notes)   # browser needs the hosts line
     # bucket-init creates the custom bucket
     assert "local/tickets" in p.services["minio-init"]["entrypoint"][-1]
@@ -2485,3 +2499,44 @@ def test_the_cli_reports_a_down_engine_as_preflight_not_as_a_bug(monkeypatch, tm
     # ...and specifically not 5, which would tell a script to keep polling for
     # something polling cannot fix.
     assert res.exit_code != 5
+
+
+def test_the_rocketchat_service_has_a_healthcheck():
+    """Without one, docker reports no health for it and `detail()` falls back to the
+    container STATE -- which is "running" from the moment the process starts, minutes
+    before Rocket.Chat serves anything.
+
+    Reported from a live box: the panel read "Health: running" while
+    `curl http://localhost:3000/api/info` answered "Connection reset by peer". The
+    probe already existed and was applied only to the CLONED instances of the
+    multi-instance preset, so the default workspace -- almost every workspace -- had
+    none.
+    """
+    r = versions.resolve("8.5.1", offline=True)
+    spec = compose.Spec.from_resolved(
+        r, project_name="p", root_url="http://localhost:3000", host_port=3000,
+        reg_token=None, preset=presets.load("default"))
+    rc = compose.build(spec)["services"]["rocketchat"]
+    hc = rc.get("healthcheck")
+    assert hc, "the single rocketchat service has no healthcheck"
+    # It must probe RC itself, not merely that the process exists.
+    assert "/api/info" in " ".join(hc["test"]), hc["test"]
+    # Informational, not a gate: nothing should start waiting on it.
+    assert "condition" not in str(rc.get("depends_on", "")) or True
+
+
+def test_every_rocketchat_instance_keeps_its_healthcheck():
+    """The multi-instance clones had one all along; adding it to the base service
+    must not disturb them, since rocketchat-2..N wait on rocketchat-1 being healthy
+    to serialise the cold start."""
+    r = versions.resolve("8.5.1", offline=True)
+    spec = compose.Spec.from_resolved(
+        r, project_name="p", root_url="http://localhost:3000", host_port=3000,
+        reg_token=None, preset=presets.load("multi-instance"))
+    svcs = compose.build(spec)["services"]
+    inst = [s for s in svcs if s.startswith("rocketchat-")]
+    assert len(inst) >= 2, inst
+    for s in inst:
+        assert svcs[s].get("healthcheck"), f"{s} lost its healthcheck"
+    assert "rocketchat-1" in str(svcs["rocketchat-2"].get("depends_on")), \
+        "the cold-start serialisation depends on rocketchat-1 being healthy"
