@@ -166,6 +166,10 @@ def test_first_run_creates_the_first_admin_in_the_browser(serve, page):
         page.fill("#p", PASSWORD)
         page.click("button[type=submit]")
         page.wait_for_selector("#repros")          # straight into the dashboard
+        # Pre-existing race, same shape as the one CI caught next door: #repros
+        # exists before app.js has filled #whoami from /api/session, so a slow
+        # runner reads "" here. It has simply not lost the race yet.
+        page.wait_for_selector("#whoami:not([hidden])")
         assert page.text_content("#whoami").strip() == "alice"
         # the key must not survive in the address bar
         assert "#k=" not in page.url
@@ -1382,6 +1386,11 @@ def test_signing_in_works_over_plain_http_on_a_real_hostname(serve_public, publi
         assert "cross-site request refused" not in public_page.content(), \
             "the sign-in form POST was refused as cross-site"
         public_page.wait_for_selector("#repros")
+        # `#whoami` is filled by app.js after /api/session answers, so reading it
+        # the moment #repros exists is a race -- it passed on a fast laptop and
+        # failed in CI with `assert '' == 'alice'`. Every other test in this file
+        # waits for the :not([hidden]) form; this one has to as well.
+        public_page.wait_for_selector("#whoami:not([hidden])")
         assert public_page.text_content("#whoami").strip() == "alice"
         assert public_page.errors == [], public_page.errors
 
@@ -1392,8 +1401,11 @@ def test_a_write_from_the_spa_survives_plain_http_on_a_real_hostname(serve_publi
 
     A same-origin POST/DELETE also carries its Origin per the referrer policy, so
     with `no-referrer` every write from the dashboard was a 403 too -- signing in
-    was merely the first thing that could not be done. A 404 here is the pass: it
-    means the request reached the handler instead of being eaten by the guard.
+    was merely the first thing that could not be done.
+
+    The pass is "the guard did not eat it", not a particular status. Asserting 404
+    tied this to the engine: resolve_name() shells out to docker, so without it the
+    handler answers 502 and the test failed for a reason it is not about.
     """
     usersvc.add("alice", PASSWORD, role="admin")
     with serve_public() as s:
@@ -1404,10 +1416,12 @@ def test_a_write_from_the_spa_survives_plain_http_on_a_real_hostname(serve_publi
         assert "cross-site request refused" not in public_page.content(), \
             "the sign-in form POST was refused as cross-site"
         public_page.wait_for_selector("#repros")
-        status = public_page.evaluate(
+        res = public_page.evaluate(
             """async () => {
                 const r = await fetch('/api/repros/does-not-exist', {
                     method: 'DELETE', credentials: 'same-origin' });
-                return r.status;
+                return {status: r.status, text: (await r.text()).slice(0, 200)};
             }""")
-        assert status == 404, f"the guard refused a same-origin write ({status})"
+        assert res["status"] != 403, \
+            f"the guard refused a same-origin write ({res['status']}: {res['text']})"
+        assert "cross-site" not in res["text"], res["text"]

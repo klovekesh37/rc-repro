@@ -43,6 +43,78 @@ def test_resolve_bad_version_raises():
     raise AssertionError("expected ValueError for a bad version")
 
 
+# --- version resolution (the LIVE lookup) -------------------------------------
+# Everything above passes offline=True, so this path had no test at all -- which is
+# how RC 7.13.x shipped unbootable. releases.rocket.chat is not consistent about the
+# shape of compatibleMongoVersions, and the value was used verbatim as a docker tag.
+
+
+class _FakeResp:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+
+    def json(self):
+        return self._payload
+
+
+def _live(monkeypatch, compatible, version="7.13.6"):
+    """Resolve `version` with the API stubbed to answer `compatible`."""
+    monkeypatch.setattr(versions.requests, "get",
+                        lambda *a, **k: _FakeResp({"compatibleMongoVersions": compatible}))
+    return versions.resolve(version)
+
+
+def test_a_bare_major_from_the_api_becomes_the_series_the_registry_publishes(monkeypatch):
+    """RC 7.13.6 answers ['5','6','7','8'] where 7.12 answers ['5.0','6.0','7.0'].
+
+    Used verbatim that produced `mongodb/mongodb-community-server:8-ubi8`, and the
+    registry has no bare-major tag -- 8-ubi8 and 7-ubi8 are both 404 while 8.0-ubi8
+    and 7.0-ubi8 are 200. Every `up` on those releases died with "failed to resolve
+    reference ... not found".
+    """
+    r = _live(monkeypatch, ["5", "6", "7", "8"])
+    assert r.mongo_tag == "8.0", "a bare major must become its .0 series"
+    assert r.source == "releases.rocket.chat"
+    assert r.mongo_flavor == "official" and r.mongo_shell == "mongosh"
+    # and it says so, so the number on screen is explainable
+    assert "bare major" in r.note and "8.0" in r.note
+
+
+def test_an_already_dotted_answer_is_left_exactly_as_it_is(monkeypatch):
+    """The common case, and it must not be rewritten: 8.2 is a real series and
+    turning it into 8.0 would silently downgrade the pairing."""
+    assert _live(monkeypatch, ["8.2"], version="8.0.1").mongo_tag == "8.2"
+    assert _live(monkeypatch, ["5.0", "6.0", "7.0"], version="7.12.0").mongo_tag == "7.0"
+    # three parts are published too, so they pass through
+    assert _live(monkeypatch, ["8.0.4"], version="8.5.1").mongo_tag == "8.0.4"
+
+
+def test_the_highest_compatible_version_still_wins(monkeypatch):
+    """Normalising must not disturb the choice, only its spelling."""
+    assert _live(monkeypatch, ["5", "8", "6"]).mongo_tag == "8.0"
+    assert _live(monkeypatch, ["6.0", "5.0"], version="7.0.0").mongo_tag == "6.0"
+
+
+def test_an_answer_that_parses_but_is_not_a_tag_falls_back_to_the_map(monkeypatch):
+    """`8.0rc1` is a valid PEP440 version, so `_highest` accepts it happily -- and it
+    is not a tag anyone publishes. Before the fix that went straight through to
+    `8.0rc1-ubi8`. The curated pairing is the better answer than a tag invented from
+    something the resolver cannot actually read.
+
+    Distinct from a value like `latest`, which never reaches this guard because
+    `_highest` cannot parse it as a version at all.
+    """
+    r = _live(monkeypatch, ["8.0rc1"], version="7.13.6")
+    assert r.source == "map (fallback)"
+    assert r.mongo_tag == "7.0", "the map's own answer for RC 7.x"
+
+
+def test_an_api_answer_with_no_versions_falls_back_to_the_map(monkeypatch):
+    """Old releases omit the field entirely."""
+    assert _live(monkeypatch, [], version="7.13.6").source == "map (fallback)"
+
+
 # --- presets ------------------------------------------------------------------
 
 

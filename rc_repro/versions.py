@@ -91,17 +91,54 @@ def _resolve_online(version: str, rc: Version, timeout: float = 5.0) -> Resolved
     best = _highest(compatible)
     if best is None:
         return None  # old releases omit the field
+    # The API's answer is not necessarily a tag. Returning None here rather than
+    # guessing means the curated map decides, which is the better answer when the
+    # live value cannot be read at all.
+    tag = _series_tag(best)
+    if tag is None:
+        return None
+
+    note = "compatibleMongoVersions=" + ",".join(compatible)
+    if tag != best:
+        # Said out loud in `rc-repro versions <x>`: the pairing on screen is then
+        # explainable, instead of a number that appears nowhere in the API's answer.
+        note += f" (bare major {best!r} -> {tag}, the series the registry publishes)"
 
     return Resolved(
         rc_version=version,
         rc_image="",  # filled in by resolve()
-        mongo_tag=best,
-        mongo_flavor=_flavor(best),
-        mongo_shell=_shell(best),
+        mongo_tag=tag,
+        mongo_flavor=_flavor(tag),
+        mongo_shell=_shell(tag),
         oplog=_oplog(rc),
         source="releases.rocket.chat",
-        note="compatibleMongoVersions=" + ",".join(compatible),
+        note=note,
     )
+
+
+def _series_tag(value: str) -> str | None:
+    """A `compatibleMongoVersions` entry as a tag the registry actually publishes.
+
+    releases.rocket.chat is not consistent about the shape of this field. RC 7.12
+    and below answer ["5.0","6.0","7.0"] and 8.x answers ["8.0"] -- but RC 7.13.x
+    answers ["5","6","7","8"], a bare major. The value was used verbatim as a
+    docker tag, and `mongodb/mongodb-community-server` publishes only
+    <major>.<minor>, so RC 7.13.x resolved to `8-ubi8` and every boot died on
+    "failed to resolve reference ... not found". Checked against the registry:
+    8-ubi8 and 7-ubi8 are 404; 8.0-ubi8 and 7.0-ubi8 are 200.
+
+    A bare major means the GA series for that major, which is always `.0` -- every
+    Mongo major from 4 to 8 publishes one. Anything that already carries a minor is
+    left alone, including a three-part tag like 8.0.4, which the registry also
+    publishes.
+
+    None for anything that is not a plain numeric version, so the caller falls back
+    to the curated map instead of inventing a tag out of something it cannot read.
+    """
+    parts = value.split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return f"{parts[0]}.0" if len(parts) == 1 else value
 
 
 def _highest(tags: list[str]) -> str | None:

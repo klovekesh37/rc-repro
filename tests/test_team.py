@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 
 import pytest
 from typer.testing import CliRunner
@@ -19,6 +20,24 @@ from rc_repro.services import users
 
 cli_runner = CliRunner()
 GOOD = "correct-horse-battery"
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def flat_help(output: str) -> str:
+    """`--help` reduced to one line of plain text, for substring assertions.
+
+    Two things have to come out first, and BOTH are environment-dependent, which is
+    how a test that passes locally fails in CI:
+
+    * ANSI colour. typer renders help through Rich, which highlights `--flags` --
+      and it inserts the escape codes INSIDE the token, so the raw output does not
+      contain the literal "--trust-proxy" at all when colour is on. CI enables it;
+      a local run does not.
+    * The option table's box rules, which land mid-sentence once help text wraps,
+      so an assertion would really be about the terminal width.
+    """
+    return " ".join(_ANSI.sub("", output).replace("│", " ").split())
 
 
 @pytest.fixture(autouse=True)
@@ -431,8 +450,13 @@ def test_the_no_accounts_refusal_names_the_command_to_run_again(served):
     than as two commands in a row. That is how a support box stayed down.
     """
     r = cli_runner.invoke(cli.app, [
+        # --bind, so the Docker bridge is never consulted: with --domain and no
+        # --bind, `serve` reads edgesvc.bridge_address() before it reaches the
+        # accounts check, and on a machine without Docker these three failed with
+        # "could not read the Docker bridge address" instead of the message under
+        # test. Nothing in this suite should need the engine.
         "serve", "--domain", "rc.example.com", "--email", "ops@example.com",
-        "--no-open"])
+        "--bind", "172.17.0.1", "--no-open"])
     assert r.exit_code != 0
     assert "users add" in r.output
     # The re-run line, rebuilt from argv, so it carries the flags that were given.
@@ -654,8 +678,13 @@ def test_the_no_accounts_stop_is_not_dressed_as_a_failure(served):
     the worse lie.
     """
     r = cli_runner.invoke(cli.app, [
+        # --bind, so the Docker bridge is never consulted: with --domain and no
+        # --bind, `serve` reads edgesvc.bridge_address() before it reaches the
+        # accounts check, and on a machine without Docker these three failed with
+        # "could not read the Docker bridge address" instead of the message under
+        # test. Nothing in this suite should need the engine.
         "serve", "--domain", "rc.example.com", "--email", "ops@example.com",
-        "--no-open"])
+        "--bind", "172.17.0.1", "--no-open"])
     assert r.exit_code == 3, f"want 3 (preflight), got {r.exit_code}"
     assert "error:" not in r.output, "this is a next step, not a failure"
     assert "needs an account" in r.output
@@ -676,8 +705,13 @@ def test_the_domain_path_does_not_warn_about_publishing_before_refusing(served):
     answers on one screen is what made the whole message untrustworthy.
     """
     r = cli_runner.invoke(cli.app, [
+        # --bind, so the Docker bridge is never consulted: with --domain and no
+        # --bind, `serve` reads edgesvc.bridge_address() before it reaches the
+        # accounts check, and on a machine without Docker these three failed with
+        # "could not read the Docker bridge address" instead of the message under
+        # test. Nothing in this suite should need the engine.
         "serve", "--domain", "rc.example.com", "--email", "ops@example.com",
-        "--no-open"])
+        "--bind", "172.17.0.1", "--no-open"])
     assert "publishes the GUI" not in r.output, r.output
     assert "needs an account" in r.output
 
@@ -689,10 +723,7 @@ def test_insecure_is_not_advertised_as_replaceable_by_trust_proxy():
     no address to name."""
     r = cli_runner.invoke(cli.app, ["serve", "--help"])
     assert r.exit_code == 0
-    # The option table's box rules land mid-sentence once help text wraps, so they
-    # come out before the whitespace is collapsed -- otherwise every assertion here
-    # is really an assertion about the terminal width.
-    flat = " ".join(r.output.replace("│", " ").split())
+    flat = flat_help(r.output)
     assert "deprecated: prefer --trust-proxy" not in flat
     # --insecure is HIDDEN now: it is the only way to serve plain http on a
     # reachable bind, so it keeps working, but a first-time reader on localhost or
