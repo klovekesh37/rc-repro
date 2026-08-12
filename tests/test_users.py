@@ -97,12 +97,66 @@ def test_a_short_password_is_refused():
         users.add("alice", "short")
 
 
-def test_names_are_restricted_to_a_dns_label():
-    """The name becomes part of a workspace name and therefore a hostname."""
-    for bad in ("Alice", "al ice", "alice.b", "-alice", "", "a" * 32, "al_ice"):
-        with pytest.raises(errors.ValidationError):
-            users.add(bad, GOOD)
-    users.add("alice-2", GOOD)          # allowed shape
+def test_names_are_normalised_to_a_dns_label_rather_than_refused():
+    """The name becomes part of a workspace name and therefore a hostname — but
+    that is a reason to TRANSFORM it, not to refuse it, exactly as `up --name
+    TICKET-1234` has always created `ticket-1234`.
+
+    Refusing was not the cosmetic problem it looked like: `serve` also refuses to
+    start on a network-reachable bind with no accounts, so `users add lucy.felix`
+    failing was the whole reason a box could not be brought up.
+    """
+    users.add("keeper", GOOD)           # so nothing below is the last admin
+    for typed, stored in (("Alice", "alice"), ("al ice", "al-ice"),
+                          ("alice.b", "alice-b"), ("-alice", "alice"),
+                          ("al_ice", "al-ice"), ("Lucy.Felix", "lucy-felix"),
+                          ("lovekesh.kumar", "lovekesh-kumar")):
+        assert users.add(typed, GOOD).name == stored
+        assert users.role_of(stored), f"{typed!r} was not stored as {stored!r}"
+        users.remove(stored)
+    users.add("alice-2", GOOD)          # already a label: untouched
+
+
+def test_a_name_that_cannot_become_a_label_is_still_refused():
+    """Normalising is not a licence to invent one. Nothing to work with, and too
+    long to shorten safely, are the two that survive — and they say different
+    things, because they have different fixes."""
+    with pytest.raises(errors.ValidationError, match="at least one letter or digit"):
+        users.add("...", GOOD)
+    with pytest.raises(errors.ValidationError, match="at least one letter or digit"):
+        users.add("", GOOD)
+    # Truncating somebody's identity silently is worse than refusing it.
+    with pytest.raises(errors.ValidationError, match="the limit is 31"):
+        users.add("a" * 32, GOOD)
+
+
+def test_the_normalisation_is_the_one_repro_names_already_use():
+    """`normalize_name` is a deliberate copy of `lifecycle.sanitize` — users.py sits
+    below lifecycle and importing it would drag compose, runner and the version
+    index in. This is what stops the copy drifting; if it fails, the two rules have
+    diverged and an account name no longer survives becoming a workspace name."""
+    from rc_repro.services.lifecycle import sanitize
+    for raw in ("lucy.felix", "Lucy.Felix", "lovekesh.kumar", "al_ice", "-alice-",
+                "a..b", "a  b", "TICKET-1234", "alice", "ålice", "a.b_c d"):
+        assert users.normalize_name(raw) == sanitize(raw), raw
+
+
+def test_a_dotted_name_signs_in_and_is_managed_by_what_was_typed():
+    """The name someone is given is the one they type. Having `add` fold the dot
+    while `verify` did not would hand every dotted account a login it cannot use."""
+    users.add("keeper", GOOD)           # the demotion below must not be the last admin
+    created = users.add("lucy.felix", GOOD)
+    assert created.name == "lucy-felix"
+    assert users.verify("lucy.felix", GOOD) is True, "the name as typed must work"
+    assert users.verify("lucy-felix", GOOD) is True, "and so must the stored one"
+    assert users.verify("lucy.felix", "wrong-password-entirely") is False
+    assert users.role_of("lucy.felix") == users.role_of("lucy-felix") != ""
+    users.set_role("lucy.felix", "readonly")
+    assert users.role_of("lucy-felix") == "readonly"
+    users.set_password("lucy.felix", "another-good-password")
+    assert users.verify("lucy.felix", "another-good-password") is True
+    users.remove("lucy.felix")
+    assert users.role_of("lucy-felix") == ""
 
 
 def test_adding_twice_is_a_conflict_not_a_silent_overwrite():

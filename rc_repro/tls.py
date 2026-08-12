@@ -127,17 +127,13 @@ def local_host_for(name: str) -> str:
 _LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 
 
-def normalize_domain(value: str) -> tuple[str, str]:
-    """Turn a user-supplied --domain into a bare hostname. Returns (host, note).
+def _clean_host(value: str) -> tuple[str, list[str]]:
+    """Shared cleanup for a user-supplied hostname: scheme, trailing slash, dot, case.
 
-    The official Rocket.Chat compose docs spell out that DOMAIN must be set
-    "without https:// or trailing slashes", which is a strong hint that people get
-    it wrong -- and unguarded it produced ROOT_URL="https://https://host" plus a
-    bogus ACME `domains` entry that Let's Encrypt rejects.
-
-    Forms with one obvious meaning are corrected and reported. Forms that would
-    change what gets served (a port, a path) are refused, because silently
-    dropping them would not do what the user asked.
+    ONE implementation, because `--domain` and `--allow-host` are mistyped in exactly
+    the same ways -- a pasted URL, a trailing slash, a capitalised name -- and
+    diverging on which of those is forgiven is how one flag ends up accepting what
+    the other refuses. They differ only on a PORT, which each decides for itself.
     """
     raw = value.strip()
     fixes = ["trimmed whitespace"] if raw != value else []
@@ -156,6 +152,66 @@ def normalize_domain(value: str) -> tuple[str, str]:
     if raw != raw.lower():
         raw = raw.lower()
         fixes.append("lower-cased it")
+    return raw, fixes
+
+
+def normalize_allow_host(value: str) -> tuple[str, str]:
+    """Turn a user-supplied --allow-host into a bare hostname. Returns (host, note).
+
+    The same cleanup as --domain, with one deliberate difference: a port is DROPPED
+    and reported rather than refused. The Host guard compares hostnames with the port
+    already stripped off the incoming header (`_hostname` in web/app.py), so
+    `--allow-host lab.example.com:9944` names exactly the right host -- and keeping
+    the port, which is what used to happen, made it match nothing at all.
+
+    Not hypothetical. Measured on a lab box, three of the five forms somebody typed
+    in a row -- `https://h/`, `h/`, `h:9944` -- were each unmatchable, and `serve`
+    started and reported itself healthy every time before 403ing every request. The
+    port form is the sharpest of the three: you are serving on 9944, so writing the
+    host with its port is the obvious thing to do.
+
+    `*` is the documented "any Host" wildcard and passes through untouched.
+    """
+    if value.strip() == "*":
+        return "*", ""
+    raw, fixes = _clean_host(value)
+    if raw.startswith("["):
+        # `[::1]:9944` / `[::1]` -- the guard unwraps the brackets too, so match it.
+        inner = raw[1:].split("]", 1)[0]
+        if inner:
+            raw = inner
+            fixes.append("unwrapped the IPv6 brackets")
+    elif raw.count(":") == 1:
+        # host:port. More than one colon and no brackets is a bare IPv6 literal
+        # (`::1`), which has no port to drop and must survive untouched.
+        raw, port = raw.split(":", 1)
+        fixes.append(f"dropped the port {port!r} — a Host header's port is not matched")
+    if not raw:
+        raise ValidationError(
+            f"--allow-host {value!r} has no hostname in it. Pass the name you will "
+            "type in the address bar — e.g. --allow-host lab.example.com, or '*' "
+            "for any host.")
+    if "/" in raw:
+        raise ValidationError(
+            f"--allow-host {value!r} contains a path. Pass the hostname only "
+            f"({raw.split('/', 1)[0]}) — the guard matches the Host header, and a "
+            "Host header has no path in it.")
+    return raw, ("; ".join(fixes) if fixes else "")
+
+
+def normalize_domain(value: str) -> tuple[str, str]:
+    """Turn a user-supplied --domain into a bare hostname. Returns (host, note).
+
+    The official Rocket.Chat compose docs spell out that DOMAIN must be set
+    "without https:// or trailing slashes", which is a strong hint that people get
+    it wrong -- and unguarded it produced ROOT_URL="https://https://host" plus a
+    bogus ACME `domains` entry that Let's Encrypt rejects.
+
+    Forms with one obvious meaning are corrected and reported. Forms that would
+    change what gets served (a port, a path) are refused, because silently
+    dropping them would not do what the user asked.
+    """
+    raw, fixes = _clean_host(value)
 
     if not raw:
         raise ValidationError("--domain is empty")

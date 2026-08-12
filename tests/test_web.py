@@ -266,8 +266,32 @@ def test_security_headers_are_set():
     assert directives["object-src"].strip() == "'none'"
     r = client().get("/api/health")
     assert r.headers["x-content-type-options"] == "nosniff"
-    # the session token rides in ?t=, so no Referer may carry it off-origin
-    assert r.headers["referrer-policy"] == "no-referrer"
+    # No Referer may carry anything off-origin -- `same-origin` sends none at all
+    # to another origin, which is the whole of what `no-referrer` bought here. See
+    # test_the_referrer_policy_does_not_null_this_pages_own_origin for why it may
+    # not be `no-referrer`.
+    assert r.headers["referrer-policy"] == "same-origin"
+
+
+def test_the_referrer_policy_does_not_null_this_pages_own_origin():
+    """`no-referrer` is not free: per Fetch, the `Origin` of a non-CORS POST follows
+    the referrer policy, so it makes this page's own form POST arrive as
+    `Origin: null`.
+
+    That is survivable while `Sec-Fetch-Site` is present to answer first -- but a
+    browser omits `Sec-Fetch-*` for any URL that is not potentially trustworthy,
+    and `rc-repro serve --insecure` on a real hostname is exactly that. The guard
+    then saw a bare `Origin: null`, could not match it against the allow-list, and
+    refused every sign-in and every SPA write as cross-site.
+
+    Asserted on the sign-in page specifically because that is the one a signed-out
+    browser POSTs. tests/test_browser.py drives the real thing over a public name.
+    """
+    r = client().get("/signin")
+    assert r.headers["referrer-policy"] == "same-origin"
+    # The property `no-referrer` was there for: nothing about this origin travels
+    # to another one. `same-origin` still guarantees it.
+    assert r.headers["referrer-policy"] != "no-referrer"
 
 
 def test_up_endpoint_recreates_a_downed_repro_from_stored_metadata(monkeypatch):
@@ -1912,6 +1936,63 @@ def test_a_same_origin_form_post_with_a_null_origin_is_allowed(anon_client):
                          headers={"Host": "localhost", "Origin": "null",
                                   "Sec-Fetch-Site": "same-origin"})
     assert r.status_code == 303 and r.headers["location"] == "/"
+
+
+def test_the_host_guard_names_the_host_it_refused(anon_client):
+    """"host not allowed (use serve --allow-host)" never said WHICH name to add —
+    and the name is right there in the request. Naming it turns the 403 a browser
+    shows into a one-step fix instead of a guessing game.
+
+    The value is attacker-supplied, so it is truncated and repr-quoted. This is a
+    JSON body served with nosniff, so it cannot become markup.
+    """
+    r = anon_client.get("/api/health", headers={"Host": "lab.example.com"})
+    assert r.status_code == 403
+    body = r.json()["error"]
+    assert "lab.example.com" in body, body
+    assert "--allow-host lab.example.com" in body, "and the exact flag to add"
+    # A port on the refused Host must not end up inside the suggested flag.
+    r2 = anon_client.get("/api/health", headers={"Host": "lab.example.com:9944"})
+    assert "--allow-host lab.example.com`" in r2.json()["error"], r2.json()
+
+
+def test_the_host_guard_bounds_what_it_echoes_back(anon_client):
+    """A 4 KB Host header must not become a 4 KB error body."""
+    r = anon_client.get("/api/health", headers={"Host": "a" * 4000})
+    assert r.status_code == 403
+    assert len(r.json()["error"]) < 400, "the echoed Host was not truncated"
+
+
+def test_signing_in_by_a_dotted_name_files_the_session_under_the_stored_one(anon_client):
+    """verify() accepts `lucy.felix` for the `lucy-felix` account, so the session
+    must be filed under the name that EXISTS — not the one that was typed.
+
+    Filing it as typed broke the guarantee set_password() is built to make.
+    users.set_password() and users.remove() call sessions.revoke_user() with the
+    stored name, so a dotted account's live sessions survived a password reset:
+    changing a compromised credential left the intruder signed in for up to seven
+    days, and revoke reported 0 sessions ended while saying it had succeeded.
+
+    Found in a browser — the top bar read `lucy.felix` beside a People row reading
+    `lucy-felix`, which is the same defect wearing a cosmetic face.
+    """
+    from rc_repro.services import sessions as sessionsvc
+    from rc_repro.services import users as usersvc
+    usersvc.add("lucy.felix", "correct-horse-battery")
+
+    r = anon_client.post("/signin", follow_redirects=False,
+                         data={"user": "lucy.felix",
+                               "password": "correct-horse-battery"},
+                         headers={"Host": "localhost", "Origin": "null",
+                                  "Sec-Fetch-Site": "same-origin"})
+    assert r.status_code == 303, r.text
+    token = r.cookies.get("rc_repro_session") or ""
+    assert sessionsvc.verify(token).user == "lucy-felix", "filed under the typed name"
+
+    # The invariant that broke: replacing the password must end that session.
+    ended = usersvc.set_password("lucy.felix", "a-brand-new-password")
+    assert ended == 1, f"password reset ended {ended} sessions, so one outlived it"
+    assert sessionsvc.verify(token) is None, "the session survived its own password"
 
 
 def test_a_null_origin_without_sec_fetch_site_is_still_refused(basic_client):

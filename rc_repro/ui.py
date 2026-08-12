@@ -16,8 +16,14 @@ def ok(msg: str) -> None:
     typer.secho(msg, fg=typer.colors.GREEN)
 
 
-def warn(msg: str) -> None:
-    typer.secho(msg, fg=typer.colors.YELLOW)
+def warn(msg: str, *, err: bool = False) -> None:
+    """Amber: something wants the reader's attention but nothing has failed.
+
+    `err` puts it on stderr, for the case where the warning precedes a non-zero
+    exit -- `rc-repro serve > /dev/null` must still show why nothing started.
+    Default stays stdout so no existing caller moves stream.
+    """
+    typer.secho(msg, fg=typer.colors.YELLOW, err=err)
 
 
 def fail(msg: str) -> None:

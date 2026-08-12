@@ -1306,3 +1306,108 @@ def test_preset_notes_are_read_as_points_not_as_lines(serve, page):
         assert oidc[0].startswith("OIDC needs one host entry") and "same URL" in oidc[0], \
             "a sentence wrapped across two lines was split into two paragraphs"
         assert page.errors == [], page.errors
+
+
+# --- plain http on a real hostname (the --insecure / --bind 0.0.0.0 box) -----------
+#
+# Every other test here drives http://127.0.0.1, which browsers class as
+# "potentially trustworthy" -- and that one property is why the whole suite, and
+# every local run, was blind to the defect below. A shared box reached by NAME over
+# plain http is not trustworthy, so the browser omits `Sec-Fetch-*` entirely, and
+# the cross-site guard falls through to `Origin`.
+
+PUBLIC_NAME = "rcrepro.support.example.com"
+
+
+@pytest.fixture
+def public_browser():
+    """A browser that resolves a real-looking hostname to the loopback server.
+
+    `--host-resolver-rules` is what makes the origin `http://<name>:<port>` rather
+    than `http://127.0.0.1:<port>`, without touching /etc/hosts or needing DNS.
+    """
+    with sync_playwright() as p:
+        b = p.chromium.launch(
+            args=[f"--host-resolver-rules=MAP {PUBLIC_NAME} 127.0.0.1"])
+        yield b
+        b.close()
+
+
+@pytest.fixture
+def public_page(public_browser):
+    ctx = public_browser.new_context()
+    pg = ctx.new_page()
+    pg.errors = []
+    pg.on("pageerror", lambda e: pg.errors.append(str(e)))
+    yield pg
+    ctx.close()
+
+
+@pytest.fixture
+def serve_public(tmp_path, monkeypatch):
+    """As `serve`, but answering to the public name as well as the loopback one."""
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    def _start(**kw):
+        app = create_app(allow_hosts=["127.0.0.1", PUBLIC_NAME], **kw)
+        port = _free_port()
+        srv = _Server(app, port)
+        srv.public_url = f"http://{PUBLIC_NAME}:{port}"
+        return srv
+    return _start
+
+
+def test_signing_in_works_over_plain_http_on_a_real_hostname(serve_public, public_page):
+    """The defect a support engineer hit on a shared AWS box, and the reason the
+    GUI could not be used there at all.
+
+    `rc-repro serve --bind 0.0.0.0 --allow-host <name> --insecure` serves the login
+    over plain http on a public name. A browser attaches `Sec-Fetch-*` only to a
+    potentially trustworthy URL, which that is not -- so the guard fell through to
+    `Origin`, and the page's own `Referrer-Policy: no-referrer` had already nulled
+    it (per Fetch, a non-CORS POST's Origin follows the referrer policy). The guard
+    cannot match "null" against the allow-list, so every sign-in was answered
+    `{"error": "cross-site request refused"}` and there was no way into the GUI.
+
+    Nothing localhost-shaped reproduces it: 127.0.0.1 IS potentially trustworthy,
+    so there the `Sec-Fetch-Site: same-origin` branch answers first and the null
+    Origin is never consulted.
+    """
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve_public() as s:
+        _sign_in(public_page, s.public_url)
+        public_page.wait_for_load_state()
+        # Checked before waiting on any selector, so the refusal reports itself
+        # instead of arriving 30s later as "#repros never appeared".
+        assert "cross-site request refused" not in public_page.content(), \
+            "the sign-in form POST was refused as cross-site"
+        public_page.wait_for_selector("#repros")
+        assert public_page.text_content("#whoami").strip() == "alice"
+        assert public_page.errors == [], public_page.errors
+
+
+def test_a_write_from_the_spa_survives_plain_http_on_a_real_hostname(serve_public,
+                                                                    public_page):
+    """The same missing `Sec-Fetch-*` reaches every `fetch()` the SPA makes.
+
+    A same-origin POST/DELETE also carries its Origin per the referrer policy, so
+    with `no-referrer` every write from the dashboard was a 403 too -- signing in
+    was merely the first thing that could not be done. A 404 here is the pass: it
+    means the request reached the handler instead of being eaten by the guard.
+    """
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve_public() as s:
+        _sign_in(public_page, s.public_url)
+        public_page.wait_for_load_state()
+        # Pre-fix this is where it stops: the login itself was refused, so the
+        # write below could not even be reached to be measured.
+        assert "cross-site request refused" not in public_page.content(), \
+            "the sign-in form POST was refused as cross-site"
+        public_page.wait_for_selector("#repros")
+        status = public_page.evaluate(
+            """async () => {
+                const r = await fetch('/api/repros/does-not-exist', {
+                    method: 'DELETE', credentials: 'same-origin' });
+                return r.status;
+            }""")
+        assert status == 404, f"the guard refused a same-origin write ({status})"

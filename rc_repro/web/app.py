@@ -339,6 +339,94 @@ def parse_trusted(entries) -> list:
     return out
 
 
+def _matches_nothing(net) -> bool:
+    """The wildcard address pinned to a single host: 0.0.0.0/32, ::/128.
+
+    Syntactically valid, matches no peer that ever connects, and the only reason
+    anyone types it is meaning "anywhere". One predicate because three callers ask
+    the same question -- the diagnosis, the effective set, and the posture line --
+    and answering it three ways is how two of them end up disagreeing.
+    """
+    return int(net.network_address) == 0 and net.prefixlen == net.max_prefixlen
+
+
+def _matches_everything(net) -> bool:
+    """0.0.0.0/0 or ::/0 — every address there is.
+
+    Usable, unlike `_matches_nothing`, so nothing refuses it; but it says "believe
+    X-Forwarded-* from anyone", which is a different statement from "believe my
+    proxy" and worth hearing out loud. resolve_peer()'s docstring spells out both
+    consequences: a chosen scheme turns Secure on, and a chosen address dodges the
+    sign-in throttle.
+    """
+    return int(net.network_address) == 0 and net.prefixlen == 0
+
+
+def usable_trusted(entries) -> list[str]:
+    """The given entries that can actually match a peer, as written.
+
+    What the posture line and the app should both go by. `--trust-proxy 0.0.0.0`
+    made `serve` announce "https, trusted from 0.0.0.0" while trusting nothing,
+    because the line tested whether the LIST was non-empty rather than whether
+    anything in it could match.
+    """
+    out = []
+    for raw in entries or []:
+        for part in str(raw).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                net = ipaddress.ip_network(part, strict=False)
+            except ValueError:
+                continue
+            if not _matches_nothing(net):
+                out.append(part)
+    return out
+
+
+def trusted_problems(entries) -> list[str]:
+    """What is wrong with these `--trust-proxy` values, in the order given.
+
+    Kept beside parse_trusted() because it is a second reading of the same input:
+    apart, one of them drifts and the diagnosis stops matching the behaviour.
+
+    Dropping a bad entry silently is right for the PARSER -- a typo should mean
+    "that proxy is not trusted", never a server that will not start. Saying
+    nothing about it is what made `--trust-proxy 0.0.0.0` survive: it parses, it
+    is not dropped, and it becomes 0.0.0.0/32 -- an address no peer ever has. The
+    flag is then indistinguishable from --insecure, the cookie it was passed to
+    mark Secure is not Secure, and nothing anywhere says so.
+    """
+    out = []
+    for raw in entries or []:
+        for part in str(raw).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                net = ipaddress.ip_network(part, strict=False)
+            except ValueError:
+                out.append(f"--trust-proxy {part!r} is not an address or CIDR, "
+                           "so it was ignored — no proxy is trusted by it.")
+                continue
+            if _matches_everything(net):
+                out.append(
+                    f"--trust-proxy {part} trusts X-Forwarded-* from ANY client, "
+                    "not just a proxy: anyone can then claim X-Forwarded-Proto: "
+                    "https to get a Secure cookie and silence the unencrypted "
+                    "warning, and set X-Forwarded-For to dodge the sign-in "
+                    "throttle. Name the proxy's own address instead.")
+                continue
+            if _matches_nothing(net):
+                every = "0.0.0.0/0" if net.version == 4 else "::/0"
+                out.append(f"--trust-proxy {part} means the single address {net}, "
+                           f"which no proxy has — did you mean {every}? As it "
+                           "stands nothing is trusted and the session cookie will "
+                           "not be marked Secure.")
+    return out
+
+
 def create_app(allow_hosts: list[str] | None = None, *,
                accounts: bool = True, public_https: bool = False,
                first_run: bool = False, trust_proxy=None) -> FastAPI:
@@ -456,9 +544,17 @@ def create_app(allow_hosts: list[str] | None = None, *,
             # HTTP test passed, because TestClient sends neither header.
             return site not in ("same-origin", "none")
         origin = headers.get("origin", "")
-        # No Sec-Fetch-Site (a non-browser client, or a very old browser). A
-        # literal "null" is an opaque origin -- a sandboxed iframe, a data: URL --
-        # and cannot be matched against the allow-list, so it counts as cross.
+        # No Sec-Fetch-Site. NOT only a non-browser client or an old browser, which
+        # is what this said while the sign-in form on every --insecure box 403'd: a
+        # current browser omits `Sec-Fetch-*` for any URL that is not "potentially
+        # trustworthy", and plain http on a real hostname is not (localhost is,
+        # which is why nothing local ever reproduced it). So this branch IS the
+        # browser path whenever the GUI is served over http off-loopback, and the
+        # `Origin` it carries has to be a real one -- see the Referrer-Policy note
+        # in `guard`, which is what makes sure it is.
+        #
+        # A literal "null" is still an opaque origin -- a sandboxed iframe, a data:
+        # URL -- unmatchable against the allow-list, so it still counts as cross.
         if origin:
             if origin == "null":
                 return True
@@ -562,7 +658,18 @@ def create_app(allow_hosts: list[str] | None = None, *,
     @app.middleware("http")
     async def guard(request: Request, call_next):
         if not host_ok(request.headers.get("host")):
-            return JSONResponse({"error": "host not allowed (use serve --allow-host)"}, status_code=403)
+            # Name the Host that was refused, and the exact flag that would admit
+            # it. "host not allowed (use serve --allow-host)" left the reader to
+            # guess WHICH name to add, which is the whole of the fix -- and the
+            # value is right there in the request. Truncated and quoted with !r
+            # because it is attacker-supplied; this is a JSON body served with
+            # nosniff, so it cannot become markup, but it should not be unbounded.
+            refused = (request.headers.get("host") or "")[:120]
+            return JSONResponse(
+                {"error": f"host not allowed: {refused!r} is not in the allow-list. "
+                          f"Restart with `--allow-host {refused.split(':')[0]}` "
+                          "(or '*' for any host).",
+                 "kind": "Forbidden"}, status_code=403)
         path = request.url.path
         # Cross-site request. In TOKEN mode the unguessable ?t= doubles as a CSRF
         # token, but a Basic credential is attached by the BROWSER on every
@@ -663,10 +770,23 @@ def create_app(allow_hosts: list[str] | None = None, *,
         # answers 304, so this costs a conditional request, not a re-download.
         if not path.startswith("/api/"):
             response.headers.setdefault("Cache-Control", "no-cache")
-        # No credential rides in a URL any more, but the first-run key does ride
-        # in a FRAGMENT -- suppress the Referer regardless, so nothing about this
-        # origin travels with an outbound link.
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        # `same-origin`, not `no-referrer`. The reason for suppressing the Referer
+        # is unchanged and still met: the first-run key rides in a FRAGMENT, which
+        # no policy ever copies into a Referer, and `same-origin` sends nothing at
+        # all to another origin -- so no outbound link carries anything about this
+        # one either.
+        #
+        # What `no-referrer` ALSO did was null the `Origin` header on this page's
+        # own form POST: per Fetch, the Origin of a non-CORS POST follows the
+        # referrer policy, so a same-origin sign-in arrived as `Origin: null`. That
+        # is survivable while `Sec-Fetch-Site` is there to appeal to -- but a
+        # browser omits `Sec-Fetch-*` entirely for a URL that is not "potentially
+        # trustworthy", and plain http on a real hostname is not. On an --insecure
+        # box the guard therefore saw a bare `Origin: null`, could not match it
+        # against the allow-list, and refused every sign-in and every SPA write as
+        # cross-site. `http://localhost` IS potentially trustworthy, which is
+        # exactly why the suite and every local run missed it.
+        response.headers.setdefault("Referrer-Policy", "same-origin")
         return response
 
     @app.exception_handler(ReproError)
@@ -699,7 +819,18 @@ def create_app(allow_hosts: list[str] | None = None, *,
             _signin_failed(source)
             return "", "bad"
         _signin_ok(source)
-        return sessions.create(user, label=sessions.describe_agent(agent)), ""
+        # The session carries the STORED name, not the one that was typed. verify()
+        # accepts either, so `lucy.felix` signs in to the `lucy-felix` account --
+        # and a session filed under `lucy.felix` then belongs to an account that
+        # does not exist by that name. Two things break, one of them quietly:
+        # `sessions.revoke_user()` is called with the stored name by
+        # users.set_password() and users.remove(), so a dotted account's live
+        # sessions SURVIVED a password reset -- the one guarantee set_password
+        # exists to make -- and the audit trail spelled the same person two ways.
+        # Found in a browser, where the top bar read `lucy.felix` next to a People
+        # row reading `lucy-felix`.
+        return (sessions.create(usersvc.normalize_name(user),
+                                label=sessions.describe_agent(agent)), "")
 
     # --- first run: creating the very first account ---------------------------
     # Reachable ONLY while there are no accounts. Once one exists these 404, so a
@@ -754,7 +885,12 @@ def create_app(allow_hosts: list[str] | None = None, *,
                 {"error": "that setup link is wrong or has expired. Restart "
                           "`rc-repro serve` for a fresh one.", "kind": "Unauthorized"},
                 status_code=401)
-        name = str(body.get("user") or "").strip().lower()
+        # Normalised before ANYTHING else uses it. `add()` would normalise on its
+        # own, but the audit actor, and above all the session minted below, are
+        # built from this variable -- so the raw form would sign the very first
+        # admin in under a name that does not exist in the users file, and the
+        # next request would bounce them back to a login they cannot pass.
+        name = usersvc.normalize_name(str(body.get("user") or ""))
         password = str(body.get("password") or "")
         usersvc.require_valid_name(name)
         usersvc.require_valid_password(password)
@@ -927,7 +1063,9 @@ def create_app(allow_hosts: list[str] | None = None, *,
         can reset the credential but never hold it.
         """
         from rc_repro.services import users as usersvc
-        name = str(body.get("name") or "").strip().lower()
+        # The response below is what the People dialog renders the new row from,
+        # so it has to carry the name that was STORED, not the one that was typed.
+        name = usersvc.normalize_name(str(body.get("name") or ""))
         role = str(body.get("role") or "member")
         usersvc.require_valid_name(name)
         usersvc.require_valid_role(role)
@@ -946,7 +1084,10 @@ def create_app(allow_hosts: list[str] | None = None, *,
         # effect only when they next sign in -- and the person being demoted is
         # the least likely to sign out. (role_of is read live per request, so this
         # is belt and braces; the sign-out is what makes it visible to them.)
-        ended = sessions.revoke_user(name)
+        # u.name, not the path segment: set_role() resolves the account by its
+        # stored name, so revoking by anything else can end nobody's session while
+        # reporting the role change as done.
+        ended = sessions.revoke_user(u.name)
         return {"name": u.name, "role": u.role, "sessions_ended": ended}
 
     @app.post("/api/users/{name}/password")

@@ -184,7 +184,10 @@ def served(monkeypatch):
 def test_accounts_on_a_reachable_interface_are_refused_over_plain_http(served):
     users.add("alice", GOOD)
     r = cli_runner.invoke(cli.app, ["serve", "--bind", "0.0.0.0", "--no-open"])
-    assert r.exit_code != 0
+    # 3 (`preflight`), the same as the no-accounts branch: these are the two halves
+    # of one question — may this bind serve? — and they used to report it as 1 and
+    # 3, so a script could not treat "fix your invocation" as a single case.
+    assert r.exit_code == 3, f"want 3 (preflight), got {r.exit_code}"
     assert "0.0.0.0" in r.output, "the refusal should name the interface it refused"
     assert "--insecure" in r.output, "and the way out that works behind a remote proxy"
     assert served == {}, "nothing should be bound"
@@ -215,7 +218,7 @@ def test_without_accounts_a_reachable_bind_is_refused(served):
     and Codespaces path is `users add` first, then --allow-host as before."""
     r = cli_runner.invoke(cli.app, ["serve", "--bind", "0.0.0.0", "--no-open"])
     assert r.exit_code != 0
-    assert "refusing to start" in r.output and served == {}
+    assert "needs an account" in r.output and served == {}
 
 
 # --- serve --domain: rc-repro arranges the TLS itself ---------------------------
@@ -292,7 +295,7 @@ def test_a_domain_with_no_accounts_is_refused_not_merely_warned(fronted):
     r = cli_runner.invoke(cli.app, [
         "serve", "--domain", "support.example.com", "--email", "ops@example.com"])
     assert r.exit_code != 0
-    assert "refusing to start" in r.output and "users add" in r.output
+    assert "needs an account" in r.output and "users add" in r.output
 
 
 def test_a_scheme_in_the_domain_is_corrected_not_carried(fronted):
@@ -408,7 +411,7 @@ def test_a_reachable_bind_with_no_accounts_refuses_to_start(served):
     """The replacement for the token is not a smaller token."""
     r = cli_runner.invoke(cli.app, ["serve", "--bind", "0.0.0.0", "--no-open"])
     assert r.exit_code != 0
-    assert "refusing to start" in r.output and "users add" in r.output
+    assert "needs an account" in r.output and "users add" in r.output
     assert served == {}, "nothing should be bound"
 
 
@@ -416,7 +419,299 @@ def test_insecure_does_not_buy_a_way_past_it(served):
     """--insecure says "this hop is protected", not "skip authentication"."""
     r = cli_runner.invoke(cli.app, [
         "serve", "--bind", "0.0.0.0", "--insecure", "--no-open"])
-    assert r.exit_code != 0 and "refusing to start" in r.output
+    assert r.exit_code != 0 and "needs an account" in r.output
+
+
+def test_the_no_accounts_refusal_names_the_command_to_run_again(served):
+    """Both steps, and the second one is the line that was just typed.
+
+    Naming only `users add` left the reader to reconstruct a `--domain --email`
+    invocation from scrollback, and on a rebuilt box -- where ~/.rc-repro is empty
+    and EVERY serve says this -- it read as rc-repro having stopped working rather
+    than as two commands in a row. That is how a support box stayed down.
+    """
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--domain", "rc.example.com", "--email", "ops@example.com",
+        "--no-open"])
+    assert r.exit_code != 0
+    assert "users add" in r.output
+    # The re-run line, rebuilt from argv, so it carries the flags that were given.
+    assert "--domain rc.example.com" in r.output, r.output
+    assert "--email ops@example.com" in r.output, r.output
+    # "the command was fine" is carried by the amber styling and the numbered
+    # steps now, rather than by a sentence saying so — see
+    # test_the_no_accounts_stop_is_not_dressed_as_a_failure.
+    assert "users add <name>" in r.output
+
+
+def test_there_is_a_way_to_ask_which_version_is_installed():
+    """`rc-repro --version` did not exist — it answered "No such option", exit 2 —
+    while the project's own notes told people to run it to check what a box has,
+    and the number appeared nowhere but the sign-in page footer, which needs the
+    GUI up and reachable to read.
+
+    So the one question worth asking a remote box after deploying to it had no
+    answer from a shell, and every version bump made to render that answerable was
+    answerable only in a browser.
+    """
+    from rc_repro import __version__
+    for flag in ("--version", "-V"):
+        r = cli_runner.invoke(cli.app, [flag])
+        assert r.exit_code == 0, f"{flag}: {r.output}"
+        assert __version__ in r.output, f"{flag} did not name the version: {r.output}"
+        assert "rc-repro" in r.output
+    # Eager: it must not need a subcommand, and must not be swallowed by one.
+    assert cli_runner.invoke(cli.app, ["--version", "list"]).exit_code == 0
+
+
+def test_the_refusal_is_where_insecure_is_taught(served):
+    """Hiding it from --help only works if the one moment it IS needed says so.
+
+    That moment is this refusal, and it is precisely targeted: the reader has a
+    reachable bind, no domain and no proxy, which is the entire set of people the
+    flag applies to.
+    """
+    users.add("alice", GOOD)
+    r = cli_runner.invoke(cli.app, ["serve", "--bind", "0.0.0.0", "--no-open"])
+    assert r.exit_code != 0
+    assert "--insecure" in r.output, "hidden from --help, but named where it is needed"
+    assert served == {}, "nothing should be bound"
+
+
+def test_a_bare_trust_proxy_address_is_called_out_not_silently_useless(served):
+    """`--trust-proxy 0.0.0.0` parses, is not dropped, and becomes 0.0.0.0/32 — an
+    address no peer has. The flag is then indistinguishable from --insecure and
+    the cookie it was passed to mark Secure is not Secure.
+
+    Found on a real box, where it had been running that way for weeks: the server
+    starts, it serves, and the one thing the flag was for silently did not happen.
+    """
+    users.add("alice", GOOD)
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--bind", "0.0.0.0", "--allow-host", "*",
+        "--trust-proxy", "0.0.0.0", "--no-open"])
+    assert r.exit_code == 0, r.output
+    assert "0.0.0.0/32" in r.output and "did you mean 0.0.0.0/0" in r.output
+    # And the posture line agrees with reality. It used to read "https, trusted
+    # from 0.0.0.0" — the one line an operator reads to learn the posture, saying
+    # the opposite of it — because it tested the LIST for emptiness rather than
+    # whether anything in it could match.
+    assert "trusted from" not in r.output, r.output
+    assert "PLAIN HTTP on a reachable interface" in r.output
+    assert served.get("trust_proxy") == [], "nothing usable was passed to the app"
+
+    # A CIDR that CAN match says nothing, and is reported as trusted.
+    r2 = cli_runner.invoke(cli.app, [
+        "serve", "--bind", "0.0.0.0", "--allow-host", "*",
+        "--trust-proxy", "0.0.0.0/0", "--no-open"])
+    assert "did you mean" not in r2.output, r2.output
+    # Conditional wording on purpose: --trust-proxy grants permission to believe
+    # X-Forwarded-Proto, so until a peer inside the CIDR actually sends it this is
+    # plain http with a non-Secure cookie. "https, trusted from X" claimed otherwise.
+    assert "https when the proxy says so, trusted from 0.0.0.0/0" in r2.output
+
+
+_LAB = "6a6ee0279ef1d3d348968822-0e9f82.node-ap-b1d4.iximiuz.com"
+
+
+@pytest.mark.parametrize("given, note", [
+    (f"https://{_LAB}/", "dropped 'https://'"),
+    (f"{_LAB}/", "dropped the trailing slash"),
+    (f"{_LAB}:9944", "dropped the port"),
+    (f"{_LAB}.", "dropped the trailing dot"),
+    (_LAB.upper(), "lower-cased it"),
+])
+def test_an_allow_host_that_is_not_a_bare_hostname_is_corrected(served, given, note):
+    """Every one of these was silently unmatchable, and `serve` reported itself
+    healthy each time before 403ing every request.
+
+    The Host guard strips the port off the INCOMING header but compared against the
+    raw string it was given, so `--allow-host <lab>:9944` — the obvious thing to
+    type when you are serving on 9944 — matched nothing. Three of five forms tried
+    in a row on a real lab box failed this way.
+
+    The same raw value also built the startup URL, which is where
+    `http://https://<lab>/:9944/` came from.
+    """
+    users.add("alice", GOOD)
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--bind", "0.0.0.0", "--insecure", "--port", "9944",
+        "--allow-host", given, "--no-open"])
+    assert r.exit_code == 0, r.output
+    assert note in r.output, f"the correction was not reported: {r.output}"
+    assert served["allow_hosts"] == [_LAB], served.get("allow_hosts")
+    # And the URL is built from the corrected value, not the raw one.
+    assert f"rc-repro GUI: http://{_LAB}:9944/" in r.output, r.output
+
+
+def test_the_allow_host_wildcard_survives_correction(served):
+    """`*` is the documented any-Host value and must not be mangled into a name."""
+    users.add("alice", GOOD)
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--bind", "0.0.0.0", "--insecure", "--allow-host", "*", "--no-open"])
+    assert r.exit_code == 0, r.output
+    assert served["allow_hosts"] == ["*"]
+
+
+@pytest.mark.parametrize("given", ["https://", "/", "host/path"])
+def test_an_allow_host_with_no_hostname_in_it_is_refused(served, given):
+    """Correcting is not inventing. Nothing left to match, or a path the Host header
+    cannot carry, are refused rather than quietly turned into something else."""
+    users.add("alice", GOOD)
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--bind", "0.0.0.0", "--insecure", "--allow-host", given, "--no-open"])
+    assert r.exit_code != 0
+    assert "--allow-host" in r.output
+    assert served == {}, "nothing should be bound"
+
+
+def test_a_reachable_bind_with_an_empty_allow_list_says_only_localhost_works(served):
+    """The mirror of the --allow-host-without-a-bind note, and the one that cost the
+    time: bound where others can reach it, but the allow-list holds nothing, so only
+    localhost passes the Host guard and every request by a real name is a 403.
+    `serve` printed a healthy startup screen and said nothing.
+    """
+    users.add("alice", GOOD)
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--bind", "0.0.0.0", "--trust-proxy", "10.0.0.1", "--no-open"])
+    assert r.exit_code == 0, r.output
+    assert "nothing is in --allow-host" in r.output
+    assert "will be a 403" in r.output
+
+
+def test_trusting_every_address_is_called_out(served):
+    """`--trust-proxy 0.0.0.0/0` is usable, so nothing refuses it — but it says
+    "believe X-Forwarded-* from anyone", which is a different statement from
+    "believe my proxy". resolve_peer()'s docstring names both consequences: a chosen
+    scheme turns Secure on, a chosen address dodges the sign-in throttle."""
+    users.add("alice", GOOD)
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--bind", "0.0.0.0", "--allow-host", "*",
+        "--trust-proxy", "0.0.0.0/0", "--no-open"])
+    assert r.exit_code == 0, r.output
+    assert "ANY client" in r.output and "dodge the sign-in throttle" in r.output
+    # A specific proxy address says nothing.
+    r2 = cli_runner.invoke(cli.app, [
+        "serve", "--bind", "0.0.0.0", "--allow-host", "*",
+        "--trust-proxy", "10.0.0.1", "--no-open"])
+    assert "ANY client" not in r2.output, r2.output
+
+
+def test_a_wildcard_bind_does_not_print_a_url_nobody_can_open(served):
+    """`--bind 0.0.0.0 --allow-host '*'` — the shape a lab box is run in — has no
+    host to name, and `http://0.0.0.0:7070/` is not something anyone can open. A
+    placeholder is honest; a copy-pasteable-looking URL that fails is not."""
+    users.add("alice", GOOD)
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--bind", "0.0.0.0", "--allow-host", "*", "--insecure",
+        "--port", "7070", "--no-open"])
+    assert r.exit_code == 0, r.output
+    assert "http://0.0.0.0:7070/" not in r.output
+    assert "rc-repro GUI: http://<this-box>:7070/" in r.output, r.output
+
+
+def test_a_reachable_bind_prints_a_url_somebody_can_actually_open(served):
+    """It printed `http://localhost:<port>/` while bound to 0.0.0.0.
+
+    That is the one run where the URL is not obvious — the whole reason for the
+    bind is that the useful address is somewhere else — and the reader was left to
+    assemble it from the --allow-host they had just typed. Observed on a real box:
+    the operator worked out `http://18.232.139.213:7070/` by hand.
+    """
+    users.add("alice", GOOD)
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--bind", "0.0.0.0", "--allow-host", "18.232.139.213",
+        "--insecure", "--port", "7070", "--no-open"])
+    assert r.exit_code == 0, r.output
+    assert "rc-repro GUI: http://18.232.139.213:7070/" in r.output, r.output
+
+
+def test_allow_host_without_a_bind_says_it_is_doing_nothing(served):
+    """--allow-host names WHO may reach it; --bind decides whether anyone can.
+
+    Given one without the other the flag is inert, and the server then reports
+    itself as working — so the reader retries the same command or concludes the
+    address is wrong. It cost three attempts on a real box. A note, not a refusal:
+    naming a Host reached through a proxy on loopback is a legitimate setup.
+    """
+    users.add("alice", GOOD)
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--allow-host", "18.232.139.213", "--insecure", "--no-open"])
+    assert r.exit_code == 0, r.output
+    assert "the bind is still" in r.output and "--bind 0.0.0.0" in r.output
+    # Still starts, and still on loopback.
+    assert served["host"] == "127.0.0.1"
+
+
+def test_the_no_accounts_stop_is_not_dressed_as_a_failure(served):
+    """Nothing has gone wrong when a fresh box has no accounts — that is the
+    documented first-run sequence, and on a rebuilt box EVERY serve says it. A red
+    `error:` there reads as rc-repro being broken rather than as two commands in a
+    row, which is exactly how a working box got reported as dead.
+
+    It still exits non-zero, and with 3 (`preflight` in errors.EXIT_CODES): serve
+    did not serve, and a systemd unit reporting success while nothing listens is
+    the worse lie.
+    """
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--domain", "rc.example.com", "--email", "ops@example.com",
+        "--no-open"])
+    assert r.exit_code == 3, f"want 3 (preflight), got {r.exit_code}"
+    assert "error:" not in r.output, "this is a next step, not a failure"
+    assert "needs an account" in r.output
+    # The two paragraphs that pushed the commands off the top of the screen. The
+    # DNS-label rule matters when a name is REFUSED, and names are normalised now;
+    # the loopback aside answers a question nobody standing here is asking.
+    assert "folded to a DNS label" not in r.output
+    assert "one-time setup link" not in r.output
+    assert served == {}, "nothing should be bound"
+
+
+def test_the_domain_path_does_not_warn_about_publishing_before_refusing(served):
+    """It used to warn "this publishes the GUI on the internet with no login" and
+    then refuse to publish anything, one line apart.
+
+    With --domain the bind is never loopback, so the accounts check ALWAYS refuses
+    -- the warning described something that cannot happen, and two contradictory
+    answers on one screen is what made the whole message untrustworthy.
+    """
+    r = cli_runner.invoke(cli.app, [
+        "serve", "--domain", "rc.example.com", "--email", "ops@example.com",
+        "--no-open"])
+    assert "publishes the GUI" not in r.output, r.output
+    assert "needs an account" in r.output
+
+
+def test_insecure_is_not_advertised_as_replaceable_by_trust_proxy():
+    """They answer different questions, and --help used to say otherwise while its
+    own examples, and the running server's own hint, both told you to use
+    --insecure. `--trust-proxy` cannot replace it: with no proxy in front there is
+    no address to name."""
+    r = cli_runner.invoke(cli.app, ["serve", "--help"])
+    assert r.exit_code == 0
+    # The option table's box rules land mid-sentence once help text wraps, so they
+    # come out before the whitespace is collapsed -- otherwise every assertion here
+    # is really an assertion about the terminal width.
+    flat = " ".join(r.output.replace("│", " ").split())
+    assert "deprecated: prefer --trust-proxy" not in flat
+    # --insecure is HIDDEN now: it is the only way to serve plain http on a
+    # reachable bind, so it keeps working, but a first-time reader on localhost or
+    # behind a lab's TLS should not have to weigh a security decision that does
+    # not apply to them. It is taught where it is needed instead — see
+    # test_the_refusal_is_where_insecure_is_taught.
+    assert "--insecure" not in flat, "--help should not offer it unprompted"
+    assert "--trust-proxy" in flat, "the one that DOES apply stays"
+    # The footgun that ran for weeks looking like it worked.
+    assert "a bare 0.0.0.0 is one address and matches nothing" in flat
+    # And the case a first-timer is really in — localhost — comes first. The TLS
+    # options used to be introduced by network examples, so the commonest reader
+    # met them before learning they had no use for them.
+    assert "TRYING IT OUT? There is nothing to learn: rc-repro serve" in flat
+    # ...but not by claiming something that is false on a box already set up with
+    # a domain, where plain `serve` keeps serving it and never touches loopback.
+    # Reported from exactly such a box: `rc-repro serve` came up on https with the
+    # public name, against a --help that had just promised localhost.
+    assert "--no-domain for a local session" in flat
 
 
 def test_loopback_with_no_accounts_prints_a_one_time_setup_link(served):
@@ -443,7 +738,7 @@ def test_a_domain_with_no_accounts_refuses_rather_than_minting_anything(fronted)
     a public name with no accounts does not start at all."""
     r = cli_runner.invoke(cli.app, [
         "serve", "--domain", "rc.example.com", "--email", "ops@example.com"])
-    assert r.exit_code != 0 and "refusing to start" in r.output
+    assert r.exit_code != 0 and "needs an account" in r.output
 
 
 def test_with_accounts_the_url_carries_no_token(fronted):

@@ -42,8 +42,13 @@ _N, _R, _P, _DKLEN, _SALT = 16384, 8, 1, 32, 16
 MIN_PASSWORD = 12
 
 #: Usernames become part of a repro name and therefore a DNS label, so they are
-#: restricted to what `sanitize()` would leave untouched.
+#: restricted to what `sanitize()` would leave untouched. Input is normalised to
+#: this shape rather than refused -- see normalize_name().
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+_NAME_MAX = 31
+#: Everything `sanitize()` folds to a dash. Kept in step with it by a test rather
+#: than by importing it; see normalize_name().
+_NAME_SEPARATORS = re.compile(r"[^a-z0-9-]+")
 
 
 def users_file() -> Path:
@@ -258,7 +263,7 @@ def role_of(name: str) -> str:
     has not happened, and the person you are demoting is the one least likely to
     sign out.
     """
-    stored = _read().get(name)
+    stored = _read().get(normalize_name(name))
     return normalise_role(stored[2]) if stored else ""
 
 
@@ -288,12 +293,51 @@ def _require_not_last_admin(name: str, users: dict, what: str) -> None:
             "`rc-repro users role <name> admin`")
 
 
+def normalize_name(name: str) -> str:
+    """The stored form of `name`. `lucy.felix` -> `lucy-felix`.
+
+    People's names are dotted -- that is how every corporate directory writes them
+    -- and refusing them outright was not the cosmetic problem it looked like. A
+    box with no accounts also refuses to start `serve` on a network-reachable bind,
+    so `users add lucy.felix` failing was the reason the GUI could not be brought
+    up at all. Repro names have always been TRANSFORMED rather than rejected
+    (`up --name TICKET-1234` creates `ticket-1234`); account names now agree.
+
+    The rule is `lifecycle.sanitize()`'s, character for character, and it is
+    duplicated rather than imported on purpose: this is the bottom of the service
+    stack, and lifecycle pulls in compose, runner, presets and the version index
+    behind it. test_users.py pins the two together so the copy cannot drift.
+
+    Length is deliberately NOT touched. Silently truncating somebody's identity is
+    worse than refusing it, so a name still too long after this is
+    `require_valid_name`'s to reject and the person's to shorten.
+    """
+    cleaned = (name or "").lower().replace(".", "-")
+    return _NAME_SEPARATORS.sub("-", cleaned).strip("-")
+
+
 def require_valid_name(name: str) -> None:
-    if not _NAME_RE.match(name or ""):
+    """The invariant for what may be STORED, applied to an already-normalised name.
+
+    Every caller runs normalize_name() first, so what arrives here is lowercase
+    `[a-z0-9-]` already. That leaves exactly two ways to fail, and they have
+    different fixes, so they say different things -- the single combined message
+    used to answer "at most 31 characters" to somebody whose name was `...`.
+    """
+    if not (name or ""):
+        raise ValidationError(
+            "a user name needs at least one letter or digit — it becomes part of "
+            "a workspace name, and therefore a DNS label.")
+    if len(name) > _NAME_MAX:
+        raise ValidationError(
+            f"user name {name!r} is {len(name)} characters; the limit is "
+            f"{_NAME_MAX}, because it becomes part of a workspace name and "
+            "therefore a DNS label.")
+    if not _NAME_RE.match(name):
         raise ValidationError(
             f"invalid user name {name!r} — lowercase letters, digits and '-', "
-            "starting with a letter or digit, at most 31 characters. It becomes "
-            "part of a workspace name and therefore a DNS label.")
+            "starting with a letter or digit. It becomes part of a workspace "
+            "name and therefore a DNS label.")
 
 
 def require_valid_password(password: str) -> None:
@@ -352,6 +396,11 @@ def mint_password() -> str:
 
 
 def add(name: str, password: str, *, role: str = "") -> User:
+    # Normalised HERE rather than only at the two front ends, so the service is
+    # correct on its own terms: `add` is what decides the stored form, and the
+    # returned User carries it back so a caller prints the name it really made
+    # instead of the one it was handed.
+    name = normalize_name(name)
     require_valid_name(name)
     require_valid_password(password)
     if role:
@@ -402,6 +451,7 @@ def set_password(name: str, password: str) -> int:
     lands.
     """
     require_valid_password(password)
+    name = normalize_name(name)
     hashed = hash_password(password)          # outside the lock, as in add()
     with _locked():
         users = _read()
@@ -422,6 +472,7 @@ def remove(name: str) -> int:
     role_of() answers "" for a missing account and at_least("", anything) is False
     -- so the window between the two writes is closed from both directions.)
     """
+    name = normalize_name(name)
     with _locked():
         users = _read()
         if name not in users:
@@ -436,6 +487,7 @@ def remove(name: str) -> int:
 def set_role(name: str, role: str) -> User:
     """Change what `name` may do. Returns the updated user."""
     require_valid_role(role)
+    name = normalize_name(name)
     wanted = normalise_role(role)
     with _locked():
         users = _read()
@@ -533,8 +585,13 @@ def verify(name: str, password: str, *, source: str = "") -> bool:
     if not name or password is None:
         return False
 
+    # Looked up normalised, so somebody created as `lucy-felix` can sign in with
+    # the `lucy.felix` they were asked for and think of as their name. Audited
+    # RAW, though: _audit_failure's contract is that an invalid name is exactly
+    # the traffic worth seeing, and normalising it first would launder a probe for
+    # `Lucy.Felix` into a tidy line about `lucy-felix`.
     users = _read()
-    stored = users.get(name)
+    stored = users.get(normalize_name(name))
     if stored is None:
         # Burn the same work as a real check so timing does not enumerate users.
         # ONE derivation, exactly like the branch below -- see _DUMMY_HASH for the

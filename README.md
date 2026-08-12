@@ -70,6 +70,12 @@ CLI-only install. In a checkout: `pip install -e '.[gui]'`.
 To update: `pipx reinstall rc-repro` (`upgrade` only moves when the version was
 bumped). In a checkout: `git pull && pip install -e '.[gui]'`.
 
+`rc-repro --version` reports what is **installed**, which is the number the running
+code actually is. In a checkout that comes from the distribution metadata, not from
+`pyproject.toml`, so `git pull` alone does not move it — re-run `pip install -e .`
+or the version will keep naming the release you had before. On a remote box that
+one command is how you tell whether a deploy actually landed.
+
 ## Your first repro
 
 ```bash
@@ -160,6 +166,13 @@ rc-repro users remove alice       # and every session it minted
 
 The **first** account is an admin; every one after it is a `member` until you say otherwise.
 
+A name is **folded into a DNS label**, because it becomes part of a workspace name
+— `lucy.felix` and `Lucy_Felix` both create `lucy-felix`, and `users add` prints
+what it made. Sign-in, `passwd`, `role` and `remove` all accept either spelling, so
+the name somebody was given is the one they can type. A name with nothing usable
+left in it (`...`) or one over 31 characters is refused rather than invented or
+truncated.
+
 The password is generated rather than typed unless --ask-password; and a generated one is ~96 bits where a typed one clears a
 12-character minimum with scrypt.
 Stored in `~/.rc-repro/users`, mode `0600`, hashed with `hashlib.scrypt`.
@@ -193,22 +206,40 @@ row that matches where TLS actually ends:
 
 | Where TLS ends | Command |
 |---|---|
-| Nowhere — just you, on this machine | `rc-repro serve` |
+| Nowhere — just you, on this machine | `rc-repro serve` (add `--no-domain` if this box was set up with `--domain`, or it keeps serving that name) |
 | rc-repro does it, on a name that points here | `rc-repro serve --domain rc.example.com --email you@example.com` |
 | A TLS proxy on **this** box | `rc-repro serve --bind 127.0.0.1 --allow-host rc.example.com` |
 | A proxy **elsewhere** — a lab, Codespaces, ngrok, a load balancer | `rc-repro serve --bind 0.0.0.0 --allow-host rc.example.com --trust-proxy 10.0.0.1` |
 | Nothing, and you accept it | `rc-repro serve --bind 0.0.0.0 --allow-host <name> --insecure` |
+
+`--insecure` is deliberately **not** listed in `serve --help`: it is a security
+decision that does not apply on localhost or behind a lab's TLS, which is where
+almost everyone starts. It still works, and `serve` names it — with the exact
+command to add it to — at the one moment it applies, which is when it refuses to
+put a password on the wire by accident.
 
 Two flags do the work, and they answer different questions:
 
 - **`--allow-host`** is a **DNS-rebinding guard**: whatever you type in the address
   bar has to be named here, or the request is a 403. Repeatable; `*` accepts any
   host. This is the one people miss when a proxy forwards its own `Host` and every request 403s.
+  It wants a **bare hostname** — a scheme, a port or a trailing slash is corrected
+  and reported (`--allow-host https://lab.example.com:9944/` becomes
+  `lab.example.com`), because the guard matches the `Host` header with its port
+  already stripped. Omit it on a reachable bind and only `localhost` is accepted;
+  `serve` says so at startup, and the 403 names the host it refused.
 - **`--trust-proxy <address-or-CIDR>`** says *this peer terminates TLS, believe its
   `X-Forwarded-Proto`/`-For`*. Without it rc-repro cannot tell the browser's hop is
   https, so it will not mark the session cookie `Secure` and the sign-in page warns
-  about a connection that is actually encrypted. Name the proxy's address, not
-  `0.0.0.0`, unless nothing else can reach the port.
+  about a connection that is actually encrypted. It grants *permission to believe*
+  that header — the cookie becomes `Secure` only once a peer inside the given range
+  actually sends it, which is why the startup line reads "https **when the proxy
+  says so**". `0.0.0.0/0` believes any client, so anyone can then claim https and
+  dodge the sign-in throttle; `serve` warns about it.
+  > **A bare `0.0.0.0` is not "anywhere" — it is the single address `0.0.0.0/32`,
+  > which no peer ever has.** It parses, so nothing used to complain, and the flag
+  > then did exactly nothing while looking correct. Write `0.0.0.0/0` for anywhere,
+  > or better, the proxy's actual address. `serve` now says so at startup.
 
 > Run `rc-repro users add <name>` first. The one-time setup link is offered on a loopback bind only.
 

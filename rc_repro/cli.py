@@ -34,8 +34,32 @@ app = typer.Typer(
 )
 
 
+def _print_version(value: bool) -> None:
+    """`--version`, eager so it answers before any command is resolved.
+
+    It did not exist, while CONTRIBUTING and this project's own notes told people
+    to run it to check what a box has -- and the only place the number appeared at
+    all was the sign-in page footer, which needs the GUI up and reachable to read.
+    So the one question you ask a remote box after deploying to it ("did the pull
+    land?") had no answer from a shell, and a version bump meant to make that
+    answerable was answerable only in a browser.
+
+    Read from the INSTALLED distribution metadata, like `__version__` itself: that
+    is the number the running code actually is, and a stale editable install
+    reporting an old one is the true answer, not a bug to paper over.
+    """
+    if value:
+        from rc_repro import __version__
+        typer.echo(f"rc-repro {__version__}")
+        raise typer.Exit(0)
+
+
 @app.callback()
-def _before_any_command() -> None:
+def _before_any_command(
+    version: bool = typer.Option(False, "--version", "-V", is_eager=True,
+                                 callback=lambda v: _print_version(v),
+                                 help="print the installed rc-repro version and exit"),
+) -> None:
     """Runs before every command.
 
     Publishes who is running this so the service layer can audit without every
@@ -702,6 +726,12 @@ def users_cmd(
     if not name:
         _err(f"`users {action}` needs a name, e.g. `rc-repro users {action} alice`")
 
+    # One normalisation for every branch below, so `role`, `remove` and `passwd`
+    # find the account that `add` created and every line printed names it the way
+    # the file spells it. The service normalises too -- but it cannot fix what this
+    # layer PRINTS, and `revoke_user` here takes the name straight from argv.
+    typed, name = name, usersvc.normalize_name(name)
+
     if action == "role":
         if not role:
             _err(f"`users role {name}` needs a role "
@@ -738,6 +768,9 @@ def users_cmd(
             usersvc.require_valid_name(name)
         except errors.ReproError as exc:
             _fail(exc)
+        if name != typed:
+            ui.note(f"  {typed!r} becomes {name!r} — an account name becomes part "
+                    "of a workspace name, and therefore a DNS label.")
         if ask_password:
             pw = typer.prompt(f"Password for {name}", hide_input=True)
             again = typer.prompt("Repeat", hide_input=True)
@@ -2479,58 +2512,59 @@ def serve(
     no_token: bool = typer.Option(False, "--no-token", hidden=True,
                                   help="deprecated no-op: there is no session token any more"),
     print_service: bool = typer.Option(False, "--print-service", help="print how to keep this running (systemd unit, or nohup) and exit — writes nothing"),
-    insecure: bool = typer.Option(False, "--insecure", help="serve the login over plain http (deprecated: prefer --trust-proxy, which also fixes the cookie)"),
-    trust_proxy: list[str] = typer.Option(None, "--trust-proxy", help="believe X-Forwarded-Proto/-For from this address or CIDR (repeatable). Needed when TLS terminates at somebody else's proxy: without it the session cookie is not marked Secure and the sign-in page warns about a connection that is actually encrypted"),
+    # Hidden, not removed. It is the only way to serve plain http on a reachable
+    # interface (an EC2 public IP with no proxy), so it has to keep working -- but
+    # putting it in --help meant every first-time reader met a security decision
+    # that does not apply to them, on localhost or behind a lab's TLS. The one
+    # moment it IS needed, `serve` refuses and names it, with the command to add
+    # it to. That refusal is a better teacher than a line in a list.
+    insecure: bool = typer.Option(False, "--insecure", hidden=True,
+                                  help="no TLS anywhere: the password crosses the network readable, and you accept that. Only needed on a reachable bind with no proxy in front"),
+    trust_proxy: list[str] = typer.Option(None, "--trust-proxy", help="TLS ends at this proxy: believe its X-Forwarded-Proto/-For and mark the cookie Secure (address or CIDR, repeatable)"),
 ) -> None:
-    """Launch the web GUI (needs `pip install 'rc-repro[gui]'`).
+    # `\\[gui]` and not `[gui]`: typer renders this docstring as Rich markup, which
+    # eats a bare bracket group as a style tag -- so the one line telling you what
+    # to install rendered as `pip install 'rc-repro'`, which installs the core
+    # package WITHOUT fastapi and uvicorn, and `serve` then refuses to start. The
+    # backslash cannot come from a raw docstring either: the `\b` markers below are
+    # real backspaces, which is how Click is told not to rewrap the blocks.
+    """Launch the web GUI (needs `pip install 'rc-repro\\[gui]'`).
 
     \b
-    ON THIS MACHINE — no domain, no email, nothing to configure:
+    TRYING IT OUT? There is nothing to learn:
         rc-repro serve
 
-    The first run prints a one-time link ending in /setup#k=... — open the WHOLE
-    url, including the part after #, and it creates the first account. After that
-    it is a normal sign-in page. Everything below is only about who else can
-    reach it.
+    Binds localhost — nothing crosses a network, and none of the options below
+    apply. The first run prints a one-time link ending in /setup#k=... ; open the
+    whole url, including the part after #, to make the first account.
+
+    (On a box already set up with --domain, plain `serve` keeps serving that name.
+    Add --no-domain for a local session.)
+
+    The rest is only about letting OTHER machines reach it:
 
     \b
-    REACHABLE FROM YOUR NETWORK, plain http:
-        rc-repro serve --bind 0.0.0.0 --allow-host 192.168.1.50 --insecure
+        your team, over HTTPS    --domain rc.example.com --email you@example.com
+        a lab or proxy in front  --bind 0.0.0.0 --allow-host <name> --trust-proxy <ip>
+        a plain IP, no TLS       --bind 0.0.0.0 --allow-host <ip>
 
-    --allow-host is the one people miss: the Host allow-list is a DNS-rebinding
-    guard, so whatever you type in the address bar has to be named here (an IP, a
-    hostname, several of them, or '*' on a throwaway network). Without it every
-    request is a 403. --insecure acknowledges that the password crosses the wire
-    in the clear.
+    --bind decides whether anything off this machine can reach it; --allow-host
+    says which names may be used to. Whatever you type in the address bar must be
+    listed there or every request is a 403, and either flag alone does nothing.
 
-    \b
-    HTTPS, with a name that already points at this host:
-        rc-repro serve --domain support.example.com --email ops@example.com
+    --trust-proxy names whatever already terminates TLS (a lab url, ngrok, a load
+    balancer) so the session cookie can be marked Secure. Address or CIDR — a bare
+    0.0.0.0 is one address and matches nothing; 0.0.0.0/0 is anywhere.
 
-    rc-repro gets the certificate itself and starts the shared front door, which
-    holds :443 and serves both the GUI and every `up --domain ...` workspace. The
-    email is Let's Encrypt's contact address and is remembered after the first
-    use. --print-service prints a systemd unit to keep it running.
+    The third row is refused until you say what protects the password. `serve`
+    prints the flag to add, and why, at the point it stops.
 
-    \b
-    BEHIND SOMEBODY ELSE'S TLS (a lab, Codespaces, ngrok, a load balancer):
-        rc-repro serve --bind 0.0.0.0 --allow-host rc.example.com \\
-                       --trust-proxy 10.0.0.1
-
-    Name the proxy's address. Without it rc-repro cannot tell that the browser's
-    hop is https, so it will not mark the session cookie Secure and the sign-in
-    page will warn about a connection that is actually encrypted. --trust-proxy
-    is always the better answer than --insecure when something in front really is
-    doing TLS.
-
-    Binding anything but loopback exposes docker control — creating and deleting
-    containers and their volumes, minting admin tokens — to whoever can reach the
-    port. Accounts and roles bound what each person may do; they do not make the
-    port safe to leave open.
+    Binding anything but localhost exposes docker control — creating and deleting
+    repros and their volumes — to whoever can reach the port.
     """
     try:
         import uvicorn
-        from rc_repro.web.app import create_app
+        from rc_repro.web.app import create_app, trusted_problems, usable_trusted
     except ImportError:
         _err("the web GUI needs extra deps — install them with: pip install 'rc-repro[gui]'")
     import webbrowser
@@ -2541,7 +2575,24 @@ def serve(
 
     from rc_repro.services import firstrun as frsvc
 
-    allow = list(allow_host or [])
+    # Normalised HERE, before anything reads it: `allow` becomes the Host allow-list
+    # AND the host in the printed URL, so a value carrying a scheme, a port or a
+    # trailing slash used to produce both a list that matched nothing and a URL like
+    # `http://https://lab.example.com/:9944/`. Reported as three separate attempts
+    # that each started, claimed to be healthy, and 403'd every request.
+    #
+    # Reported the way --domain already reports its own fix-ups, a few lines below,
+    # so the correction is visible rather than silent.
+    allow = []
+    for _given in (allow_host or []):
+        try:
+            _host, _fixed = tlsmod.normalize_allow_host(_given)
+        except errors.ReproError as exc:
+            _fail(exc)
+        if _fixed:
+            ui.note(f"  using --allow-host {_host} ({_fixed})")
+        allow.append(_host)
+    allow_host = list(allow)      # so _cmdline() echoes the corrected form back
     # Posture is decided by the BIND, not by whether <home>/users happens to be
     # empty. Security should not be a side effect of a file's contents.
     basic = usersvc.any_users()
@@ -2575,11 +2626,11 @@ def serve(
             # `up` documents the email as remembered after first use; it was not
             # true here, so every restart needed it retyped.
             config.save_config({**cfg, "acme_email": email})
-        if not basic:
-            ui.warn("  ⚠ this publishes the GUI on the internet with no login — "
-                    "anyone who finds the name can create and delete repros.")
-            ui.warn("    `rc-repro users add <name>` first, then restart, gives "
-                    "each person their own account.")
+        # No "this publishes the GUI with no login" warning here any more. With a
+        # --domain the bind is never loopback, so the accounts check below ALWAYS
+        # refuses -- nothing was ever published, and warning about a thing that
+        # cannot happen, one line above refusing to do it, is what made this screen
+        # read as two contradictory answers to the same question.
         # The bridge, not 0.0.0.0: the front door is the only thing that needs to
         # reach the GUI, so the port never has to be exposed to the network.
         gui_bind = bind or edgesvc.bridge_address()
@@ -2599,6 +2650,39 @@ def serve(
         bind = "127.0.0.1"
 
     loopback = bind in ("127.0.0.1", "localhost", "::1")
+
+    def _cmdline(exe: str = "rc-repro", *, service: bool = False) -> str:
+        """This invocation, rebuilt from the RESOLVED options.
+
+        Two callers: the no-accounts refusal, which prints the line to run again,
+        and --print-service, which bakes it into a systemd unit. Rebuilt rather
+        than read from sys.argv because argv is not this command's arguments in
+        every context that matters -- under the test runner it is pytest's, and it
+        would carry through any embedding. Resolved, so a `serve` that inherited
+        its --domain from the box prints the domain rather than dropping it.
+        """
+        import shlex
+        parts = [exe, "serve"]
+        if domain:
+            # --insecure and --trust-proxy are both about a transport rc-repro is
+            # not arranging, so neither belongs beside a --domain that says it is.
+            parts += ["--domain", domain, "--email", email]
+        else:
+            parts += ["--bind", bind]
+            if insecure:
+                parts.append("--insecure")
+            for cidr in (trust_proxy or []):
+                parts += ["--trust-proxy", cidr]
+        if port != 7070:
+            parts += ["--port", str(port)]
+        # allow_host, not `allow`: --domain appends itself to the latter, and
+        # echoing that back adds a flag the reader never typed.
+        for h in (allow_host or []):
+            parts += ["--allow-host", h]
+        if service:
+            parts.append("--no-open")    # no browser to open from a service
+        return " ".join(shlex.quote(p) for p in parts)
+
     # No accounts? Two cases, and only one of them starts.
     #
     # A session token in the URL is gone: it was a standing credential with no
@@ -2614,14 +2698,28 @@ def serve(
             # version -- the URL just printed is always the one that works.
             setup_key = frsvc.mint()
         else:
-            _err("refusing to start: this will be reachable from the network and "
-                 "has no accounts.\n"
-                 "  Create the first one, then start it again:\n"
-                 "    rc-repro users add <name>\n"
-                 "  (On a loopback bind rc-repro prints a one-time setup link "
-                 "instead. A bootstrap\n"
-                 "  credential reachable from the network is not something it "
-                 "will hand out.)")
+            # Amber and two steps, NOT a red `error:`. Nothing has gone wrong
+            # here: this is the documented first-run sequence on a shared box, and
+            # on a rebuilt one -- where ~/.rc-repro is empty, so EVERY serve says
+            # it -- a red failure reads as rc-repro being broken rather than as
+            # two commands in a row. Red is reserved for something that failed.
+            #
+            # It still EXITS NON-ZERO, and it has to: `serve` did not serve, and a
+            # systemd unit reporting success while nothing is listening is the
+            # worse lie. Exit 3, `preflight` -- the taxonomy's name for a
+            # condition the caller must fix before this can run at all.
+            # Whole block on stderr, heading and steps together: it precedes a
+            # non-zero exit, so `serve > /dev/null` must still say why nothing
+            # started -- and a block split across two streams interleaves into
+            # nonsense the moment either one is redirected.
+            ui.warn("rc-repro needs an account before it will serve on an "
+                    "interface other than loopback.", err=True)
+            typer.echo("\n  1. create one — the password is generated and shown "
+                       "once:\n"
+                       "       rc-repro users add <name>\n"
+                       "  2. start it again:\n"
+                       f"       {_cmdline()}\n", err=True)
+            raise typer.Exit(3)
 
     # --domain means rc-repro is arranging TLS itself, through its own front door.
     # It therefore KNOWS the browser hop is https and the plain-http last hop is
@@ -2660,10 +2758,22 @@ def serve(
              f"    rc-repro serve --bind 127.0.0.1 --port {port} "
              "--allow-host <your-domain>\n"
              "  TLS terminating upstream (remote proxy, lab, load balancer)?\n"
-             "    tell rc-repro which peer, so the cookie is marked Secure too:\n"
+             "    name the peer, so the cookie is marked Secure too:\n"
              "      --trust-proxy <the proxy's address>\n"
-             "  Just testing locally, and you accept a plain-http password?\n"
-             "    add --insecure to the command you just ran")
+             "  Nothing doing TLS at all, on a network you trust?\n"
+             "    add --insecure to the command you just ran\n"
+             "  --trust-proxy and --insecure answer different questions: the first "
+             "says who is\n"
+             "  encrypting it, the second says nobody is and you accept that. If "
+             "there is a\n"
+             "  proxy, name it — it is the better answer and --insecure is then "
+             "not needed.",
+             # Exit 3 (`preflight`), matching the no-accounts branch a few lines
+             # up. These are the two halves of one question -- may this bind
+             # serve? -- and they reported it as 3 and 1, so a script could not
+             # treat "fix your invocation" as one case. 1 means an internal fault,
+             # which neither of them is.
+             exit_code=3)
 
     # Not for the bridge: that address is reachable from containers on this box,
     # not from the network, which is the entire reason the front door uses it.
@@ -2672,32 +2782,38 @@ def serve(
                 "to your network — use only if you mean to.")
     if "*" in allow:
         ui.warn("  ⚠ --allow-host '*' accepts ANY Host header — only on a trusted/ephemeral network.")
+    # Said BEFORE the server comes up, because the symptom otherwise is silence:
+    # it starts, it serves, and the one thing the flag was for quietly did not
+    # happen.
+    for problem in trusted_problems(trust_proxy):
+        ui.warn(f"  ⚠ {problem}")
+    # --allow-host names who may reach it; --bind decides whether anyone can. Given
+    # one without the other, the flag is inert and the server comes up answering
+    # loopback only -- which it then reports as working, so the reader retries the
+    # same command or concludes the address is wrong. Observed costing three
+    # attempts on a real box. It is a note, not a refusal: naming a Host you will
+    # reach through a proxy on loopback is a legitimate setup.
+    if allow_host and loopback and not domain:
+        ui.note(f"  note: --allow-host {allow_host[0]} names who may reach this, but "
+                "the bind is still\n        loopback, so nothing off this machine "
+                "can. Add --bind 0.0.0.0 if you\n        meant to publish it.")
+    # The mirror image, and the one that actually cost the time: bound where others
+    # can reach it, but the allow-list still holds nothing, so only localhost passes
+    # the Host guard and every request by the name somebody types is a 403. `serve`
+    # used to print a healthy startup screen and say nothing about it.
+    if not loopback and not door and not allow_host:
+        ui.warn("  ⚠ nothing is in --allow-host, so only localhost is accepted — a "
+                "request by any\n    other name will be a 403. Add --allow-host "
+                "<the name you will type>, or '*'.")
 
     if print_service:
         # Printed after the checks above, never before: a unit that reproduces a
         # command which would be refused is worse than no unit at all.
-        import shlex
-
         # systemd REFUSES a relative ExecStart, so this has to be absolute even
         # when rc-repro is not on PATH. In a venv the console script sits next to
         # the interpreter, which is the case `which` misses.
         exe = shutil.which("rc-repro") or str(Path(sys.executable).parent / "rc-repro")
-        parts = [exe, "serve"]
-        if domain:
-            parts += ["--domain", domain, "--email", email]
-        else:
-            parts += ["--bind", bind]
-            if insecure:
-                parts.append("--insecure")
-            for cidr in (trust_proxy or []):
-                parts += ["--trust-proxy", cidr]
-        if port != 7070:
-            parts += ["--port", str(port)]
-        for h in (allow_host or []):     # not `allow`: --domain re-adds itself
-            parts += ["--allow-host", h]
-
-        parts.append("--no-open")        # no browser to open from a service
-        cmdline = " ".join(shlex.quote(p) for p in parts)
+        cmdline = _cmdline(exe, service=True)
 
         typer.echo(f"\n# systemd — survives logout, restarts on crash, starts on boot.\n"
                    f"# Write this to {edgesvc.UNIT_PATH}:\n")
@@ -2726,13 +2842,32 @@ def serve(
                  + f"  Its compose project is `{edgesvc.PROJECT}` in "
                  f"{edgesvc.edge_dir()}; `rc-repro edge status` reports it.")
         url = f"https://{domain}/"
-    elif setup_key:
-        # The key rides in the FRAGMENT: a fragment is never sent to the server,
-        # so it cannot land in an access log, a proxy log or a Referer header.
-        url = f"http://localhost:{port}/setup#k={setup_key}"
     else:
-        url = f"http://localhost:{port}/"
-    trusted = list(trust_proxy or [])
+        # The host somebody can actually TYPE. Printing `localhost` while bound to
+        # 0.0.0.0 was wrong on the one run where the URL is not obvious: the whole
+        # reason for that bind is that the useful address is somewhere else, and
+        # the reader was left to assemble it from the --allow-host they had just
+        # passed. '*' is skipped -- it allows any Host but names none.
+        host = "localhost"
+        if not loopback:
+            # `0.0.0.0` is every interface, not an address anyone can open, so a
+            # wildcard bind with no named host gets a placeholder rather than a URL
+            # that looks copy-pasteable and is not. That is the `--allow-host '*'`
+            # case, which is exactly how a lab box is run.
+            wildcard = bind in ("0.0.0.0", "::", "[::]")
+            host = (next((h for h in (allow_host or []) if h != "*"), "")
+                    or ("<this-box>" if wildcard else bind))
+        if setup_key:
+            # The key rides in the FRAGMENT: a fragment is never sent to the
+            # server, so it cannot land in an access log, a proxy log or a Referer.
+            url = f"http://{host}:{port}/setup#k={setup_key}"
+        else:
+            url = f"http://{host}:{port}/"
+    # Only what can actually match a peer. The posture line and the app both read
+    # this, and testing the LIST for emptiness made `--trust-proxy 0.0.0.0`
+    # announce "https, trusted from 0.0.0.0" while trusting nothing at all -- the
+    # one line an operator reads to learn the posture, saying the opposite of it.
+    trusted = usable_trusted(trust_proxy)
     if domain:
         # The edge terminates TLS for --domain, so its own container addresses are
         # trusted automatically -- the EXACT set, never the bridge subnet, which
@@ -2782,7 +2917,12 @@ def serve(
     # whether the transport is believed, without inferring it from flags.
     if basic:
         how = ("https, arranged by rc-repro" if domain
-               else f"https, trusted from {', '.join(trusted)}" if trusted
+               # "https, trusted from X" read as a statement of fact, and it is
+               # conditional: --trust-proxy grants permission to believe
+               # X-Forwarded-Proto, and until a peer in X actually sends it this is
+               # plain http with a non-Secure cookie. The line said otherwise.
+               else f"https when the proxy says so, trusted from {', '.join(trusted)}"
+               if trusted
                # Loopback is not "plain http" in any sense that matters: the
                # password crosses no network. Saying so keeps the warning that
                # DOES matter (the line below, on a reachable bind) meaningful.
@@ -2793,12 +2933,16 @@ def serve(
             # The commonest question after "it works": how do I let anyone else
             # in. Answered here rather than only in --help, because this is the
             # screen somebody is actually looking at.
-            ui.hint("  reachable from this machine only. To share it or add "
-                    "HTTPS:")
-            ui.hint("    rc-repro serve --bind 0.0.0.0 --allow-host <ip-or-name> "
-                    "--insecure")
+            # The two answers that need no security decision from the reader. The
+            # plain-http one is deliberately absent: this is the screen a
+            # first-time user is looking at, and it used to hand them --insecure
+            # before they had any reason to weigh it. Somebody who wants that path
+            # reaches it by adding --bind, and the refusal explains it there.
+            ui.hint("  reachable from this machine only. To share it:")
             ui.hint("    rc-repro serve --domain <name.example.com> --email "
                     "you@example.com")
+            ui.hint("    …or, behind a lab/proxy already doing TLS: --bind 0.0.0.0 "
+                    "--allow-host <name>\n      --trust-proxy <its address>")
         if not domain and not trusted and not loopback:
             ui.warn("  ⚠ the session cookie will NOT be marked Secure, and the "
                     "sign-in page will warn\n    about an unencrypted connection. "
