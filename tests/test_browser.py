@@ -1000,7 +1000,9 @@ def test_a_running_workspace_on_home_offers_both_places_it_could_mean(serve, pag
         # Open leaves for Rocket.Chat, in a new tab
         opener = row.locator("a", has_text="Open")
         assert opener.get_attribute("target") == "_blank"
-        assert opener.get_attribute("href").endswith(":3001/"), \
+        # The workspace's ROOT_URL, verbatim -- no trailing slash, because nothing
+        # normalises it through URL.toString() any more.
+        assert opener.get_attribute("href") == "http://localhost:3001", \
             opener.get_attribute("href")
 
         # and the row itself stays inside rc-repro
@@ -1180,7 +1182,7 @@ def test_the_scenarios_page_shows_the_setup_step_a_preset_needs(serve, page):
         assert "Keycloak admin console" in row.locator(".l-n").inner_text()
         assert row.locator(".l-c").inner_text() == "admin/admin", "credentials not lifted out"
         assert "rcrepro" in row.locator(".l-sub").inner_text(), "the realm was dropped"
-        assert row.first.get_attribute("href").endswith("8085/")
+        assert row.first.get_attribute("href") == "http://keycloak:8085"
         assert page.errors == [], page.errors
 
 
@@ -1425,3 +1427,59 @@ def test_a_write_from_the_spa_survives_plain_http_on_a_real_hostname(serve_publi
         assert res["status"] != 403, \
             f"the guard refused a same-origin write ({res['status']}: {res['text']})"
         assert "cross-site" not in res["text"], res["text"]
+
+
+def test_a_link_row_shows_the_workspaces_root_url_verbatim(serve_public, public_page,
+                                                          monkeypatch):
+    """One workspace, one address, everywhere: the ROOT_URL the server reported.
+
+    The panel used to show two. `localUrl()` swapped `localhost` for whatever host
+    the GUI was loaded from -- applied to the href but not the label, so "What is in
+    this workspace" read http://localhost:3000 while the URL row below it read
+    http://<gui-host>:3000/. The rewrite is gone entirely: ROOT_URL is what Rocket
+    .Chat itself is configured with, so it is the address that identifies the
+    workspace, and a number that appears in no config file is not an improvement on
+    it.
+
+    Never caught because `_fake_detail()` carries `"links": []`, so no browser test
+    had ever rendered one of these rows.
+    """
+    d = _fake_detail()
+    d["links"] = [{"label": "Rocket.Chat", "url": "http://localhost:3001", "kind": ""}]
+    _stub_lifecycle(monkeypatch, d)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve_public() as s:
+        _sign_in(public_page, s.public_url)
+        public_page.wait_for_selector("#repros")
+        public_page.wait_for_selector("#whoami:not([hidden])")
+        public_page.click("text=t1234")
+        public_page.wait_for_selector(".linkrow")
+        row = public_page.locator(".linkrow").first
+        shown = row.locator(".l-u").inner_text().strip()
+        href = row.get_attribute("href")
+        assert shown == "http://localhost:3001", shown
+        assert href == "http://localhost:3001", href
+        assert shown == href, "the row must open exactly what it displays"
+        # The GUI is being viewed at a public name; that must not leak into the url.
+        assert PUBLIC_NAME not in shown and PUBLIC_NAME not in href
+        assert public_page.errors == [], public_page.errors
+
+
+def test_a_placeholder_url_in_a_link_row_is_left_alone(serve_public, public_page,
+                                                       monkeypatch):
+    """A preset note can name a place as `<repro-url>/livechat` rather than a real
+    url. That is not a URL and must not go through the host rewrite, which would
+    turn it into `http://<host>/<repro-url>/livechat`."""
+    d = _fake_detail()
+    d["links"] = [{"label": "Livechat", "url": "<repro-url>/livechat", "kind": ""}]
+    _stub_lifecycle(monkeypatch, d)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve_public() as s:
+        _sign_in(public_page, s.public_url)
+        public_page.wait_for_selector("#repros")
+        public_page.wait_for_selector("#whoami:not([hidden])")
+        public_page.click("text=t1234")
+        public_page.wait_for_selector(".linkrow")
+        shown = public_page.locator(".linkrow").first.locator(".l-u").inner_text().strip()
+        assert shown == "<repro-url>/livechat", shown
+        assert public_page.errors == [], public_page.errors

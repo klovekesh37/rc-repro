@@ -27,19 +27,20 @@ function toast(msg, kind = "error") {
   setTimeout(() => t.remove(), 4000);
 }
 
-// Server-built URLs are always http://localhost:<port> -- that is genuinely the
-// repro's ROOT_URL, and the ports are published on the DOCKER HOST. When the GUI
-// itself is reached from somewhere else (serve --allow-host behind a proxy, a
-// remote lab), "localhost" resolves to the user's own machine and every link is
-// dead. Point them at whatever host the GUI was loaded from instead.
-function localUrl(u) {
-  if (!u) return u;
-  try {
-    const url = new URL(u, location.origin);
-    if (url.hostname === "localhost" || url.hostname === "127.0.0.1") url.hostname = location.hostname;
-    return url.toString();
-  } catch (_) { return u; }
-}
+// EVERY url on screen is the one the server reported, shown and linked verbatim.
+//
+// There used to be a rewrite here that swapped `localhost` for whatever host the
+// GUI was loaded from, so that links stayed clickable when `serve` is reached
+// through a proxy or a remote lab. It is gone, deliberately: a workspace's
+// ROOT_URL is what Rocket.Chat itself is configured with, so it is the address
+// that identifies the workspace, and the rewrite meant the interface showed a
+// number that appears in no config file anywhere. Applying it to an href but not
+// to the label also put two different addresses for one workspace on one screen.
+//
+// The cost is real and is accepted: from a browser that is not on the docker host,
+// `http://localhost:3000` is that browser's own machine, so the link will not
+// open the workspace. It is still the correct thing to display, and copying it is
+// what a support engineer pastes into a ticket.
 
 // Set once the server says a login is in force. Until then every 401 is a token
 // problem, not an expired session, and bouncing to /signin would be wrong.
@@ -470,7 +471,7 @@ function runningRow(r) {
     right.append(el("span", { class: "wsrow-up" + (bad ? " bad" : "") },
       r.uptime, el("i", {}, bad ? health : "uptime")));
   }
-  right.append(el("a", { class: "btn small", href: localUrl(r.public_url || r.root_url),
+  right.append(el("a", { class: "btn small", href: r.public_url || r.root_url,
                          target: "_blank", rel: "noreferrer",
                          title: "Open Rocket.Chat itself, in a new tab" }, "Open"));
   row.append(right);
@@ -777,7 +778,7 @@ function renderDetail() {
   if (!canWrite() && (dstate.tab === "logs" || dstate.tab === "env")) dstate.tab = "overview";
   const actions = el("div", { class: "d-actions" });
   if (d.state !== "?") {
-    actions.append(el("a", { href: localUrl(d.root_url), target: "_blank", style: "text-decoration:none" },
+    actions.append(el("a", { href: d.root_url, target: "_blank", style: "text-decoration:none" },
       el("button", { class: "btn primary" }, "↗ Open RC")));
   }
   if (!canWrite()) {
@@ -854,8 +855,8 @@ function renderTab() {
     }
     const url = el("div", { class: "urlbox" },
       el("div", {}, el("div", { class: "k" }, "URL"),
-        el("a", { href: localUrl(d.root_url), target: "_blank" }, localUrl(d.root_url))),
-      el("button", { class: "copy", onclick: () => copy(localUrl(d.root_url)) }, "copy"));
+        el("a", { href: d.root_url, target: "_blank" }, d.root_url)),
+      el("button", { class: "copy", onclick: () => copy(d.root_url) }, "copy"));
     body.append(url);
     // The admin login was only ever shown in the create dialog's result box, so
     // once that was closed nothing in the GUI could tell you the password again --
@@ -1262,7 +1263,7 @@ function renderLogs(body, d) {
   // named, because the two have nothing in common as problems.
   const stat = el("span", { class: "logstat", id: "log-stat" });
   ctl.append(levelSel, svcSel, search, follow, clear, stat);
-  if (d.grafana_url) ctl.append(el("a", { class: "linkchip monitor", href: localUrl(d.grafana_url) + "/d/rcrepro-logs", target: "_blank" }, "Logs in Grafana (Loki)"));
+  if (d.grafana_url) ctl.append(el("a", { class: "linkchip monitor", href: d.grafana_url + "/d/rcrepro-logs", target: "_blank" }, "Logs in Grafana (Loki)"));
   const box = el("div", { class: "logview", id: "logview" });
   // The way back. Scrolling up detaches you from the stream, so there has to be
   // one press that returns -- and it says how much arrived while you were reading,
@@ -1763,10 +1764,10 @@ function renderCreateResult(r) {
   const kv = (k, v) => el("div", {}, el("b", {}, k + ": "), v);
   box.append(el("div", { html: "<hr>" }));
   if (r.rc_version) box.append(kv("Rocket.Chat", `${r.rc_version}  ·  Mongo ${r.mongo_tag || "?"}  ·  preset ${r.preset || "?"}`));
-  if (r.root_url) box.append(kv("URL", localUrl(r.root_url)));
+  if (r.root_url) box.append(kv("URL", r.root_url));
   if (r.login) box.append(kv("Login", `${r.login.user} / ${r.login.password}`));
-  for (const u of (r.instance_urls || [])) box.append(kv("instance", localUrl(u)));
-  if (r.grafana_url) box.append(kv("Grafana", localUrl(r.grafana_url)));
+  for (const u of (r.instance_urls || [])) box.append(kv("instance", u));
+  if (r.grafana_url) box.append(kv("Grafana", r.grafana_url));
   pre.append(box);
   appendNotes(pre, r.notes);
   pre.scrollTop = pre.scrollHeight;
@@ -1802,7 +1803,7 @@ function linkify(line) {
     if (!m) { out.append(rest); return out; }
     out.append(rest.slice(0, m.index));
     if (m[1]) out.append(el("code", { class: "inline" }, m[1]));
-    else out.append(el("a", { href: localUrl(m[0]), target: "_blank", rel: "noreferrer" }, m[0]));
+    else out.append(el("a", { href: m[0], target: "_blank", rel: "noreferrer" }, m[0]));
     rest = rest.slice(m.index + m[0].length);
   }
 }
@@ -1892,11 +1893,18 @@ function parseNotes(notes) {
 function placeRow(p) {
   const real = !String(p.url || "").startsWith("<");
   const row = real
-    ? el("a", { class: "linkrow " + (p.kind || ""), href: localUrl(p.url),
+    ? el("a", { class: "linkrow " + (p.kind || ""), href: p.url,
                 target: "_blank", rel: "noreferrer" })
     : el("div", { class: "linkrow static " + (p.kind || "") });
   row.append(el("span", { class: "l-n" }, p.label));
   if (p.what) row.append(el("span", { class: "l-w" }, p.what));
+  // The url as it will actually open, not as the server spelled it. The href above
+  // is already rewritten by localUrl(), and showing the raw one here put two
+  // different addresses for the same thing on one screen -- "What is in this
+  // workspace" saying localhost:3000 while the URL row below it said the host the
+  // GUI was loaded from. Only when it IS a url: `real` is false for a preset
+  // placeholder like `<repro-url>/livechat`, and localUrl() would resolve that
+  // against the page origin and produce `http://<host>/<repro-url>/livechat`.
   row.append(el("span", { class: "l-u" }, p.url));
   if (p.creds) row.append(el("span", { class: "l-c" }, p.creds));
   if (real) row.append(el("span", { class: "l-go" }, "↗"));
@@ -1951,7 +1959,7 @@ function renderPerfResult(r) {
   // a COLLSCAN, whether the Node event loop saturated, and when errors started.
   renderDiagnosis(pre, r);
   if (r.grafana_url) {
-    const url = `${localUrl(r.grafana_url)}/d/rcrepro-k6-loadtest?from=now-15m&to=now&kiosk`;
+    const url = `${r.grafana_url}/d/rcrepro-k6-loadtest?from=now-15m&to=now&kiosk`;
     pre.append(el("div", { class: "result" },
       el("a", { href: url, target: "_blank", style: "text-decoration:none" }, el("button", { class: "btn small" }, "Open k6 dashboard in Grafana"))));
     const frame = el("iframe", { src: url, class: "grafana-embed" });
