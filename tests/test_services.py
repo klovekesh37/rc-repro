@@ -2953,3 +2953,85 @@ def test_a_failure_reports_its_reason_not_the_warnings_printed_before_it():
     assert k8s.why(sp.CompletedProcess([], 1, "", "")) == "no reason given"
     # stdout is consulted too -- kubectl puts some failures there.
     assert "boom" in k8s.why(sp.CompletedProcess([], 1, "boom", ""))
+
+
+def test_up_uses_the_runtime_the_workspace_already_has(monkeypatch, tmp_path):
+    """`rc-repro up -v 8.5.1 --name X` on a Kubernetes workspace defaulted to docker
+    and ran `docker compose up` against a workspace with no compose file:
+
+        'rc8-5-1' already exists - bringing it back up.
+        no configuration file provided: not found
+        error: `docker compose up` failed
+
+    `--runtime` says what to CREATE. What already exists is a fact, not a preference.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="u", host_port=3000,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+    lc.runner.write("k", "", m)
+
+    took: list = []
+    monkeypatch.setattr(lc, "_create_kubernetes",
+                        lambda req, emit=None: took.append(req.runtime) or {})
+    monkeypatch.setattr(lc.runner, "up",
+                        lambda *a, **kw: pytest.fail("it ran docker compose up"))
+    # No --runtime at all, exactly as the failing command had it.
+    lc._create_repro_locked(lc.CreateReq(version="8.5.1", name="k"))
+    assert took == [topology.KUBERNETES], took
+
+
+def test_up_brings_a_downed_kubernetes_workspace_back_instead_of_refusing(
+        monkeypatch, tmp_path):
+    """Two messages in the same tool contradicting each other about one workspace:
+
+        $ rc-repro down --name rc8-5-1
+        ✓ down (the namespace and its PersistentVolumeClaim are kept).
+          bring it back: rc-repro up --version <same> --name rc8-5-1
+        $ rc-repro up -v 8.5.1 --runtime kubernetes
+        error: 'rc8-5-1' already exists. `down` first, or pass --force
+
+    Compose reuses an existing workspace. So does this now -- the namespace and PVC
+    surviving a plain `down` is exactly what makes bringing it back meaningful.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="u", host_port=3000,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    lc.runner.write("k", "", m)
+
+    monkeypatch.setattr(lc, "check_capacity", lambda *a, **kw: None)
+    monkeypatch.setattr(lc, "pick_host_port", lambda *a, **kw: 3000)
+    monkeypatch.setattr(lc.versions, "resolve", lambda v, offline=False: type(
+        "R", (), {"rc_version": v, "mongo_tag": "8.0", "rc_image": "img",
+                  "mongo_flavor": "official", "oplog": False, "source": "t"})())
+    monkeypatch.setattr(k8s, "create_workspace", lambda **kw: {
+        "context": k8s.CONTEXT, "namespace": "rc-repro-k", "chart_version": "7.0.0",
+        "release": k8s.RELEASE, "port_forward_pid": 0, "bind_host": "",
+        "microservices": False})
+
+    out = lc._create_kubernetes(lc.CreateReq(version="8.5.1", name="k",
+                                            runtime=topology.KUBERNETES))
+    assert out["reused"] is True, "it refused a workspace `down` said to bring back"
+
+
+def test_the_install_is_idempotent_so_bringing_one_back_works(monkeypatch):
+    """`helm install` fails on a release that already exists, which is every `up`
+    over an existing workspace and every retry after a partial failure."""
+    from rc_repro.services import k8s
+
+    seen: list = []
+    monkeypatch.setattr(k8s.subprocess, "run",
+                        lambda argv, **kw: seen.append(argv) or
+                        __import__("subprocess").CompletedProcess(argv, 0, "", ""))
+    k8s.install(namespace="ns", context=k8s.CONTEXT, values={}, chart_version="7.0.0")
+    assert seen[0][1:3] == ["upgrade", "--install"], seen[0][:4]

@@ -977,8 +977,12 @@ def install(*, namespace: str, context: str, values: dict,
     The release is `rocketchat` -- the official docs' own name -- so every command
     in them works here by substituting the namespace.
     """
-    argv = ["helm", "install", RELEASE, CHART, "--kube-context", context,
-            "-n", namespace, "--values", "-"]
+    # `upgrade --install`, not `install`. Bringing a workspace back up re-runs this
+    # sequence, and plain `install` fails on a release that is already there --
+    # which is every `up` over an existing workspace, and every retry after a
+    # partial failure.
+    argv = ["helm", "upgrade", "--install", RELEASE, CHART,
+            "--kube-context", context, "-n", namespace, "--values", "-"]
     if chart_version:
         argv += ["--version", chart_version]
     try:

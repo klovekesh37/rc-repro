@@ -756,6 +756,21 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
 
 def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
                          stream_output: bool = False) -> dict:
+    # An existing workspace's RECORDED runtime beats the flag default. Without this,
+    # `rc-repro up -v 8.5.1 --name X` on a Kubernetes workspace defaulted to docker
+    # and ran `docker compose up` against a workspace with no compose file:
+    #
+    #     'rc8-5-1' already exists - bringing it back up.
+    #     no configuration file provided: not found
+    #     error: `docker compose up` failed
+    #
+    # The flag says what to CREATE. What already exists is a fact, not a preference,
+    # and `--runtime` is only consulted when there is nothing to consult instead.
+    # Read BEFORE resolve_axes: it normalises an empty --runtime to "docker",
+    # after which `not req.runtime` is never true and this could not fire.
+    existing = _derive_for(req)
+    if not req.runtime and existing and runner.exists(existing):
+        req.runtime = topology.of_repro(existing)
     # Runtime x deployment x scenario, decided before anything else looks at the
     # request. The resolved axes are written BACK onto `req` as a preset name and
     # `--set` params, so every reader below -- name derivation, the preset loader,
@@ -1739,10 +1754,15 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
 
     repro_name = _derive_for(req)
     _require_valid_name(repro_name)
-    if runner.exists(repro_name) and not req.force:
-        raise ConflictError(
-            f"{repro_name!r} already exists. `rc-repro down --name {repro_name}` "
-            "first, or pass --force to rebuild it.")
+    # NO refusal for an existing workspace. `down` tells the user "bring it back:
+    # rc-repro up ...", and this raised "already exists, down first or --force" at
+    # them -- two messages in the same tool contradicting each other about the same
+    # workspace. Compose reuses; so does this. The namespace and its PVC survived a
+    # plain `down`, which is exactly what makes bringing it back meaningful.
+    reused = runner.exists(repro_name)
+    if reused:
+        info(emit, f"{repro_name!r} already exists — bringing it back up",
+             phase="plan")
     check_capacity(req, req.preset, emit)
 
     try:
@@ -1820,7 +1840,7 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
                         json.dumps(asdict(meta), indent=2))
     info(emit, f"{root}  admin / {config.ADMIN_PASSWORD}", phase="done", pct=100)
     return {"name": repro_name, "meta": asdict(meta), "url": root,
-            "reused": False, "runtime": topology.KUBERNETES}
+            "reused": reused, "runtime": topology.KUBERNETES}
 
 
 def _stop_port_forward(pid: int) -> None:
