@@ -1056,11 +1056,16 @@ def port_forward(name: str, *, namespace: str, context: str, host_port: int,
     A port-forward dies with its pod, which is a real difference from Compose --
     hence `ensure_port_forward`, which `ready` and `start` use to re-establish it.
     """
+    # RUNNING, not merely existing. `kubectl port-forward` refuses a pod that is
+    # still ContainerCreating ("unable to forward port because pod is not
+    # running") and exits, which is precisely what happened when this waited only
+    # for a pod NAME: the forward was spawned a second after `helm install`, died
+    # at once, and the URL never answered. Existence is not reachability.
     for attempt in range(POD_WAIT_TRIES):
         res = run(["kubectl", "--context", context, "-n", namespace, "get", "pod",
                    "-l", "app.kubernetes.io/name=rocketchat", "-o",
-                   "jsonpath={.items[0].metadata.name}"], own=is_ours(context))
-        if (res.stdout or "").strip():
+                   "jsonpath={.items[0].status.phase}"], own=is_ours(context))
+        if (res.stdout or "").strip() == "Running":
             break
         if attempt % 4 == 0:
             info(emit, "waiting for the Rocket.Chat pod", phase="wait")
@@ -1139,7 +1144,21 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
 
     pid = port_forward(name, namespace=namespace, context=context,
                        host_port=host_port, emit=emit)
-    info(emit, f"http://localhost:{host_port}", phase="boot", pct=90)
+    # Confirmed, not assumed. A port-forward that died on spawn leaves a URL that
+    # looks like an address and answers nothing, which is worse than no URL -- it
+    # sends someone to debug Rocket.Chat when the forward is what failed. If it is
+    # not alive, say so and hand over the command that establishes one.
+    time.sleep(1.0)
+    if forward_alive(pid):
+        info(emit, f"http://localhost:{host_port}", phase="boot", pct=90)
+    else:
+        pid = 0
+        warn(emit, f"the port-forward did not stay up, so "
+                   f"http://localhost:{host_port} is not reachable yet. Once the "
+                   f"pod is running: kubectl -n {namespace} port-forward "
+                   f"deployment/{RELEASE}-rocketchat {host_port}:3000 "
+                   f"— or `rc-repro ready --name {name}` to re-establish it.",
+             phase="boot")
     return {"context": context, "namespace": namespace,
             "chart_version": chart_version, "release": RELEASE,
             "port_forward_pid": pid, "microservices": microservices}

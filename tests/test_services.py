@@ -2593,7 +2593,9 @@ def test_the_port_forward_targets_the_deployment_not_the_service(monkeypatch, tm
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     spawned = []
-    monkeypatch.setattr(k8s, "run", _fake_run({"jsonpath": (0, "rocketchat-abc")}))
+    # "Running", not a pod name: kubectl refuses a ContainerCreating pod, so
+    # waiting for existence alone spawned a forward that died immediately.
+    monkeypatch.setattr(k8s, "run", _fake_run({"jsonpath": (0, "Running")}))
     monkeypatch.setattr(k8s.subprocess, "Popen",
                         lambda argv, **kw: spawned.append(argv) or type(
                             "P", (), {"pid": 4242})())
@@ -2622,10 +2624,47 @@ def test_a_dead_port_forward_is_replaced_rather_than_trusted(monkeypatch, tmp_pa
     assert k8s.forward_alive(_os.getpid()) is False
 
     spawned = []
-    monkeypatch.setattr(k8s, "run", _fake_run({"jsonpath": (0, "pod-1")}))
+    monkeypatch.setattr(k8s, "run", _fake_run({"jsonpath": (0, "Running")}))
     monkeypatch.setattr(k8s.subprocess, "Popen",
                         lambda argv, **kw: spawned.append(argv) or type(
                             "P", (), {"pid": 77})())
     assert k8s.ensure_port_forward("k", namespace="ns", context=k8s.CONTEXT,
                                    host_port=3010, pid=999999999) == 77
     assert spawned, "it trusted a dead pid"
+
+
+def test_a_url_is_only_printed_once_the_forward_is_confirmed_alive(monkeypatch, tmp_path):
+    """A port-forward that dies on spawn leaves a URL that looks like an address and
+    answers nothing -- which sends someone to debug Rocket.Chat when the forward is
+    what failed. Observed twice on live runs before this.
+
+    So the URL is confirmed, not assumed, and a dead forward hands over the command
+    that establishes one instead of a promise.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    said: list = []
+    monkeypatch.setattr(k8s.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(k8s, "ensure_cluster", lambda **k: k8s.CONTEXT)
+    monkeypatch.setattr(k8s, "ensure_repo", lambda **k: None)
+    monkeypatch.setattr(k8s, "resolve_chart_version", lambda *a, **k: "7.0.2")
+    monkeypatch.setattr(k8s, "preflight",
+                        lambda *a, **k: k8s.Preflight(cluster_reachable=True,
+                                                      default_storage_class="s"))
+    monkeypatch.setattr(k8s, "ensure_namespace", lambda n, **k: f"rc-repro-{n}")
+    monkeypatch.setattr(k8s, "apply", lambda *a, **k: None)
+    monkeypatch.setattr(k8s, "init_replica_set", lambda **k: None)
+    monkeypatch.setattr(k8s, "install", lambda **k: None)
+    monkeypatch.setattr(k8s, "clusters", lambda: ([k8s.CLUSTER_NAME], ""))
+    monkeypatch.setattr(k8s, "port_forward", lambda *a, **k: 999999999)  # dead pid
+    resolved = type("R", (), {"rc_version": "8.6.1", "mongo_tag": "8.0",
+                              "rc_image": "img", "oplog": False})()
+
+    out = k8s.create_workspace(name="k", resolved=resolved, host_port=3010,
+                               microservices=False,
+                               emit=lambda e: said.append(e.message))
+    assert out["port_forward_pid"] == 0, "a dead forward must not be recorded as live"
+    assert not any(m.strip() == "http://localhost:3010" for m in said), \
+        "it printed a URL it had not confirmed"
+    assert any("port-forward" in m and "kubectl" in m for m in said), said
