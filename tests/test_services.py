@@ -1329,16 +1329,22 @@ def test_a_compose_only_operation_refuses_a_kubernetes_workspace(monkeypatch, tm
     topology.require_compose("k", "stats")
 
 
-def test_only_compose_is_registered_so_up_cannot_yet_be_asked_for_kubernetes():
-    """`kubernetes` is a spellable canonical name with no implementation, which is
-    deliberate: the parser recognises it so the refusal can name it, rather than
-    reporting it as a typo."""
+def test_both_runtimes_are_registered_and_a_third_would_not_be():
+    """Kubernetes joined `REGISTERED` only once its whole sequence -- cluster,
+    namespace, MongoDB with an initiated replica set, the chart, a port-forward --
+    ran on a live cluster rather than in stubs.
+
+    Registration is what `up` consults, and it is deliberately separate from being
+    SPELLABLE: a name can be recognised, and reported honestly as unavailable,
+    before it works. That is how `kubernetes` behaved for six commits.
+    """
     from rc_repro.services import topology
 
-    assert topology.REGISTERED == frozenset({topology.DOCKER})
+    assert topology.REGISTERED == frozenset({topology.DOCKER, topology.KUBERNETES})
     assert topology.is_registered(topology.DOCKER)
-    assert not topology.is_registered(topology.KUBERNETES)
-    assert topology.normalize("k8s") == topology.KUBERNETES, "spellable but unregistered"
+    assert topology.is_registered(topology.KUBERNETES)
+    assert not topology.is_registered("nomad")
+    assert topology.normalize("k8s") == topology.KUBERNETES
 
 
 def test_the_create_path_stamps_the_runtime_on_a_compose_workspace(monkeypatch, tmp_path):
@@ -1431,12 +1437,15 @@ def test_the_refusals_name_what_to_do_instead(monkeypatch):
         assert expect in str(caught.value), f"{kwargs} said {caught.value!r}"
         assert caught.value.exit_code == 2, "a bad combination is a usage error"
 
-    # An unregistered runtime is refused separately from being resolved, so a GUI
-    # can name Kubernetes as an option without failing on it.
+    # Resolving and being allowed stay separate questions, so a GUI can name a
+    # runtime it cannot yet create. Both are registered now, so neither refuses --
+    # the separation is what lets a THIRD runtime be named before it works.
     assert T.resolve_axes(runtime="k8s").runtime == T.KUBERNETES
-    with pytest.raises(errors.ValidationError):
-        T.require_registered(T.KUBERNETES)
+    T.require_registered(T.KUBERNETES)
     T.require_registered(T.DOCKER)
+    with pytest.raises(errors.ValidationError) as caught:
+        T.require_registered("nomad")
+    assert "not available in this build" in str(caught.value)
 
 
 def test_the_old_spellings_keep_working_and_say_what_they_are_now():

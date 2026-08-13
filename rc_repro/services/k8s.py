@@ -1001,3 +1001,81 @@ def init_replica_set(*, namespace: str, context: str, emit: Emit = null_emit,
             "the MongoDB replica set is not initiated, so Rocket.Chat's change "
             "streams cannot work: " + (ok.stdout or ok.stderr or "").strip()[:300])
     info(emit, "replica set ready", phase="boot")
+
+
+def port_forward(name: str, *, namespace: str, context: str, host_port: int) -> int:
+    """Publish a workspace on a host port. Returns the pid, or 0.
+
+    Detached with `start_new_session`, so it outlives the `up` that started it --
+    the workspace has to stay reachable after the command returns, exactly as a
+    published Compose port does.
+
+    A port-forward dies with its pod, which is a real difference from Compose and
+    is why `start` re-establishes it rather than assuming.
+    """
+    argv = ["kubectl", "--context", context, "-n", namespace, "port-forward",
+            f"svc/{RELEASE}-rocketchat", f"{host_port}:80"]
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True,
+                                env=owned_env() if is_ours(context) else None)
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    return proc.pid
+
+
+def create_workspace(*, name: str, resolved, host_port: int, microservices: bool,
+                     replicas: int = 1, owner: str = "", root_url: str = "",
+                     emit: Emit = null_emit) -> dict:
+    """Build a Kubernetes workspace, and return what repro.json needs.
+
+    A PARALLEL path to lifecycle's compose one rather than a refactor of it, which
+    is PR #3's call and the right one: lifecycle.py is compose-shaped throughout
+    and two front-ends depend on it, so the Docker default stays byte-identical
+    and this owns the Kubernetes sequence instead. Naming, version resolution and
+    metadata are shared, not reimplemented.
+
+    Ordered so nothing waits on something that cannot happen: the replica set is
+    initiated BEFORE the chart goes in, because Rocket.Chat needs change streams
+    and would otherwise sit at not-ready with nothing in its logs naming MongoDB.
+    """
+    context = ensure_cluster(emit=emit)
+    ensure_repo(emit=emit)
+    chart_version = resolve_chart_version(resolved.rc_version, emit=emit)
+    info(emit, f"chart {chart_version} for Rocket.Chat {resolved.rc_version}",
+         phase="plan")
+
+    pre = preflight(context)
+    blocked = storage_blocker(pre)
+    if blocked:
+        raise PreflightError(blocked)
+
+    namespace = ensure_namespace(name, context=context, owner=owner, emit=emit)
+    info(emit, f"MongoDB {resolved.mongo_tag}, {MONGO_VOLUME_GB}Gi volume",
+         phase="provision", pct=20)
+    apply(mongo_manifest(name, resolved.mongo_tag, owner=owner),
+          namespace=namespace, context=context)
+    init_replica_set(namespace=namespace, context=context, emit=emit)
+
+    values = values_for(rc_version=resolved.rc_version, rc_image=resolved.rc_image,
+                        microservices=microservices, replicas=replicas,
+                        root_url=root_url, oplog=resolved.oplog)
+    info(emit, f"installing {CHART} as {RELEASE}", phase="boot", pct=60)
+    install(namespace=namespace, context=context, values=values,
+            chart_version=chart_version)
+
+    pid = port_forward(name, namespace=namespace, context=context,
+                       host_port=host_port)
+    info(emit, f"http://localhost:{host_port}", phase="boot", pct=90)
+    return {"context": context, "namespace": namespace,
+            "chart_version": chart_version, "release": RELEASE,
+            "port_forward_pid": pid, "microservices": microservices}
+
+
+def workspace_ready(name: str, *, context: str) -> bool:
+    """Whether the Rocket.Chat pod reports itself Ready."""
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "pod", "-l", "app.kubernetes.io/name=rocketchat", "-o",
+               "jsonpath={.items[0].status.containerStatuses[0].ready}"],
+              own=is_ours(context))
+    return (res.stdout or "").strip() == "true"

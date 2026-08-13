@@ -23,9 +23,9 @@ and the message can say what to do instead. Reading is not use.
 `normalize` is the opposite and does raise, because it is only ever called on
 input a human just typed, where a silent fallback would boot the wrong thing.
 
-Only `docker` is registered. A second runtime is an entry in `REGISTERED` plus
-the module implementing it; nothing else in the codebase compares this string to
-a literal.
+Two runtimes are registered: `docker`, and `kubernetes` once its whole sequence
+was proven on a live cluster. A third is an entry in `REGISTERED` plus the module
+implementing it; nothing else in the codebase compares this string to a literal.
 """
 
 from __future__ import annotations
@@ -86,10 +86,10 @@ ALIASES: dict[str, str] = {
     "kube": KUBERNETES,
 }
 
-#: Runtimes this build can actually create. `KUBERNETES` is a canonical name with
-#: no implementation yet -- it is spellable so that the refusal names it, rather
-#: than the parser pretending never to have heard of it.
-REGISTERED: frozenset[str] = frozenset({DOCKER})
+#: Runtimes this build can actually create. Kubernetes joined once the whole
+#: sequence -- cluster, namespace, MongoDB with an initiated replica set, the
+#: chart, a port-forward -- was proven on a live cluster rather than in stubs.
+REGISTERED: frozenset[str] = frozenset({DOCKER, KUBERNETES})
 
 #: Human labels, for a message or a GUI row.
 LABELS: dict[str, str] = {

@@ -7,10 +7,13 @@ never call typer / sys.exit / typer.confirm.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+
+from dataclasses import asdict
 
 from rc_repro import compose, config, presets, rcapi, runner, versions
 from rc_repro import seed as seeder
@@ -751,6 +754,13 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
     req.preset, req.params = axes.preset, axes.params
     req.runtime, req.deployment, req.replicas = (axes.runtime, axes.deployment,
                                                  axes.replicas)
+    if req.runtime == topology.KUBERNETES:
+        # A PARALLEL path, not a branch woven through this function. Everything
+        # below is compose-shaped -- host ports, a compose document, `docker
+        # compose up` -- and two front-ends depend on it behaving exactly as it
+        # does. Handing Kubernetes off here keeps the Docker default byte-identical
+        # and puts the Kubernetes sequence in the module that owns it.
+        return _create_kubernetes(req, emit=emit)
     require_docker()
     cfg = config.load_config()
 
@@ -1627,3 +1637,69 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         removed.append(name)
         info(emit, f"pruned {name!r}", phase="done")
     return {"targets": targets, "removed": removed}
+
+
+def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
+    """The Kubernetes half of `_create_repro_locked`.
+
+    Shares everything that is not runtime-specific -- name derivation, version
+    resolution, the capacity refusal, host-port allocation, repro.json -- and
+    delegates only the sequence that differs. A workspace created here is a
+    workspace like any other: `list`, `info`, `logs` and `down` find it because it
+    has a repro.json, which is what `runner.exists()` now looks for.
+    """
+    from rc_repro.services import k8s
+
+    repro_name = _derive_for(req)
+    _require_valid_name(repro_name)
+    if runner.exists(repro_name) and not req.force:
+        raise ConflictError(
+            f"{repro_name!r} already exists. `rc-repro down --name {repro_name}` "
+            "first, or pass --force to rebuild it.")
+    check_capacity(req, req.preset, emit)
+
+    try:
+        resolved = versions.resolve(req.version, offline=req.offline)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    if req.rc_image:
+        resolved.rc_image = req.rc_image
+    if req.mongo:
+        versions.apply_mongo_override(resolved, req.mongo)
+
+    host_port = pick_host_port(req.port, presets.load("default", {}),
+                               exclude=repro_name)
+    root = f"http://localhost:{host_port}"
+    microservices = req.deployment == topology.MICROSERVICES
+    out = k8s.create_workspace(
+        name=repro_name, resolved=resolved, host_port=host_port,
+        microservices=microservices, replicas=req.replicas or 1,
+        owner=req.actor, emit=emit)
+
+    meta = runner.Metadata(
+        name=repro_name, project=out["namespace"], rc_version=resolved.rc_version,
+        rc_image=resolved.rc_image, mongo_tag=resolved.mongo_tag,
+        mongo_flavor=resolved.mongo_flavor, preset=req.preset, root_url=root,
+        host_port=host_port, version_source=resolved.source, pinned=req.pin,
+        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    topology.stamp(meta.extra, topology.KUBERNETES)
+    meta.extra[config.EXTRA_DEPLOYMENT] = req.deployment or topology.MICROSERVICES
+    meta.extra.update({k: v for k, v in out.items() if k != "microservices"})
+    if req.replicas > 1:
+        meta.extra["instances"] = req.replicas
+    if req.actor:
+        meta.extra["created_by"] = req.actor
+    meta.extra["notes"] = [
+        f"namespace {out['namespace']} on cluster {out['context']}",
+        f"kubectl -n {out['namespace']} get pods",
+        f"helm -n {out['namespace']} list",
+    ]
+    # No compose document, so `write` is given an empty one rather than a fake:
+    # a file that looks like a compose project but is not would be worse than none.
+    ws = runner.workspace(repro_name)
+    ws.mkdir(parents=True, exist_ok=True)
+    runner.atomic_write(ws / "repro.json",
+                        json.dumps(asdict(meta), indent=2))
+    info(emit, f"{root}  admin / {config.ADMIN_PASSWORD}", phase="done", pct=100)
+    return {"name": repro_name, "meta": asdict(meta), "url": root,
+            "reused": False, "runtime": topology.KUBERNETES}
