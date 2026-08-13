@@ -35,10 +35,18 @@ from rc_repro import config
 #: concurrent repros on laptop-scale hardware, which is behaviour rc-repro
 #: already has on Compose.
 #:
-#: rc-repro NEVER adopts a cluster it finds. A cluster it created it may delete;
-#: one it found it may not -- and kind's `extraPortMappings`, which the ingress
-#: needs, can only be set at creation, so adopting one would also mean it could
-#: never serve a hostname.
+#: rc-repro USES whatever cluster it is pointed at and creates this one only when
+#: there is none. An earlier draft always created it, on the argument that kind's
+#: `extraPortMappings` are fixed at creation so an adopted cluster could never
+#: serve a hostname. Measured on Linux, that is false: kind nodes are directly
+#: routable from the host on the `kind` bridge (`curl https://172.19.0.2:6443` ->
+#: 200, no mapping), so an ingress in any kind cluster is reachable at the node's
+#: :80 and the edge reaches it with `docker network connect`, as it already does
+#: for Compose workspaces.
+#:
+#: What survives is the TEARDOWN asymmetry, which is the part that matters: a
+#: cluster rc-repro created it may delete; in one you supplied it owns only the
+#: namespaces carrying its label.
 CLUSTER_NAME = "rc-repro-local"
 
 #: kind prefixes the kubeconfig context with `kind-`.
