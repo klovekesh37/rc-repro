@@ -1481,3 +1481,201 @@ def test_rebuilding_a_workspace_does_not_nag_about_a_spelling_nobody_typed():
                              version_source="t")
     assert T.axes_of_meta(old)["deployment"] == T.MULTI_INSTANCE
     assert T.axes_of_meta(old)["runtime"] == T.DOCKER
+
+
+# --- the Kubernetes preflight ---------------------------------------------------
+# Phase 3 rung 1: `doctor` learns Kubernetes. Nothing here creates anything -- every
+# function is a read, so these tests drive the whole surface with `k8s.run` stubbed.
+
+def _fake_run(mapping):
+    """Stub k8s.run: match on a substring of the joined argv."""
+    import subprocess as sp
+
+    def run(argv, timeout=None):
+        joined = " ".join(argv)
+        for needle, (rc, out) in mapping.items():
+            if needle in joined:
+                return sp.CompletedProcess(argv, rc, out, "")
+        return sp.CompletedProcess(argv, 1, "", "no stub")
+    return run
+
+
+def test_tool_versions_parse_the_three_formats_the_tools_actually_print():
+    """Each tool spells its version differently, and all three strings below are
+    real output from this machine. A parser that only handled one would report a
+    present tool as unknown and, with a floor to check, refuse to proceed."""
+    from rc_repro.services import k8s
+
+    assert k8s._parse_version("kind v0.32.0 go1.26.3 linux/amd64") == (0, 32, 0)
+    assert k8s._parse_version("Client Version: v1.36.3") == (1, 36, 3)
+    assert k8s._parse_version("v4.2.3+g43e8b7f") == (4, 2, 3)
+    assert k8s._parse_version("something unparseable") == ()
+
+
+def test_an_unparseable_version_is_not_treated_as_too_old():
+    """A distro may print something this does not recognise. Refusing to proceed
+    over an unrecognised version string is worse than trying: the binary is there,
+    and the floor exists to catch a genuinely ancient one, not to gate on parsing."""
+    from rc_repro.services import k8s
+
+    assert k8s.Tool(name="helm", path="/usr/bin/helm", raw="weird").new_enough
+    assert not k8s.Tool(name="helm", path="/usr/bin/helm", version=(2, 17)).new_enough
+    assert k8s.Tool(name="helm", path="/usr/bin/helm", version=(3, 0)).new_enough
+    assert not k8s.Tool(name="helm").present
+
+
+def test_a_missing_binary_never_raises_out_of_the_seam():
+    """`doctor` is the command someone runs BECAUSE things are wrong. If the seam
+    raised on a missing binary, every call site would need a wrapper and one
+    forgotten wrapper takes down the whole report."""
+    from rc_repro.services import k8s
+
+    res = k8s.run(["definitely-not-a-real-binary-xyz", "version"])
+    assert res.returncode != 0
+    assert res.stdout == ""
+
+
+def test_namespaces_are_selected_by_label_never_by_name(monkeypatch):
+    """The safety property. Anyone can create a namespace called
+    `rc-repro-anything`; a teardown matching on the prefix would eventually delete
+    one rc-repro never made. Asserted on the argv, because that is the thing that
+    reaches the cluster."""
+    from rc_repro.services import k8s
+
+    seen = []
+
+    def spy(argv, timeout=None):
+        import subprocess as sp
+        seen.append(argv)
+        return sp.CompletedProcess(argv, 0, "namespace/rc-repro-t1\n", "")
+
+    monkeypatch.setattr(k8s, "run", spy)
+    assert k8s.workspace_namespaces() == ["rc-repro-t1"]
+    argv = seen[0]
+    assert "-l" in argv and k8s.OWNER_SELECTOR in argv, argv
+    # The context legitimately contains the prefix (kind-rc-repro-local). What must
+    # not appear is a SELECTOR built from the name: no field-selector, and no
+    # argument that is the prefix used as a match.
+    selectors = [a for i, a in enumerate(argv)
+                 if i and argv[i - 1] not in ("--context",) and a != "--context"]
+    assert not any(a.startswith("--field-selector") for a in selectors), argv
+    assert not any(a.strip('"\'') == k8s.NAMESPACE_PREFIX for a in selectors), argv
+
+
+def test_the_release_is_named_as_the_official_docs_name_it():
+    """PR #3 calls the release `rc`. The official guide calls it `rocketchat`, and
+    with one release per namespace there is no reason to differ -- so every command
+    copied from docs.rocket.chat works by substituting the namespace alone."""
+    from rc_repro.services import k8s
+
+    assert k8s.RELEASE == "rocketchat"
+    assert k8s.CLUSTER_NAME == "rc-repro-local"
+
+
+def test_preflight_stops_before_asking_a_cluster_that_is_not_there(monkeypatch):
+    """Ordering matters: asking an absent API server for storage classes would time
+    out, and the timeout would be reported as "no storage" -- a wrong answer that
+    sends someone to fix the wrong thing."""
+    from rc_repro.services import k8s
+
+    asked = []
+
+    def spy(argv, timeout=None):
+        import subprocess as sp
+        asked.append(" ".join(argv))
+        if "get clusters" in " ".join(argv):
+            return sp.CompletedProcess(argv, 0, "kind\n", "")
+        return sp.CompletedProcess(argv, 0, "v1.0.0", "")
+
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "run", spy)
+    pre = k8s.preflight()
+    assert pre.cluster_exists is False
+    assert pre.other_clusters == ["kind"]
+    assert not any("storageclass" in a for a in asked), \
+        "it asked an absent cluster for storage"
+
+
+def test_doctor_stays_quiet_about_kubernetes_when_nobody_is_using_it(monkeypatch, tmp_path):
+    """A doctor that reports FAIL for a feature you are not using teaches people to
+    ignore its failures. With no tools and no Kubernetes workspace, the whole
+    subject is one informational line -- not five rows of absence."""
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda _t: "")
+    report = doctor.run_checks()
+    kube = [r for r in report["checks"] if "ubernetes" in r["message"]]
+    assert len(kube) == 1, f"expected one line, got {[r['message'] for r in kube]}"
+    assert kube[0]["status"] == "ok"
+    assert "unaffected" in kube[0]["message"]
+
+
+def test_doctor_fails_when_a_kubernetes_workspace_exists_but_the_tools_do_not(
+        monkeypatch, tmp_path):
+    """The same finding, opposite severity. A workspace that cannot be reached OR
+    TORN DOWN is a real fault -- and the teardown half is what makes it urgent,
+    because the resources keep running."""
+    from rc_repro.services import doctor, k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
+                           mongo_tag="8.0", mongo_flavor="official", preset="default",
+                           root_url="u", host_port=3010, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    lc.runner.write("k", "services: {}\n", m)
+
+    monkeypatch.setattr(k8s, "which", lambda _t: "")
+    report = doctor.run_checks()
+    kube = [r for r in report["checks"] if "Kubernetes workspace(s) exist" in r["message"]]
+    assert len(kube) == 1, [r["message"] for r in report["checks"]]
+    assert kube[0]["status"] == "fail"
+    assert "torn down" in kube[0]["message"]
+    assert report["verdict"] == "fail"
+
+
+def test_a_cluster_with_no_default_storageclass_is_reported(monkeypatch, tmp_path):
+    """The guide opens with this warning: local distributions "often ship without a
+    storage provisioner enabled". The failure it causes is silent -- a PVC stays
+    Pending forever and nothing in the output names storage."""
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "run", _fake_run({
+        "get clusters": (0, f"{k8s.CLUSTER_NAME}\n"),
+        "/readyz": (0, "ok"),
+        "get storageclass": (0, '{"items": []}'),
+        "get namespace": (0, ""),
+        "version": (0, "v9.9.9"),
+    }))
+    report = doctor.run_checks()
+    sc = [r for r in report["checks"] if "StorageClass" in r["message"]]
+    assert len(sc) == 1 and sc[0]["status"] == "warn", [r["message"] for r in report["checks"]]
+    assert "Pending" in sc[0]["message"], "it must name the symptom, not just the cause"
+
+
+def test_a_stopped_docker_is_not_reported_as_a_missing_cluster(monkeypatch, tmp_path):
+    """`kind` talks to Docker. With Docker stopped, `kind get clusters` exits
+    non-zero -- which reads as an empty list if only stdout is consulted, and
+    "your cluster does not exist" is then a WRONG answer that sends someone to
+    create a cluster that is already there.
+
+    The two are kept apart: answered-no and could-not-ask.
+    """
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "run", _fake_run({
+        "get clusters": (1, ""),          # non-zero: Docker is down
+        "version": (0, "v9.9.9"),
+    }))
+    found, why = k8s.clusters()
+    assert found == [] and why, "the reason must survive, not be flattened to []"
+
+    report = doctor.run_checks()
+    msgs = [r["message"] for r in report["checks"]]
+    assert any("Could not tell whether cluster" in m for m in msgs), msgs
+    assert not any("does not exist" in m for m in msgs), \
+        "it claimed the cluster is absent when it merely could not ask"
