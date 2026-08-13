@@ -1787,3 +1787,95 @@ def test_the_cluster_in_use_is_not_also_listed_as_another_cluster(monkeypatch, t
     assert any("Using your cluster 'kind-kind'" in m for m in msgs), msgs
     assert not any("other kind cluster" in m for m in msgs), \
         "the cluster in use was counted again as an 'other' one"
+
+
+def test_missing_storage_is_a_refusal_because_nothing_would_ever_log_it():
+    """The reason this cannot be left to the logs.
+
+    With no provisioner the PVC stays Pending, the pod stays Pending, and
+    Rocket.Chat NEVER STARTS -- so there are no Rocket.Chat logs to find it in.
+    Left to run it costs the full readiness timeout and then reports "Rocket.Chat
+    did not become ready", which blames the one component that is innocent and
+    sends someone to debug it.
+
+    Same reasoning as the mongo/kernel gate: there is no case where continuing
+    works, so a warning would only be a slower failure.
+    """
+    from rc_repro.services import k8s
+
+    none_at_all = k8s.Preflight(context="c", cluster_reachable=True)
+    msg = k8s.storage_blocker(none_at_all)
+    assert msg, "an unprovisioned cluster must be refused"
+    assert "never start" in msg, "it must name the symptom"
+    assert "logs" in msg, "and say why the logs will not show it"
+
+    # A cluster with classes but no DEFAULT is the subtler half, and fails the
+    # same way -- so it gets the command that fixes it.
+    no_default = k8s.Preflight(context="c", cluster_reachable=True,
+                               storage_classes=["fast", "slow"])
+    msg2 = k8s.storage_blocker(no_default)
+    assert "none is marked default" in msg2
+    assert "kubectl patch storageclass" in msg2, "name the fix, not just the fault"
+
+    # Provisioned: silent.
+    ok = k8s.Preflight(context="c", cluster_reachable=True,
+                       storage_classes=["standard"], default_storage_class="standard")
+    assert k8s.storage_blocker(ok) == ""
+
+
+def test_storage_is_not_reported_for_a_cluster_nobody_could_reach():
+    """Reporting "no StorageClass" for an unreachable cluster is the same wrong
+    answer as reporting an absent cluster for a stopped Docker: it sends someone
+    to fix storage when the problem is that nothing answered."""
+    from rc_repro.services import k8s
+
+    unreachable = k8s.Preflight(context="c", cluster_reachable=False)
+    assert k8s.storage_blocker(unreachable) == ""
+
+
+def test_a_missing_ingress_controller_only_blocks_a_request_that_needs_one():
+    """Conditional on purpose. A workspace reached by port-forward needs no
+    ingress controller, so an absent one is not a fault -- it is only a fault
+    against `--domain`. Warning about it in `doctor` would tell every port-forward
+    user about something that cannot affect them."""
+    from rc_repro.services import k8s
+
+    bare = k8s.Preflight(context="kind-kind", cluster_reachable=True,
+                         provider=k8s.PROVIDER_EXTERNAL)
+    assert k8s.ingress_blocker(bare, wants_domain=False) == "", \
+        "port-forward needs no ingress"
+    msg = k8s.ingress_blocker(bare, wants_domain=True)
+    assert "no ingress controller" in msg
+    assert "does not install one into a cluster it does not own" in msg
+    assert "helm install traefik" in msg, "name what to run"
+
+    # In OUR cluster the same gap is rc-repro's job, so the message differs.
+    ours = k8s.Preflight(context=k8s.CONTEXT, cluster_reachable=True,
+                         provider=k8s.PROVIDER_KIND)
+    assert "rc-repro installs one" in k8s.ingress_blocker(ours, wants_domain=True)
+
+    # Present: silent either way.
+    have = k8s.Preflight(context="c", cluster_reachable=True,
+                         ingress_classes=["traefik"])
+    assert k8s.ingress_blocker(have, wants_domain=True) == ""
+
+
+def test_doctor_says_nothing_about_ingress(monkeypatch, tmp_path):
+    """Deliberate omission, asserted so it stays deliberate. `doctor` does not know
+    whether you are about to ask for `--domain`, and most workspaces never do."""
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "run", _fake_run({
+        "get clusters": (0, f"{k8s.CLUSTER_NAME}\n"),
+        "/readyz": (0, "ok"),
+        "get storageclass": (0, '{"items": [{"metadata": {"name": "standard",'
+                                ' "annotations": {"storageclass.kubernetes.io/'
+                                'is-default-class": "true"}}}]}'),
+        "get ingressclass": (0, ""),
+        "get namespace": (0, ""),
+        "version": (0, "v9.9.9"),
+    }))
+    msgs = [r["message"] for r in doctor.run_checks()["checks"]]
+    assert not any("ingress" in m.lower() for m in msgs), msgs

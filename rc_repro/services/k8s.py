@@ -127,6 +127,10 @@ class Preflight:
     cluster_reachable: bool = False
     storage_classes: list[str] = field(default_factory=list)
     default_storage_class: str = ""
+    #: Ingress controllers installed here. Empty is NOT a fault -- a workspace
+    #: reached by port-forward needs none. It only blocks `--domain`, so it is
+    #: checked at create time against what was asked for, never in `doctor`.
+    ingress_classes: list[str] = field(default_factory=list)
     other_clusters: list[str] = field(default_factory=list)
     namespaces: list[str] = field(default_factory=list)
     #: The context actually probed, and how that cluster came to exist. On a box
@@ -272,6 +276,20 @@ def storage_classes(context: str = CONTEXT) -> tuple[list[str], str]:
     return names, default
 
 
+def ingress_classes(context: str = CONTEXT) -> list[str]:
+    """Ingress controllers installed in this cluster.
+
+    kind ships none -- verified on this box, `get ingressclass` returns "No
+    resources found" -- which is why rc-repro installs Traefik into its OWN
+    cluster and refuses `--domain` against yours rather than installing into it.
+    """
+    res = run(["kubectl", "--context", context, "get", "ingressclass", "-o", "name"])
+    if res.returncode != 0:
+        return []
+    return [ln.split("/", 1)[-1].strip()
+            for ln in (res.stdout or "").splitlines() if ln.strip()]
+
+
 def workspace_namespaces(context: str = CONTEXT) -> list[str]:
     """Namespaces rc-repro owns, selected by LABEL.
 
@@ -339,5 +357,61 @@ def preflight(context: str = "") -> Preflight:
     if not out.cluster_reachable:
         return out
     out.storage_classes, out.default_storage_class = storage_classes(out.context)
+    out.ingress_classes = ingress_classes(out.context)
     out.namespaces = workspace_namespaces(out.context)
     return out
+
+
+def storage_blocker(pre: Preflight) -> str:
+    """Why a workspace's volume could not bind in this cluster, or "".
+
+    Takes an already-probed Preflight rather than a context, so it cannot be
+    called on data from an unreachable cluster -- reporting "no StorageClass" for
+    a cluster nobody could reach is the same wrong answer as reporting an absent
+    cluster for a stopped Docker.
+
+    This is a REFUSAL, not a warning, for the reason that makes it nasty: with no
+    provisioner the PVC stays Pending, the pod stays Pending, and **Rocket.Chat
+    never starts** -- so there are no Rocket.Chat logs to find it in. Left to run,
+    it costs the full readiness timeout and then reports "Rocket.Chat did not
+    become ready", which blames the one component that is innocent.
+    """
+    if not pre.cluster_reachable:
+        return ""          # not our question; the caller reports unreachable first
+    if pre.default_storage_class:
+        return ""
+    where = f"Cluster {pre.context!r}"
+    if pre.storage_classes:
+        return (f"{where} has StorageClasses ({', '.join(pre.storage_classes)}) but "
+                "none is marked default, so the workspace's volume would stay Pending "
+                "and Rocket.Chat would never start. Mark one default with: kubectl "
+                "patch storageclass <name> -p "
+                "'{\"metadata\":{\"annotations\":"
+                "{\"storageclass.kubernetes.io/is-default-class\":\"true\"}}}'")
+    return (f"{where} has no StorageClass, so the workspace's volume would stay "
+            "Pending forever and Rocket.Chat would never start — with nothing in its "
+            "logs naming storage, because it never runs. The official guide warns "
+            "that local distributions often ship without a provisioner.")
+
+
+def ingress_blocker(pre: Preflight, *, wants_domain: bool) -> str:
+    """Why a hostname could not be served here, or "".
+
+    Conditional on purpose. A workspace reached by port-forward needs no ingress
+    controller at all, so an absent one is not a fault -- it is only a fault
+    against a request for `--domain`. Checking it unconditionally in `doctor`
+    would warn every port-forward user about something that cannot affect them.
+    """
+    if not wants_domain or not pre.cluster_reachable:
+        return ""
+    if pre.ingress_classes:
+        return ""
+    if pre.provider == PROVIDER_KIND:
+        # Our own cluster: this is rc-repro's job to fix, not the user's.
+        return (f"Cluster {pre.context!r} has no ingress controller yet — rc-repro "
+                "installs one into its own cluster; re-create it with "
+                "`rc-repro down --name <workspace>` and `up` again.")
+    return (f"Cluster {pre.context!r} has no ingress controller, so --domain could "
+            "not be served. rc-repro does not install one into a cluster it does not "
+            "own. Install one (e.g. helm install traefik traefik/traefik -n traefik "
+            "--create-namespace), or drop --domain and use the port-forward.")
