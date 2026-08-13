@@ -525,6 +525,12 @@ def monitor(
             res = monitorsvc.detach(target, emit=_cli_emit)
             ui.ok(f"✓ monitoring detached from {res['name']!r}"
                   + ("" if res["rc_setting_reset"] else " (metrics setting left as-is — repro not reachable)"))
+            # On Kubernetes the stack is shared, so "detached" does not mean
+            # "gone" -- and a user who came to free memory needs to know which
+            # of the two happened.
+            if res.get("stack_removed") is False:
+                ui.note("the shared monitoring stack stays up — other workspaces "
+                        "on this cluster are still using it")
         else:
             res = monitorsvc.attach(target, emit=_cli_emit)
             ui.ok(f"✓ monitoring attached to {res['name']!r}")

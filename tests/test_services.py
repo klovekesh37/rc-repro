@@ -3224,7 +3224,7 @@ def test_every_compose_only_command_refuses_with_a_way_forward(monkeypatch, tmp_
     implementation that does not exist yet, and it can ship first. Each refusal
     names the namespace, so it is copy-pasteable rather than a hint.
     """
-    from rc_repro.services import backup, envvars, k8s, monitor, topology, upgrade
+    from rc_repro.services import backup, envvars, k8s, topology, upgrade
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
@@ -3236,7 +3236,9 @@ def test_every_compose_only_command_refuses_with_a_way_forward(monkeypatch, tmp_
     lc.runner.write("k", "", m)
 
     cases = [
-        (lambda: monitor.attach("k"), "monitoring"),
+        # `monitor` used to be here. It is implemented now -- the shared stack in
+        # rc-repro-system plus a Grafana forward -- so it is covered by the
+        # monitoring tests below instead. The list shrinks as the gaps close.
         (lambda: backup.create("k"), "mongodump"),
         (lambda: envvars.set_env("k", {"A": "b"}), "helm"),
         (lambda: upgrade.run("k", "8.6.1"), "image.tag"),
@@ -3477,3 +3479,102 @@ def test_asking_for_the_operator_explicitly_satisfies_the_opt_in_but_not_the_flo
     assert not k8s.operator_supports("8.0"), "off by default"
     assert k8s.operator_supports("8.0", forced=True), "--mongo-operator asks for it"
     assert not k8s.operator_supports("5.0", forced=True), "the floor still holds"
+
+
+def test_the_monitoring_stack_is_shared_by_the_cluster_not_owned_by_a_workspace():
+    """The Compose shape does not transfer, and copying it would break at two.
+
+    `helm template rocketchat/monitoring` with every dependency disabled still
+    renders a ClusterRole and a ClusterRoleBinding at FIXED names
+    (`monitoring-otel-collector-role`) plus a log-collector DaemonSet -- so a
+    per-workspace release collides on cluster-scoped objects at the second
+    workspace, exactly as the MongoDB operator's CRDs do, and would also put one
+    collector per node per workspace on the same host paths.
+
+    So it lives once in rc-repro-system, like the operator, and `--monitor` on a
+    workspace means "point the shared Prometheus at me", not "install a stack".
+    """
+    from rc_repro.services import k8s
+
+    assert k8s.MONITORING_NAMESPACE == k8s.OPERATOR_NAMESPACE == "rc-repro-system"
+
+
+def test_prometheus_is_told_to_look_outside_its_own_release():
+    """The one setting a shared stack cannot work without.
+
+    kube-prometheus-stack defaults `serviceMonitorSelectorNilUsesHelmValues` and its
+    pod equivalent to true, which restricts Prometheus to monitors carrying its own
+    release label. A workspace's PodMonitor is in another namespace and another
+    release, so it is silently ignored: nothing errors, Grafana just draws empty
+    graphs -- which reads as "monitoring is broken" rather than "the selector
+    excluded it".
+    """
+    import inspect
+
+    from rc_repro.services import k8s
+
+    src = inspect.getsource(k8s.ensure_monitoring)
+    for key in ("serviceMonitorSelectorNilUsesHelmValues=false",
+                "podMonitorSelectorNilUsesHelmValues=false"):
+        assert key in src.replace("\"\n               \"", ""), key
+
+
+def test_detaching_monitoring_leaves_it_up_for_the_workspaces_still_using_it(
+        monkeypatch):
+    """Shared means one workspace's `--off` must not blind the others.
+
+    This is the real behavioural difference from Compose, where the stack belongs to
+    a project and detaching is unambiguous. Getting it wrong is silent: the other
+    workspaces keep running and just stop being observable.
+    """
+    import subprocess
+
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(k8s, "workspace_namespaces",
+                        lambda ctx: ["rc-repro-a", "rc-repro-b"])
+    monkeypatch.setattr(k8s, "monitoring_wanted",
+                        lambda ns, *, context: ns == "rc-repro-b")
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(k8s, "run", fake_run)
+
+    assert k8s.remove_monitoring(context=k8s.CONTEXT) is False
+    assert not any("uninstall" in a for argv in calls for a in argv), calls
+
+    monkeypatch.setattr(k8s, "monitoring_wanted", lambda ns, *, context: False)
+    calls.clear()
+    assert k8s.remove_monitoring(context=k8s.CONTEXT) is True
+    assert any("uninstall" in a for argv in calls for a in argv), calls
+
+
+def test_grafana_is_forwarded_from_the_instance_not_the_operator():
+    """`monitoring-grafana` is the grafana-OPERATOR and serves nothing useful;
+    `monitoring-grafana-deployment` is the Grafana it manages. Forwarding the wrong
+    one gives a page that loads and has no dashboards -- a working URL showing
+    nothing, which is worse than a refusal."""
+    from rc_repro.services import k8s
+
+    assert k8s.GRAFANA_DEPLOYMENT == "monitoring-grafana-deployment"
+    # Deployment, not Service, for the same reason the workspace forward is:
+    # a Service with no ready endpoint makes kubectl exit at once.
+    import inspect
+    src = inspect.getsource(k8s.grafana_forward)
+    assert "deployment/{GRAFANA_DEPLOYMENT}" in src
+
+
+def test_monitor_at_create_time_waits_for_the_workspace_first():
+    """Attaching turns on RC's own Prometheus_Enabled over REST, so it needs a
+    workspace that answers. `up --monitor` without `--wait` would otherwise attach
+    to something not yet serving and fail -- which is exactly what `--seed` did
+    before it was fixed on this path."""
+    import inspect
+
+    src = inspect.getsource(lc._create_kubernetes)
+    monitor_at = src.index("req.monitor")
+    assert "wait_serving" in src[monitor_at:monitor_at + 400], \
+        "--monitor must wait for the workspace before attaching"

@@ -1726,3 +1726,213 @@ def wait_for_mongodb(*, namespace: str, context: str, emit: Emit = null_emit,
            " — and reports no status at all, which means it never reconciled the "
            "resource (usually an unusable spec.version)")
         + f". kubectl -n {namespace} describe mongodbcommunity {MONGO_SERVICE}")
+
+
+# --- monitoring: Prometheus + Grafana, once per cluster ---------------------------
+
+#: The official chart, and it is a STACK: kube-prometheus-stack, grafana-operator
+#: and Loki as dependencies. Eleven pods and about 1.0 GB measured on kind.
+MONITORING_RELEASE = "monitoring"
+MONITORING_CHART = f"{HELM_REPO}/monitoring"
+
+#: Installed ONCE per cluster, next to the MongoDB operator, for the same reason and
+#: then one more. The reason it shares: kube-prometheus-stack owns cluster-scoped
+#: CRDs (Prometheus, PodMonitor, ...), so a per-workspace install collides on them
+#: at the second workspace. The extra reason: even with every dependency disabled
+#: the chart still renders a ClusterRole and ClusterRoleBinding at FIXED names
+#: (`monitoring-otel-collector-role`) plus a log-collector DaemonSet -- so the
+#: per-namespace install that looks like the compose shape does not compose either,
+#: and would put one collector per node per workspace on the same host paths.
+#:
+#: Sharing is also what makes this affordable: one 1.0 GB stack for every workspace
+#: on the box rather than 1.0 GB each, on a tool whose capacity preflight exists
+#: because it runs on laptops.
+MONITORING_NAMESPACE = OPERATOR_NAMESPACE
+
+#: Measured: 7554 MB free before `helm install`, 6524 MB with all eleven pods
+#: Running. Rounded up, and charged only to the FIRST monitored workspace on a
+#: cluster, because that is the one that pays for it.
+MONITORING_MB = 1100
+
+#: grafana-operator names the Grafana instance's Service this; `monitoring-grafana`
+#: is the operator itself and serves nothing useful. Forwarding the wrong one gives
+#: a page that loads and has no dashboards.
+GRAFANA_SERVICE = "monitoring-grafana-service"
+GRAFANA_DEPLOYMENT = "monitoring-grafana-deployment"
+GRAFANA_PORT = 3000
+
+#: Up to four minutes. The operator has to reconcile a Grafana CR into a Deployment
+#: and then pull its image, which is well past what helm's own wait allows for.
+GRAFANA_WAIT_TRIES = 48
+GRAFANA_WAIT_INTERVAL = 5.0
+
+
+def monitoring_installed(context: str) -> bool:
+    """Whether this cluster already has the shared stack."""
+    res = run(["helm", "status", MONITORING_RELEASE, "--kube-context", context,
+               "-n", MONITORING_NAMESPACE], own=is_ours(context))
+    return res.returncode == 0
+
+
+def ensure_monitoring(*, context: str, emit: Emit = null_emit) -> None:
+    """Install the shared stack, or leave the existing one alone.
+
+    The two `...SelectorNilUsesHelmValues=false` overrides are the whole reason a
+    shared stack works. kube-prometheus-stack defaults them to true, which restricts
+    Prometheus to monitors carrying its OWN release label -- so a workspace's
+    PodMonitor, in a different namespace and a different release, is ignored and
+    Grafana shows a dashboard with no data. Nothing errors; the graphs are simply
+    empty, which is the kind of failure that gets read as "monitoring is broken"
+    rather than "the selector excluded it".
+
+    Rocket.Chat's own chart needs nothing: `prometheusScraping.enabled` and
+    `podMonitor.enabled` are already its defaults, so the workspace publishes a
+    PodMonitor as soon as it is installed. The scrape starts because the shared
+    Prometheus is willing to look outside its own release, not because `--monitor`
+    changed anything about the workspace.
+    """
+    run(["helm", "repo", "add", HELM_REPO, HELM_REPO_URL, "--force-update"],
+        timeout=APPLY_TIMEOUT, own=is_ours(context))
+    if monitoring_installed(context):
+        info(emit, "monitoring stack already on this cluster (shared)",
+             phase="monitor")
+        return
+    info(emit, f"installing the monitoring stack in {MONITORING_NAMESPACE} "
+               "(once per cluster, ~1 GB)", phase="monitor")
+    # Deliberately NOT `--wait`. This chart creates grafana-operator custom
+    # resources in the same release that installs the operator, and helm's readiness
+    # check reaches them before the operator has reconciled anything:
+    #
+    #     Error: resource GrafanaDashboard/rc-repro-system/monitoring-node-exporter-full
+    #     not ready. status: NotFound, message: Resource not found
+    #
+    # which is a race, not a failure -- the stack came up perfectly well anyway, and
+    # ten pods were Running while helm reported it broken. So the release is applied
+    # without waiting and the thing that actually matters is waited for below.
+    res = run(["helm", "upgrade", "--install", MONITORING_RELEASE, MONITORING_CHART,
+               "--kube-context", context, "-n", MONITORING_NAMESPACE,
+               "--create-namespace",
+               "--set", "operator.prometheus.prometheusSpec."
+                        "serviceMonitorSelectorNilUsesHelmValues=false",
+               "--set", "operator.prometheus.prometheusSpec."
+                        "podMonitorSelectorNilUsesHelmValues=false",
+               "--timeout", "9m"],
+              timeout=INSTALL_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        raise CreateFailedError("could not install the monitoring stack: " + why(res))
+    wait_for_grafana(context=context, emit=emit)
+
+
+def wait_for_grafana(*, context: str, emit: Emit = null_emit,
+                     sleep=time.sleep) -> None:
+    """Wait for the Grafana the operator builds, in two steps, because it arrives late.
+
+    `monitoring-grafana-deployment` does not exist when helm returns: the
+    grafana-operator has to see the Grafana custom resource and create it. So this
+    waits for the Deployment to EXIST and only then for it to be available --
+    `kubectl rollout status` on a missing Deployment is an error, not a wait, which
+    would turn "not yet" into "failed".
+    """
+    for attempt in range(GRAFANA_WAIT_TRIES):
+        res = run(["kubectl", "--context", context, "-n", MONITORING_NAMESPACE,
+                   "get", "deployment", GRAFANA_DEPLOYMENT, "-o",
+                   "jsonpath={.status.availableReplicas}"], own=is_ours(context))
+        if (res.stdout or "").strip() not in ("", "0"):
+            return
+        if attempt % 5 == 0:
+            info(emit, "waiting for Grafana", phase="monitor")
+        sleep(GRAFANA_WAIT_INTERVAL)
+    warn(emit, "Grafana has not come up yet; the stack is installed and it should "
+               f"appear shortly — kubectl -n {MONITORING_NAMESPACE} get pods",
+         phase="monitor")
+
+
+def remove_monitoring(*, context: str, emit: Emit = null_emit) -> bool:
+    """Uninstall the shared stack. Returns False if another workspace still wants it.
+
+    Shared, so `--off` on one workspace must not blind the others. This is the whole
+    behavioural difference from Compose, where the stack belongs to a project and
+    detaching it is unambiguous.
+    """
+    others = [n for n in workspace_namespaces(context)
+              if monitoring_wanted(n, context=context)]
+    if others:
+        info(emit, "leaving the monitoring stack up — still used by "
+                   + ", ".join(sorted(n.removeprefix(NAMESPACE_PREFIX) for n in others)),
+             phase="monitor")
+        return False
+    # The grafana-operator's own resources go FIRST, while the operator that
+    # processes their finalizers is still running. Letting helm delete everything at
+    # once deadlocks: it removes the operator Deployment and then waits on a
+    # GrafanaFolder whose finalizer nothing is left to clear --
+    #
+    #     resource GrafanaFolder/rc-repro-system/monitoring-rocketchat still exists.
+    #     status: Terminating ...
+    #     context deadline exceeded
+    #
+    # -- after which the release is gone, the CR is wedged, and the next install
+    # fails on an object that no longer belongs to any release. Observed on the
+    # first real uninstall.
+    for kind in ("grafanadashboard", "grafanadatasource", "grafanafolder", "grafana"):
+        run(["kubectl", "--context", context, "-n", MONITORING_NAMESPACE, "delete",
+             kind, "--all", "--ignore-not-found", "--timeout=60s"],
+            timeout=APPLY_TIMEOUT, own=is_ours(context))
+    res = run(["helm", "uninstall", MONITORING_RELEASE, "--kube-context", context,
+               "-n", MONITORING_NAMESPACE, "--wait", "--timeout", "5m"],
+              timeout=INSTALL_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        # The release is removed either way; a stuck finalizer must not leave the
+        # cluster in a state the next `--monitor` cannot install into.
+        for kind in ("grafanafolder", "grafanadashboard", "grafanadatasource"):
+            for name in (run(["kubectl", "--context", context, "-n",
+                              MONITORING_NAMESPACE, "get", kind, "-o",
+                              "jsonpath={.items[*].metadata.name}"],
+                             own=is_ours(context)).stdout or "").split():
+                run(["kubectl", "--context", context, "-n", MONITORING_NAMESPACE,
+                     "patch", kind, name, "--type=merge", "-p",
+                     '{"metadata":{"finalizers":[]}}'], own=is_ours(context))
+        warn(emit, "the monitoring stack needed its finalizers cleared by hand: "
+                   + why(res), phase="monitor")
+    return True
+
+
+def monitoring_wanted(namespace: str, *, context: str) -> bool:
+    """Whether a workspace namespace is marked as wanting monitoring.
+
+    A label on the namespace rather than a lookup in repro.json: `remove_monitoring`
+    has to answer "does anyone else still want this?" about workspaces it is not
+    holding the record for, and possibly ones created by a different user of the
+    same cluster.
+    """
+    res = run(["kubectl", "--context", context, "get", "namespace", namespace,
+               "-o", "jsonpath={.metadata.labels.rc-repro\\.io/monitoring}"],
+              own=is_ours(context))
+    return (res.stdout or "").strip() == "true"
+
+
+def set_monitoring_label(namespace: str, *, context: str, wanted: bool) -> None:
+    """Mark (or unmark) a namespace as wanting the shared stack."""
+    value = "true" if wanted else "-"
+    run(["kubectl", "--context", context, "label", "--overwrite", "namespace",
+         namespace, f"rc-repro.io/monitoring={value}" if wanted
+         else "rc-repro.io/monitoring-"], own=is_ours(context))
+
+
+def grafana_forward(*, context: str, host_port: int, bind_host: str = "") -> int:
+    """Publish Grafana on a host port. Returns the pid, or 0.
+
+    Same deployment-not-Service rule as the workspace forward, for the same reason:
+    a Service with no ready endpoint makes kubectl exit immediately.
+    """
+    argv = ["kubectl", "--context", context, "-n", MONITORING_NAMESPACE,
+            "port-forward"]
+    if bind_host and bind_host not in ("127.0.0.1", "localhost"):
+        argv += ["--address", bind_host]
+    argv += [f"deployment/{GRAFANA_DEPLOYMENT}", f"{host_port}:{GRAFANA_PORT}"]
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True,
+                                env=owned_env() if is_ours(context) else None)
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    return proc.pid

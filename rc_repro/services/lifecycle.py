@@ -22,7 +22,8 @@ from pathlib import Path
 from rc_repro import compose, config, presets, rcapi, runner, versions
 from rc_repro import seed as seeder
 from rc_repro.errors import (ConflictError, DockerError, NotFoundError,
-                             NotReadyError, PreflightError, ValidationError)
+                             NotReadyError, PreflightError, ReproError,
+                             ValidationError)
 from rc_repro.services import audit as auditsvc
 from rc_repro.services import edge as edgesvc
 from rc_repro.services import diagnose, postready, topology
@@ -1878,6 +1879,27 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         result["ready"] = True
     if req.seed:
         result["seed"] = run_seed_inline(meta, req.seed_profile, req.stats, emit)
+    # `--monitor` last, and only once the workspace is serving: attaching turns on
+    # RC's own Prometheus_Enabled over REST, which needs a workspace that answers.
+    # Ignoring the flag here is what `--seed` did, and it produced a create that
+    # silently did less than it was asked for.
+    if req.monitor:
+        if not (req.wait or req.seed):
+            wait_serving(meta, emit, timeout=600.0)
+        from rc_repro.services import monitor as monitorsvc
+        # An add-on failing does not un-create the workspace. The first live run of
+        # this failed on the monitoring chart and exited 7 with `montest` up,
+        # serving, and listed as running -- a create reported as failed while its
+        # result was sitting there working. The workspace is the deliverable; say
+        # what went wrong with the extra and name the command that retries it.
+        try:
+            result["monitoring"] = monitorsvc.attach(repro_name, emit)
+        except ReproError as exc:
+            warn(emit, f"the workspace is up, but monitoring did not attach: {exc}",
+                 phase="monitor")
+            warn(emit, f"retry it with: rc-repro monitor --name {repro_name}",
+                 phase="monitor")
+            result["monitoring"] = {"monitoring": False, "error": str(exc)}
     info(emit, f"{root}  admin / {config.ADMIN_PASSWORD}", phase="done", pct=100)
     return result
 
