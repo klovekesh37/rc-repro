@@ -2534,3 +2534,98 @@ def test_down_removes_a_kubernetes_workspace_instead_of_asking_docker(monkeypatc
     # reimplemented per runtime.
     with pytest.raises(errors.ValidationError):
         lc.teardown("k", volumes=True, confirm=False)
+
+
+def test_start_stop_and_logs_refuse_a_kubernetes_workspace_with_a_way_forward(
+        monkeypatch, tmp_path):
+    """Guarded in `set_state`, not in each front-end: the CLI's stop/start/restart
+    and the GUI's always-enabled buttons both arrive through that one function, so
+    one guard covers both and cannot drift.
+
+    Kubernetes has no pause -- the plan is to scale to 0, which maps onto this
+    contract exactly -- but it is not written. Reaching for `docker compose stop`
+    against a workspace with no compose project fails with "no configuration file
+    provided", which tells the user nothing. A refusal that names the kubectl
+    command is worth more than an implementation that does not exist.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.6.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="u", host_port=3010,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+    lc.runner.write("k", "", m)
+
+    monkeypatch.setattr(lc.runner, "stop",
+                        lambda *a, **kw: pytest.fail("it called docker compose stop"))
+    for action in ("start", "stop", "restart"):
+        with pytest.raises(errors.ValidationError) as caught:
+            lc.set_state("k", action)
+        assert "kubectl" in str(caught.value), f"{action}: name the way forward"
+        assert caught.value.exit_code == 2
+
+    # And a Compose workspace is untouched by the guard.
+    plain = lc.runner.Metadata(name="d", project="rcrepro-d", rc_version="8.5.1",
+                               rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                               preset="default", root_url="u", host_port=3011,
+                               version_source="t")
+    topology.stamp(plain.extra, topology.DOCKER)
+    lc.runner.write("d", "services: {}\n", plain)
+    called = []
+    monkeypatch.setattr(lc.runner, "stop", lambda *a, **kw: called.append(1) or 0)
+    monkeypatch.setattr(lc.runner, "exists", lambda _n: True)
+    lc.set_state("d", "stop")
+    assert called, "the guard fired on a Compose workspace"
+
+
+def test_the_port_forward_targets_the_deployment_not_the_service(monkeypatch, tmp_path):
+    """`port-forward svc/...` needs a ready ENDPOINT, and a Service has none until
+    its pod passes readiness. The first version started the forward straight after
+    `helm install`, kubectl found nothing to attach to and exited, and the URL that
+    `up` printed never answered -- a lie rather than a delay.
+
+    A deployment target only needs a pod to EXIST.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    spawned = []
+    monkeypatch.setattr(k8s, "run", _fake_run({"jsonpath": (0, "rocketchat-abc")}))
+    monkeypatch.setattr(k8s.subprocess, "Popen",
+                        lambda argv, **kw: spawned.append(argv) or type(
+                            "P", (), {"pid": 4242})())
+    pid = k8s.port_forward("k", namespace="rc-repro-k", context=k8s.CONTEXT,
+                           host_port=3010, sleep=lambda _s: None)
+    assert pid == 4242
+    argv = spawned[0]
+    target = argv[argv.index("port-forward") + 1]
+    assert target.startswith("deployment/"), f"forwarded to {target}"
+    assert argv[-1] == "3010:3000", "the container port is 3000; the Service is 80"
+
+
+def test_a_dead_port_forward_is_replaced_rather_than_trusted(monkeypatch, tmp_path):
+    """A forward dies with its pod, so a recorded pid is not evidence it is alive --
+    and a recycled pid is not evidence it is OURS. `ready` and `start` re-establish
+    through this rather than assuming the create-time pid still holds."""
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    assert k8s.forward_alive(None) is False
+    assert k8s.forward_alive(999999999) is False, "a pid that cannot be read is dead"
+    # Our own process is alive but is NOT a port-forward, which is the recycled-pid
+    # case: believing it would leave the workspace unreachable AND, at teardown,
+    # signal something unrelated.
+    import os as _os
+    assert k8s.forward_alive(_os.getpid()) is False
+
+    spawned = []
+    monkeypatch.setattr(k8s, "run", _fake_run({"jsonpath": (0, "pod-1")}))
+    monkeypatch.setattr(k8s.subprocess, "Popen",
+                        lambda argv, **kw: spawned.append(argv) or type(
+                            "P", (), {"pid": 77})())
+    assert k8s.ensure_port_forward("k", namespace="ns", context=k8s.CONTEXT,
+                                   host_port=3010, pid=999999999) == 77
+    assert spawned, "it trusted a dead pid"

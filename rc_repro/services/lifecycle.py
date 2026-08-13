@@ -1320,7 +1320,14 @@ def list_repros() -> list[dict]:
         rc_status = status_map.get(m.project, "")
         # `states` is only consulted for "does this project have ANY container",
         # never for the state itself -- see repro_state().
-        state = "?" if not docker_up else repro_state(rc_status, bool(states.get(m.project)))
+        # A Kubernetes workspace has no compose project, so asking docker whether
+        # its containers exist answered `down` for a workspace that was running --
+        # the state column was reporting on the wrong runtime entirely.
+        if topology.of_meta(m) == topology.KUBERNETES:
+            state = kubernetes_state(m.name, m)
+        else:
+            state = "?" if not docker_up else repro_state(
+                rc_status, bool(states.get(m.project)))
         uptime, health = _uptime_health(rc_status)
         monitored = bool(isinstance(m.extra, dict) and m.extra.get("monitoring"))
         extra_ = m.extra if isinstance(m.extra, dict) else {}
@@ -1414,6 +1421,15 @@ def detail(name: str) -> dict:
         d["env"] = _env_rows(runner.read_compose(target), m.extra.get("env")
                              if isinstance(m.extra, dict) else None)
         return d
+    if topology.of_meta(m) == topology.KUBERNETES:
+        # Same reason as `list_repros`. The panel's containers/env/health blocks are
+        # compose-shaped and stay empty rather than being faked: an empty list is a
+        # readable absence, and invented rows would be a plausible wrong answer.
+        d["state"] = kubernetes_state(target, m)
+        d["containers"] = []
+        d["uptime"] = ""
+        d["health"] = ""
+        return d
     containers = runner.container_details(target)
     rc = [c for c in containers if c["service"] == "rocketchat" or c["service"].startswith("rocketchat-")]
     rc_status = next((c["status"] for c in rc), "")
@@ -1436,6 +1452,19 @@ def detail(name: str) -> dict:
 
 def set_state(name: str, action: str) -> None:
     target = resolve_name(name)
+    # Guarded here rather than in each front-end: the CLI's `stop`/`start`/`restart`
+    # and the GUI's always-enabled buttons both arrive through this one function, so
+    # one guard covers both and cannot drift between them.
+    #
+    # Kubernetes has no pause. The plan is to scale the Deployments and the
+    # StatefulSet to 0, which maps onto this contract exactly -- but it is not
+    # written, and reaching for `docker compose stop` on a workspace with no compose
+    # project fails with "no configuration file provided", which tells the user
+    # nothing about what to do.
+    topology.require_compose(
+        target, action,
+        instead=f"Kubernetes scale-to-zero is not implemented yet; for now "
+                f"`kubectl -n rc-repro-{target} scale deploy --all --replicas=0`.")
     # Looked up by a hashable key: `action` arrives from a JSON body, and a dict or
     # list reached .get() and raised "unhashable type" -- a 500 rather than the
     # "unknown action" this already knows how to say.

@@ -1424,6 +1424,13 @@ def create_app(allow_hosts: list[str] | None = None, *,
 
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue(maxsize=WS_QUEUE_MAX)
+        # A Kubernetes workspace has no compose project, so the stream would
+        # open, produce nothing, and look like a quiet workspace rather than an
+        # unsupported one. Refused before the socket carries anything.
+        try:
+            topology.require_compose(target, "logs", instead="Use kubectl logs.")
+        except ReproError as exc:
+            await ws.send_json(error_body(exc)); await ws.close(); return
         proc = open_log_process(runner.workspace(target), _clamp_tail(tail))
 
         dropped = [0]

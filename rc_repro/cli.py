@@ -2368,6 +2368,12 @@ def logs(
     """Tail a repro's logs."""
     _require_docker()
     target = _resolve_name(name)
+    try:
+        topology.require_compose(
+            target, "logs",
+            instead=f"Use `kubectl -n rc-repro-{target} logs -l app.kubernetes.io/name=rocketchat -f`.")
+    except errors.ReproError as exc:
+        _fail(exc)
     runner.logs(target, follow=follow, tail=tail or None)
 
 

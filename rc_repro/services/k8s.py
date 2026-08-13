@@ -623,6 +623,10 @@ MONGO_VOLUME_GB = 8
 #: node before rs.initiate" -- and the first cut of this module did not.
 MONGO_DIRECT_URI = "mongodb://localhost:27017/?directConnection=true"
 
+#: How long to wait for the Rocket.Chat pod to EXIST before forwarding to it.
+POD_WAIT_TRIES = 40
+POD_WAIT_INTERVAL = 3.0
+
 APPLY_TIMEOUT = 120.0
 INSTALL_TIMEOUT = 900.0
 
@@ -837,7 +841,12 @@ def values_for(*, rc_version: str, rc_image: str, microservices: bool,
     """
     repo, tag = split_image(rc_image, rc_version)
     values: dict = {
-        "image": {"repository": repo, "tag": tag},
+        # pullPolicy and the NATS cluster name are the guide's own values.yaml.
+        # IfNotPresent also matters here specifically: a repro box re-creates
+        # workspaces on the same versions constantly, and Always would re-pull
+        # 1.6 GB each time.
+        "image": {"repository": repo, "tag": tag, "pullPolicy": "IfNotPresent"},
+        "nats": {"cluster": {"name": "rocketchat-nats-cluster"}},
         "replicaCount": max(1, int(replicas or 1)),
         "microservices": {"enabled": bool(microservices)},
         "mongodb": {"enabled": False},
@@ -1026,18 +1035,38 @@ def init_replica_set(*, namespace: str, context: str, emit: Emit = null_emit,
     info(emit, "replica set ready", phase="boot")
 
 
-def port_forward(name: str, *, namespace: str, context: str, host_port: int) -> int:
+def port_forward(name: str, *, namespace: str, context: str, host_port: int,
+                 emit: Emit = null_emit, sleep=time.sleep) -> int:
     """Publish a workspace on a host port. Returns the pid, or 0.
 
     Detached with `start_new_session`, so it outlives the `up` that started it --
     the workspace has to stay reachable after the command returns, exactly as a
     published Compose port does.
 
-    A port-forward dies with its pod, which is a real difference from Compose and
-    is why `start` re-establishes it rather than assuming.
+    **Forwards to the DEPLOYMENT, not the Service.** `port-forward svc/...` needs a
+    ready ENDPOINT, and a Service has none until its pod passes readiness -- so the
+    first version started the forward immediately after `helm install`, kubectl
+    found nothing to attach to and exited, and the URL `up` printed never answered.
+    A deployment target only needs a pod to exist, which is the difference between
+    a URL that works and one that lies.
+
+    It still waits for that pod, briefly. A forward started before the ReplicaSet
+    has created anything exits just the same.
+
+    A port-forward dies with its pod, which is a real difference from Compose --
+    hence `ensure_port_forward`, which `ready` and `start` use to re-establish it.
     """
+    for attempt in range(POD_WAIT_TRIES):
+        res = run(["kubectl", "--context", context, "-n", namespace, "get", "pod",
+                   "-l", "app.kubernetes.io/name=rocketchat", "-o",
+                   "jsonpath={.items[0].metadata.name}"], own=is_ours(context))
+        if (res.stdout or "").strip():
+            break
+        if attempt % 4 == 0:
+            info(emit, "waiting for the Rocket.Chat pod", phase="wait")
+        sleep(POD_WAIT_INTERVAL)
     argv = ["kubectl", "--context", context, "-n", namespace, "port-forward",
-            f"svc/{RELEASE}-rocketchat", f"{host_port}:80"]
+            f"deployment/{RELEASE}-rocketchat", f"{host_port}:3000"]
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, start_new_session=True,
@@ -1109,7 +1138,7 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
         raise
 
     pid = port_forward(name, namespace=namespace, context=context,
-                       host_port=host_port)
+                       host_port=host_port, emit=emit)
     info(emit, f"http://localhost:{host_port}", phase="boot", pct=90)
     return {"context": context, "namespace": namespace,
             "chart_version": chart_version, "release": RELEASE,
@@ -1123,3 +1152,33 @@ def workspace_ready(name: str, *, context: str) -> bool:
                "jsonpath={.items[0].status.containerStatuses[0].ready}"],
               own=is_ours(context))
     return (res.stdout or "").strip() == "true"
+
+
+def forward_alive(pid: int | None) -> bool:
+    """Whether a recorded port-forward is still running and still ours.
+
+    A pid alone is not enough: the OS recycles them, so this confirms the process
+    is still a kubectl port-forward before believing it. The same check keeps
+    teardown from signalling an unrelated process.
+    """
+    if not pid:
+        return False
+    try:
+        cmdline = Path(f"/proc/{int(pid)}/cmdline").read_bytes().decode("utf-8", "replace")
+    except (OSError, ValueError, TypeError):
+        return False
+    return "port-forward" in cmdline
+
+
+def ensure_port_forward(name: str, *, namespace: str, context: str, host_port: int,
+                        pid: int | None = None, emit: Emit = null_emit) -> int:
+    """Return a live port-forward pid, starting one if the recorded one is gone.
+
+    A forward dies with its pod, so `ready` and `start` call this rather than
+    assuming the one written at create time is still there. Idempotent: an
+    already-live forward is left alone rather than duplicated onto a busy port.
+    """
+    if forward_alive(pid):
+        return int(pid)
+    return port_forward(name, namespace=namespace, context=context,
+                        host_port=host_port, emit=emit)
