@@ -313,11 +313,15 @@ def run_checks() -> dict:
         line("warn", "Identity status could not be determined")
 
     # --- Kubernetes -------------------------------------------------------
-    # Severity depends on whether anything USES Kubernetes. A box with no `kind`
-    # is perfectly healthy if nobody wants it, and broken if a Kubernetes
-    # workspace already exists on it -- so the same finding is `ok` in one case
-    # and `fail` in the other. A doctor that reports FAIL for a feature you are
-    # not using teaches people to ignore its failures.
+    # Severity depends on whether anything USES Kubernetes. A box with no cluster
+    # is perfectly healthy if nobody wants one, and broken if a Kubernetes
+    # workspace already exists on it -- the same finding, opposite severity. A
+    # doctor that reports FAIL for a feature you are not using teaches people to
+    # ignore its failures.
+    #
+    # kind is OPTIONAL throughout. Creating a cluster needs it; using one does
+    # not, and k3s, minikube, Docker Desktop and remote clusters are all ordinary
+    # Kubernetes to everything rc-repro does inside a namespace.
     try:
         from rc_repro.services import k8s, topology
         k8s_workspaces = [m.name for m in runner.list_meta()
@@ -341,42 +345,61 @@ def run_checks() -> dict:
                 floor = ".".join(str(n) for n in k8s.TOOLS[name])
                 line(needed, f"{name} {got.pretty} is older than {floor}, the floor "
                              "the official Rocket.Chat guide requires")
-            ready = [t for t in pre.tools.values() if t.present and t.new_enough]
-            if len(ready) == len(pre.tools):
+            if pre.tools_ready:
                 line("ok", "Kubernetes tools present (" + ", ".join(
-                    f"{t.name} {t.pretty}" for t in pre.tools.values()) + ")")
+                    f"{t.name} {t.pretty}" for t in pre.tools.values()
+                    if t.present) + ")")
 
-            if pre.cluster_exists and pre.cluster_reachable:
+            if pre.cluster_reachable:
                 where = (f", {len(pre.namespaces)} workspace namespace(s)"
                          if pre.namespaces else "")
-                line("ok", f"Cluster {k8s.CLUSTER_NAME!r} reachable{where}")
+                if pre.provider == k8s.PROVIDER_EXTERNAL:
+                    # Saying whose cluster it is, before anything is created in it.
+                    # rc-repro owns the namespaces it labels and never the cluster,
+                    # so `down` and `prune` will leave this cluster standing.
+                    line("ok", f"Using your cluster {pre.context!r}{where} — rc-repro "
+                               "creates namespaces in it and never removes the "
+                               "cluster itself")
+                else:
+                    line("ok", f"Cluster {k8s.CLUSTER_NAME!r} reachable{where}")
                 if not pre.default_storage_class:
-                    # The guide's own warning, and the failure it causes is silent:
-                    # a PVC stays Pending forever and nothing names storage.
-                    line(needed, f"Cluster {k8s.CLUSTER_NAME!r} has no default "
+                    # The guide's own warning, and the failure is silent: a PVC
+                    # stays Pending forever and nothing names storage.
+                    line(needed, f"Cluster {pre.context!r} has no default "
                                  "StorageClass — a workspace's volume would stay "
                                  "Pending with no error naming storage")
-            elif pre.cluster_exists:
-                line(needed, f"Cluster {k8s.CLUSTER_NAME!r} exists but its API server "
-                             "is not answering — is Docker running?")
             elif pre.probe_failed:
                 # NOT "does not exist". `kind` talks to Docker, so this is what a
                 # stopped Docker looks like -- and telling someone their cluster is
                 # absent would send them to create one that is already there.
                 line(needed, f"Could not tell whether cluster {k8s.CLUSTER_NAME!r} "
                              f"exists ({pre.probe_failed}) — kind needs Docker")
-            elif pre.tools_ready:
+            elif pre.context:
+                line(needed, f"Cluster {pre.context!r} is configured but its API "
+                             "server is not answering")
+            elif pre.can_provision:
                 line("fail" if in_use else "ok",
-                     f"Cluster {k8s.CLUSTER_NAME!r} does not exist"
-                     + (" — its workspaces cannot be reached" if in_use
-                        else " — it is created on first use"))
+                     f"No cluster yet — {k8s.CLUSTER_NAME!r} is created on first use"
+                     if not in_use else
+                     f"Cluster {k8s.CLUSTER_NAME!r} is gone and its workspaces "
+                     "cannot be reached")
+            elif pre.tools_ready:
+                # kubectl and helm but no kind and no kubeconfig: usable the moment
+                # a cluster is pointed at, and the two ways to get one are named.
+                line(needed, "No Kubernetes cluster configured — install kind so "
+                             "rc-repro can create one, or point kubectl at an "
+                             "existing cluster (k3s, minikube, Docker Desktop)")
 
-        if pre.other_clusters:
+        # "Other" must exclude the one we just said we are USING, or the report
+        # describes the same cluster twice and the second mention reads as a
+        # different one.
+        others = [c for c in pre.other_clusters if f"kind-{c}" != pre.context]
+        if others:
             # Named, not warned about. Another cluster on the box is normal and
             # none of rc-repro's business; saying so is how the boundary becomes
             # visible before somebody wonders why `prune` left it alone.
-            line("ok", f"{len(pre.other_clusters)} other kind cluster(s) on this box "
-                       f"({', '.join(pre.other_clusters)}) — rc-repro never touches "
+            line("ok", f"{len(others)} other kind cluster(s) on this box "
+                       f"({', '.join(others)}) — rc-repro never deletes "
                        "a cluster it did not create")
     except Exception:  # noqa: BLE001 - a check must never break the report
         line("warn", "Kubernetes status could not be determined")

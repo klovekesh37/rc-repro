@@ -59,14 +59,29 @@ OWNER_SELECTOR = f"{OWNER_LABEL_KEY}={OWNER_LABEL_VALUE}"
 WORKSPACE_LABEL = "rc-repro.io/workspace"
 OWNER_OF_LABEL = "rc-repro.io/owner"
 
-#: The tools, and the floor each must clear. kubectl and helm floors are the
-#: official guide's own ("kubectl v1.21+, Helm 3"); kind has no documented floor,
-#: so 0.20 is where `extraPortMappings` and the config API this needs settled.
-TOOLS: dict[str, tuple[int, int]] = {
-    "kind": (0, 20),
+#: The tools, and the floor each must clear. These two are the official guide's
+#: own requirement ("kubectl v1.21+, Helm 3") and they are all that USING
+#: Kubernetes needs -- namespaces, helm, PVCs, port-forward and exec are plain
+#: Kubernetes and work on k3s, minikube, Docker Desktop or a remote cluster
+#: exactly as they work on kind.
+CORE_TOOLS: dict[str, tuple[int, int]] = {
     "kubectl": (1, 21),
     "helm": (3, 0),
 }
+
+#: Needed only to PROVISION a cluster, never to use one. kind has no documented
+#: floor, so 0.20 is where `extraPortMappings` and the config API settled.
+#: Without it rc-repro cannot create a cluster; it can still run perfectly well
+#: in one you already have.
+PROVISION_TOOLS: dict[str, tuple[int, int]] = {
+    "kind": (0, 20),
+}
+
+TOOLS: dict[str, tuple[int, int]] = {**CORE_TOOLS, **PROVISION_TOOLS}
+
+#: How a cluster came to exist, which is what decides how far rc-repro may go.
+PROVIDER_KIND = "kind"          # rc-repro made it, so rc-repro may delete it
+PROVIDER_EXTERNAL = "external"  # you made it; rc-repro owns its namespaces only
 
 #: Seconds. Long enough for a loaded laptop, short enough that `doctor` answers.
 PROBE_TIMEOUT = 8.0
@@ -114,6 +129,12 @@ class Preflight:
     default_storage_class: str = ""
     other_clusters: list[str] = field(default_factory=list)
     namespaces: list[str] = field(default_factory=list)
+    #: The context actually probed, and how that cluster came to exist. On a box
+    #: with no kind this is whatever `kubectl` is already pointed at -- the
+    #: bring-your-own-cluster case, where rc-repro manages namespaces and never
+    #: the cluster.
+    context: str = ""
+    provider: str = ""
     #: Why the cluster question could not be ANSWERED, as opposed to answered no.
     #: `kind get clusters` fails when Docker is down, and returns nothing when there
     #: are simply no clusters -- both give an empty list. Reporting the first as
@@ -123,15 +144,30 @@ class Preflight:
 
     @property
     def tools_ready(self) -> bool:
-        return all(t.present and t.new_enough for t in self.tools.values())
+        """Whether Kubernetes can be USED. Provisioning is a separate question."""
+        return all(self.tools[n].present and self.tools[n].new_enough
+                   for n in CORE_TOOLS if n in self.tools)
+
+    @property
+    def can_provision(self) -> bool:
+        """Whether rc-repro can CREATE a cluster, as opposed to use one."""
+        return all(self.tools[n].present and self.tools[n].new_enough
+                   for n in PROVISION_TOOLS if n in self.tools)
 
     @property
     def missing_tools(self) -> list[str]:
-        return [n for n, t in self.tools.items() if not t.present]
+        """Only the ones that stop Kubernetes working. A missing `kind` means
+        rc-repro cannot make you a cluster, not that it cannot use yours."""
+        return [n for n in CORE_TOOLS if n in self.tools and not self.tools[n].present]
 
     @property
     def outdated_tools(self) -> list[str]:
         return [n for n, t in self.tools.items() if t.present and not t.new_enough]
+
+    @property
+    def usable(self) -> bool:
+        """A cluster is reachable and rc-repro could put a workspace in it."""
+        return self.tools_ready and self.cluster_reachable
 
 
 def which(tool: str) -> str:
@@ -249,26 +285,59 @@ def workspace_namespaces(context: str = CONTEXT) -> list[str]:
             for ln in (res.stdout or "").splitlines() if ln.strip()]
 
 
-def preflight() -> Preflight:
+def active_context() -> str:
+    """The context `kubectl` would use right now, or "".
+
+    This is the bring-your-own-cluster entry point: on a box with k3s, minikube,
+    Docker Desktop or a kubeconfig pointing at a remote cluster, this is the
+    cluster rc-repro would work in.
+    """
+    res = run(["kubectl", "config", "current-context"])
+    return (res.stdout or "").strip() if res.returncode == 0 else ""
+
+
+def preflight(context: str = "") -> Preflight:
     """Everything `doctor` needs, in one pass, changing nothing.
 
-    Ordered so that each step's precondition is already known: there is no point
-    asking an API server for storage classes when `kubectl` is not installed, and
-    a timeout there would be misreported as "no storage".
+    **kind is optional.** Creating a cluster needs it; using one does not.
+    Namespaces, helm releases, PVCs, port-forwards and exec are plain Kubernetes
+    and behave the same on k3s, minikube, Docker Desktop or a remote cluster. So
+    a missing `kind` narrows what rc-repro can do -- it cannot make you a cluster
+    -- without stopping it working in the cluster you already have.
+
+    Which cluster gets probed, in order: the one asked for, else rc-repro's own if
+    it exists, else whatever `kubectl` is already pointed at.
+
+    Ordered so each step's precondition is known. There is no point asking an API
+    server for storage classes when `kubectl` is absent or the server is not
+    answering, and a timeout there would be misreported as "no storage" -- sending
+    someone to fix the wrong thing.
     """
     out = Preflight(tools={name: tool(name) for name in TOOLS})
-    if not out.tools["kind"].present:
+
+    if out.can_provision:
+        found, out.probe_failed = clusters()
+        if out.probe_failed:
+            return out
+        out.cluster_exists = CLUSTER_NAME in found
+        out.other_clusters = [c for c in found if c != CLUSTER_NAME]
+
+    if not out.tools["kubectl"].present:
         return out
-    found, out.probe_failed = clusters()
-    if out.probe_failed:
+
+    if context:
+        out.context = context
+    elif out.cluster_exists:
+        out.context = CONTEXT
+    else:
+        out.context = active_context()
+    out.provider = PROVIDER_KIND if out.context == CONTEXT else PROVIDER_EXTERNAL
+
+    if not out.context:
         return out
-    out.cluster_exists = CLUSTER_NAME in found
-    out.other_clusters = [c for c in found if c != CLUSTER_NAME]
-    if not out.cluster_exists or not out.tools["kubectl"].present:
-        return out
-    out.cluster_reachable = reachable()
+    out.cluster_reachable = reachable(out.context)
     if not out.cluster_reachable:
         return out
-    out.storage_classes, out.default_storage_class = storage_classes()
-    out.namespaces = workspace_namespaces()
+    out.storage_classes, out.default_storage_class = storage_classes(out.context)
+    out.namespaces = workspace_namespaces(out.context)
     return out

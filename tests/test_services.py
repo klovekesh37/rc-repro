@@ -1679,3 +1679,111 @@ def test_a_stopped_docker_is_not_reported_as_a_missing_cluster(monkeypatch, tmp_
     assert any("Could not tell whether cluster" in m for m in msgs), msgs
     assert not any("does not exist" in m for m in msgs), \
         "it claimed the cluster is absent when it merely could not ask"
+
+
+def test_kubernetes_works_without_kind_because_kind_only_creates_clusters(monkeypatch):
+    """kind is needed to PROVISION a cluster, never to USE one.
+
+    Namespaces, helm releases, PVCs, port-forwards and exec are plain Kubernetes.
+    They behave the same on k3s, minikube, Docker Desktop or a remote cluster, so a
+    box with kubectl and helm and no kind is fully usable -- it just cannot be
+    handed a cluster, it has to be pointed at one.
+
+    The first cut of this module returned early when kind was absent, which made a
+    perfectly good k3s box look like it had no Kubernetes at all.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(k8s, "which", lambda t: "" if t == "kind" else f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "run", _fake_run({
+        "config current-context": (0, "k3s-default\n"),
+        "/readyz": (0, "ok"),
+        "get storageclass": (0, '{"items": [{"metadata": {"name": "local-path",'
+                                ' "annotations": {"storageclass.kubernetes.io/'
+                                'is-default-class": "true"}}}]}'),
+        "get namespace": (0, ""),
+        "version": (0, "v9.9.9"),
+    }))
+    pre = k8s.preflight()
+    assert pre.tools_ready, "kubectl + helm is all that USING Kubernetes needs"
+    assert not pre.can_provision, "without kind it cannot create a cluster"
+    assert pre.missing_tools == [], "a missing kind is not a missing requirement"
+    assert pre.context == "k3s-default", "it fell back to the configured cluster"
+    assert pre.provider == k8s.PROVIDER_EXTERNAL
+    assert pre.cluster_reachable and pre.usable
+    assert pre.default_storage_class == "local-path"
+
+
+def test_a_cluster_rc_repro_did_not_create_is_marked_external(monkeypatch):
+    """The ownership rule at the right granularity. rc-repro may delete a cluster
+    it created; in one you supplied it owns only the namespaces it labelled, and
+    the cluster itself is never its to remove."""
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "run", _fake_run({
+        "get clusters": (0, "somebody-elses\n"),
+        "config current-context": (0, "kind-somebody-elses\n"),
+        "/readyz": (0, "ok"),
+        "get storageclass": (0, '{"items": []}'),
+        "get namespace": (0, ""),
+        "version": (0, "v9.9.9"),
+    }))
+    pre = k8s.preflight()
+    assert pre.cluster_exists is False, "ours is not among them"
+    assert pre.provider == k8s.PROVIDER_EXTERNAL
+    assert pre.context == "kind-somebody-elses"
+
+    # And ours, when it IS there, is the one rc-repro may manage fully.
+    monkeypatch.setattr(k8s, "run", _fake_run({
+        "get clusters": (0, f"{k8s.CLUSTER_NAME}\n"),
+        "/readyz": (0, "ok"),
+        "get storageclass": (0, '{"items": []}'),
+        "get namespace": (0, ""),
+        "version": (0, "v9.9.9"),
+    }))
+    ours = k8s.preflight()
+    assert ours.cluster_exists and ours.provider == k8s.PROVIDER_KIND
+    assert ours.context == k8s.CONTEXT
+
+
+def test_doctor_names_both_ways_to_get_a_cluster_when_there_is_none(monkeypatch, tmp_path):
+    """kubectl and helm but nothing to point them at. Naming only kind would be
+    wrong -- pointing at an existing k3s or Docker Desktop cluster is equally
+    valid, and for most people already done."""
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: "" if t == "kind" else f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "run", _fake_run({
+        "config current-context": (1, ""),
+        "version": (0, "v9.9.9"),
+    }))
+    msgs = [r["message"] for r in doctor.run_checks()["checks"]]
+    hit = [m for m in msgs if "No Kubernetes cluster configured" in m]
+    assert len(hit) == 1, msgs
+    assert "kind" in hit[0] and "k3s" in hit[0], "both routes must be named"
+
+
+def test_the_cluster_in_use_is_not_also_listed_as_another_cluster(monkeypatch, tmp_path):
+    """It described the same cluster twice -- "Using your cluster 'kind-kind'"
+    followed by "1 other kind cluster(s) (kind)" -- and the second mention reads as
+    a different one."""
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "run", _fake_run({
+        "get clusters": (0, "kind\n"),
+        "config current-context": (0, "kind-kind\n"),
+        "/readyz": (0, "ok"),
+        "get storageclass": (0, '{"items": [{"metadata": {"name": "standard",'
+                                ' "annotations": {"storageclass.kubernetes.io/'
+                                'is-default-class": "true"}}}]}'),
+        "get namespace": (0, ""),
+        "version": (0, "v9.9.9"),
+    }))
+    msgs = [r["message"] for r in doctor.run_checks()["checks"]]
+    assert any("Using your cluster 'kind-kind'" in m for m in msgs), msgs
+    assert not any("other kind cluster" in m for m in msgs), \
+        "the cluster in use was counted again as an 'other' one"
