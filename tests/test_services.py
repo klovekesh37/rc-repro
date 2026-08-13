@@ -2825,3 +2825,67 @@ def test_exec_survives_a_terminating_pod_rather_than_failing_the_create(monkeypa
                         .CompletedProcess(argv, 1, "", "authentication failed"))
     out = k8s._mongo_exec(k8s.CONTEXT, "rc-repro-k", "x", sleep=lambda _s: None)
     assert out.returncode == 1
+
+
+def test_bind_reaches_the_port_forward_instead_of_being_dropped(monkeypatch, tmp_path):
+    """`--bind 0.0.0.0` was accepted on the Kubernetes path and then dropped, which
+    is worse than refusing it: a workspace created for a shared box was reachable
+    only from localhost and nothing said so.
+
+    kubectl binds 127.0.0.1 by default and takes `--address`, so this is a real
+    setting rather than a Compose-only one.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "run", _fake_run({"jsonpath": (0, "true")}))
+    spawned: list = []
+    monkeypatch.setattr(k8s.subprocess, "Popen",
+                        lambda argv, **kw: spawned.append(argv) or type(
+                            "P", (), {"pid": 9})())
+
+    k8s.port_forward("n", namespace="ns", context=k8s.CONTEXT, host_port=3000,
+                     bind_host="0.0.0.0", sleep=lambda _s: None)
+    assert "--address" in spawned[0] and "0.0.0.0" in spawned[0], spawned[0]
+
+    # Loopback needs no flag, and the default must stay loopback -- repros ship
+    # fixed weak credentials, so widening is opt-in on both runtimes.
+    for quiet in ("", "127.0.0.1", "localhost"):
+        spawned.clear()
+        k8s.port_forward("n", namespace="ns", context=k8s.CONTEXT, host_port=3000,
+                         bind_host=quiet, sleep=lambda _s: None)
+        assert "--address" not in spawned[0], quiet
+
+
+def test_teardown_waits_for_the_namespace_rather_than_claiming_it_is_gone(
+        monkeypatch, tmp_path):
+    """`kubectl delete namespace --wait=false` returns instantly, so `down` printed
+    "removed" while the namespace was Terminating, the pods were still shutting down
+    and the PVC was still there. Anyone checking with kubectl saw the opposite of
+    what they had just been told, and `up` with the same name could race a
+    half-deleted namespace.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    said: list = []
+    phases = ["Terminating", "Terminating", ""]
+
+    def spy(argv, timeout=None, own=False):
+        import subprocess as sp
+        joined = " ".join(argv)
+        if "get namespace" in joined and "jsonpath" in joined:
+            return sp.CompletedProcess(argv, 0, phases.pop(0) if phases else "", "")
+        if "get namespace" in joined:
+            return sp.CompletedProcess(argv, 0, "namespace/rc-repro-k\n", "")
+        if "get pvc" in joined:
+            return sp.CompletedProcess(argv, 0, "persistentvolumeclaim/data-mongodb-0\n", "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", spy)
+    assert k8s.delete_namespace("k", context=k8s.CONTEXT, volumes=True,
+                                emit=lambda e: said.append(e.message),
+                                sleep=lambda _s: None) is True
+    assert any("1 volume(s)" in m for m in said), said
+    assert any("Terminating" in m for m in said), "it never said it was waiting"
+    assert any("are gone" in m for m in said), "it never confirmed the end state"

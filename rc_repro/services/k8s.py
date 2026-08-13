@@ -643,6 +643,11 @@ MONGO_DIRECT_URI = "mongodb://localhost:27017/?directConnection=true"
 POD_WAIT_TRIES = 40
 POD_WAIT_INTERVAL = 3.0
 
+#: How long to watch a namespace actually go away. Deleting one is not instant:
+#: pods drain, finalizers run, and the PVC goes last.
+NS_GONE_TRIES = 24
+NS_GONE_INTERVAL = 2.5
+
 APPLY_TIMEOUT = 120.0
 INSTALL_TIMEOUT = 900.0
 
@@ -937,7 +942,7 @@ def install(*, namespace: str, context: str, values: dict,
 
 
 def delete_namespace(name: str, *, context: str, volumes: bool = False,
-                     emit: Emit = null_emit) -> bool:
+                     emit: Emit = null_emit, sleep=time.sleep) -> bool:
     """Remove a workspace. Returns False if there was nothing there.
 
     **`helm uninstall` does not delete the PVCs a StatefulSet created.** Kubernetes
@@ -954,12 +959,36 @@ def delete_namespace(name: str, *, context: str, volumes: bool = False,
     if ns not in workspace_namespaces(context):
         return False
     if volumes:
-        info(emit, f"deleting namespace {ns} and its volumes", phase="teardown")
+        # Reported as it happens, and WAITED for. `--wait=false` returned instantly
+        # and `down` said "removed" while the namespace was still Terminating, the
+        # pods still shutting down and the PVC still there -- so `rc-repro up` with
+        # the same name could race a half-deleted namespace, and anyone checking
+        # with kubectl saw the opposite of what they had just been told.
+        pvcs = workspace_pvcs(name, context=context)
+        info(emit, f"deleting namespace {ns}: {len(pvcs)} volume(s), "
+                   "pods and the release", phase="teardown", pct=10)
         res = run(["kubectl", "--context", context, "delete", "namespace", ns,
                    "--wait=false"], timeout=APPLY_TIMEOUT, own=own)
         if res.returncode != 0:
             raise DockerError(f"could not delete namespace {ns}: "
                               + (res.stderr or res.stdout or "").strip()[:200])
+        for attempt in range(NS_GONE_TRIES):
+            check = run(["kubectl", "--context", context, "get", "namespace", ns,
+                         "-o", "jsonpath={.status.phase}"], own=own)
+            phase = (check.stdout or "").strip()
+            if check.returncode != 0 or not phase:
+                info(emit, f"namespace {ns} and its volume(s) are gone",
+                     phase="teardown", pct=100)
+                return True
+            if attempt % 4 == 0:
+                info(emit, f"namespace {ns} is {phase} — waiting for the pods and "
+                           "volume(s) to go", phase="teardown",
+                     pct=min(90, 20 + attempt * 5))
+            sleep(NS_GONE_INTERVAL)
+        # Not an error: Kubernetes will finish on its own. Saying so beats either
+        # blocking forever or claiming it is done.
+        warn(emit, f"namespace {ns} is still terminating. Kubernetes will finish; "
+                   f"check with `kubectl get ns {ns}`.", phase="teardown")
         return True
     info(emit, f"uninstalling {RELEASE} from {ns} — the volume is kept",
          phase="teardown")
@@ -1081,7 +1110,8 @@ def init_replica_set(*, namespace: str, context: str, emit: Emit = null_emit,
 
 
 def port_forward(name: str, *, namespace: str, context: str, host_port: int,
-                 emit: Emit = null_emit, sleep=time.sleep) -> int:
+                 bind_host: str = "", emit: Emit = null_emit,
+                 sleep=time.sleep) -> int:
     """Publish a workspace on a host port. Returns the pid, or 0.
 
     Detached with `start_new_session`, so it outlives the `up` that started it --
@@ -1115,8 +1145,15 @@ def port_forward(name: str, *, namespace: str, context: str, host_port: int,
         if attempt % 4 == 0:
             info(emit, "waiting for the Rocket.Chat pod", phase="wait")
         sleep(POD_WAIT_INTERVAL)
-    argv = ["kubectl", "--context", context, "-n", namespace, "port-forward",
-            f"deployment/{RELEASE}-rocketchat", f"{host_port}:3000"]
+    # `--bind` was accepted and then dropped on this path, which is worse than
+    # refusing it: a workspace created with `--bind 0.0.0.0` on a shared box was
+    # reachable only from localhost, and nothing said so. kubectl binds 127.0.0.1
+    # by default and takes --address, so this is a real setting rather than a
+    # Compose-only one.
+    argv = ["kubectl", "--context", context, "-n", namespace, "port-forward"]
+    if bind_host and bind_host not in ("127.0.0.1", "localhost"):
+        argv += ["--address", bind_host]
+    argv += [f"deployment/{RELEASE}-rocketchat", f"{host_port}:3000"]
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, start_new_session=True,
@@ -1128,7 +1165,7 @@ def port_forward(name: str, *, namespace: str, context: str, host_port: int,
 
 def create_workspace(*, name: str, resolved, host_port: int, microservices: bool,
                      replicas: int = 1, owner: str = "", root_url: str = "",
-                     emit: Emit = null_emit) -> dict:
+                     bind_host: str = "", emit: Emit = null_emit) -> dict:
     """Build a Kubernetes workspace, and return what repro.json needs.
 
     A PARALLEL path to lifecycle's compose one rather than a refactor of it, which
@@ -1201,7 +1238,7 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
         raise
 
     pid = port_forward(name, namespace=namespace, context=context,
-                       host_port=host_port, emit=emit)
+                       host_port=host_port, bind_host=bind_host, emit=emit)
     # Confirmed, not assumed. A port-forward that died on spawn leaves a URL that
     # looks like an address and answers nothing, which is worse than no URL -- it
     # sends someone to debug Rocket.Chat when the forward is what failed. If it is
@@ -1217,7 +1254,7 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
                    f"deployment/{RELEASE}-rocketchat {host_port}:3000 "
                    f"— or `rc-repro ready --name {name}` to re-establish it.",
              phase="boot")
-    return {"context": context, "namespace": namespace,
+    return {"context": context, "namespace": namespace, "bind_host": bind_host,
             "chart_version": chart_version, "release": RELEASE,
             "port_forward_pid": pid, "microservices": microservices}
 
@@ -1248,7 +1285,8 @@ def forward_alive(pid: int | None) -> bool:
 
 
 def ensure_port_forward(name: str, *, namespace: str, context: str, host_port: int,
-                        pid: int | None = None, emit: Emit = null_emit) -> int:
+                        pid: int | None = None, bind_host: str = "",
+                        emit: Emit = null_emit) -> int:
     """Return a live port-forward pid, starting one if the recorded one is gone.
 
     A forward dies with its pod, so `ready` and `start` call this rather than
@@ -1258,4 +1296,4 @@ def ensure_port_forward(name: str, *, namespace: str, context: str, host_port: i
     if forward_alive(pid):
         return int(pid)
     return port_forward(name, namespace=namespace, context=context,
-                        host_port=host_port, emit=emit)
+                        host_port=host_port, bind_host=bind_host, emit=emit)

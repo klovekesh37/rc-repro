@@ -1756,12 +1756,16 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
 
     host_port = pick_host_port(req.port, presets.load("default", {}),
                                exclude=repro_name)
+    # Same resolution order Compose uses: the flag, then the box-level config, then
+    # loopback. This was dropped entirely on the Kubernetes path.
+    cfg = config.load_config()
+    bind_host = req.bind or cfg.get("bind_host") or config.DEFAULT_BIND_HOST
     root = f"http://localhost:{host_port}"
     microservices = req.deployment == topology.MICROSERVICES
     out = k8s.create_workspace(
         name=repro_name, resolved=resolved, host_port=host_port,
         microservices=microservices, replicas=req.replicas or 1,
-        owner=req.actor, emit=emit)
+        owner=req.actor, bind_host=bind_host, emit=emit)
 
     meta = runner.Metadata(
         name=repro_name, project=out["namespace"], rc_version=resolved.rc_version,
