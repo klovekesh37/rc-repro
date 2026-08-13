@@ -2668,3 +2668,25 @@ def test_a_url_is_only_printed_once_the_forward_is_confirmed_alive(monkeypatch, 
     assert not any(m.strip() == "http://localhost:3010" for m in said), \
         "it printed a URL it had not confirmed"
     assert any("port-forward" in m and "kubectl" in m for m in said), said
+
+
+def test_the_microservices_surcharge_matches_the_pods_that_were_observed():
+    """Half measured, half estimated, and the test says which.
+
+    MEASURED live on chart 7.0.2: nine pods against a monolith's five, the four
+    extra being account, authorization, ddp-streamer and presence. NOT five -- this
+    chart ships no stream-hub deployment, which the first estimate assumed.
+
+    STILL ESTIMATED: what they cost. Both memory readings were taken at readiness
+    with pods still ContainerCreating, and the microservices one came out LOWER than
+    the monolith's, which cannot be true.
+    """
+    from rc_repro.services import lifecycle as lc
+
+    assert lc.MICROSERVICES_MB == 800, "4 observed pods x ~200 MB"
+    # Generous on purpose: under-charging lets through a create that OOMs a swapless
+    # host, and the kernel picks its own victim.
+    assert lc.MICROSERVICES_MB >= 4 * 200
+    # And it is charged ON TOP of the chart baseline, not instead of it -- NATS is
+    # in KUBE_CHART_MB because a monolith runs it too.
+    assert lc.KUBE_CHART_MB > 0 and lc.CLUSTER_MB > 0

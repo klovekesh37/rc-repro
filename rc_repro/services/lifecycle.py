@@ -142,13 +142,25 @@ CLUSTER_MB = 600
 # that leaves roughly this much unaccounted for.
 KUBE_CHART_MB = 500
 
-# MICROSERVICES_MB is still an ESTIMATE and is labelled as one, because no
-# microservices workspace has been booted. It is the five additional service pods
-# -- account, authorization, ddp-streamer, presence, stream-hub -- at roughly
-# 200 MB each; NATS is already counted in KUBE_CHART_MB above rather than here.
-# Correct it from a measurement rather than trusting it: an estimate inside a
-# refusal is a guess with authority.
-MICROSERVICES_MB = 1000
+# MICROSERVICES_MB is now HALF measured, and the halves are worth separating.
+#
+# MEASURED: a microservices workspace on chart 7.0.2 is nine pods against a
+# monolith's five, and the four extra are `account`, `authorization`,
+# `ddp-streamer` and `presence`. Not five -- this chart version ships no
+# `stream-hub` deployment, which the earlier estimate assumed it did.
+#
+# STILL ESTIMATED: what those four cost. The memory delta could NOT be measured,
+# and the reason is worth recording so nobody trusts the number more than it
+# deserves: both readings -- 1971 MB for the monolith, 1787 MB for microservices --
+# were taken at readiness, while several pods were still ContainerCreating. They
+# are early reads, they are within noise of each other, and the microservices one
+# came out LOWER, which cannot be true. A real figure needs a settle-time wait and
+# per-pod `docker stats`.
+#
+# So this is 4 pods x ~200 MB, and it stays deliberately on the generous side:
+# under-charging lets through a create that OOMs a swapless host, where the kernel
+# picks its own victim and destroys somebody else's work.
+MICROSERVICES_MB = 800
 #: Left unspent: for the OS, Docker, the page cache -- and, mostly, for GROWTH.
 #: A fifth of the host, never below 1 GB.
 #:
