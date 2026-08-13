@@ -2048,3 +2048,211 @@ def test_the_kubernetes_overhead_actually_reaches_the_refusal(monkeypatch, tmp_p
     # does not free memory. Same argument that moved `require_docker` off exit 5.
     assert caught.value.exit_code == 3, "a full host is a preflight failure"
     assert caught.value.code == "PREFLIGHT_FAILED"
+
+
+# --- provisioning ---------------------------------------------------------------
+
+def test_creating_a_cluster_never_writes_the_users_kubeconfig(monkeypatch, tmp_path):
+    """kind writes the file it is GIVEN and also honours KUBECONFIG for the context
+    switch, so both are set. Verified live as well -- a real `kind create` left
+    ~/.kube/config byte-identical and current-context on kind-kind -- but pinned
+    here because the live check is not in CI."""
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    calls = []
+
+    def spy(argv, timeout=None, own=False):
+        import subprocess as sp
+        calls.append((own, argv))
+        j = " ".join(argv)
+        if "get clusters" in j:
+            return sp.CompletedProcess(argv, 0, "", "")
+        if "current-context" in j:
+            return sp.CompletedProcess(argv, 0, k8s.CONTEXT, "")
+        if "/readyz" in j:
+            return sp.CompletedProcess(argv, 0, "ok", "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", spy)
+    assert k8s.ensure_cluster() == k8s.CONTEXT
+    create = [a for own, a in calls if "create" in a]
+    assert create, calls
+    argv = create[0]
+    assert "--kubeconfig" in argv, "kind must be told where to write"
+    assert str(tmp_path) in argv[argv.index("--kubeconfig") + 1], \
+        "it wrote outside RC_REPRO_HOME"
+    assert all(own for own, a in calls if "create" in a), \
+        "the create must also run with the redirected environment"
+
+
+def test_a_second_up_reuses_the_cluster_instead_of_racing_to_create_it(monkeypatch, tmp_path):
+    """Two simultaneous `up`s would both see no cluster and both run `kind create`;
+    the second fails with "node(s) already exist". The re-check inside the lock
+    means the loser reuses rather than retries -- concurrent workspaces are the
+    whole point of one-cluster-many-namespaces."""
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    created = []
+
+    def spy(argv, timeout=None, own=False):
+        import subprocess as sp
+        j = " ".join(argv)
+        if "get clusters" in j:
+            return sp.CompletedProcess(argv, 0, f"{k8s.CLUSTER_NAME}\n", "")
+        if "current-context" in j:
+            return sp.CompletedProcess(argv, 0, k8s.CONTEXT, "")
+        if "/readyz" in j:
+            return sp.CompletedProcess(argv, 0, "ok", "")
+        if "create" in argv:
+            created.append(argv)
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", spy)
+    k8s.ensure_cluster()
+    assert not created, "it created a cluster that was already there"
+
+
+def test_a_create_that_lost_a_race_is_success_not_failure(monkeypatch, tmp_path):
+    """Somebody ran `kind create cluster --name rc-repro-local` by hand while we
+    held the lock. "already exist" means the thing we wanted is true."""
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+
+    def spy(argv, timeout=None, own=False):
+        import subprocess as sp
+        j = " ".join(argv)
+        if "get clusters" in j:
+            return sp.CompletedProcess(argv, 0, "", "")
+        if "current-context" in j:
+            return sp.CompletedProcess(argv, 0, k8s.CONTEXT, "")
+        if "/readyz" in j:
+            return sp.CompletedProcess(argv, 0, "ok", "")
+        if "create" in argv:
+            return sp.CompletedProcess(argv, 1, "", "node(s) already exist for a "
+                                                     "cluster with the name")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", spy)
+    assert k8s.ensure_cluster() == k8s.CONTEXT
+
+    # A create that fails for any OTHER reason is terminal, and says why.
+    def broken(argv, timeout=None, own=False):
+        import subprocess as sp
+        j = " ".join(argv)
+        if "get clusters" in j:
+            return sp.CompletedProcess(argv, 0, "", "")
+        if "create" in argv:
+            return sp.CompletedProcess(argv, 1, "", "ERROR: failed to pull image")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", broken)
+    with pytest.raises(errors.CreateFailedError) as caught:
+        k8s.ensure_cluster()
+    assert "failed to pull image" in str(caught.value), "the reason must reach the user"
+    assert caught.value.exit_code == 7, "known dead, not 'poll again'"
+
+
+def test_ensure_cluster_refuses_without_kind_and_names_the_alternative(monkeypatch, tmp_path):
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda _t: "")
+    with pytest.raises(errors.PreflightError) as caught:
+        k8s.ensure_cluster()
+    assert "point kubectl at a cluster you already have" in str(caught.value)
+    assert caught.value.exit_code == 3
+
+
+def test_deleting_the_cluster_can_only_ever_target_our_own(monkeypatch, tmp_path):
+    """The safety property. There is no parameter for which cluster to delete,
+    because a delete that can be pointed anywhere eventually is. Asserted on the
+    argv, since that is what reaches the machine.
+
+    Verified live too: after `delete_cluster`, the unrelated `kind` cluster on this
+    box was still there.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    seen = []
+
+    def spy(argv, timeout=None, own=False):
+        import subprocess as sp
+        seen.append(argv)
+        j = " ".join(argv)
+        if "get clusters" in j:
+            return sp.CompletedProcess(argv, 0, f"kind\n{k8s.CLUSTER_NAME}\nother\n", "")
+        if "current-context" in j:
+            return sp.CompletedProcess(argv, 0, k8s.CONTEXT, "")
+        if "/readyz" in j:
+            return sp.CompletedProcess(argv, 0, "ok", "")
+        if "get namespace" in j:
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", spy)
+    assert k8s.delete_cluster() is True
+    deletes = [a for a in seen if "delete" in a]
+    assert len(deletes) == 1, deletes
+    argv = deletes[0]
+    # The property is about the --name VALUE, not about the whole argv: `kind` is
+    # legitimately argv[0], the binary.
+    assert argv[argv.index("--name") + 1] == k8s.CLUSTER_NAME, argv
+    # And no other cluster the machine happens to have is named anywhere in it.
+    targets = argv[argv.index("--name") + 1:]
+    assert targets == [k8s.CLUSTER_NAME], f"more than our cluster is targeted: {targets}"
+
+
+def test_the_cluster_is_not_taken_out_from_under_a_colleagues_workspace(monkeypatch, tmp_path):
+    """On a shared box the cluster holds other people's workspaces. `prune`
+    reclaiming it mid-ticket is the failure this guards, and the namespaces carry
+    an owner label so the refusal can be specific."""
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    deleted = []
+
+    def spy(argv, timeout=None, own=False):
+        import subprocess as sp
+        j = " ".join(argv)
+        if "get clusters" in j:
+            return sp.CompletedProcess(argv, 0, f"{k8s.CLUSTER_NAME}\n", "")
+        if "current-context" in j:
+            return sp.CompletedProcess(argv, 0, k8s.CONTEXT, "")
+        if "/readyz" in j:
+            return sp.CompletedProcess(argv, 0, "ok", "")
+        if "get namespace" in j:
+            return sp.CompletedProcess(argv, 0, "namespace/rc-repro-t1\n"
+                                                "namespace/rc-repro-t2\n", "")
+        if "delete" in argv:
+            deleted.append(argv)
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", spy)
+    with pytest.raises(errors.ConflictError) as caught:
+        k8s.delete_cluster()
+    assert "2 workspace namespace(s)" in str(caught.value)
+    assert "rc-repro-t1" in str(caught.value), "name them, so it is actionable"
+    assert not deleted, "it deleted the cluster anyway"
+
+    # --force takes it, because sometimes that is what you want.
+    assert k8s.delete_cluster(force=True) is True
+    assert deleted, "--force must actually delete"
+
+
+def test_deleting_a_cluster_that_is_not_there_is_not_an_error(monkeypatch, tmp_path):
+    """`prune` calls this unconditionally; a missing cluster is the state it wanted."""
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "run", _fake_run({"get clusters": (0, "somebody-else\n")}))
+    assert k8s.delete_cluster() is False

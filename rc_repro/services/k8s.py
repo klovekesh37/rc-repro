@@ -28,7 +28,10 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from rc_repro import config
+from rc_repro import config, runner
+from rc_repro.errors import (ConflictError, CreateFailedError, DockerError,
+                            PreflightError)
+from rc_repro.services.events import Emit, info, null_emit
 
 #: The cluster rc-repro creates and owns. One cluster with a namespace per
 #: workspace, not a cluster per workspace: a control plane each would forbid
@@ -483,3 +486,111 @@ def ingress_blocker(pre: Preflight, *, wants_domain: bool) -> str:
             "not be served. rc-repro does not install one into a cluster it does not "
             "own. Install one (e.g. helm install traefik traefik/traefik -n traefik "
             "--create-namespace), or drop --domain and use the port-forward.")
+
+
+# --- provisioning: the first thing here that writes to the machine ---------------
+
+#: Lock name for cluster creation. Not a valid repro name (`sanitize` strips the
+#: underscores), so it can never collide with a workspace's own lock.
+CLUSTER_LOCK = "__cluster__"
+
+#: Creating a cluster pulls a node image on first use and waits for the control
+#: plane. Nothing like the 8s a probe gets.
+CREATE_TIMEOUT = 600.0
+DELETE_TIMEOUT = 120.0
+
+
+def cluster_context() -> str:
+    """The context rc-repro's own cluster is reachable at.
+
+    Read back from the owned kubeconfig rather than assumed from kind's naming
+    convention, so a future kind that names contexts differently does not silently
+    point every command at nothing.
+    """
+    res = run(["kubectl", "config", "current-context"], own=True)
+    found = (res.stdout or "").strip() if res.returncode == 0 else ""
+    return found or CONTEXT
+
+
+def ensure_cluster(emit: Emit = null_emit) -> str:
+    """Create rc-repro's cluster if it is not there, and return its context.
+
+    Serialised with the SAME lock every other mutating operation uses
+    (`runner.repro_lock`), rather than a second lock of its own. Two simultaneous
+    `up`s would otherwise both see no cluster and both run `kind create`, and the
+    second fails with "node(s) already exist". The re-check inside the lock means
+    the loser of the race reuses rather than retries -- concurrent workspaces are
+    the entire point of one-cluster-many-namespaces, so the lock has to hold.
+
+    Nothing about this touches `~/.kube/config`: `--kubeconfig` is passed
+    explicitly AND the environment is redirected, because kind writes the file it
+    is given and also honours KUBECONFIG for the context switch.
+    """
+    if not which("kind"):
+        raise PreflightError(
+            "kind is not installed, so rc-repro cannot create a cluster. Install "
+            "kind, or point kubectl at a cluster you already have.")
+    kubeconfig = owned_kubeconfig()
+    with runner.repro_lock(CLUSTER_LOCK, timeout=CREATE_TIMEOUT):
+        if CLUSTER_NAME in clusters()[0]:
+            info(emit, f"reusing cluster {CLUSTER_NAME}", phase="provision")
+        else:
+            info(emit, f"creating cluster {CLUSTER_NAME} — first time on this "
+                       "machine, so this pulls a node image",
+                 phase="provision", pct=5)
+            owned_env()          # make the directories before kind writes into them
+            res = run(["kind", "create", "cluster", "--name", CLUSTER_NAME,
+                       "--kubeconfig", str(kubeconfig)],
+                      timeout=CREATE_TIMEOUT, own=True)
+            if res.returncode != 0:
+                combined = f"{res.stdout or ''}\n{res.stderr or ''}".lower()
+                # A create that lost a race to something not holding this lock
+                # (a manual `kind create`) is success, not failure.
+                if "already exist" not in combined:
+                    detail = (res.stderr or res.stdout or "").strip().splitlines()
+                    raise CreateFailedError(
+                        f"could not create the cluster {CLUSTER_NAME}: "
+                        + (detail[-1][:200] if detail else "kind gave no reason"))
+    context = cluster_context()
+    if not reachable(context):
+        raise CreateFailedError(
+            f"cluster {CLUSTER_NAME} was created but its API server is not "
+            f"answering at {context!r}. `kind delete cluster --name "
+            f"{CLUSTER_NAME}` and try again.")
+    info(emit, f"cluster {CLUSTER_NAME} ready at {context}", phase="provision")
+    return context
+
+
+def delete_cluster(*, force: bool = False, emit: Emit = null_emit) -> bool:
+    """Delete rc-repro's own cluster. Returns False if there was nothing to delete.
+
+    Refuses while any workspace namespace is still in it, unless forced. On a
+    shared box the cluster holds other people's workspaces, and `prune` reclaiming
+    the cluster out from under a colleague mid-ticket is the failure this guards --
+    the namespaces carry `rc-repro.io/owner`, so the refusal can say whose.
+
+    Only ever CLUSTER_NAME. There is no parameter for which cluster to delete,
+    because a delete that can be pointed anywhere eventually is.
+    """
+    if not which("kind"):
+        return False
+    with runner.repro_lock(CLUSTER_LOCK, timeout=DELETE_TIMEOUT):
+        if CLUSTER_NAME not in clusters()[0]:
+            return False
+        context = cluster_context()
+        if not force and reachable(context):
+            live = workspace_namespaces(context)
+            if live:
+                raise ConflictError(
+                    f"cluster {CLUSTER_NAME} still holds {len(live)} workspace "
+                    f"namespace(s): {', '.join(sorted(live)[:5])}. Remove those "
+                    "workspaces first, or pass --force to take the cluster and "
+                    "everything in it.")
+        info(emit, f"deleting cluster {CLUSTER_NAME}", phase="teardown")
+        res = run(["kind", "delete", "cluster", "--name", CLUSTER_NAME],
+                  timeout=DELETE_TIMEOUT, own=True)
+        if res.returncode != 0:
+            detail = (res.stderr or res.stdout or "").strip().splitlines()
+            raise DockerError(f"could not delete the cluster {CLUSTER_NAME}: "
+                              + (detail[-1][:200] if detail else "kind gave no reason"))
+    return True
