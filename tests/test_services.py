@@ -2290,7 +2290,7 @@ def test_the_replica_set_is_initiated_and_verified_not_assumed(monkeypatch, tmp_
         import subprocess as sp
         j = " ".join(argv)
         if "jsonpath" in j:
-            return sp.CompletedProcess(argv, 0, "Running", "")
+            return sp.CompletedProcess(argv, 0, "true", "")
         if "--eval" in argv:
             script = argv[argv.index("--eval") + 1]
             scripts.append(script)
@@ -2309,7 +2309,7 @@ def test_the_replica_set_is_initiated_and_verified_not_assumed(monkeypatch, tmp_
         import subprocess as sp
         j = " ".join(argv)
         if "jsonpath" in j:
-            return sp.CompletedProcess(argv, 0, "Running", "")
+            return sp.CompletedProcess(argv, 0, "true", "")
         if "--eval" in argv:
             script = argv[argv.index("--eval") + 1]
             if script == "rs.status().ok":
@@ -2334,7 +2334,7 @@ def test_an_uninitiated_replica_set_is_reported_as_dead_not_left_to_time_out(
     def never_ok(argv, timeout=None, own=False):
         import subprocess as sp
         if "jsonpath" in " ".join(argv):
-            return sp.CompletedProcess(argv, 0, "Running", "")   # pod is up...
+            return sp.CompletedProcess(argv, 0, "true", "")   # container is up...
         if "--eval" in argv:
             return sp.CompletedProcess(argv, 0, "0", "")   # ...but rs.status().ok == 0
         return sp.CompletedProcess(argv, 0, "", "")
@@ -2350,7 +2350,7 @@ def test_an_uninitiated_replica_set_is_reported_as_dead_not_left_to_time_out(
     # that shows why.
     def never_ready(argv, timeout=None, own=False):
         import subprocess as sp
-        return sp.CompletedProcess(argv, 0, "Pending", "")
+        return sp.CompletedProcess(argv, 0, "false", "")
 
     monkeypatch.setattr(k8s, "run", never_ready)
     monkeypatch.setattr(k8s, "MONGO_READY_TRIES", 2)
@@ -2386,10 +2386,11 @@ def test_initiation_waits_for_a_running_pod_not_a_ready_one(monkeypatch, tmp_pat
         joined = " ".join(argv)
         asked.append(joined)
         if "jsonpath" in joined:
-            # Ready is FALSE and stays false, exactly as an uninitiated set behaves.
-            if "containerStatuses" in joined:
+            # `ready` is FALSE and stays false, exactly as an uninitiated set
+            # behaves; `started` is what says the container is exec-able.
+            if "].ready" in joined:
                 return sp.CompletedProcess(argv, 0, "false", "")
-            return sp.CompletedProcess(argv, 0, "Running", "")
+            return sp.CompletedProcess(argv, 0, "true", "")
         if "--eval" in argv:
             script = argv[argv.index("--eval") + 1]
             return sp.CompletedProcess(argv, 0,
@@ -2400,9 +2401,9 @@ def test_initiation_waits_for_a_running_pod_not_a_ready_one(monkeypatch, tmp_pat
     # Must succeed despite readiness never being true.
     k8s.init_replica_set(namespace="rc-repro-t", context=k8s.CONTEXT,
                          sleep=lambda _s: None)
-    assert not any("containerStatuses" in a for a in asked), \
+    assert not any("].ready" in a for a in asked), \
         "it waited on readiness, which cannot happen before initiation"
-    assert any("status.phase" in a for a in asked), asked[:3]
+    assert any(".started" in a for a in asked), asked[:3]
     # And every mongosh call carries the direct URI.
     for call in [a for a in asked if "mongosh" in a]:
         assert "directConnection=true" in call, call
@@ -2451,7 +2452,7 @@ def test_a_failed_create_leaves_no_namespace_nobody_can_see(monkeypatch, tmp_pat
             return sp.CompletedProcess(argv, 0,
                 '[{"version":"7.0.2","app_version":"8.6.1"}]', "")
         if "jsonpath" in joined:
-            return sp.CompletedProcess(argv, 0, "Running", "")
+            return sp.CompletedProcess(argv, 0, "true", "")
         if "--eval" in argv:
             return sp.CompletedProcess(argv, 0, "1", "")
         return sp.CompletedProcess(argv, 0, "", "")

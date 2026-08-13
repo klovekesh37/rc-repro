@@ -485,13 +485,23 @@ def down(
             ui.warn(f"deleting {target!r}, owned by {owner}.")
     try:
         # confirm=True: the prompt above (or --yes) already gated it.
-        lcsvc.teardown(target, volumes=volumes, confirm=True)
+        out = lcsvc.teardown(target, volumes=volumes, confirm=True)
     except errors.ReproError as exc:
         _fail(exc)
+    # The nouns depend on the runtime, and this line hardcoded Docker's. A
+    # Kubernetes workspace has no containers and no Docker volume -- it has a
+    # namespace and a PersistentVolumeClaim -- and `helm uninstall` does NOT delete
+    # a PVC, so which of the two paths kept the data is exactly what needs saying.
+    # The service layer already knows; asking it beats guessing here.
+    kube = (out or {}).get("runtime") == topology.KUBERNETES
+    what = ("namespace, PersistentVolumeClaim and record" if kube
+            else "containers, data volume, and record")
     if volumes:
-        ui.ok(f"✓ {target!r} removed (containers, data volume, and record).")
+        ui.ok(f"✓ {target!r} removed ({what}).")
     else:
-        ui.ok(f"✓ {target!r} down (data kept).")
+        kept = ("the namespace and its PersistentVolumeClaim are kept" if kube
+                else "data kept")
+        ui.ok(f"✓ {target!r} down ({kept}).")
         typer.echo(f"  bring it back: rc-repro up --version <same> --name {target}")
         typer.echo("  delete for good: add --volumes, or run `rc-repro prune`")
 

@@ -1024,10 +1024,20 @@ def init_replica_set(*, namespace: str, context: str, emit: Emit = null_emit,
     # while mongod had in fact been up the whole time, logging
     # "ReadConcernMajorityNotAvailableYet".
     for attempt in range(MONGO_READY_TRIES):
+        # `started`, not `phase`. A pod reports Running before its container is
+        # exec-able, and `kubectl exec` then fails with `container not found
+        # ("mongod")` -- which is what `up` after a plain `down` hit: the PVC was
+        # still there, the StatefulSet came back, the pod said Running, and the exec
+        # raced the container.
+        #
+        # Not `ready` either: readiness needs the replica set initiated, and this IS
+        # the initiation. `started` is the field that means "the container is up",
+        # independent of whether it is serving.
         res = run(["kubectl", "--context", context, "-n", namespace, "get", "pod",
-                   f"{MONGO_SERVICE}-0", "-o", "jsonpath={.status.phase}"],
+                   f"{MONGO_SERVICE}-0", "-o",
+                   "jsonpath={.status.containerStatuses[0].started}"],
                   own=is_ours(context))
-        if (res.stdout or "").strip() == "Running":
+        if (res.stdout or "").strip() == "true":
             break
         if attempt % 6 == 0:
             info(emit, "waiting for MongoDB", phase="wait")
