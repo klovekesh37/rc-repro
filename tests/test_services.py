@@ -2911,11 +2911,15 @@ def test_the_admin_and_the_setup_wizard_reach_a_kubernetes_workspace():
     assert env["ADMIN_USERNAME"] == config.ADMIN_USERNAME
     assert env["ADMIN_PASS"] == config.ADMIN_PASSWORD
     assert env["ADMIN_EMAIL"] == config.ADMIN_EMAIL
-    # These two are facts about where it runs, and Rocket.Chat reports them in
-    # support dumps -- a Kubernetes repro claiming "compose" would mislead whoever
-    # reads one next.
-    assert env["DEPLOY_METHOD"] == "helm"
-    assert env["DEPLOY_PLATFORM"] == "kubernetes"
+    # And NOTHING the chart already sets. These two were here for one commit and
+    # broke every install: a second entry for the same env key is not an override
+    # but a conflict, and server-side apply refuses the Deployment outright --
+    # "duplicate entries for key [name=\"DEPLOY_PLATFORM\"]". The chart knows it is
+    # helm on Kubernetes; extraEnv is for what the chart does NOT know.
+    for owned in ("DEPLOY_METHOD", "DEPLOY_PLATFORM", "MONGO_URL", "ROOT_URL",
+                  "PORT"):
+        assert owned not in env, (
+            f"{owned} is set by the chart; a duplicate env key fails the install")
 
 
 def test_a_failure_reports_its_reason_not_the_warnings_printed_before_it():

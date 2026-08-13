@@ -890,9 +890,19 @@ def values_for(*, rc_version: str, rc_image: str, microservices: bool,
     # is worse than printing nothing.
     #
     # Same set and same reasoning as compose.py: skip the wizard, auto-provision the
-    # first admin. `DEPLOY_PLATFORM` differs because it is a fact about where this
-    # runs, and Rocket.Chat reports it back in support dumps -- a Kubernetes repro
-    # claiming "compose" would mislead the next person reading one.
+    # first admin.
+    #
+    # DEPLOY_METHOD and DEPLOY_PLATFORM are NOT here, and were, for one commit. The
+    # chart sets them itself -- it knows perfectly well it is helm on Kubernetes --
+    # and a second entry for the same key is not an override but a conflict:
+    #
+    #   Error: INSTALLATION FAILED: server-side apply failed ... .spec.template
+    #   .spec.containers[name="rocketchat"].env: duplicate entries for key
+    #   [name="DEPLOY_PLATFORM"]
+    #
+    # So anything the chart already provides must not be repeated here. `extraEnv`
+    # is for what the chart does NOT know: rc-repro's fixed admin and the skipped
+    # wizard. That is the line to check before adding to this list.
     env: list[dict] = [
         {"name": "OVERWRITE_SETTING_Show_Setup_Wizard", "value": "completed"},
         {"name": "INITIAL_USER", "value": "yes"},
@@ -900,8 +910,6 @@ def values_for(*, rc_version: str, rc_image: str, microservices: bool,
         {"name": "ADMIN_NAME", "value": config.ADMIN_NAME},
         {"name": "ADMIN_EMAIL", "value": config.ADMIN_EMAIL},
         {"name": "ADMIN_PASS", "value": config.ADMIN_PASSWORD},
-        {"name": "DEPLOY_METHOD", "value": "helm"},
-        {"name": "DEPLOY_PLATFORM", "value": "kubernetes"},
         {"name": "ALLOW_UNSAFE_QUERY_AND_FIELDS_API_PARAMS", "value": "true"},
     ]
     values: dict = {
