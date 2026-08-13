@@ -3389,13 +3389,13 @@ def test_the_operator_is_opt_in_until_it_is_proven(monkeypatch):
 
 def test_the_operator_volume_claims_cover_both_volumes_the_pod_mounts():
     """The operator's pod mounts `data-volume` AND `logs-volume`, and overriding
-    `volumeClaimTemplates` REPLACES its defaults rather than merging with them.
+    `volumeClaimTemplates` REPLACES its defaults rather than merging with them --
+    a run that declared only `data-volume` produced exactly one PVC, while both of
+    the pod's containers mount both volumes. A template list that drops one leaves
+    the pod referencing a claim nothing creates.
 
-    Declaring only `data-volume` left the pod referencing a claim no template
-    creates, so it never scheduled -- and the PVC that WAS declared sat Pending
-    forever, because kind's StorageClass is WaitForFirstConsumer and no consumer
-    ever arrived. The symptom named neither volume: "Pending ReplicaSet is not yet
-    ready, retrying in 10 seconds".
+    (This was NOT what held the first live run at Pending -- that was the missing
+    ServiceAccount, see the RBAC test below. Both are real; only one was blocking.)
     """
     import yaml
 
@@ -3405,6 +3405,65 @@ def test_the_operator_volume_claims_cover_both_volumes_the_pod_mounts():
     names = [v["metadata"]["name"]
              for v in doc["spec"]["statefulSet"]["spec"]["volumeClaimTemplates"]]
     assert names == ["data-volume", "logs-volume"], names
+
+
+def test_the_database_pod_gets_its_service_account_in_the_workspace_namespace():
+    """What actually held the operator path at Pending for three sessions.
+
+    The operator writes a StatefulSet whose pod runs as `mongodb-kubernetes-appdb`.
+    Its chart creates that account only in the namespace the chart is installed
+    into. rc-repro installs the operator ONCE, in `rc-repro-system`, because the
+    chart owns cluster-scoped CRDs and a per-workspace install collides on them at
+    the second workspace -- so the account is missing exactly where the pod needs it:
+
+        error: pods "mongodb-0" is forbidden: error looking up service account
+        rc-repro-optest/mongodb-kubernetes-appdb: serviceaccount ... not found
+
+    That is an event on the StatefulSet. The MongoDBCommunity resource reports only
+    "Pending ReplicaSet is not yet ready", and because no pod is ever created,
+    WaitForFirstConsumer holds both PVCs at Pending -- which is the symptom seen
+    first and points at storage, which was never the problem.
+    """
+    import yaml
+
+    from rc_repro.services import k8s
+
+    docs = {d["kind"]: d
+            for d in yaml.safe_load_all(k8s.mongo_rbac_manifest("t", owner="o"))}
+    assert set(docs) == {"ServiceAccount", "Role", "RoleBinding"}, sorted(docs)
+
+    sa = k8s.MONGO_DB_SERVICE_ACCOUNT
+    assert all(d["metadata"]["name"] == sa for d in docs.values())
+    # The binding must name the LOCAL account. Pointing at the operator's namespace
+    # would apply cleanly and still leave the pod unable to start.
+    subject = docs["RoleBinding"]["subjects"][0]
+    assert subject["kind"] == "ServiceAccount" and subject["name"] == sa
+    assert "namespace" not in subject, "must bind the account in OUR namespace"
+    assert docs["RoleBinding"]["roleRef"]["name"] == sa
+
+    # Exactly what a member pod needs: read its own password Secret, and
+    # patch/delete/get its own Pod to mark readiness and roll itself.
+    rules = {r["resources"][0]: set(r["verbs"]) for r in docs["Role"]["rules"]}
+    assert rules == {"secrets": {"get"}, "pods": {"patch", "delete", "get"}}, rules
+
+    # Owned like everything else, so `prune` and the ownership guards see it.
+    for doc in docs.values():
+        assert doc["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "rc-repro"
+
+
+def test_the_service_account_is_applied_before_the_database_that_needs_it():
+    """Order matters and is not obvious: the RoleBinding has to exist before the
+    StatefulSet tries to create a pod, or the pod is rejected and the operator
+    backs off. Applying it with the Secrets -- ahead of the MongoDBCommunity
+    resource -- is what makes the first attempt the successful one."""
+    import inspect
+
+    from rc_repro.services import k8s
+
+    body = inspect.getsource(k8s.create_workspace)
+    rbac = body.index("mongo_rbac_manifest")
+    community = body.index("mongodb_community_manifest")
+    assert rbac < community, "RBAC must be applied before the MongoDBCommunity"
 
 
 def test_asking_for_the_operator_explicitly_satisfies_the_opt_in_but_not_the_floor(

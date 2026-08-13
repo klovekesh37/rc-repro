@@ -1271,6 +1271,8 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
             app_password = secrets.token_urlsafe(24)
             info(emit, f"MongoDB {resolved.mongo_tag} via the operator, SCRAM auth, "
                        f"{MONGO_VOLUME_GB}Gi volume", phase="provision", pct=20)
+            apply(mongo_rbac_manifest(name, owner=owner),
+                  namespace=namespace, context=context)
             apply(mongo_secret_manifest(name, admin_password=secrets.token_urlsafe(24),
                                         app_password=app_password, owner=owner),
                   namespace=namespace, context=context)
@@ -1424,6 +1426,13 @@ MONGO_ADMIN_USER = "admin"
 MONGO_APP_USER = "rocketchat"
 MONGO_APP_DB = "rocketchat"
 
+#: The ServiceAccount the operator puts on the database pod. Not configurable and
+#: not namespaced to the operator: the StatefulSet the operator writes into OUR
+#: namespace names this account, so it has to exist THERE, not where the operator
+#: runs. `kubectl -n <ns> get sts mongodb -o jsonpath='{.spec.template.spec.serviceAccountName}'`
+#: is where the name comes from.
+MONGO_DB_SERVICE_ACCOUNT = "mongodb-kubernetes-appdb"
+
 
 #: The operator is OPT-IN until it is proven, and the reason is a regression I
 #: caused. The hand-written StatefulSet was verified end to end on a live cluster --
@@ -1460,6 +1469,74 @@ def operator_supports(mongo_tag: str, *, forced: bool = False) -> bool:
     except (ValueError, TypeError):
         return False
     return len(parts) == 2 and parts >= OPERATOR_MIN_MONGO
+
+
+def mongo_rbac_manifest(name: str, *, owner: str = "") -> str:
+    """The database pod's ServiceAccount, Role and RoleBinding, in OUR namespace.
+
+    The guide never mentions these because it installs the operator into the same
+    namespace as MongoDB, where the operator's own chart creates them. rc-repro
+    cannot do that -- the chart owns cluster-scoped CRDs, so a per-workspace install
+    collides on them at the second workspace -- so the operator lives once in
+    `rc-repro-system` and watches everything. That works for reconciliation and
+    silently does not work for the database pod, which needs an account the chart
+    only created next to itself.
+
+    Missing, the failure names none of this. The StatefulSet appears, the claims
+    appear, and then:
+
+        Warning  FailedCreate  statefulset/mongodb  Create Pod mongodb-0 ... failed
+        error: pods "mongodb-0" is forbidden: error looking up service account
+        <ns>/mongodb-kubernetes-appdb: serviceaccount ... not found
+
+    is an event on the StatefulSet, while the MongoDBCommunity resource -- the thing
+    anyone would look at -- reports only "Pending ReplicaSet is not yet ready,
+    retrying in 10 seconds", forever. No pod is ever created, so `WaitForFirstConsumer`
+    keeps both PVCs Pending, which is the symptom that shows up first and points at
+    storage, which is not the problem.
+
+    The rules are copied from the Role the operator's chart creates for itself; they
+    are what a member pod needs and nothing more -- read its own password Secret, and
+    patch/delete/get its own Pod to mark readiness and roll itself. Everything here
+    is namespaced, so `down` removing the namespace removes it.
+    """
+    labels = _labels(name, owner)
+    lab = "\n".join(f"    {k}: {v}" for k, v in labels.items())
+    return f"""apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {MONGO_DB_SERVICE_ACCOUNT}
+  labels:
+{lab}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {MONGO_DB_SERVICE_ACCOUNT}
+  labels:
+{lab}
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["patch", "delete", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {MONGO_DB_SERVICE_ACCOUNT}
+  labels:
+{lab}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {MONGO_DB_SERVICE_ACCOUNT}
+subjects:
+- kind: ServiceAccount
+  name: {MONGO_DB_SERVICE_ACCOUNT}
+"""
 
 
 def mongo_secret_manifest(name: str, *, admin_password: str, app_password: str,
@@ -1556,16 +1633,17 @@ spec:
           resources:
             requests:
               storage: {storage_gb}Gi
-      # `logs-volume` as well as `data-volume`. The operator's pod mounts BOTH, and
-      # overriding volumeClaimTemplates replaces its defaults rather than merging
-      # with them -- so declaring only `data-volume` leaves the pod referencing a
-      # claim that no template creates, it never schedules, and the PVC that IS
-      # declared sits Pending forever because kind's StorageClass is
-      # WaitForFirstConsumer and no consumer ever arrives.
+      # `logs-volume` as well as `data-volume`, because overriding
+      # volumeClaimTemplates REPLACES the operator's list rather than merging with
+      # it -- confirmed by watching a run that declared only data-volume produce
+      # exactly one PVC -- while both of the pod's containers mount both volumes:
       #
-      # The symptom names neither volume: "Pending ReplicaSet is not yet ready".
-      # The guide shows only data-volume because its example does not override the
-      # template list in a way that drops the other.
+      #   mongod:         data-volume ... logs-volume ...
+      #   mongodb-agent:  data-volume ... logs-volume ...
+      #
+      # so a template list that drops one leaves the pod referencing a claim nothing
+      # creates. The guide shows only data-volume because its example is the whole
+      # override, and it is reproduced here in full for the same reason.
       - metadata:
           name: logs-volume
         spec:
