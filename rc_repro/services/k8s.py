@@ -861,6 +861,27 @@ def values_for(*, rc_version: str, rc_image: str, microservices: bool,
     is broken on half the hosts.
     """
     repo, tag = split_image(rc_image, rc_version)
+    # THE WORKSPACE HAS TO BE USABLE ON ARRIVAL, which is what these five give and
+    # what Kubernetes was missing entirely. `up` printed "Login admin / admin123"
+    # for a workspace where that user had never been created and the setup wizard
+    # was still waiting -- confidently stated credentials that did not work, which
+    # is worse than printing nothing.
+    #
+    # Same set and same reasoning as compose.py: skip the wizard, auto-provision the
+    # first admin. `DEPLOY_PLATFORM` differs because it is a fact about where this
+    # runs, and Rocket.Chat reports it back in support dumps -- a Kubernetes repro
+    # claiming "compose" would mislead the next person reading one.
+    env: list[dict] = [
+        {"name": "OVERWRITE_SETTING_Show_Setup_Wizard", "value": "completed"},
+        {"name": "INITIAL_USER", "value": "yes"},
+        {"name": "ADMIN_USERNAME", "value": config.ADMIN_USERNAME},
+        {"name": "ADMIN_NAME", "value": config.ADMIN_NAME},
+        {"name": "ADMIN_EMAIL", "value": config.ADMIN_EMAIL},
+        {"name": "ADMIN_PASS", "value": config.ADMIN_PASSWORD},
+        {"name": "DEPLOY_METHOD", "value": "helm"},
+        {"name": "DEPLOY_PLATFORM", "value": "kubernetes"},
+        {"name": "ALLOW_UNSAFE_QUERY_AND_FIELDS_API_PARAMS", "value": "true"},
+    ]
     values: dict = {
         # pullPolicy and the NATS cluster name are the guide's own values.yaml.
         # IfNotPresent also matters here specifically: a repro box re-creates
@@ -872,7 +893,7 @@ def values_for(*, rc_version: str, rc_image: str, microservices: bool,
         "microservices": {"enabled": bool(microservices)},
         "mongodb": {"enabled": False},
         "externalMongodbUrl": MONGO_URL,
-        "extraEnv": [],
+        "extraEnv": env,
     }
     if oplog:
         # Rocket.Chat below 8.x still wants the oplog URL; 8.x deprecates it.

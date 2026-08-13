@@ -2889,3 +2889,30 @@ def test_teardown_waits_for_the_namespace_rather_than_claiming_it_is_gone(
     assert any("1 volume(s)" in m for m in said), said
     assert any("Terminating" in m for m in said), "it never said it was waiting"
     assert any("are gone" in m for m in said), "it never confirmed the end state"
+
+
+def test_the_admin_and_the_setup_wizard_reach_a_kubernetes_workspace():
+    """`up` printed "Login admin / admin123" for a workspace where that user had
+    never been created and the setup wizard was still waiting.
+
+    Compose sets five variables to make a repro usable on arrival -- skip the wizard,
+    auto-provision the first admin -- and the Kubernetes values carried none of them.
+    Confidently stated credentials that do not work are worse than printing nothing:
+    they send someone to debug their own typing.
+    """
+    from rc_repro import config
+    from rc_repro.services import k8s
+
+    env = {e["name"]: e["value"] for e in
+           k8s.values_for(rc_version="8.5.1", rc_image="img",
+                          microservices=True)["extraEnv"]}
+    assert env["OVERWRITE_SETTING_Show_Setup_Wizard"] == "completed"
+    assert env["INITIAL_USER"] == "yes", "without this no admin is created at all"
+    assert env["ADMIN_USERNAME"] == config.ADMIN_USERNAME
+    assert env["ADMIN_PASS"] == config.ADMIN_PASSWORD
+    assert env["ADMIN_EMAIL"] == config.ADMIN_EMAIL
+    # These two are facts about where it runs, and Rocket.Chat reports them in
+    # support dumps -- a Kubernetes repro claiming "compose" would mislead whoever
+    # reads one next.
+    assert env["DEPLOY_METHOD"] == "helm"
+    assert env["DEPLOY_PLATFORM"] == "kubernetes"

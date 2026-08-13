@@ -1787,9 +1787,23 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     kubeconfig = k8s.owned_kubeconfig()
     ns = out["namespace"]
     pods = 9 if microservices else 5
+    # The port-forward is the ONLY way in without an ingress, and it dies with its
+    # pod -- so the command to re-establish it belongs here rather than in someone's
+    # memory. It carries the bind host, because a workspace created with
+    # `--bind 0.0.0.0` needs `--address 0.0.0.0` to come back the same way.
+    addr = ("" if bind_host in ("", "127.0.0.1", "localhost")
+            else f"--address {bind_host} ")
+    reach = (f"reachable on this box at {root}" if not addr else
+             f"reachable at {root} and, from other machines, at "
+             f"http://<this-box>:{host_port} — it publishes on {bind_host} and the "
+             "workspace runs admin/admin123, so keep it off untrusted networks")
     meta.extra["notes"] = [
         f"{'microservices' if microservices else 'monolith'} on "
         f"{out['context']} — about {pods} pods, namespace {ns}",
+        reach,
+        "the port-forward dies with its pod; bring it back with:",
+        f"    kubectl -n {ns} port-forward {addr}"
+        f"deployment/{out['release']}-rocketchat {host_port}:3000",
         "rc-repro keeps its own kubeconfig; a bare kubectl will not see this:",
         f"    export KUBECONFIG={kubeconfig}",
         f"    kubectl -n {ns} get pods",
