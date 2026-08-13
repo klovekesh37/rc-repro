@@ -3336,3 +3336,24 @@ def test_the_mongo_uri_carries_credentials_and_the_operator_service_name():
     assert "authSource=rocketchat" in uri and "replicaSet=mongodb" in uri
     # The oplog URI points at `local` and needs no authSource.
     assert "/local?" in k8s.operator_mongo_url("rc-repro-t", "s3cret", oplog=True)
+
+
+def test_the_operator_gets_a_full_release_version_not_a_docker_tag():
+    """rc-repro carries a Docker TAG -- "8.0" -- because that is what pulls an image.
+    The operator wants a RELEASE version, and the guide shows "8.0.0".
+
+    Given "8.0" it accepts the resource and never reconciles it: no `.status.phase`
+    at all, the operator healthy, MongoDB simply absent. The create then waited 300s
+    and reported "the operator did not bring MongoDB up", which names nothing. Found
+    on the first live run of the operator path.
+    """
+    import yaml
+
+    from rc_repro.services import k8s
+
+    assert k8s.operator_version("8.0") == "8.0.0"
+    assert k8s.operator_version("7.0") == "7.0.0"
+    # An explicit --mongo 8.0.4 still means 8.0.4.
+    assert k8s.operator_version("8.0.4") == "8.0.4"
+    doc = yaml.safe_load(k8s.mongodb_community_manifest("t", "8.0"))
+    assert doc["spec"]["version"] == "8.0.0", "a bare tag never reconciles"

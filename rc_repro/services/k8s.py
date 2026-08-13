@@ -1456,6 +1456,24 @@ def mongo_secret_manifest(name: str, *, admin_password: str, app_password: str,
     ])
 
 
+def operator_version(tag: str) -> str:
+    """A full MongoDB release version for the operator's `spec.version`.
+
+    rc-repro carries a Docker TAG -- "8.0" -- because that is what pulls an image.
+    The operator wants a RELEASE version and the guide shows "8.0.0"; given "8.0" it
+    accepts the resource and then never reconciles it, so the workspace sits at no
+    `.status.phase` until the wait gives up. The failure names nothing: the resource
+    exists, the operator is healthy, and MongoDB simply never appears.
+
+    A tag that already has three parts is passed through, so an explicit
+    `--mongo 8.0.4` still means 8.0.4.
+    """
+    parts = str(tag).split(".")
+    while len(parts) < 3:
+        parts.append("0")
+    return ".".join(parts[:3])
+
+
 def mongodb_community_manifest(name: str, tag: str, *, owner: str = "",
                                storage_gb: int = MONGO_VOLUME_GB) -> str:
     """The guide's MongoDBCommunity resource.
@@ -1475,7 +1493,7 @@ metadata:
 spec:
   members: 1
   type: ReplicaSet
-  version: "{tag}"
+  version: "{operator_version(tag)}"
   security:
     authentication:
       modes: ["SCRAM"]
@@ -1569,6 +1587,17 @@ def wait_for_mongodb(*, namespace: str, context: str, emit: Emit = null_emit,
         if attempt % 6 == 0:
             info(emit, "waiting for the operator to bring MongoDB up", phase="wait")
         sleep(MONGO_READY_INTERVAL)
+    # Say what the resource itself reports. An empty phase means the operator never
+    # reconciled it at all -- which is what an unusable `spec.version` looks like,
+    # and "did not come up" sent me to the wrong place for it.
+    detail = run(["kubectl", "--context", context, "-n", namespace, "get",
+                  "mongodbcommunity", MONGO_SERVICE, "-o",
+                  "jsonpath={.status.phase}{\" \"}{.status.message}"],
+                 own=is_ours(context))
+    said = (detail.stdout or "").strip()
     raise CreateFailedError(
-        "the operator did not bring MongoDB up. "
-        f"kubectl -n {namespace} describe mongodbcommunity {MONGO_SERVICE}")
+        "the operator did not bring MongoDB up"
+        + (f" — it reports: {said}" if said else
+           " — and reports no status at all, which means it never reconciled the "
+           "resource (usually an unusable spec.version)")
+        + f". kubectl -n {namespace} describe mongodbcommunity {MONGO_SERVICE}")
