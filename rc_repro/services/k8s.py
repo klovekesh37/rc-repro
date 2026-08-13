@@ -616,6 +616,13 @@ MONGO_OPLOG_URL = f"mongodb://{MONGO_SERVICE}-0.{MONGO_SERVICE}:27017/local?repl
 #: `restore` and `upgrade` all assume the data survives a restart.
 MONGO_VOLUME_GB = 8
 
+#: How mongosh must connect BEFORE the replica set is initiated. Without
+#: `directConnection=true` it tries to discover the set's topology, finds no
+#: primary, and fails its handshake with "ReadConcernMajorityNotAvailableYet".
+#: `compose.py` already knew this -- "directConnection=true lets mongosh reach the
+#: node before rs.initiate" -- and the first cut of this module did not.
+MONGO_DIRECT_URI = "mongodb://localhost:27017/?directConnection=true"
+
 APPLY_TIMEOUT = 120.0
 INSTALL_TIMEOUT = 900.0
 
@@ -772,7 +779,8 @@ spec:
           mountPath: /data/db
         readinessProbe:
           exec:
-            command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+            command: ["mongosh", "{MONGO_DIRECT_URI}", "--quiet", "--eval",
+                      "db.adminCommand('ping')"]
           initialDelaySeconds: 10
           periodSeconds: 5
   volumeClaimTemplates:
@@ -956,7 +964,8 @@ MONGO_READY_INTERVAL = 5.0
 
 def _mongo_exec(context: str, namespace: str, script: str):
     return run(["kubectl", "--context", context, "-n", namespace, "exec",
-                f"{MONGO_SERVICE}-0", "--", "mongosh", "--quiet", "--eval", script],
+                f"{MONGO_SERVICE}-0", "--", "mongosh", MONGO_DIRECT_URI,
+                "--quiet", "--eval", script],
                timeout=APPLY_TIMEOUT, own=is_ours(context))
 
 
@@ -974,19 +983,25 @@ def init_replica_set(*, namespace: str, context: str, emit: Emit = null_emit,
     CreateFailedError -- exit 7, known dead -- because every second spent waiting
     afterwards is spent waiting for something that cannot happen.
     """
+    # RUNNING, not READY -- and the difference is a circular wait. The readiness
+    # probe cannot pass until the replica set is initiated, and initiation cannot
+    # run until something answers. Waiting on readiness here made the whole create
+    # a coin flip: the probe occasionally scraped through and the workspace built,
+    # otherwise it timed out at 300s reporting that MongoDB never became ready --
+    # while mongod had in fact been up the whole time, logging
+    # "ReadConcernMajorityNotAvailableYet".
     for attempt in range(MONGO_READY_TRIES):
         res = run(["kubectl", "--context", context, "-n", namespace, "get", "pod",
-                   f"{MONGO_SERVICE}-0", "-o",
-                   "jsonpath={.status.containerStatuses[0].ready}"],
+                   f"{MONGO_SERVICE}-0", "-o", "jsonpath={.status.phase}"],
                   own=is_ours(context))
-        if (res.stdout or "").strip() == "true":
+        if (res.stdout or "").strip() == "Running":
             break
         if attempt % 6 == 0:
             info(emit, "waiting for MongoDB", phase="wait")
         sleep(MONGO_READY_INTERVAL)
     else:
         raise CreateFailedError(
-            "MongoDB did not become ready, and Rocket.Chat cannot work without it "
+            "the MongoDB pod never started, and Rocket.Chat cannot work without it "
             f"(kubectl -n {namespace} describe pod {MONGO_SERVICE}-0)")
 
     info(emit, "initiating the replica set", phase="boot", pct=45)
@@ -1039,6 +1054,7 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
     initiated BEFORE the chart goes in, because Rocket.Chat needs change streams
     and would otherwise sit at not-ready with nothing in its logs naming MongoDB.
     """
+    had_cluster = CLUSTER_NAME in clusters()[0]
     context = ensure_cluster(emit=emit)
     ensure_repo(emit=emit)
     chart_version = resolve_chart_version(resolved.rc_version, emit=emit)
@@ -1051,18 +1067,38 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
         raise PreflightError(blocked)
 
     namespace = ensure_namespace(name, context=context, owner=owner, emit=emit)
-    info(emit, f"MongoDB {resolved.mongo_tag}, {MONGO_VOLUME_GB}Gi volume",
-         phase="provision", pct=20)
-    apply(mongo_manifest(name, resolved.mongo_tag, owner=owner),
-          namespace=namespace, context=context)
-    init_replica_set(namespace=namespace, context=context, emit=emit)
+    try:
+        info(emit, f"MongoDB {resolved.mongo_tag}, {MONGO_VOLUME_GB}Gi volume",
+             phase="provision", pct=20)
+        apply(mongo_manifest(name, resolved.mongo_tag, owner=owner),
+              namespace=namespace, context=context)
+        init_replica_set(namespace=namespace, context=context, emit=emit)
 
-    values = values_for(rc_version=resolved.rc_version, rc_image=resolved.rc_image,
-                        microservices=microservices, replicas=replicas,
-                        root_url=root_url, oplog=resolved.oplog)
-    info(emit, f"installing {CHART} as {RELEASE}", phase="boot", pct=60)
-    install(namespace=namespace, context=context, values=values,
-            chart_version=chart_version)
+        values = values_for(rc_version=resolved.rc_version,
+                            rc_image=resolved.rc_image,
+                            microservices=microservices, replicas=replicas,
+                            root_url=root_url, oplog=resolved.oplog)
+        info(emit, f"installing {CHART} as {RELEASE}", phase="boot", pct=60)
+        install(namespace=namespace, context=context, values=values,
+                chart_version=chart_version)
+    except Exception:
+        # A failed create must not leave anything a user cannot see. No repro.json
+        # is written until this returns, so a surviving namespace would be
+        # invisible to `list` and to `down` -- and on Compose a failed `up` at
+        # least leaves a workspace directory you can find. The cluster goes too if
+        # this call created it and nothing else is using it: `delete_cluster`
+        # refuses while any other workspace namespace is there, so a colleague's
+        # concurrent `up` is safe from this.
+        warn(emit, f"create failed — removing namespace {namespace}",
+             phase="teardown")
+        try:
+            run(["kubectl", "--context", context, "delete", "namespace", namespace,
+                 "--wait=false"], timeout=APPLY_TIMEOUT, own=is_ours(context))
+            if not had_cluster:
+                delete_cluster(emit=emit)
+        except Exception:  # noqa: BLE001 - the original failure is what matters
+            pass
+        raise
 
     pid = port_forward(name, namespace=namespace, context=context,
                        host_port=host_port)

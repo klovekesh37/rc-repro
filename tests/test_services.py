@@ -2290,7 +2290,7 @@ def test_the_replica_set_is_initiated_and_verified_not_assumed(monkeypatch, tmp_
         import subprocess as sp
         j = " ".join(argv)
         if "jsonpath" in j:
-            return sp.CompletedProcess(argv, 0, "true", "")
+            return sp.CompletedProcess(argv, 0, "Running", "")
         if "--eval" in argv:
             script = argv[argv.index("--eval") + 1]
             scripts.append(script)
@@ -2309,7 +2309,7 @@ def test_the_replica_set_is_initiated_and_verified_not_assumed(monkeypatch, tmp_
         import subprocess as sp
         j = " ".join(argv)
         if "jsonpath" in j:
-            return sp.CompletedProcess(argv, 0, "true", "")
+            return sp.CompletedProcess(argv, 0, "Running", "")
         if "--eval" in argv:
             script = argv[argv.index("--eval") + 1]
             if script == "rs.status().ok":
@@ -2334,9 +2334,9 @@ def test_an_uninitiated_replica_set_is_reported_as_dead_not_left_to_time_out(
     def never_ok(argv, timeout=None, own=False):
         import subprocess as sp
         if "jsonpath" in " ".join(argv):
-            return sp.CompletedProcess(argv, 0, "true", "")
+            return sp.CompletedProcess(argv, 0, "Running", "")   # pod is up...
         if "--eval" in argv:
-            return sp.CompletedProcess(argv, 0, "0", "")   # rs.status().ok == 0
+            return sp.CompletedProcess(argv, 0, "0", "")   # ...but rs.status().ok == 0
         return sp.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(k8s, "run", never_ok)
@@ -2350,7 +2350,7 @@ def test_an_uninitiated_replica_set_is_reported_as_dead_not_left_to_time_out(
     # that shows why.
     def never_ready(argv, timeout=None, own=False):
         import subprocess as sp
-        return sp.CompletedProcess(argv, 0, "false", "")
+        return sp.CompletedProcess(argv, 0, "Pending", "")
 
     monkeypatch.setattr(k8s, "run", never_ready)
     monkeypatch.setattr(k8s, "MONGO_READY_TRIES", 2)
@@ -2358,3 +2358,114 @@ def test_an_uninitiated_replica_set_is_reported_as_dead_not_left_to_time_out(
         k8s.init_replica_set(namespace="rc-repro-t", context=k8s.CONTEXT,
                              sleep=lambda _s: None)
     assert "describe pod" in str(caught2.value), "name what to run next"
+    assert "never started" in str(caught2.value), \
+        "a pod stuck Pending has not started; it is not 'not ready'"
+
+
+def test_initiation_waits_for_a_running_pod_not_a_ready_one(monkeypatch, tmp_path):
+    """A circular wait, and it made the whole create a coin flip.
+
+    The readiness probe runs mongosh, which cannot complete its handshake against
+    an UNINITIATED replica set -- mongod logs
+    "ReadConcernMajorityNotAvailableYet". So readiness depends on initiation, and
+    waiting for readiness before initiating means each waits for the other. The
+    probe occasionally scraped through and the workspace built; otherwise it timed
+    out at 300s reporting that MongoDB never became ready, while mongod had been
+    up the whole time.
+
+    So this polls `.status.phase`, and the probe itself connects with
+    `directConnection=true` -- which `compose.py` already knew it had to.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    asked = []
+
+    def spy(argv, timeout=None, own=False):
+        import subprocess as sp
+        joined = " ".join(argv)
+        asked.append(joined)
+        if "jsonpath" in joined:
+            # Ready is FALSE and stays false, exactly as an uninitiated set behaves.
+            if "containerStatuses" in joined:
+                return sp.CompletedProcess(argv, 0, "false", "")
+            return sp.CompletedProcess(argv, 0, "Running", "")
+        if "--eval" in argv:
+            script = argv[argv.index("--eval") + 1]
+            return sp.CompletedProcess(argv, 0,
+                                       "1" if script == "rs.status().ok" else "", "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", spy)
+    # Must succeed despite readiness never being true.
+    k8s.init_replica_set(namespace="rc-repro-t", context=k8s.CONTEXT,
+                         sleep=lambda _s: None)
+    assert not any("containerStatuses" in a for a in asked), \
+        "it waited on readiness, which cannot happen before initiation"
+    assert any("status.phase" in a for a in asked), asked[:3]
+    # And every mongosh call carries the direct URI.
+    for call in [a for a in asked if "mongosh" in a]:
+        assert "directConnection=true" in call, call
+
+
+def test_the_readiness_probe_can_answer_before_the_set_is_initiated():
+    """The manifest half of the same bug. A probe that cannot pass until initiation
+    keeps the pod unready forever, and Kubernetes gives no hint that the PROBE is
+    the problem."""
+    import yaml
+
+    from rc_repro.services import k8s
+
+    sts = [d for d in yaml.safe_load_all(k8s.mongo_manifest("t", "8.0"))
+           if d["kind"] == "StatefulSet"][0]
+    cmd = sts["spec"]["template"]["spec"]["containers"][0]["readinessProbe"]["exec"]["command"]
+    assert any("directConnection=true" in part for part in cmd), cmd
+
+
+def test_a_failed_create_leaves_no_namespace_nobody_can_see(monkeypatch, tmp_path):
+    """repro.json is written only after a successful create, so a namespace that
+    survives a failure is invisible to `list` and to `down`. On Compose a failed
+    `up` at least leaves a workspace directory you can find."""
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    deleted = []
+
+    def spy(argv, timeout=None, own=False):
+        import subprocess as sp
+        joined = " ".join(argv)
+        if "get clusters" in joined:
+            return sp.CompletedProcess(argv, 0, f"{k8s.CLUSTER_NAME}\n", "")
+        if "current-context" in joined:
+            return sp.CompletedProcess(argv, 0, k8s.CONTEXT, "")
+        if "/readyz" in joined:
+            return sp.CompletedProcess(argv, 0, "ok", "")
+        if "get storageclass" in joined:
+            return sp.CompletedProcess(argv, 0, '{"items":[{"metadata":{"name":"s",'
+                '"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}]}', "")
+        if "get ingressclass" in joined or "get namespace" in joined:
+            return sp.CompletedProcess(argv, 0, "", "")
+        if "delete namespace" in joined:
+            deleted.append(joined)
+        if "search repo" in joined:
+            return sp.CompletedProcess(argv, 0,
+                '[{"version":"7.0.2","app_version":"8.6.1"}]', "")
+        if "jsonpath" in joined:
+            return sp.CompletedProcess(argv, 0, "Running", "")
+        if "--eval" in argv:
+            return sp.CompletedProcess(argv, 0, "1", "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", spy)
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "apply", lambda *a, **k: None)
+    monkeypatch.setattr(k8s, "install",
+                        lambda **k: (_ for _ in ()).throw(
+                            errors.CreateFailedError("helm exploded")))
+    resolved = type("R", (), {"rc_version": "8.6.1", "mongo_tag": "8.0",
+                              "rc_image": "img", "oplog": False})()
+    with pytest.raises(errors.CreateFailedError):
+        k8s.create_workspace(name="t", resolved=resolved, host_port=3000,
+                             microservices=False)
+    assert deleted, "the namespace survived a failed create"
+    assert "rc-repro-t" in deleted[0]
