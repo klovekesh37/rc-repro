@@ -1423,8 +1423,30 @@ MONGO_APP_USER = "rocketchat"
 MONGO_APP_DB = "rocketchat"
 
 
+#: The operator is OPT-IN until it is proven, and the reason is a regression I
+#: caused. The hand-written StatefulSet was verified end to end on a live cluster --
+#: admin login, PVC Bound, data surviving a down/up cycle. Routing MongoDB 6.0+ to
+#: the operator by default replaced that with a path whose PVC never binds:
+#:
+#:     it reports: Pending ReplicaSet is not yet ready, retrying in 10 seconds
+#:     data-volume-mongodb-0   Pending
+#:
+#: A default that breaks the working case is worse than a missing feature, so the
+#: operator waits behind this flag until a live run says otherwise. Auth is the
+#: thing it buys and auth is still absent without it -- that is the honest trade,
+#: and it is recorded here rather than in a plan nobody reads.
+USE_OPERATOR_ENV = "RC_REPRO_MONGO_OPERATOR"
+
+
+def operator_enabled() -> bool:
+    """Whether to use the operator at all. Off by default -- see USE_OPERATOR_ENV."""
+    return os.environ.get(USE_OPERATOR_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
 def operator_supports(mongo_tag: str) -> bool:
     """Whether the operator will manage this MongoDB version."""
+    if not operator_enabled():
+        return False
     try:
         parts = tuple(int(n) for n in str(mongo_tag).split(".")[:2])
     except (ValueError, TypeError):

@@ -3271,6 +3271,9 @@ def test_mongodb_uses_the_operator_where_it_can_and_the_statefulset_where_it_can
     """
     from rc_repro.services import k8s
 
+    # The version rule, with the operator switched on -- it is opt-in by default
+    # until its PVC binds on a live cluster (see the opt-in test).
+    monkeypatch.setenv(k8s.USE_OPERATOR_ENV, "1")
     for old in ("3.6", "4.4", "5.0"):
         assert not k8s.operator_supports(old), old
     for new in ("6.0", "7.0", "8.0", "8.2"):
@@ -3357,3 +3360,28 @@ def test_the_operator_gets_a_full_release_version_not_a_docker_tag():
     assert k8s.operator_version("8.0.4") == "8.0.4"
     doc = yaml.safe_load(k8s.mongodb_community_manifest("t", "8.0"))
     assert doc["spec"]["version"] == "8.0.0", "a bare tag never reconciles"
+
+
+def test_the_operator_is_opt_in_until_it_is_proven(monkeypatch):
+    """A default that breaks the working case is worse than a missing feature.
+
+    The hand-written StatefulSet was verified end to end on a live cluster -- admin
+    login, PVC Bound, data surviving a down/up cycle. Routing MongoDB 6.0+ to the
+    operator by default replaced that with a path whose PVC never binds:
+
+        it reports: Pending ReplicaSet is not yet ready, retrying in 10 seconds
+        data-volume-mongodb-0   Pending
+
+    So the operator waits behind a flag. What that costs is auth, which is the
+    thing it was adopted for -- and saying so is the point of this test.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.delenv(k8s.USE_OPERATOR_ENV, raising=False)
+    assert not k8s.operator_enabled()
+    assert not k8s.operator_supports("8.0"), "a supported version must still not route"
+
+    monkeypatch.setenv(k8s.USE_OPERATOR_ENV, "1")
+    assert k8s.operator_enabled()
+    assert k8s.operator_supports("8.0")
+    assert not k8s.operator_supports("5.0"), "the version floor still applies"
