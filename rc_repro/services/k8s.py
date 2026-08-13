@@ -21,10 +21,14 @@ one that says "cannot reach it" -- `doctor` exists to answer quickly.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
+
+from rc_repro import config
 
 #: The cluster rc-repro creates and owns. One cluster with a namespace per
 #: workspace, not a cluster per workspace: a control plane each would forbid
@@ -174,13 +178,65 @@ class Preflight:
         return self.tools_ready and self.cluster_reachable
 
 
+def owned_kubeconfig() -> Path:
+    """rc-repro's OWN kubeconfig, under RC_REPRO_HOME.
+
+    `kind create cluster` writes `~/.kube/config` AND switches current-context to
+    the cluster it just made. Without this, creating a workspace would silently
+    redirect the user's own `kubectl` -- somebody working in their k3s cluster
+    runs `rc-repro up` and their next `kubectl get pods` answers from somewhere
+    else. That is the one way cluster creation genuinely disturbs existing work,
+    and it is not acceptable for a tool that is supposed to be disposable.
+
+    Adopted from PR #3, which also redirects every Helm home: pinning only
+    repositories.yaml still leaves cache and data writes in the user's home.
+    """
+    return config.home() / "clients" / "kubernetes" / "config"
+
+
+def owned_env() -> dict[str, str]:
+    """An environment whose client state cannot reach the user's home.
+
+    Used for anything touching rc-repro's OWN cluster. Discovery -- finding the
+    cluster you already have -- deliberately does NOT use this, because the whole
+    point there is to read the config you already set up.
+    """
+    root = config.home() / "clients"
+    helm = root / "helm"
+    kubeconfig = owned_kubeconfig()
+    for directory in (kubeconfig.parent, helm / "cache", helm / "config",
+                      helm / "data", helm / "cache" / "repository"):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    env = os.environ.copy()
+    env.update({
+        "KUBECONFIG": str(kubeconfig),
+        "HELM_CACHE_HOME": str(helm / "cache"),
+        "HELM_CONFIG_HOME": str(helm / "config"),
+        "HELM_DATA_HOME": str(helm / "data"),
+        "HELM_REPOSITORY_CONFIG": str(helm / "config" / "repositories.yaml"),
+        "HELM_REPOSITORY_CACHE": str(helm / "cache" / "repository"),
+    })
+    return env
+
+
+def is_ours(context: str) -> bool:
+    """Whether a context names the cluster rc-repro created."""
+    return context == CONTEXT
+
+
 def which(tool: str) -> str:
     """Absolute path to a tool, or "" -- the one place PATH is consulted."""
     return shutil.which(tool) or ""
 
 
-def run(argv: list[str], *, timeout: float = PROBE_TIMEOUT) -> subprocess.CompletedProcess:
+def run(argv: list[str], *, timeout: float = PROBE_TIMEOUT,
+        own: bool = False) -> subprocess.CompletedProcess:
     """Run a kind/kubectl/helm command. Never raises; the caller reads returncode.
+
+    `own=True` runs against rc-repro's own client state, so nothing it does can
+    reach or rewrite the user's `~/.kube/config` or Helm homes. Never guessed at a
+    call site: each function derives it from the context it is targeting, so
+    forgetting it is not a thing that can happen.
 
     A preflight that raises on a missing binary or an unreachable API server would
     have to be wrapped at every call site, and one forgotten wrapper takes down
@@ -189,7 +245,8 @@ def run(argv: list[str], *, timeout: float = PROBE_TIMEOUT) -> subprocess.Comple
     """
     try:
         return subprocess.run(argv, capture_output=True, text=True,
-                              timeout=timeout, check=False)
+                              timeout=timeout, check=False,
+                              env=owned_env() if own else None)
     except (OSError, subprocess.SubprocessError) as exc:
         return subprocess.CompletedProcess(argv, returncode=127, stdout="",
                                            stderr=str(exc))
@@ -233,7 +290,7 @@ def clusters() -> tuple[list[str], str]:
     clusters" if only the stdout is read. Returning the reason separately is what
     stops a stopped Docker being reported as an absent cluster.
     """
-    res = run(["kind", "get", "clusters"])
+    res = run(["kind", "get", "clusters"], own=True)
     if res.returncode != 0:
         detail = (res.stderr or res.stdout or "").strip().splitlines()
         return [], (detail[0][:120] if detail else "kind could not list clusters")
@@ -244,7 +301,8 @@ def clusters() -> tuple[list[str], str]:
 def reachable(context: str = CONTEXT) -> bool:
     """Whether the API server answers. A cluster can exist and not respond --
     a stopped Docker, a half-deleted cluster, a machine that just woke up."""
-    res = run(["kubectl", "--context", context, "get", "--raw", "/readyz"])
+    res = run(["kubectl", "--context", context, "get", "--raw", "/readyz"],
+               own=is_ours(context))
     return res.returncode == 0 and "ok" in (res.stdout or "").lower()
 
 
@@ -256,7 +314,8 @@ def storage_classes(context: str = CONTEXT) -> tuple[list[str], str]:
     storage provisioner enabled." Without one, a PVC stays Pending forever and the
     workspace never boots -- with no error that names storage.
     """
-    res = run(["kubectl", "--context", context, "get", "storageclass", "-o", "json"])
+    res = run(["kubectl", "--context", context, "get", "storageclass", "-o", "json"],
+              own=is_ours(context))
     if res.returncode != 0:
         return [], ""
     try:
@@ -283,7 +342,8 @@ def ingress_classes(context: str = CONTEXT) -> list[str]:
     resources found" -- which is why rc-repro installs Traefik into its OWN
     cluster and refuses `--domain` against yours rather than installing into it.
     """
-    res = run(["kubectl", "--context", context, "get", "ingressclass", "-o", "name"])
+    res = run(["kubectl", "--context", context, "get", "ingressclass", "-o", "name"],
+              own=is_ours(context))
     if res.returncode != 0:
         return []
     return [ln.split("/", 1)[-1].strip()
@@ -296,7 +356,7 @@ def workspace_namespaces(context: str = CONTEXT) -> list[str]:
     Never by name prefix -- see OWNER_LABEL_KEY.
     """
     res = run(["kubectl", "--context", context, "get", "namespace",
-               "-l", OWNER_SELECTOR, "-o", "name"])
+               "-l", OWNER_SELECTOR, "-o", "name"], own=is_ours(context))
     if res.returncode != 0:
         return []
     return [ln.split("/", 1)[-1].strip()

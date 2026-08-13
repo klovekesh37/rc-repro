@@ -1491,7 +1491,7 @@ def _fake_run(mapping):
     """Stub k8s.run: match on a substring of the joined argv."""
     import subprocess as sp
 
-    def run(argv, timeout=None):
+    def run(argv, timeout=None, own=False):
         joined = " ".join(argv)
         for needle, (rc, out) in mapping.items():
             if needle in joined:
@@ -1544,7 +1544,7 @@ def test_namespaces_are_selected_by_label_never_by_name(monkeypatch):
 
     seen = []
 
-    def spy(argv, timeout=None):
+    def spy(argv, timeout=None, own=False):
         import subprocess as sp
         seen.append(argv)
         return sp.CompletedProcess(argv, 0, "namespace/rc-repro-t1\n", "")
@@ -1580,7 +1580,7 @@ def test_preflight_stops_before_asking_a_cluster_that_is_not_there(monkeypatch):
 
     asked = []
 
-    def spy(argv, timeout=None):
+    def spy(argv, timeout=None, own=False):
         import subprocess as sp
         asked.append(" ".join(argv))
         if "get clusters" in " ".join(argv):
@@ -1879,3 +1879,53 @@ def test_doctor_says_nothing_about_ingress(monkeypatch, tmp_path):
     }))
     msgs = [r["message"] for r in doctor.run_checks()["checks"]]
     assert not any("ingress" in m.lower() for m in msgs), msgs
+
+
+def test_rc_repro_never_rewrites_the_users_kubeconfig(monkeypatch, tmp_path):
+    """The one way creating a cluster genuinely disturbs existing work.
+
+    `kind create cluster` writes ~/.kube/config AND switches current-context to the
+    cluster it just made. Without isolation, somebody working in their own cluster
+    runs `rc-repro up` and their next `kubectl get pods` answers from somewhere
+    else -- with no indication anything moved.
+
+    So anything touching rc-repro's OWN cluster runs with KUBECONFIG and all five
+    Helm homes pointed inside RC_REPRO_HOME. Adopted from PR #3.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    env = k8s.owned_env()
+    assert env["KUBECONFIG"].startswith(str(tmp_path)), env["KUBECONFIG"]
+    for var in ("HELM_CACHE_HOME", "HELM_CONFIG_HOME", "HELM_DATA_HOME",
+                "HELM_REPOSITORY_CONFIG", "HELM_REPOSITORY_CACHE"):
+        assert env[var].startswith(str(tmp_path)), f"{var} escapes to the user's home"
+    # Pinning only repositories.yaml would still leave cache and data writes in
+    # ~/.config/helm, which is why all of them move.
+    assert k8s.owned_kubeconfig().parent.is_dir()
+
+
+def test_isolation_is_derived_from_the_target_not_chosen_at_the_call_site(monkeypatch):
+    """`own` is never passed by hand. Each function derives it from the context it
+    is targeting, so forgetting it is not a thing that can happen -- and the
+    discovery path deliberately stays ambient, because reading the cluster you
+    already configured is the entire point of it."""
+    from rc_repro.services import k8s
+
+    seen = []
+
+    def spy(argv, timeout=None, own=False):
+        import subprocess as sp
+        seen.append((own, " ".join(argv)))
+        return sp.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(k8s, "run", spy)
+    k8s.reachable(k8s.CONTEXT)          # ours -> isolated
+    k8s.reachable("k3s-default")        # theirs -> ambient
+    assert seen[0][0] is True, "our own cluster must not use the ambient kubeconfig"
+    assert seen[1][0] is False, "their cluster must be read from their kubeconfig"
+
+    # And discovery of the active context is ambient by definition.
+    seen.clear()
+    k8s.active_context()
+    assert seen[0][0] is False, "discovery must read the config the user set up"
