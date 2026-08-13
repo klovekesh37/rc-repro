@@ -3070,3 +3070,68 @@ def test_a_downed_workspace_is_down_not_perpetually_starting(monkeypatch, tmp_pa
     # And no namespace at all is still down.
     monkeypatch.setattr(k8s, "workspace_namespaces", lambda *a, **kw: [])
     assert lc.kubernetes_state("k", m) == "down"
+
+
+def test_list_says_which_runtime_each_workspace_is_on(monkeypatch, tmp_path):
+    """Two workspaces that differ in what every other command will do to them --
+    which ones refuse, where the data lives, how to reach it -- looked identical in
+    `list`, which is the one place people look first."""
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    for name, rt in (("d", topology.DOCKER), ("k", topology.KUBERNETES)):
+        m = lc.runner.Metadata(name=name, project="p", rc_version="8.5.1",
+                               rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                               preset="default", root_url="u", host_port=3000,
+                               version_source="t")
+        topology.stamp(m.extra, rt)
+        lc.runner.write(name, "services: {}\n", m)
+
+    monkeypatch.setattr(lc.runner, "docker_available", lambda **kw: True)
+    monkeypatch.setattr(lc.runner, "project_states", lambda: {})
+    monkeypatch.setattr(lc.runner, "rc_status_by_project", lambda: {})
+    monkeypatch.setattr(k8s, "workspace_namespaces", lambda *a, **kw: [])
+    rows = {r["name"]: r for r in lc.list_repros()}
+    assert rows["d"]["runtime"] == topology.DOCKER
+    assert rows["k"]["runtime"] == topology.KUBERNETES
+
+
+def test_a_workspace_comes_back_on_the_port_it_left_on(monkeypatch, tmp_path):
+    """`up` after `down` allocated a fresh port, so a workspace created on :3382
+    came back on :3000 -- every bookmark, every curl pasted into a ticket, and the
+    URL the user had just been shown all pointed at nothing.
+
+    An explicit --port still wins; otherwise the recorded one does, and only a
+    genuinely new workspace allocates.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="http://localhost:3382",
+                           host_port=3382, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    lc.runner.write("k", "", m)
+
+    monkeypatch.setattr(lc, "check_capacity", lambda *a, **kw: None)
+    monkeypatch.setattr(lc, "pick_host_port",
+                        lambda *a, **kw: 3000)          # what a fresh allocation gives
+    monkeypatch.setattr(lc.versions, "resolve", lambda v, offline=False: type(
+        "R", (), {"rc_version": v, "mongo_tag": "8.0", "rc_image": "img",
+                  "mongo_flavor": "official", "oplog": False, "source": "t"})())
+    seen: dict = {}
+    monkeypatch.setattr(k8s, "create_workspace", lambda **kw: seen.update(kw) or {
+        "context": k8s.CONTEXT, "namespace": "rc-repro-k", "chart_version": "7.0.0",
+        "release": k8s.RELEASE, "port_forward_pid": 0, "bind_host": "",
+        "microservices": False})
+
+    out = lc._create_kubernetes(lc.CreateReq(version="8.5.1", name="k",
+                                            runtime=topology.KUBERNETES))
+    assert seen["host_port"] == 3382, "it moved a returning workspace to a new port"
+    assert out["url"] == "http://localhost:3382"
+
+    # An explicit --port still wins, because asking for one is asking for one.
+    lc._create_kubernetes(lc.CreateReq(version="8.5.1", name="k", port=3999,
+                                       runtime=topology.KUBERNETES))
+    assert seen["host_port"] == 3999

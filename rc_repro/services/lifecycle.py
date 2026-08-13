@@ -1357,6 +1357,7 @@ def list_repros() -> list[dict]:
             state = "?" if not docker_up else repro_state(
                 rc_status, bool(states.get(m.project)))
         uptime, health = _uptime_health(rc_status)
+        runtime = topology.of_meta(m)
         monitored = bool(isinstance(m.extra, dict) and m.extra.get("monitoring"))
         extra_ = m.extra if isinstance(m.extra, dict) else {}
         owner = extra_.get("owner") or extra_.get("created_by", "")
@@ -1364,6 +1365,11 @@ def list_repros() -> list[dict]:
                     "owner": owner, "made_by": extra_.get("created_by", ""),
                     "rc_version": m.rc_version, "mongo_tag": m.mongo_tag,
                     "host_port": m.host_port, "root_url": m.root_url, "state": state,
+                    # Which runtime, so a row can say so. A Compose and a Kubernetes
+                    # workspace differ in what every other command will do to them --
+                    # which commands refuse, where the data lives, how to reach it --
+                    # and the list was the one place both looked identical.
+                    "runtime": runtime,
                     # The https URL when `up --https` was used; "" otherwise. The CLI
                     # and GUI show this in preference to root_url, which stays http.
                     "public_url": m.public_url, "tls": m.extra.get("tls", "") if isinstance(m.extra, dict) else "",
@@ -1774,8 +1780,19 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     if req.mongo:
         versions.apply_mongo_override(resolved, req.mongo)
 
-    host_port = pick_host_port(req.port, presets.load("default", {}),
-                               exclude=repro_name)
+    # A workspace that comes back must come back at the SAME address. Allocating
+    # afresh moved it from :3382 to :3000 on the `up` after a `down` -- so every
+    # bookmark, every curl in a ticket and the URL the user had just been shown all
+    # pointed at nothing. An explicit --port still wins; otherwise the recorded one
+    # does, and only a genuinely new workspace allocates.
+    recorded = 0
+    if reused:
+        try:
+            recorded = int(runner.read_meta(repro_name).host_port or 0)
+        except (OSError, ValueError, TypeError):
+            recorded = 0
+    host_port = req.port or recorded or pick_host_port(
+        0, presets.load("default", {}), exclude=repro_name)
     # Same resolution order Compose uses: the flag, then the box-level config, then
     # loopback. This was dropped entirely on the Kubernetes path.
     cfg = config.load_config()

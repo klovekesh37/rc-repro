@@ -619,12 +619,16 @@ def list_cmd() -> None:
     # and anything parsing it -- is unchanged.
     shared = any(r.get("created_by") for r in repros)
     owner_h = f"{'OWNER':<12} " if shared else ""
-    typer.echo(f"{'NAME':<20} {owner_h}{'RC':<9} {'MONGO':<7} {'PORT':<6} {'STATE':<10} URL")
+    typer.echo(f"{'NAME':<20} {owner_h}{'RC':<9} {'MONGO':<7} {'WHERE':<8} "
+               f"{'PORT':<6} {'STATE':<10} URL")
     for r in repros:
         flag = "*" if r["default"] else (" " if not r["pinned"] else "·")
         owner = f"{(r.get('created_by') or '-'):<12} " if shared else ""
         typer.echo(
             f"{flag}{r['name']:<19} {owner}{r['rc_version']:<9} {r['mongo_tag']:<7} "
+            # "compose"/"k8s" rather than the canonical names: this is a narrow
+            # column read at a glance, and the canonical value is in `info`.
+            f"{('k8s' if r.get('runtime') == topology.KUBERNETES else 'compose'):<8} "
             f"{r['host_port']:<6} {r['state']:<10} {r.get('public_url') or r['root_url']}"
         )
     typer.echo("\n* = default repro   · = pinned")
