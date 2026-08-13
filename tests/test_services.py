@@ -2469,3 +2469,68 @@ def test_a_failed_create_leaves_no_namespace_nobody_can_see(monkeypatch, tmp_pat
                              microservices=False)
     assert deleted, "the namespace survived a failed create"
     assert "rc-repro-t" in deleted[0]
+
+
+def test_the_headless_service_publishes_dns_before_the_pod_is_ready():
+    """The circular dependency one layer below the readiness probe.
+
+    A headless Service does not publish DNS for a not-ready pod. This pod cannot be
+    ready until the replica set is initiated, so `rs.initiate` could not resolve
+    `mongodb-0.mongodb` to verify the member is itself, and mongod refused with "no
+    host described in new configuration ... maps to this node".
+
+    Publishing not-ready addresses is the standard bootstrap pattern for a
+    StatefulSet database -- the MongoDB operator does the same.
+    """
+    import yaml
+
+    from rc_repro.services import k8s
+
+    svc = [d for d in yaml.safe_load_all(k8s.mongo_manifest("t", "8.0"))
+           if d["kind"] == "Service"][0]
+    # The literal STRING "None" -- that is how Kubernetes documents a headless
+    # Service, and YAML's null is `null`, not `None`. Asserting `is None` here
+    # would fail against a manifest the API server accepts.
+    assert svc["spec"]["clusterIP"] == "None", "must stay headless for stable pod DNS"
+    assert svc["spec"].get("publishNotReadyAddresses") is True, \
+        "without this, rs.initiate cannot resolve its own member"
+    # And the member host the initiate script uses is the one this service serves.
+    assert f"{k8s.MONGO_SERVICE}-0.{k8s.MONGO_SERVICE}" in k8s.RS_INITIATE
+
+
+def test_down_removes_a_kubernetes_workspace_instead_of_asking_docker(monkeypatch, tmp_path):
+    """The gap the first successful CLI create exposed: `down` reached for a compose
+    project that is not there and answered "no configuration file provided: not
+    found", leaving a workspace that could be CREATED and never removed.
+
+    The dispatch sits BELOW the confirmation, the ownership gate and the audit
+    record, which are about whose data is being destroyed and do not depend on the
+    runtime -- duplicating them per runtime is how one loses a check the other keeps.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.6.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="u", host_port=3010,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+    lc.runner.write("k", "", m)
+
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr(lc.runner, "down",
+                        lambda *a, **k: pytest.fail("it asked docker compose"))
+    called = {}
+    monkeypatch.setattr(k8s, "delete_namespace",
+                        lambda name, **kw: called.update(name=name, **kw) or True)
+
+    out = lc.teardown("k", volumes=False)
+    assert out["runtime"] == topology.KUBERNETES
+    assert called == {"name": "k", "context": k8s.CONTEXT, "volumes": False,
+                      "emit": lc.null_emit}, called
+
+    # And --volumes still needs the confirmation, which is shared rather than
+    # reimplemented per runtime.
+    with pytest.raises(errors.ValidationError):
+        lc.teardown("k", volumes=True, confirm=False)

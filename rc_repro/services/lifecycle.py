@@ -8,12 +8,16 @@ never call typer / sys.exit / typer.confirm.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from dataclasses import asdict
+from pathlib import Path
 
 from rc_repro import compose, config, presets, rcapi, runner, versions
 from rc_repro import seed as seeder
@@ -1572,6 +1576,33 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
     # `down --volumes` during an upgrade destroys the workspace while its
     # pre-upgrade bundle survives, so `upgrade --rollback` can never find it again.
     with runner.repro_lock(target, timeout=_INTERACTIVE_LOCK_WAIT):
+        if topology.of_repro(target) == topology.KUBERNETES:
+            # Deliberately BELOW the confirmation, the ownership gate and the audit
+            # record: all three are about whose data is being destroyed, which does
+            # not depend on the runtime, and duplicating them here is how one
+            # runtime quietly loses a check the other keeps. Inside the lock for
+            # the same reason compose is.
+            #
+            # Without this dispatch, `down` reached for a compose project that is
+            # not there and answered "no configuration file provided: not found" --
+            # a workspace that could be CREATED and never removed, which is worse
+            # than not being able to create one.
+            from rc_repro.services import k8s
+            meta = runner.read_meta(target)
+            context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
+            pid = (meta.extra or {}).get("port_forward_pid")
+            if pid:
+                _stop_port_forward(int(pid))
+            found = k8s.delete_namespace(target, context=context, volumes=volumes,
+                                         emit=emit)
+            if volumes:
+                shutil.rmtree(runner.workspace(target), ignore_errors=True)
+                _clear_default_if(target)
+            info(emit, f"{target!r} "
+                       f"{'removed' if volumes else 'down (data kept)'}",
+                 phase="done")
+            return {"name": target, "removed": volumes, "found": found,
+                    "runtime": topology.KUBERNETES}
         # BEFORE `down`, not after: compose cannot remove a network that still has
         # an active endpoint, and the edge attached to it is exactly that -- so
         # leaving it attached makes `down` fail with "network has active
@@ -1594,6 +1625,7 @@ def prunable() -> list[str]:
     """Names of repros that are safe to prune: not pinned and with no containers
     (a plain `down`). Raises DockerError if docker can't be queried — deleting on
     that ambiguity would be destructive."""
+
     require_docker()
     states = runner.project_states()
     if states is None:
@@ -1703,3 +1735,37 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     info(emit, f"{root}  admin / {config.ADMIN_PASSWORD}", phase="done", pct=100)
     return {"name": repro_name, "meta": asdict(meta), "url": root,
             "reused": False, "runtime": topology.KUBERNETES}
+
+
+def _stop_port_forward(pid: int) -> None:
+    """Kill a workspace's port-forward, if it is still ours to kill.
+
+    Best-effort and deliberately narrow: a recorded pid can have been recycled by
+    the OS, so this checks the process is still a kubectl port-forward before
+    signalling it. Killing an unrelated process because a pid was reused is a much
+    worse failure than leaving a dead forward recorded.
+    """
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return
+    if "port-forward" not in cmdline:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def kubernetes_state(name: str, meta) -> str:
+    """`running` / `down` for a Kubernetes workspace.
+
+    `repro_state()` asks docker whether the project's containers exist, so it called
+    a live Kubernetes workspace `down` -- the state column was reporting on the
+    wrong runtime entirely.
+    """
+    from rc_repro.services import k8s
+    context = str((getattr(meta, "extra", None) or {}).get("context") or k8s.CONTEXT)
+    if k8s.namespace_for(name) not in k8s.workspace_namespaces(context):
+        return "down"
+    return "running" if k8s.workspace_ready(name, context=context) else "starting"

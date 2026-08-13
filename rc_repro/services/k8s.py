@@ -744,6 +744,14 @@ metadata:
 {label_yaml}
 spec:
   clusterIP: None
+  # The same circular dependency as the readiness probe, one layer down. A headless
+  # Service does NOT publish DNS for a not-ready pod, and this pod cannot be ready
+  # until the replica set is initiated -- so `rs.initiate` could not resolve
+  # `{MONGO_SERVICE}-0.{MONGO_SERVICE}` to check the member is itself, and mongod
+  # refused with "no host described in new configuration ... maps to this node".
+  # Publishing not-ready addresses is the standard bootstrap pattern for a
+  # StatefulSet database; the MongoDB operator does the same.
+  publishNotReadyAddresses: true
   selector:
     app: {MONGO_SERVICE}
   ports:
