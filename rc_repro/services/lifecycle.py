@@ -1155,6 +1155,14 @@ def _up(name: str, *, pull: bool, emit: Emit, stream_output: bool) -> int:
 # --- readiness / finalize -----------------------------------------------------
 
 def wait_serving(meta: runner.Metadata, emit: Emit, timeout: float) -> dict:
+    if topology.of_meta(meta) == topology.KUBERNETES:
+        # `rc_state` asks docker whether a CONTAINER is running, so `ready` on a
+        # Kubernetes workspace answered "Rocket.Chat container is not running" about
+        # a workspace whose pods were fine. It also re-establishes the port-forward,
+        # which is the whole reason `ready` is the right place to ask: a forward
+        # dies with its pod, and this is the command someone runs when the URL is
+        # not answering.
+        return _wait_serving_kubernetes(meta, emit, timeout)
     seen = {"restarts": 0}
 
     def is_alive() -> bool:
@@ -1855,9 +1863,18 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     ws.mkdir(parents=True, exist_ok=True)
     runner.atomic_write(ws / "repro.json",
                         json.dumps(asdict(meta), indent=2))
+    # --wait and --seed were ignored here, so `up --seed` ran the seeder the instant
+    # helm returned and failed with "can't seed - repro not ready". The CLI already
+    # forces wait=True when seeding; this path simply never read it.
+    result = {"name": repro_name, "meta": asdict(meta), "url": root,
+              "reused": reused, "runtime": topology.KUBERNETES}
+    if req.wait or req.seed:
+        wait_serving(meta, emit, timeout=600.0)
+        result["ready"] = True
+    if req.seed:
+        result["seed"] = run_seed_inline(meta, req.seed_profile, req.stats, emit)
     info(emit, f"{root}  admin / {config.ADMIN_PASSWORD}", phase="done", pct=100)
-    return {"name": repro_name, "meta": asdict(meta), "url": root,
-            "reused": reused, "runtime": topology.KUBERNETES}
+    return result
 
 
 def _stop_port_forward(pid: int) -> None:
@@ -1898,3 +1915,44 @@ def kubernetes_state(name: str, meta) -> str:
     if not k8s.workload_exists(name, context=context):
         return "down"
     return "running" if k8s.workspace_ready(name, context=context) else "starting"
+
+
+def _wait_serving_kubernetes(meta: runner.Metadata, emit: Emit,
+                             timeout: float) -> dict:
+    """Wait for a Kubernetes workspace to serve, and make sure it is reachable.
+
+    Two jobs, because on this runtime they are different questions. The pod being
+    Ready is Kubernetes' answer; the URL answering also needs a live port-forward,
+    and a forward dies with its pod. `ready` is exactly when someone asks "why is
+    the URL not answering", so it re-establishes one rather than reporting a
+    healthy workspace the caller still cannot reach.
+    """
+    import time as _time
+
+    from rc_repro.services import k8s
+
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    context = str(extra.get("context") or k8s.CONTEXT)
+    namespace = str(extra.get("namespace") or k8s.namespace_for(meta.name))
+    deadline = _time.monotonic() + timeout
+    last = 0.0
+    while _time.monotonic() < deadline:
+        if k8s.workspace_ready(meta.name, context=context):
+            pid = k8s.ensure_port_forward(
+                meta.name, namespace=namespace, context=context,
+                host_port=meta.host_port, pid=extra.get("port_forward_pid"),
+                bind_host=str(extra.get("bind_host") or ""), emit=emit)
+            if pid and pid != extra.get("port_forward_pid"):
+                runner.update_meta(meta.name,
+                                   lambda m: m.extra.update({"port_forward_pid": pid}))
+            info(emit, f"{meta.name!r} is serving at {meta.root_url}",
+                 phase="ready", pct=100)
+            return {"ready": True, "url": meta.root_url}
+        now = _time.monotonic()
+        if now - last > 15:
+            last = now
+            info(emit, f"waiting for Rocket.Chat in {namespace}", phase="wait")
+        _time.sleep(3.0)
+    raise NotReadyError(
+        f"Rocket.Chat did not become ready within {int(timeout)}s. "
+        f"kubectl -n {namespace} get pods")

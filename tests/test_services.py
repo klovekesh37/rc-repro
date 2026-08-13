@@ -3135,3 +3135,74 @@ def test_a_workspace_comes_back_on_the_port_it_left_on(monkeypatch, tmp_path):
     lc._create_kubernetes(lc.CreateReq(version="8.5.1", name="k", port=3999,
                                        runtime=topology.KUBERNETES))
     assert seen["host_port"] == 3999
+
+
+def test_up_waits_before_seeding_a_kubernetes_workspace(monkeypatch, tmp_path):
+    """`up --seed` ran the seeder the instant helm returned:
+
+        error: can't seed — repro not ready (`rc-repro ready --name rc8-5-1`)
+
+    The CLI already forces wait=True when seeding -- `wait=(wait or seed)` -- and
+    this path never read it. Helm returning is not Rocket.Chat serving.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    order: list = []
+    monkeypatch.setattr(lc, "check_capacity", lambda *a, **kw: None)
+    monkeypatch.setattr(lc, "pick_host_port", lambda *a, **kw: 3000)
+    monkeypatch.setattr(lc.versions, "resolve", lambda v, offline=False: type(
+        "R", (), {"rc_version": v, "mongo_tag": "8.0", "rc_image": "img",
+                  "mongo_flavor": "official", "oplog": False, "source": "t"})())
+    monkeypatch.setattr(k8s, "create_workspace", lambda **kw: {
+        "context": k8s.CONTEXT, "namespace": "rc-repro-k", "chart_version": "7.0.0",
+        "release": k8s.RELEASE, "port_forward_pid": 0, "bind_host": "",
+        "microservices": False})
+    monkeypatch.setattr(lc, "wait_serving",
+                        lambda *a, **kw: order.append("wait") or {"ready": True})
+    monkeypatch.setattr(lc, "run_seed_inline",
+                        lambda *a, **kw: order.append("seed") or {"users": 5})
+
+    lc._create_kubernetes(lc.CreateReq(version="8.5.1", name="k", seed=True,
+                                       wait=True, runtime=topology.KUBERNETES))
+    assert order == ["wait", "seed"], f"seeded before it was serving: {order}"
+
+    # And without --seed or --wait it still returns promptly.
+    order.clear()
+    lc._create_kubernetes(lc.CreateReq(version="8.5.1", name="k",
+                                       runtime=topology.KUBERNETES))
+    assert order == []
+
+
+def test_ready_asks_kubernetes_not_docker(monkeypatch, tmp_path):
+    """`rc-repro ready` answered "Rocket.Chat container is not running (check
+    `logs`)" about a workspace whose pods were perfectly healthy -- `rc_state` asks
+    docker whether a CONTAINER runs.
+
+    It also re-establishes the port-forward, because `ready` is exactly the command
+    someone runs when the URL is not answering, and a forward dies with its pod.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="http://localhost:3000",
+                           host_port=3000, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra.update({"context": k8s.CONTEXT, "namespace": "rc-repro-k",
+                    "port_forward_pid": 999999999})
+    lc.runner.write("k", "", m)
+
+    monkeypatch.setattr(lc.runner, "rc_state",
+                        lambda *a, **kw: pytest.fail("it asked docker"))
+    monkeypatch.setattr(k8s, "workspace_ready", lambda *a, **kw: True)
+    established: list = []
+    monkeypatch.setattr(k8s, "ensure_port_forward",
+                        lambda *a, **kw: established.append(kw) or 4242)
+
+    out = lc.wait_serving(m, lc.null_emit, timeout=30.0)
+    assert out["ready"] is True
+    assert established, "ready did not re-establish the forward"
+    # The dead pid must be replaced in the record, or `down` later signals nothing.
+    assert lc.runner.read_meta("k").extra["port_forward_pid"] == 4242
