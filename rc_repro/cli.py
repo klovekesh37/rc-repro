@@ -270,6 +270,7 @@ def up(
     runtime: str = typer.Option("", "--runtime", help="where it runs: docker (default) | kubernetes"),
     deployment: str = typer.Option("", "--deployment", help="how RC is arranged. docker: monolith (default) | multi-instance. kubernetes: microservices (default) | monolith"),
     replicas: int = typer.Option(0, "--replicas", help="Rocket.Chat instances (needs --deployment multi-instance on docker)"),
+    mongo_operator: bool = typer.Option(False, "--mongo-operator", help="kubernetes: manage MongoDB with the official operator (adds SCRAM auth; needs MongoDB 6.0+)"),
     name: str = typer.Option("", "--name", "-n", help="repro name (default: derived)"),
     port: int = typer.Option(0, "--port", help="host port (default: first free >= 3000)"),
     root_url: str = typer.Option("", "--root-url", help="override ROOT_URL"),
@@ -306,6 +307,7 @@ def up(
         wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
         force=force, monitor=monitor, actor=_cli_actor(),
         runtime=runtime, deployment=deployment, replicas=replicas,
+        mongo_operator=mongo_operator,
         https=https, domain=domain, acme_email=email,
         env={**envsvc.parse_set(env or []), **envsvc.as_setting(setting or [])},
     )

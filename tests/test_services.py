@@ -3385,3 +3385,36 @@ def test_the_operator_is_opt_in_until_it_is_proven(monkeypatch):
     assert k8s.operator_enabled()
     assert k8s.operator_supports("8.0")
     assert not k8s.operator_supports("5.0"), "the version floor still applies"
+
+
+def test_the_operator_volume_claims_cover_both_volumes_the_pod_mounts():
+    """The operator's pod mounts `data-volume` AND `logs-volume`, and overriding
+    `volumeClaimTemplates` REPLACES its defaults rather than merging with them.
+
+    Declaring only `data-volume` left the pod referencing a claim no template
+    creates, so it never scheduled -- and the PVC that WAS declared sat Pending
+    forever, because kind's StorageClass is WaitForFirstConsumer and no consumer
+    ever arrived. The symptom named neither volume: "Pending ReplicaSet is not yet
+    ready, retrying in 10 seconds".
+    """
+    import yaml
+
+    from rc_repro.services import k8s
+
+    doc = yaml.safe_load(k8s.mongodb_community_manifest("t", "8.0"))
+    names = [v["metadata"]["name"]
+             for v in doc["spec"]["statefulSet"]["spec"]["volumeClaimTemplates"]]
+    assert names == ["data-volume", "logs-volume"], names
+
+
+def test_asking_for_the_operator_explicitly_satisfies_the_opt_in_but_not_the_floor(
+        monkeypatch):
+    """`--mongo-operator` is the user asking for it, so the opt-in switch is met.
+    The VERSION floor still applies: the operator cannot manage MongoDB 5.0, and
+    silently ignoring the flag would be worse than falling back."""
+    from rc_repro.services import k8s
+
+    monkeypatch.delenv(k8s.USE_OPERATOR_ENV, raising=False)
+    assert not k8s.operator_supports("8.0"), "off by default"
+    assert k8s.operator_supports("8.0", forced=True), "--mongo-operator asks for it"
+    assert not k8s.operator_supports("5.0", forced=True), "the floor still holds"

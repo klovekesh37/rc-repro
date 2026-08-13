@@ -541,6 +541,10 @@ class CreateReq:
     runtime: str = ""
     deployment: str = ""
     replicas: int = 0
+    # Kubernetes only. The operator brings SCRAM auth and owns the MongoDB
+    # bootstrap; it is opt-in because its default would replace a path proven on a
+    # live cluster with one that is not. See services/k8s.py.
+    mongo_operator: bool = False
     # HTTPS. Two ways in, matching the official docs' DOMAIN + LETSENCRYPT_EMAIL:
     #   --domain [+ --email]  a Let's Encrypt certificate for a public hostname
     #   --https               a certificate from rc-repro's own local CA, no domain
@@ -1810,7 +1814,8 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     out = k8s.create_workspace(
         name=repro_name, resolved=resolved, host_port=host_port,
         microservices=microservices, replicas=req.replicas or 1,
-        owner=req.actor, bind_host=bind_host, emit=emit)
+        owner=req.actor, bind_host=bind_host,
+        use_operator=req.mongo_operator, emit=emit)
 
     meta = runner.Metadata(
         name=repro_name, project=out["namespace"], rc_version=resolved.rc_version,

@@ -1222,7 +1222,8 @@ def port_forward(name: str, *, namespace: str, context: str, host_port: int,
 
 def create_workspace(*, name: str, resolved, host_port: int, microservices: bool,
                      replicas: int = 1, owner: str = "", root_url: str = "",
-                     bind_host: str = "", emit: Emit = null_emit) -> dict:
+                     bind_host: str = "", use_operator: bool = False,
+                     emit: Emit = null_emit) -> dict:
     """Build a Kubernetes workspace, and return what repro.json needs.
 
     A PARALLEL path to lifecycle's compose one rather than a refactor of it, which
@@ -1262,7 +1263,8 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
         # versions rc-repro pairs, so the hand-written StatefulSet stays for those.
         mongo_url = MONGO_URL
         oplog_url = MONGO_OPLOG_URL
-        if operator_supports(resolved.mongo_tag):
+        if (use_operator or operator_enabled()) and \
+                operator_supports(resolved.mongo_tag, forced=use_operator):
             ensure_operator(context=context, emit=emit)
             # Generated per workspace, never reused, never written to disk here:
             # the manifest goes to `kubectl apply` on stdin.
@@ -1443,9 +1445,15 @@ def operator_enabled() -> bool:
     return os.environ.get(USE_OPERATOR_ENV, "").strip().lower() in ("1", "true", "yes")
 
 
-def operator_supports(mongo_tag: str) -> bool:
-    """Whether the operator will manage this MongoDB version."""
-    if not operator_enabled():
+def operator_supports(mongo_tag: str, *, forced: bool = False) -> bool:
+    """Whether the operator will manage this MongoDB version.
+
+    `forced` is `--mongo-operator`: the user asked for it explicitly, so the opt-in
+    switch is satisfied and only the VERSION floor still applies. Asking for the
+    operator on MongoDB 5.0 still falls back, because the operator cannot manage it
+    -- silently ignoring the flag would be worse than the fallback.
+    """
+    if not forced and not operator_enabled():
         return False
     try:
         parts = tuple(int(n) for n in str(mongo_tag).split(".")[:2])
@@ -1548,6 +1556,23 @@ spec:
           resources:
             requests:
               storage: {storage_gb}Gi
+      # `logs-volume` as well as `data-volume`. The operator's pod mounts BOTH, and
+      # overriding volumeClaimTemplates replaces its defaults rather than merging
+      # with them -- so declaring only `data-volume` leaves the pod referencing a
+      # claim that no template creates, it never schedules, and the PVC that IS
+      # declared sits Pending forever because kind's StorageClass is
+      # WaitForFirstConsumer and no consumer ever arrives.
+      #
+      # The symptom names neither volume: "Pending ReplicaSet is not yet ready".
+      # The guide shows only data-volume because its example does not override the
+      # template list in a way that drops the other.
+      - metadata:
+          name: logs-volume
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 2Gi
 """
 
 
