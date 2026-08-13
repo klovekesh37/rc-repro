@@ -264,6 +264,31 @@ def run(argv: list[str], *, timeout: float = PROBE_TIMEOUT,
                                            stderr=str(exc))
 
 
+def why(res, *, limit: int = 400) -> str:
+    """The line that explains a failure, not the first 400 characters of noise.
+
+    Written after a `helm install` failure reported two harmless warnings and hid
+    its own reason. Every tool here puts its diagnostics FIRST and its error LAST --
+    helm emits klog warnings then `Error: ...`, kubectl emits deprecation notices
+    then the message -- so taking a prefix reliably shows the least useful part.
+
+    Prefers a line that announces itself as an error; falls back to the last
+    non-empty line, which is where these tools put it.
+    """
+    text = f"{getattr(res, 'stderr', '') or ''}\n{getattr(res, 'stdout', '') or ''}"
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return "no reason given"
+    named = [ln for ln in lines
+             if re.match(r"^(error|Error|ERROR|fatal|Fatal)\b", ln)
+             or "error:" in ln.lower()]
+    # Warnings are not errors, however loudly they are printed. klog prefixes them
+    # with I/W and a timestamp, and helm's install failure sits after them.
+    named = [ln for ln in named if not re.match(r"^[IWD]\d{4} ", ln)]
+    chosen = named[-1] if named else lines[-1]
+    return chosen[:limit]
+
+
 def _parse_version(text: str) -> tuple[int, ...]:
     """First dotted number in a version string, as a tuple.
 
@@ -304,8 +329,7 @@ def clusters() -> tuple[list[str], str]:
     """
     res = run(["kind", "get", "clusters"], own=True)
     if res.returncode != 0:
-        detail = (res.stderr or res.stdout or "").strip().splitlines()
-        return [], (detail[0][:120] if detail else "kind could not list clusters")
+        return [], why(res, limit=120)
     return [ln.strip() for ln in (res.stdout or "").splitlines()
             if ln.strip() and "No kind clusters" not in ln], ""
 
@@ -548,10 +572,9 @@ def ensure_cluster(emit: Emit = null_emit) -> str:
                 # A create that lost a race to something not holding this lock
                 # (a manual `kind create`) is success, not failure.
                 if "already exist" not in combined:
-                    detail = (res.stderr or res.stdout or "").strip().splitlines()
                     raise CreateFailedError(
                         f"could not create the cluster {CLUSTER_NAME}: "
-                        + (detail[-1][:200] if detail else "kind gave no reason"))
+                        + why(res))
     # ALWAYS export, not only after creating. `kind get clusters` reads Docker, so
     # it sees a cluster that rc-repro's OWN kubeconfig knows nothing about -- which
     # happens whenever the cluster outlives the kubeconfig: a different or fresh
@@ -567,7 +590,7 @@ def ensure_cluster(emit: Emit = null_emit) -> str:
     if export.returncode != 0:
         raise CreateFailedError(
             f"cluster {CLUSTER_NAME} exists but its kubeconfig could not be read: "
-            + (export.stderr or export.stdout or "").strip()[:200])
+            + why(export))
     context = cluster_context()
     if not reachable(context):
         raise CreateFailedError(
@@ -607,9 +630,8 @@ def delete_cluster(*, force: bool = False, emit: Emit = null_emit) -> bool:
         res = run(["kind", "delete", "cluster", "--name", CLUSTER_NAME],
                   timeout=DELETE_TIMEOUT, own=True)
         if res.returncode != 0:
-            detail = (res.stderr or res.stdout or "").strip().splitlines()
             raise DockerError(f"could not delete the cluster {CLUSTER_NAME}: "
-                              + (detail[-1][:200] if detail else "kind gave no reason"))
+                              + why(res))
     return True
 
 
@@ -677,7 +699,7 @@ def ensure_repo(emit: Emit = null_emit) -> None:
     if res.returncode != 0:
         raise CreateFailedError(
             "could not read the Rocket.Chat chart repository "
-            f"({HELM_REPO_URL}): " + (res.stderr or res.stdout or "").strip()[:200])
+            f"({HELM_REPO_URL}): " + why(res))
 
 
 def _version_key(text: str) -> tuple:
@@ -707,7 +729,7 @@ def resolve_chart_version(rc_version: str, emit: Emit = null_emit) -> str:
               timeout=APPLY_TIMEOUT, own=True)
     if res.returncode != 0:
         raise CreateFailedError("could not read the Rocket.Chat chart index: "
-                                + (res.stderr or res.stdout or "").strip()[:200])
+                                + why(res))
     try:
         entries = json.loads(res.stdout or "[]")
     except ValueError as exc:
@@ -920,7 +942,7 @@ def ensure_namespace(name: str, *, context: str, owner: str = "",
     if res.returncode != 0:
         raise CreateFailedError(
             f"could not label namespace {ns}: "
-            + (res.stderr or res.stdout or "").strip()[:200]
+            + why(res)
             + " — without the label it would be invisible to teardown")
     info(emit, f"namespace {ns}", phase="provision")
     return ns
@@ -937,7 +959,7 @@ def apply(manifest: str, *, namespace: str, context: str) -> None:
         raise DockerError(f"kubectl apply failed: {exc}") from exc
     if res.returncode != 0:
         raise CreateFailedError("kubectl apply failed: "
-                                + (res.stderr or res.stdout or "").strip()[:300])
+                                + why(res))
 
 
 def install(*, namespace: str, context: str, values: dict,
@@ -959,7 +981,7 @@ def install(*, namespace: str, context: str, values: dict,
         raise DockerError(f"helm install failed: {exc}") from exc
     if res.returncode != 0:
         raise CreateFailedError("helm install failed: "
-                                + (res.stderr or res.stdout or "").strip()[:400])
+                                + why(res))
 
 
 def delete_namespace(name: str, *, context: str, volumes: bool = False,
@@ -992,7 +1014,7 @@ def delete_namespace(name: str, *, context: str, volumes: bool = False,
                    "--wait=false"], timeout=APPLY_TIMEOUT, own=own)
         if res.returncode != 0:
             raise DockerError(f"could not delete namespace {ns}: "
-                              + (res.stderr or res.stdout or "").strip()[:200])
+                              + why(res))
         for attempt in range(NS_GONE_TRIES):
             check = run(["kubectl", "--context", context, "get", "namespace", ns,
                          "-o", "jsonpath={.status.phase}"], own=own)
@@ -1126,7 +1148,7 @@ def init_replica_set(*, namespace: str, context: str, emit: Emit = null_emit,
     if (ok.stdout or "").strip() != "1":
         raise CreateFailedError(
             "the MongoDB replica set is not initiated, so Rocket.Chat's change "
-            "streams cannot work: " + (ok.stdout or ok.stderr or "").strip()[:300])
+            "streams cannot work: " + why(ok))
     info(emit, "replica set ready", phase="boot")
 
 

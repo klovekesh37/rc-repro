@@ -2916,3 +2916,36 @@ def test_the_admin_and_the_setup_wizard_reach_a_kubernetes_workspace():
     # reads one next.
     assert env["DEPLOY_METHOD"] == "helm"
     assert env["DEPLOY_PLATFORM"] == "kubernetes"
+
+
+def test_a_failure_reports_its_reason_not_the_warnings_printed_before_it():
+    """A real `helm install` failure surfaced two harmless duplicate-port warnings
+    and hid its own reason, because the message took the FIRST 400 characters of
+    stderr.
+
+    Every tool here prints diagnostics first and its error last -- helm emits klog
+    warnings then `Error: ...`, kubectl emits deprecation notices then the message --
+    so a prefix reliably shows the least useful part. Warnings are not errors,
+    however loudly they are printed.
+    """
+    import subprocess as sp
+
+    from rc_repro.services import k8s
+
+    noisy = sp.CompletedProcess([], 1, "", (
+        'I0813 18:03:17.247875 477232 warnings.go:107] "Warning: '
+        'spec.template.spec.containers[2].ports[0]: duplicate port definition"\n'
+        'I0813 18:03:17.247897 477232 warnings.go:107] "Warning: duplicate port '
+        'name \\"metrics\\""\n'
+        "Error: INSTALLATION FAILED: cannot re-use a name that is still in use"))
+    got = k8s.why(noisy)
+    assert "cannot re-use a name" in got, got
+    assert "warnings.go" not in got, "a warning was reported as the failure"
+
+    # No self-announcing error line: the last line is where these tools put it.
+    assert k8s.why(sp.CompletedProcess([], 1, "", "connection refused")) == \
+        "connection refused"
+    # Nothing at all still says something, rather than an empty message.
+    assert k8s.why(sp.CompletedProcess([], 1, "", "")) == "no reason given"
+    # stdout is consulted too -- kubectl puts some failures there.
+    assert "boom" in k8s.why(sp.CompletedProcess([], 1, "boom", ""))
