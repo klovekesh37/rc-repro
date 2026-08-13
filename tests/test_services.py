@@ -2460,6 +2460,9 @@ def test_a_failed_create_leaves_no_namespace_nobody_can_see(monkeypatch, tmp_pat
     monkeypatch.setattr(k8s, "run", spy)
     monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
     monkeypatch.setattr(k8s, "apply", lambda *a, **k: None)
+    # Mongo 8.0 takes the operator path; without these the wait polls a real clock.
+    monkeypatch.setattr(k8s, "ensure_operator", lambda **k: None)
+    monkeypatch.setattr(k8s, "wait_for_mongodb", lambda **k: None)
     monkeypatch.setattr(k8s, "install",
                         lambda **k: (_ for _ in ()).throw(
                             errors.CreateFailedError("helm exploded")))
@@ -2656,6 +2659,8 @@ def test_a_url_is_only_printed_once_the_forward_is_confirmed_alive(monkeypatch, 
     monkeypatch.setattr(k8s, "ensure_namespace", lambda n, **k: f"rc-repro-{n}")
     monkeypatch.setattr(k8s, "apply", lambda *a, **k: None)
     monkeypatch.setattr(k8s, "init_replica_set", lambda **k: None)
+    monkeypatch.setattr(k8s, "ensure_operator", lambda **k: None)
+    monkeypatch.setattr(k8s, "wait_for_mongodb", lambda **k: None)
     monkeypatch.setattr(k8s, "install", lambda **k: None)
     monkeypatch.setattr(k8s, "clusters", lambda: ([k8s.CLUSTER_NAME], ""))
     monkeypatch.setattr(k8s, "port_forward", lambda *a, **k: 999999999)  # dead pid
@@ -2769,6 +2774,8 @@ def test_a_failed_recreate_never_destroys_data_that_down_promised_to_keep(
     monkeypatch.setattr(k8s, "ensure_namespace", lambda n, **kw: f"rc-repro-{n}")
     monkeypatch.setattr(k8s, "apply", lambda *a, **kw: None)
     monkeypatch.setattr(k8s, "init_replica_set", lambda **kw: None)
+    monkeypatch.setattr(k8s, "ensure_operator", lambda **kw: None)
+    monkeypatch.setattr(k8s, "wait_for_mongodb", lambda **kw: None)
     monkeypatch.setattr(k8s, "clusters", lambda: ([k8s.CLUSTER_NAME], ""))
     monkeypatch.setattr(k8s, "install", lambda **kw: (_ for _ in ()).throw(
         errors.CreateFailedError("helm exploded")))
@@ -3250,3 +3257,82 @@ def test_every_compose_only_command_refuses_with_a_way_forward(monkeypatch, tmp_
     topology.stamp(plain.extra, topology.DOCKER)
     lc.runner.write("d", "services: {}\n", plain)
     topology.require_compose("d", "backup")     # silent
+
+
+def test_mongodb_uses_the_operator_where_it_can_and_the_statefulset_where_it_cannot(
+        monkeypatch, tmp_path):
+    """Keyed on the MongoDB VERSION, which is the shape `mongo_flavor` already uses
+    on the Compose side ("official" >= 8, "bitnami-legacy" below).
+
+    rc-repro pairs twelve MongoDB versions -- 3.0 through 8.2 -- because "the
+    customer's exact version" is the product's promise, and the operator's window
+    does not reach the old half. So this is not operator-or-StatefulSet; it is
+    operator where it works, StatefulSet where it must, decided by one rule.
+    """
+    from rc_repro.services import k8s
+
+    for old in ("3.6", "4.4", "5.0"):
+        assert not k8s.operator_supports(old), old
+    for new in ("6.0", "7.0", "8.0", "8.2"):
+        assert k8s.operator_supports(new), new
+    assert not k8s.operator_supports("nonsense")
+
+
+def test_the_operator_resource_asks_for_scram_and_the_two_documented_users():
+    """Auth was the gap the operator is being adopted for: without it an
+    authentication ticket cannot be reproduced on Kubernetes at all. Users, roles
+    and secret names match the official guide so its commands transfer."""
+    import yaml
+
+    from rc_repro.services import k8s
+
+    doc = yaml.safe_load(k8s.mongodb_community_manifest("t", "8.0"))
+    assert doc["kind"] == "MongoDBCommunity"
+    assert doc["spec"]["type"] == "ReplicaSet" and doc["spec"]["members"] == 1
+    assert doc["spec"]["security"]["authentication"]["modes"] == ["SCRAM"]
+    users = {u["name"]: u for u in doc["spec"]["users"]}
+    assert users["admin"]["roles"][0]["name"] == "root"
+    assert users["rocketchat"]["roles"][0]["name"] == "readWrite"
+    assert users["rocketchat"]["scramCredentialsSecretName"] == \
+        "rocketchat-scram-credentials"
+    # The volume survives, as it does on the hand-written path.
+    assert doc["spec"]["statefulSet"]["spec"]["volumeClaimTemplates"][0][
+        "spec"]["resources"]["requests"]["storage"].endswith("Gi")
+
+
+def test_the_operator_is_installed_once_per_cluster_not_once_per_workspace(
+        monkeypatch, tmp_path):
+    """The guide installs the operator INTO the Rocket.Chat namespace, because it
+    assumes one Rocket.Chat per cluster. Its CRDs are cluster-scoped, so a second
+    per-namespace install collides on them rather than yielding a second operator --
+    which is exactly what a tool running several workspaces at once would hit.
+
+    So: one install, its own namespace, watching all of them.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    seen: list = []
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: seen.append(" ".join(argv)) or
+                        __import__("subprocess").CompletedProcess(argv, 0, "", ""))
+    k8s.ensure_operator(context=k8s.CONTEXT)
+    install = [c for c in seen if "upgrade --install" in c][0]
+    assert f"-n {k8s.OPERATOR_NAMESPACE}" in install, install
+    assert "rc-repro-" not in install.split("-n ")[1].split()[0].replace(
+        k8s.OPERATOR_NAMESPACE, ""), "it went into a workspace namespace"
+    assert "operator.watchNamespace=*" in install, "it would not see other namespaces"
+    # Idempotent: every workspace after the first re-runs this.
+    assert "upgrade --install" in install
+
+
+def test_the_mongo_uri_carries_credentials_and_the_operator_service_name():
+    """The operator names its service `<name>-svc`, not `<name>` -- the two are not
+    interchangeable, and the hand-written path uses the bare name."""
+    from rc_repro.services import k8s
+
+    uri = k8s.operator_mongo_url("rc-repro-t", "s3cret")
+    assert "rocketchat:s3cret@" in uri
+    assert "mongodb-0.mongodb-svc.rc-repro-t.svc.cluster.local" in uri
+    assert "authSource=rocketchat" in uri and "replicaSet=mongodb" in uri
+    # The oplog URI points at `local` and needs no authSource.
+    assert "/local?" in k8s.operator_mongo_url("rc-repro-t", "s3cret", oplog=True)

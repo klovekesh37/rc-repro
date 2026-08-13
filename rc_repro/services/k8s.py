@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import time
@@ -872,7 +873,8 @@ def split_image(rc_image: str, rc_version: str) -> tuple[str, str]:
 
 
 def values_for(*, rc_version: str, rc_image: str, microservices: bool,
-               replicas: int = 1, root_url: str = "", oplog: bool = False) -> dict:
+               replicas: int = 1, root_url: str = "", oplog: bool = False,
+               mongo_url: str = "", oplog_url: str = "") -> dict:
     """Chart values for one workspace.
 
     MongoDB is ALWAYS external, never the chart's bundled subchart. PR #3's reason
@@ -922,12 +924,12 @@ def values_for(*, rc_version: str, rc_image: str, microservices: bool,
         "replicaCount": max(1, int(replicas or 1)),
         "microservices": {"enabled": bool(microservices)},
         "mongodb": {"enabled": False},
-        "externalMongodbUrl": MONGO_URL,
+        "externalMongodbUrl": mongo_url or MONGO_URL,
         "extraEnv": env,
     }
     if oplog:
         # Rocket.Chat below 8.x still wants the oplog URL; 8.x deprecates it.
-        values["externalMongodbOplogUrl"] = MONGO_OPLOG_URL
+        values["externalMongodbOplogUrl"] = oplog_url or MONGO_OPLOG_URL
     if root_url:
         values["host"] = root_url
     return values
@@ -1253,16 +1255,42 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
     had_namespace = namespace_for(name) in workspace_namespaces(context)
     namespace = ensure_namespace(name, context=context, owner=owner, emit=emit)
     try:
-        info(emit, f"MongoDB {resolved.mongo_tag}, {MONGO_VOLUME_GB}Gi volume",
-             phase="provision", pct=20)
-        apply(mongo_manifest(name, resolved.mongo_tag, owner=owner),
-              namespace=namespace, context=context)
-        init_replica_set(namespace=namespace, context=context, emit=emit)
+        # Which MongoDB, keyed on the VERSION -- the same shape `mongo_flavor`
+        # already uses on the Compose side ("official" >= 8, "bitnami-legacy"
+        # below). The operator brings SCRAM auth and owns the bootstrap that cost
+        # four live failures by hand; it does not reach the old half of the twelve
+        # versions rc-repro pairs, so the hand-written StatefulSet stays for those.
+        mongo_url = MONGO_URL
+        oplog_url = MONGO_OPLOG_URL
+        if operator_supports(resolved.mongo_tag):
+            ensure_operator(context=context, emit=emit)
+            # Generated per workspace, never reused, never written to disk here:
+            # the manifest goes to `kubectl apply` on stdin.
+            app_password = secrets.token_urlsafe(24)
+            info(emit, f"MongoDB {resolved.mongo_tag} via the operator, SCRAM auth, "
+                       f"{MONGO_VOLUME_GB}Gi volume", phase="provision", pct=20)
+            apply(mongo_secret_manifest(name, admin_password=secrets.token_urlsafe(24),
+                                        app_password=app_password, owner=owner),
+                  namespace=namespace, context=context)
+            apply(mongodb_community_manifest(name, resolved.mongo_tag, owner=owner),
+                  namespace=namespace, context=context)
+            wait_for_mongodb(namespace=namespace, context=context, emit=emit)
+            mongo_url = operator_mongo_url(namespace, app_password)
+            oplog_url = operator_mongo_url(namespace, app_password, oplog=True)
+        else:
+            info(emit, f"MongoDB {resolved.mongo_tag}, {MONGO_VOLUME_GB}Gi volume "
+                       "(no operator below "
+                       f"{'.'.join(str(n) for n in OPERATOR_MIN_MONGO)}, so no auth)",
+                 phase="provision", pct=20)
+            apply(mongo_manifest(name, resolved.mongo_tag, owner=owner),
+                  namespace=namespace, context=context)
+            init_replica_set(namespace=namespace, context=context, emit=emit)
 
         values = values_for(rc_version=resolved.rc_version,
                             rc_image=resolved.rc_image,
                             microservices=microservices, replicas=replicas,
-                            root_url=root_url, oplog=resolved.oplog)
+                            root_url=root_url, oplog=resolved.oplog,
+                            mongo_url=mongo_url, oplog_url=oplog_url)
         info(emit, f"installing {CHART} as {RELEASE}", phase="boot", pct=60)
         install(namespace=namespace, context=context, values=values,
                 chart_version=chart_version)
@@ -1365,3 +1393,182 @@ def workload_exists(name: str, *, context: str) -> bool:
                "get", "deployment", f"{RELEASE}-rocketchat", "-o", "name"],
               own=is_ours(context))
     return res.returncode == 0 and bool((res.stdout or "").strip())
+
+
+# --- MongoDB via the official operator -------------------------------------------
+
+#: The operator lives ONCE per cluster, in rc-repro's own namespace, watching all
+#: namespaces. The official guide installs it into the workspace namespace because
+#: it assumes one Rocket.Chat per cluster; its CRDs are cluster-scoped, so a second
+#: per-namespace install collides on them rather than giving you a second operator.
+OPERATOR_NAMESPACE = "rc-repro-system"
+OPERATOR_RELEASE = "mongodb-kubernetes-operator"
+OPERATOR_REPO = "mongodb"
+OPERATOR_REPO_URL = "https://mongodb.github.io/helm-charts"
+OPERATOR_CHART = f"{OPERATOR_REPO}/mongodb-kubernetes"
+
+#: The oldest MongoDB the operator will manage. Below this rc-repro falls back to
+#: the hand-written StatefulSet, which is why that code stays: rc-repro pairs twelve
+#: MongoDB versions (3.0 through 8.2) because "the customer's exact version" is the
+#: product's promise, and the operator's window does not reach the old half.
+#:
+#: 6.0 is deliberately conservative and SHOULD BE VERIFIED against the operator's own
+#: documentation before anyone relies on the boundary -- picking it too low means a
+#: workspace that never starts, which is a worse failure than falling back.
+OPERATOR_MIN_MONGO = (6, 0)
+
+#: SCRAM users, matching the guide's names so its commands transfer.
+MONGO_ADMIN_USER = "admin"
+MONGO_APP_USER = "rocketchat"
+MONGO_APP_DB = "rocketchat"
+
+
+def operator_supports(mongo_tag: str) -> bool:
+    """Whether the operator will manage this MongoDB version."""
+    try:
+        parts = tuple(int(n) for n in str(mongo_tag).split(".")[:2])
+    except (ValueError, TypeError):
+        return False
+    return len(parts) == 2 and parts >= OPERATOR_MIN_MONGO
+
+
+def mongo_secret_manifest(name: str, *, admin_password: str, app_password: str,
+                          owner: str = "") -> str:
+    """The guide's five Secrets, with generated passwords rather than placeholders.
+
+    `stringData` so Kubernetes does the base64; writing it ourselves is one more
+    place to get wrong. The passwords never touch disk on this side -- the manifest
+    goes to `kubectl apply` on stdin.
+    """
+    labels = _labels(name, owner)
+    lab = "\n".join(f"    {k}: {v}" for k, v in labels.items())
+    def secret(sname: str, data: dict) -> str:
+        body = "\n".join(f"  {k}: {v}" for k, v in data.items())
+        return (f"---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: {sname}\n"
+                f"  labels:\n{lab}\ntype: Opaque\nstringData:\n{body}\n")
+    return "".join([
+        secret("mongodb-admin-password", {"password": admin_password}),
+        secret("mongodb-rocketchat-password", {"password": app_password}),
+        secret("admin-scram-credentials",
+               {"username": MONGO_ADMIN_USER, "password": admin_password}),
+        secret("rocketchat-scram-credentials",
+               {"username": MONGO_APP_USER, "password": app_password}),
+    ])
+
+
+def mongodb_community_manifest(name: str, tag: str, *, owner: str = "",
+                               storage_gb: int = MONGO_VOLUME_GB) -> str:
+    """The guide's MongoDBCommunity resource.
+
+    `type: ReplicaSet` with `members: 1` is what makes this worth doing: the
+    operator owns initiation, readiness and the bootstrap DNS -- the three things
+    that produced four separate live failures when this module did them by hand.
+    """
+    labels = _labels(name, owner)
+    lab = "\n".join(f"    {k}: {v}" for k, v in labels.items())
+    return f"""apiVersion: mongodbcommunity.mongodb.com/v1
+kind: MongoDBCommunity
+metadata:
+  name: {MONGO_SERVICE}
+  labels:
+{lab}
+spec:
+  members: 1
+  type: ReplicaSet
+  version: "{tag}"
+  security:
+    authentication:
+      modes: ["SCRAM"]
+    tls:
+      enabled: false
+  users:
+  - name: {MONGO_ADMIN_USER}
+    db: admin
+    passwordSecretRef:
+      name: mongodb-admin-password
+    scramCredentialsSecretName: admin-scram-credentials
+    roles:
+    - name: root
+      db: admin
+  - name: {MONGO_APP_USER}
+    db: {MONGO_APP_DB}
+    passwordSecretRef:
+      name: mongodb-rocketchat-password
+    scramCredentialsSecretName: rocketchat-scram-credentials
+    roles:
+    - name: readWrite
+      db: {MONGO_APP_DB}
+  statefulSet:
+    spec:
+      volumeClaimTemplates:
+      - metadata:
+          name: data-volume
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: {storage_gb}Gi
+"""
+
+
+def operator_mongo_url(namespace: str, password: str, *, oplog: bool = False) -> str:
+    """The authenticated URI, built as the guide builds it.
+
+    The operator names its service `<name>-svc`, not `<name>` -- a detail worth
+    stating, because the hand-written path uses the bare name and the two are not
+    interchangeable.
+    """
+    db = "local" if oplog else MONGO_APP_DB
+    auth = "" if oplog else f"&authSource={MONGO_APP_DB}"
+    return (f"mongodb://{MONGO_APP_USER}:{password}@"
+            f"{MONGO_SERVICE}-0.{MONGO_SERVICE}-svc.{namespace}.svc.cluster.local:27017/"
+            f"{db}?replicaSet={MONGO_SERVICE}{auth}")
+
+
+def ensure_operator(*, context: str, emit: Emit = null_emit) -> None:
+    """Install the MongoDB operator once for the cluster, watching all namespaces.
+
+    Cluster-scoped by necessity, not by preference: the chart manages CRDs, and CRDs
+    are not namespaced. Installing it per workspace collides on them at the second
+    workspace, which is why the guide's placement -- inside the Rocket.Chat namespace
+    -- cannot be followed literally by a tool that runs several at once.
+
+    `upgrade --install` so a cluster that already has it is not an error, which is
+    every workspace after the first.
+    """
+    run(["helm", "repo", "add", OPERATOR_REPO, OPERATOR_REPO_URL, "--force-update"],
+        timeout=APPLY_TIMEOUT, own=is_ours(context))
+    run(["helm", "repo", "update", OPERATOR_REPO], timeout=APPLY_TIMEOUT,
+        own=is_ours(context))
+    info(emit, f"MongoDB operator in {OPERATOR_NAMESPACE} (once per cluster)",
+         phase="provision", pct=15)
+    res = run(["helm", "upgrade", "--install", OPERATOR_RELEASE, OPERATOR_CHART,
+               "--kube-context", context, "-n", OPERATOR_NAMESPACE,
+               "--create-namespace", "--set", "operator.watchNamespace=*",
+               "--wait", "--timeout", "5m"],
+              timeout=INSTALL_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        raise CreateFailedError("could not install the MongoDB operator: " + why(res))
+
+
+def wait_for_mongodb(*, namespace: str, context: str, emit: Emit = null_emit,
+                     sleep=time.sleep) -> None:
+    """Wait for the operator to report the MongoDBCommunity Running.
+
+    The operator owns initiation and readiness, so this asks IT rather than poking
+    mongod -- which is the whole point of using it. `.status.phase` is the resource's
+    own answer; there is no exec, no rs.initiate and no readiness probe to race.
+    """
+    for attempt in range(MONGO_READY_TRIES):
+        res = run(["kubectl", "--context", context, "-n", namespace, "get",
+                   "mongodbcommunity", MONGO_SERVICE, "-o",
+                   "jsonpath={.status.phase}"], own=is_ours(context))
+        if (res.stdout or "").strip() == "Running":
+            info(emit, "MongoDB ready (operator-managed, SCRAM)", phase="boot")
+            return
+        if attempt % 6 == 0:
+            info(emit, "waiting for the operator to bring MongoDB up", phase="wait")
+        sleep(MONGO_READY_INTERVAL)
+    raise CreateFailedError(
+        "the operator did not bring MongoDB up. "
+        f"kubectl -n {namespace} describe mongodbcommunity {MONGO_SERVICE}")
