@@ -202,6 +202,12 @@ def create(name: str, *, out: str = "", note: str = "", live: bool = False,
     keyword of its own, so a service function taking one can never be submitted as
     a job with its note set.
     """
+    from rc_repro.services import topology
+    # No Kubernetes path yet. Reaching for the compose project answers
+    # "no configuration file provided", which names nothing a user can act
+    # on -- so this refuses and hands over the command that does the job.
+    topology.require_compose(name, "backup",
+                             instead="mongodump through kubectl is not wired yet: `kubectl -n rc-repro-{t} exec mongodb-0 -- mongodump --archive` .".replace("{t}", name))
     lifecycle.require_docker()
     target = lifecycle.resolve_name(name)
     with runner.repro_lock(target):

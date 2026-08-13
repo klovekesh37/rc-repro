@@ -3206,3 +3206,47 @@ def test_ready_asks_kubernetes_not_docker(monkeypatch, tmp_path):
     assert established, "ready did not re-establish the forward"
     # The dead pid must be replaced in the record, or `down` later signals nothing.
     assert lc.runner.read_meta("k").extra["port_forward_pid"] == 4242
+
+
+def test_every_compose_only_command_refuses_with_a_way_forward(monkeypatch, tmp_path):
+    """Six commands reached for a compose project that a Kubernetes workspace does
+    not have, and answered "no configuration file provided: not found" -- which names
+    nothing anyone can act on.
+
+    A refusal that hands over the working command is worth more than an
+    implementation that does not exist yet, and it can ship first. Each refusal
+    names the namespace, so it is copy-pasteable rather than a hint.
+    """
+    from rc_repro.services import backup, envvars, k8s, monitor, topology, upgrade
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="u", host_port=3000,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+    lc.runner.write("k", "", m)
+
+    cases = [
+        (lambda: monitor.attach("k"), "monitoring"),
+        (lambda: backup.create("k"), "mongodump"),
+        (lambda: envvars.set_env("k", {"A": "b"}), "helm"),
+        (lambda: upgrade.run("k", "8.6.1"), "image.tag"),
+    ]
+    for call, expect in cases:
+        with pytest.raises(errors.ValidationError) as caught:
+            call()
+        msg = str(caught.value)
+        assert expect in msg, msg
+        assert "rc-repro-k" in msg, f"the namespace must be named: {msg}"
+        assert caught.value.exit_code == 2
+
+    # A Compose workspace passes straight through the guard.
+    plain = lc.runner.Metadata(name="d", project="rcrepro-d", rc_version="8.5.1",
+                               rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                               preset="default", root_url="u", host_port=3001,
+                               version_source="t")
+    topology.stamp(plain.extra, topology.DOCKER)
+    lc.runner.write("d", "services: {}\n", plain)
+    topology.require_compose("d", "backup")     # silent

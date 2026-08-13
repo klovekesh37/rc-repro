@@ -144,6 +144,12 @@ def set_env(name: str, sets: dict | None = None, unset: list[str] | None = None,
     `sets` adds or replaces; `unset` removes a key entirely (including a base or
     preset default, which merely blanking it would not do).
     """
+    from rc_repro.services import topology
+    # No Kubernetes path yet. Reaching for the compose project answers
+    # "no configuration file provided", which names nothing a user can act
+    # on -- so this refuses and hands over the command that does the job.
+    topology.require_compose(name, "env",
+                             instead="Use `helm -n rc-repro-{t} upgrade rocketchat --reuse-values --set extraEnv[0].name=...`, or `rc-repro api` for a runtime setting.".replace("{t}", name))
     lifecycle.require_docker()
     target = lifecycle.resolve_name(name)
     # Serialised against every other mutating operation on this repro: this does

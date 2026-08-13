@@ -27,6 +27,12 @@ def _rc_services_in(doc: dict) -> list[str]:
 
 
 def attach(name: str, emit: Emit = null_emit) -> dict:
+    from rc_repro.services import topology
+    # No Kubernetes path yet. Reaching for the compose project answers
+    # "no configuration file provided", which names nothing a user can act
+    # on -- so this refuses and hands over the command that does the job.
+    topology.require_compose(name, "attach monitoring",
+                             instead="The Kubernetes stack is a separate chart: `helm install monitoring rocketchat/monitoring -n rc-repro-{t}`.".replace("{t}", name))
     lifecycle.require_docker()
     target = lifecycle.resolve_name(name)
     # Same read-compose -> write-compose -> `docker compose up` shape as env and

@@ -53,6 +53,16 @@ def require_running(name: str) -> runner.Metadata:
     """
     lifecycle.require_docker()
     target = lifecycle.resolve_name(name)
+    # BEFORE the running check, not after. `rc_state` asks docker about containers,
+    # so a healthy Kubernetes workspace was reported as "has no containers (it was
+    # `down`ed)" -- advice that is wrong twice over: it was never downed, and `up`
+    # would not have helped. The guard deeper in `run()` never got the chance.
+    from rc_repro.services import topology
+    topology.require_compose(
+        target, "upgrade",
+        instead="Use `helm -n {t} upgrade rocketchat --set image.tag=<version>`; "
+                "the chart version may need to move too.".replace(
+                    "{t}", f"rc-repro-{target}"))
     state = runner.rc_state(target)
     if state == "running":
         return runner.read_meta(target)
