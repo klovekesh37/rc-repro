@@ -116,6 +116,22 @@ PRESET_MB = {"saml": 450, "oidc": 450, "s3_minio": 120, "ldap": 80,
              "livechat": 60, "multi-instance": 400, "email": 40}
 #: Prometheus + Grafana + Loki + the OTel collector + two exporters.
 MONITORING_MB = 280
+
+# Kubernetes costs on top of a workspace, and both are load-bearing for the same
+# reason WORKSPACE_MB is: the formula that refuses a create has to know what it is
+# about to start, or it refuses the wrong things and permits the fatal ones.
+#
+# CLUSTER_MB is MEASURED -- `docker stats kind-control-plane` reads 573 MiB idle on
+# this box -- and is charged ONCE, only when the cluster still has to be created.
+# Every workspace after that shares it.
+CLUSTER_MB = 600
+
+# MICROSERVICES_MB is an ESTIMATE and is labelled as one until a real cluster
+# measures it. The chart's microservices deployment adds account, authorization,
+# ddp-streamer, presence and stream-hub plus NATS to the main app -- six more Node
+# processes, so roughly 200 MB each. Correct this from a measurement rather than
+# trusting it: an estimate in a refusal is a guess with authority.
+MICROSERVICES_MB = 1200
 #: Left unspent: for the OS, Docker, the page cache -- and, mostly, for GROWTH.
 #: A fifth of the host, never below 1 GB.
 #:
@@ -157,6 +173,40 @@ def capacity() -> dict:
             "room": max(0, avail_mb - reserve) // WORKSPACE_MB}
 
 
+def _kube_overhead_mb(req: "CreateReq") -> int:
+    """What Kubernetes adds to a workspace's memory bill, in MB.
+
+    Zero for Compose, which is every workspace today. The control plane is charged
+    only when it still has to be created: it is shared, so billing it to the second
+    and third workspace would refuse creates the host could actually hold -- and a
+    capacity check that is wrong in the safe direction still stops people using the
+    tool, which is how they learn to pass --force by reflex.
+    """
+    from rc_repro.services import topology
+    if topology.normalize(getattr(req, "runtime", "")) != topology.KUBERNETES:
+        return 0
+    need = 0
+    try:
+        from rc_repro.services import k8s
+        # Specifically OUR cluster, not "a reachable cluster". rc-repro creates its
+        # own, so somebody else's cluster being up does not mean the control plane
+        # is already paid for. Charging on `cluster_reachable` billed zero on a box
+        # whose only cluster belonged to someone else.
+        if not k8s.preflight().cluster_exists:
+            need += CLUSTER_MB
+    except Exception:  # noqa: BLE001 - an unprobeable cluster is charged for
+        need += CLUSTER_MB
+    # An empty deployment means "that runtime's default", which for Kubernetes is
+    # microservices -- the expensive one. Reading empty as free would under-charge
+    # the common case, and `check_capacity` can be reached with an unresolved
+    # request from `restore` and the GUI as well as from `up`.
+    deployment = getattr(req, "deployment", "") or topology.DEPLOYMENTS[
+        topology.KUBERNETES][0]
+    if deployment == topology.MICROSERVICES:
+        need += MICROSERVICES_MB
+    return need
+
+
 def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_emit) -> None:
     """Refuse to create a workspace the host cannot hold.
 
@@ -184,6 +234,11 @@ def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_em
     need = WORKSPACE_MB + PRESET_MB.get(preset_name, 0)
     if req.monitor:
         need += MONITORING_MB
+    # A Kubernetes workspace is not a Compose workspace with a different label. It
+    # brings a control plane if there is not one yet, and microservices runs six
+    # more processes than a monolith -- charging it as Compose would let through
+    # exactly the create this function exists to refuse.
+    need += _kube_overhead_mb(req)
 
     reserve = host_reserve_mb(total_mb)
     headroom = available_mb - reserve
@@ -201,7 +256,7 @@ def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_em
     swap_note = ("\n  This host has NO SWAP, so there is no buffer at all: memory "
                  "pressure becomes an OOM kill rather than slowdown."
                  if swap_mb == 0 else "")
-    raise NotReadyError(
+    raise PreflightError(
         f"not enough memory: this workspace needs about {need} MB and only "
         f"{max(0, headroom)} MB is free to use "
         f"({available_mb} MB available, {reserve} MB kept for the OS, Docker and "

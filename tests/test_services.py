@@ -1009,12 +1009,17 @@ def _mem(monkeypatch, available_mb, total_mb=10000, swap_mb=0):
                         lambda: (total_mb, available_mb, swap_mb))
 
 
+# These five assert PreflightError, not NotReadyError. errors.py always documented
+# capacity that way -- "capacity shortfalls ... use this" -- while the code raised
+# NotReadyError, which is exit 5 and means "still unknown, poll again". Polling does
+# not free memory, so exit 5 told a script to retry something retrying cannot fix.
+# Same argument that moved `require_docker` off exit 5; HTTP status is 409 either way.
 def test_a_workspace_is_refused_when_the_host_cannot_hold_it(monkeypatch):
     from rc_repro import errors
     from rc_repro.services import lifecycle as lc
 
     _mem(monkeypatch, available_mb=1000)      # 100 MB usable after the reserve
-    with pytest.raises(errors.NotReadyError) as exc:
+    with pytest.raises(errors.PreflightError) as exc:
         lc.check_capacity(lc.CreateReq(version="8.5.1"))
     assert "not enough memory" in str(exc.value)
 
@@ -1025,7 +1030,7 @@ def test_the_refusal_says_what_to_stop_and_how(monkeypatch):
     from rc_repro.services import lifecycle as lc
 
     _mem(monkeypatch, available_mb=1000)
-    with pytest.raises(errors.NotReadyError) as exc:
+    with pytest.raises(errors.PreflightError) as exc:
         lc.check_capacity(lc.CreateReq(version="8.5.1"))
     msg = str(exc.value)
     assert "rc-repro stop" in msg and "--force" in msg
@@ -1047,7 +1052,7 @@ def test_a_preset_with_keycloak_needs_more_than_a_bare_workspace(monkeypatch):
     # Enough for a bare workspace, not for one plus Keycloak.
     _mem(monkeypatch, available_mb=lc.host_reserve_mb(10024) + lc.WORKSPACE_MB + 100)
     lc.check_capacity(lc.CreateReq(version="8.5.1"))       # bare: fits
-    with pytest.raises(errors.NotReadyError):
+    with pytest.raises(errors.PreflightError):
         lc.check_capacity(lc.CreateReq(version="8.5.1"), "saml")
 
 
@@ -1056,7 +1061,7 @@ def test_monitoring_counts_towards_the_estimate(monkeypatch):
     from rc_repro.services import lifecycle as lc
 
     _mem(monkeypatch, available_mb=lc.host_reserve_mb(10024) + lc.WORKSPACE_MB + 100)
-    with pytest.raises(errors.NotReadyError):
+    with pytest.raises(errors.PreflightError):
         lc.check_capacity(lc.CreateReq(version="8.5.1", monitor=True))
 
 
@@ -1104,7 +1109,7 @@ def test_the_guard_would_have_stopped_the_incident(monkeypatch):
     from rc_repro.services import lifecycle as lc
 
     _mem(monkeypatch, total_mb=10024, available_mb=3350, swap_mb=0)
-    with pytest.raises(errors.NotReadyError):
+    with pytest.raises(errors.PreflightError):
         lc.check_capacity(lc.CreateReq(version="8.5.1"), "multi-instance")
 
 
@@ -1929,3 +1934,117 @@ def test_isolation_is_derived_from_the_target_not_chosen_at_the_call_site(monkey
     seen.clear()
     k8s.active_context()
     assert seen[0][0] is False, "discovery must read the config the user set up"
+
+
+# --- capacity knows what Kubernetes costs ---------------------------------------
+
+def test_a_kubernetes_workspace_is_not_charged_as_a_compose_one(monkeypatch, tmp_path):
+    """`check_capacity` computed `WORKSPACE_MB + PRESET_MB` and nothing about the
+    runtime, so a Kubernetes workspace was billed as if it were Compose -- missing a
+    control plane (573 MiB measured) and five extra Node processes.
+
+    This function exists because seven concurrent stacks OOM-killed a 10 GB host.
+    Under-charging is not a rounding error here: the OOM killer picks its own
+    victim, so it destroys somebody else's work.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda _t: "")     # no cluster of ours
+
+    compose = lc.CreateReq(version="8.6.1")
+    assert lc._kube_overhead_mb(compose) == 0, "Compose must be unaffected"
+
+    # Kubernetes with nothing resolved: an empty deployment means that runtime's
+    # DEFAULT, which is microservices -- the expensive one. Reading empty as free
+    # would under-charge the common case.
+    default_k8s = lc.CreateReq(version="8.6.1", runtime="kubernetes")
+    assert lc._kube_overhead_mb(default_k8s) == lc.CLUSTER_MB + lc.MICROSERVICES_MB
+
+    mono = lc.CreateReq(version="8.6.1", runtime="k8s",
+                        deployment=topology.MONOLITH)
+    assert lc._kube_overhead_mb(mono) == lc.CLUSTER_MB, "monolith pays for the cluster only"
+
+
+def test_the_control_plane_is_charged_once_not_per_workspace(monkeypatch, tmp_path):
+    """It is shared. Billing it to the second and third workspace would refuse
+    creates the host could hold -- and a capacity check that is wrong in the safe
+    direction still stops people using the tool, which is how they learn to pass
+    --force by reflex."""
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    req = lc.CreateReq(version="8.6.1", runtime="k8s", deployment=topology.MONOLITH)
+
+    monkeypatch.setattr(k8s, "preflight",
+                        lambda *a, **k: k8s.Preflight(cluster_exists=False))
+    assert lc._kube_overhead_mb(req) == lc.CLUSTER_MB, "first one pays"
+
+    monkeypatch.setattr(k8s, "preflight",
+                        lambda *a, **k: k8s.Preflight(cluster_exists=True))
+    assert lc._kube_overhead_mb(req) == 0, "the rest share it"
+
+
+def test_somebody_elses_reachable_cluster_does_not_pay_for_ours(monkeypatch, tmp_path):
+    """The charge is on OUR cluster existing, not on "a cluster is reachable".
+
+    Keyed on `cluster_reachable` it billed zero on this box -- whose only cluster
+    belongs to someone else -- because rc-repro would still have to create its own
+    alongside it, and the 573 MiB would be spent after the check said there was room.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    req = lc.CreateReq(version="8.6.1", runtime="k8s", deployment=topology.MONOLITH)
+    monkeypatch.setattr(k8s, "preflight", lambda *a, **k: k8s.Preflight(
+        cluster_exists=False, cluster_reachable=True,      # theirs is up
+        context="kind-somebody-else", provider=k8s.PROVIDER_EXTERNAL))
+    assert lc._kube_overhead_mb(req) == lc.CLUSTER_MB, \
+        "another cluster being up does not pay for the one we still have to create"
+
+
+def test_an_unprobeable_cluster_is_charged_for_rather_than_assumed_free(monkeypatch, tmp_path):
+    """If the cluster cannot be probed, the safe assumption is that it is not there.
+    Assuming it exists would let the create through and spend the memory anyway."""
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    def boom(*_a, **_k):
+        raise OSError("kubectl exploded")
+    monkeypatch.setattr(k8s, "preflight", boom)
+    req = lc.CreateReq(version="8.6.1", runtime="k8s")
+    assert lc._kube_overhead_mb(req) >= lc.CLUSTER_MB
+
+
+def test_the_kubernetes_overhead_actually_reaches_the_refusal(monkeypatch, tmp_path):
+    """The helper existing is not the same as it being used. Asserted end-to-end
+    through `check_capacity`, because a correct estimate nothing consults refuses
+    nothing -- and the first version of this change computed the overhead and then
+    did not add it to `need`.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "preflight",
+                        lambda *a, **k: k8s.Preflight(cluster_exists=False))
+    # A host with room for exactly one Compose workspace and no more.
+    need_k8s = lc.WORKSPACE_MB + lc.CLUSTER_MB + lc.MICROSERVICES_MB
+    tight = lc.WORKSPACE_MB + 200
+    monkeypatch.setattr(lc.runner, "host_memory",
+                        lambda: (8000, tight + lc.host_reserve_mb(8000), 0))
+    monkeypatch.setattr(lc.runner, "list_meta", lambda: [])
+
+    # Compose fits.
+    lc.check_capacity(lc.CreateReq(version="8.6.1"), "default")
+    # The same host cannot hold a Kubernetes one, and must say so.
+    with pytest.raises(errors.PreflightError) as caught:
+        lc.check_capacity(lc.CreateReq(version="8.6.1", runtime="kubernetes"),
+                          "default")
+    assert need_k8s > tight, "the fixture must actually be too small"
+    assert "2900 MB" in str(caught.value), "the bill must include the Kubernetes parts"
+    # And it is a PREFLIGHT failure, not a "poll again". errors.py already said so
+    # -- "capacity shortfalls ... use this" -- while the code raised NotReadyError,
+    # exit 5, which tells a script to retry something retrying cannot fix. Polling
+    # does not free memory. Same argument that moved `require_docker` off exit 5.
+    assert caught.value.exit_code == 3, "a full host is a preflight failure"
+    assert caught.value.code == "PREFLIGHT_FAILED"
