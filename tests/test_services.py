@@ -2742,3 +2742,86 @@ def test_a_cluster_that_outlived_its_kubeconfig_is_reconnected(monkeypatch, tmp_
     with pytest.raises(errors.CreateFailedError) as caught:
         k8s.ensure_cluster()
     assert "kubeconfig could not be read" in str(caught.value)
+
+
+def test_a_failed_recreate_never_destroys_data_that_down_promised_to_keep(
+        monkeypatch, tmp_path):
+    """The most damaging defect on this branch, and it was caused by a fix.
+
+    The rollback added for failed creates deletes the namespace -- correct when this
+    call created it, catastrophic over a namespace `down` had kept. Proven live: a
+    marker document written before `down` was GONE after a failed `up`, because the
+    rollback took the namespace and the PVC with it. `down` had printed "the
+    namespace and its PersistentVolumeClaim are kept" moments earlier.
+
+    A failure may only undo what the same call did. Deleting retained data is what
+    `down --volumes` is for -- asked for deliberately, behind a confirmation.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "ensure_cluster", lambda **kw: k8s.CONTEXT)
+    monkeypatch.setattr(k8s, "ensure_repo", lambda **kw: None)
+    monkeypatch.setattr(k8s, "resolve_chart_version", lambda *a, **kw: "7.0.2")
+    monkeypatch.setattr(k8s, "preflight", lambda *a, **kw: k8s.Preflight(
+        cluster_reachable=True, default_storage_class="standard"))
+    monkeypatch.setattr(k8s, "ensure_namespace", lambda n, **kw: f"rc-repro-{n}")
+    monkeypatch.setattr(k8s, "apply", lambda *a, **kw: None)
+    monkeypatch.setattr(k8s, "init_replica_set", lambda **kw: None)
+    monkeypatch.setattr(k8s, "clusters", lambda: ([k8s.CLUSTER_NAME], ""))
+    monkeypatch.setattr(k8s, "install", lambda **kw: (_ for _ in ()).throw(
+        errors.CreateFailedError("helm exploded")))
+    resolved = type("R", (), {"rc_version": "8.6.1", "mongo_tag": "8.0",
+                              "rc_image": "img", "oplog": False})()
+
+    deleted: list = []
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: (
+        deleted.append(" ".join(argv)) if "delete namespace" in " ".join(argv) else None)
+        or __import__("subprocess").CompletedProcess(argv, 0, "", ""))
+
+    # The namespace was ALREADY there -- a re-create after `down`.
+    monkeypatch.setattr(k8s, "workspace_namespaces", lambda *a, **kw: ["rc-repro-k"])
+    with pytest.raises(errors.CreateFailedError):
+        k8s.create_workspace(name="k", resolved=resolved, host_port=3010,
+                             microservices=False)
+    assert not deleted, "the rollback destroyed a namespace it did not create"
+
+    # A genuinely new namespace IS cleaned up, or a failed create leaks something
+    # `list` cannot show.
+    monkeypatch.setattr(k8s, "workspace_namespaces", lambda *a, **kw: [])
+    with pytest.raises(errors.CreateFailedError):
+        k8s.create_workspace(name="k", resolved=resolved, host_port=3010,
+                             microservices=False)
+    assert deleted, "a namespace this call created was left behind"
+
+
+def test_exec_survives_a_terminating_pod_rather_than_failing_the_create(monkeypatch):
+    """`containerStatuses[0].started` is still true for a TERMINATING pod, so a
+    re-create can pass the wait and then exec into a pod on its way out:
+    "unable to upgrade connection: container not found (mongod)". A one-shot exec
+    turns that race into a failed create; retrying turns it into a delay."""
+    from rc_repro.services import k8s
+
+    calls = []
+
+    def flaky(argv, **kw):
+        import subprocess as sp
+        calls.append(1)
+        if len(calls) < 3:
+            return sp.CompletedProcess(argv, 1, "",
+                                       'unable to upgrade connection: container '
+                                       'not found ("mongod")')
+        return sp.CompletedProcess(argv, 0, "1", "")
+
+    monkeypatch.setattr(k8s, "run", flaky)
+    res = k8s._mongo_exec(k8s.CONTEXT, "rc-repro-k", "rs.status().ok",
+                          sleep=lambda _s: None)
+    assert res.returncode == 0 and len(calls) == 3, calls
+
+    # A different failure is NOT retried -- that would just delay a real error.
+    calls.clear()
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: __import__("subprocess")
+                        .CompletedProcess(argv, 1, "", "authentication failed"))
+    out = k8s._mongo_exec(k8s.CONTEXT, "rc-repro-k", "x", sleep=lambda _s: None)
+    assert out.returncode == 1

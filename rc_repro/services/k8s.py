@@ -995,7 +995,26 @@ MONGO_READY_TRIES = 60
 MONGO_READY_INTERVAL = 5.0
 
 
-def _mongo_exec(context: str, namespace: str, script: str):
+def _mongo_exec(context: str, namespace: str, script: str, *, tries: int = 5,
+               sleep=time.sleep):
+    """mongosh inside the MongoDB pod, retried.
+
+    `containerStatuses[0].started` is still true for a pod that is TERMINATING, so
+    a re-create over an existing namespace can pass the wait and then exec into a
+    pod on its way out -- `unable to upgrade connection: container not found
+    ("mongod")`. A one-shot exec turns that race into a failed create; retrying
+    turns it into a two-second delay.
+    """
+    for attempt in range(tries):
+        res = _mongo_exec_once(context, namespace, script)
+        combined = f"{res.stdout or ''}{res.stderr or ''}".lower()
+        if res.returncode == 0 or "container not found" not in combined:
+            return res
+        sleep(2.0)
+    return res
+
+
+def _mongo_exec_once(context: str, namespace: str, script: str):
     return run(["kubectl", "--context", context, "-n", namespace, "exec",
                 f"{MONGO_SERVICE}-0", "--", "mongosh", MONGO_DIRECT_URI,
                 "--quiet", "--eval", script],
@@ -1134,6 +1153,12 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
     if blocked:
         raise PreflightError(blocked)
 
+    # Whether the namespace was already here decides what a failure may undo. A
+    # re-create over a namespace kept by `down` must NOT have its rollback delete
+    # that namespace: the PVC goes with it, and `down` had just promised the data
+    # would be there. Observed exactly that way -- a marker document written before
+    # `down` was gone after a failed `up`.
+    had_namespace = namespace_for(name) in workspace_namespaces(context)
     namespace = ensure_namespace(name, context=context, owner=owner, emit=emit)
     try:
         info(emit, f"MongoDB {resolved.mongo_tag}, {MONGO_VOLUME_GB}Gi volume",
@@ -1157,6 +1182,13 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
         # this call created it and nothing else is using it: `delete_cluster`
         # refuses while any other workspace namespace is there, so a colleague's
         # concurrent `up` is safe from this.
+        if had_namespace:
+            # Leave it. The data in it predates this call and is not ours to
+            # discard on a failure -- `down --volumes` is how a user asks for that,
+            # deliberately and with a confirmation.
+            warn(emit, f"create failed — namespace {namespace} and its volume are "
+                       "left as they were", phase="teardown")
+            raise
         warn(emit, f"create failed — removing namespace {namespace}",
              phase="teardown")
         try:
