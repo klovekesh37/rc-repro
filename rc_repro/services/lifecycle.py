@@ -126,12 +126,22 @@ MONITORING_MB = 280
 # Every workspace after that shares it.
 CLUSTER_MB = 600
 
-# MICROSERVICES_MB is an ESTIMATE and is labelled as one until a real cluster
-# measures it. The chart's microservices deployment adds account, authorization,
-# ddp-streamer, presence and stream-hub plus NATS to the main app -- six more Node
-# processes, so roughly 200 MB each. Correct this from a measurement rather than
-# trusting it: an estimate in a refusal is a guess with authority.
-MICROSERVICES_MB = 1200
+# KUBE_CHART_MB is what the CHART costs beyond the app itself, and it applies to
+# both deployments. Measured, and it corrected an assumption: a "monolith" on this
+# chart is FIVE pods, not two -- it runs NATS (two pods plus nats-box) regardless
+# of `microservices.enabled`, which Compose's monolith does not. A live monolith
+# workspace plus a fresh cluster took the host from 8322 MB available to 6351, so
+# 1971 MB total with NATS still starting; against WORKSPACE_MB + CLUSTER_MB = 1700
+# that leaves roughly this much unaccounted for.
+KUBE_CHART_MB = 500
+
+# MICROSERVICES_MB is still an ESTIMATE and is labelled as one, because no
+# microservices workspace has been booted. It is the five additional service pods
+# -- account, authorization, ddp-streamer, presence, stream-hub -- at roughly
+# 200 MB each; NATS is already counted in KUBE_CHART_MB above rather than here.
+# Correct it from a measurement rather than trusting it: an estimate inside a
+# refusal is a guess with authority.
+MICROSERVICES_MB = 1000
 #: Left unspent: for the OS, Docker, the page cache -- and, mostly, for GROWTH.
 #: A fifth of the host, never below 1 GB.
 #:
@@ -185,7 +195,8 @@ def _kube_overhead_mb(req: "CreateReq") -> int:
     from rc_repro.services import topology
     if topology.normalize(getattr(req, "runtime", "")) != topology.KUBERNETES:
         return 0
-    need = 0
+    # The chart's own baseline, on both deployments -- see KUBE_CHART_MB.
+    need = KUBE_CHART_MB
     try:
         from rc_repro.services import k8s
         # Specifically OUR cluster, not "a reachable cluster". rc-repro creates its

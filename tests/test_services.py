@@ -1959,11 +1959,14 @@ def test_a_kubernetes_workspace_is_not_charged_as_a_compose_one(monkeypatch, tmp
     # DEFAULT, which is microservices -- the expensive one. Reading empty as free
     # would under-charge the common case.
     default_k8s = lc.CreateReq(version="8.6.1", runtime="kubernetes")
-    assert lc._kube_overhead_mb(default_k8s) == lc.CLUSTER_MB + lc.MICROSERVICES_MB
+    assert lc._kube_overhead_mb(default_k8s) == (lc.CLUSTER_MB + lc.KUBE_CHART_MB
+                                                + lc.MICROSERVICES_MB)
 
     mono = lc.CreateReq(version="8.6.1", runtime="k8s",
                         deployment=topology.MONOLITH)
-    assert lc._kube_overhead_mb(mono) == lc.CLUSTER_MB, "monolith pays for the cluster only"
+    # A "monolith" on this chart is five pods, not two -- it runs NATS regardless
+    # of microservices.enabled -- so it pays for the cluster AND the chart baseline.
+    assert lc._kube_overhead_mb(mono) == lc.CLUSTER_MB + lc.KUBE_CHART_MB
 
 
 def test_the_control_plane_is_charged_once_not_per_workspace(monkeypatch, tmp_path):
@@ -1978,11 +1981,12 @@ def test_the_control_plane_is_charged_once_not_per_workspace(monkeypatch, tmp_pa
 
     monkeypatch.setattr(k8s, "preflight",
                         lambda *a, **k: k8s.Preflight(cluster_exists=False))
-    assert lc._kube_overhead_mb(req) == lc.CLUSTER_MB, "first one pays"
+    assert lc._kube_overhead_mb(req) == lc.CLUSTER_MB + lc.KUBE_CHART_MB, "first one pays"
 
     monkeypatch.setattr(k8s, "preflight",
                         lambda *a, **k: k8s.Preflight(cluster_exists=True))
-    assert lc._kube_overhead_mb(req) == 0, "the rest share it"
+    assert lc._kube_overhead_mb(req) == lc.KUBE_CHART_MB, \
+        "the rest share the cluster but still pay for their own chart"
 
 
 def test_somebody_elses_reachable_cluster_does_not_pay_for_ours(monkeypatch, tmp_path):
@@ -1999,7 +2003,7 @@ def test_somebody_elses_reachable_cluster_does_not_pay_for_ours(monkeypatch, tmp
     monkeypatch.setattr(k8s, "preflight", lambda *a, **k: k8s.Preflight(
         cluster_exists=False, cluster_reachable=True,      # theirs is up
         context="kind-somebody-else", provider=k8s.PROVIDER_EXTERNAL))
-    assert lc._kube_overhead_mb(req) == lc.CLUSTER_MB, \
+    assert lc._kube_overhead_mb(req) == lc.CLUSTER_MB + lc.KUBE_CHART_MB, \
         "another cluster being up does not pay for the one we still have to create"
 
 
@@ -2028,7 +2032,8 @@ def test_the_kubernetes_overhead_actually_reaches_the_refusal(monkeypatch, tmp_p
     monkeypatch.setattr(k8s, "preflight",
                         lambda *a, **k: k8s.Preflight(cluster_exists=False))
     # A host with room for exactly one Compose workspace and no more.
-    need_k8s = lc.WORKSPACE_MB + lc.CLUSTER_MB + lc.MICROSERVICES_MB
+    need_k8s = (lc.WORKSPACE_MB + lc.CLUSTER_MB + lc.KUBE_CHART_MB
+                + lc.MICROSERVICES_MB)
     tight = lc.WORKSPACE_MB + 200
     monkeypatch.setattr(lc.runner, "host_memory",
                         lambda: (8000, tight + lc.host_reserve_mb(8000), 0))
@@ -2041,7 +2046,7 @@ def test_the_kubernetes_overhead_actually_reaches_the_refusal(monkeypatch, tmp_p
         lc.check_capacity(lc.CreateReq(version="8.6.1", runtime="kubernetes"),
                           "default")
     assert need_k8s > tight, "the fixture must actually be too small"
-    assert "2900 MB" in str(caught.value), "the bill must include the Kubernetes parts"
+    assert f"{need_k8s} MB" in str(caught.value), "the bill must include the Kubernetes parts"
     # And it is a PREFLIGHT failure, not a "poll again". errors.py already said so
     # -- "capacity shortfalls ... use this" -- while the code raised NotReadyError,
     # exit 5, which tells a script to retry something retrying cannot fix. Polling
