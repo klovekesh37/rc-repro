@@ -25,13 +25,14 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from rc_repro import config, runner
 from rc_repro.errors import (ConflictError, CreateFailedError, DockerError,
                             PreflightError)
-from rc_repro.services.events import Emit, info, null_emit
+from rc_repro.services.events import Emit, info, null_emit, warn
 
 #: The cluster rc-repro creates and owns. One cluster with a namespace per
 #: workspace, not a cluster per workspace: a control plane each would forbid
@@ -594,3 +595,409 @@ def delete_cluster(*, force: bool = False, emit: Emit = null_emit) -> bool:
             raise DockerError(f"could not delete the cluster {CLUSTER_NAME}: "
                               + (detail[-1][:200] if detail else "kind gave no reason"))
     return True
+
+
+# --- a workspace: namespace, MongoDB, the chart ----------------------------------
+
+#: The chart, never vendored -- it is the topology's source of truth.
+HELM_REPO = "rocketchat"
+HELM_REPO_URL = "https://rocketchat.github.io/helm-charts"
+CHART = f"{HELM_REPO}/rocketchat"
+
+#: In-cluster MongoDB. `mongodb` rather than PR #3's `mongo`, so the URL matches
+#: Compose's `config.MONGO_URL` and the two runtimes read the same way.
+MONGO_SERVICE = "mongodb"
+MONGO_URL = f"mongodb://{MONGO_SERVICE}-0.{MONGO_SERVICE}:27017/rocketchat?replicaSet=rs0"
+MONGO_OPLOG_URL = f"mongodb://{MONGO_SERVICE}-0.{MONGO_SERVICE}:27017/local?replicaSet=rs0"
+
+#: The volume a workspace's data lives on. PR #3 runs MongoDB with no volume at
+#: all, so its data lives in the pod's writable layer and dies with a reschedule --
+#: while `--fresh` tells the user it deleted a PVC that never existed. `backup`,
+#: `restore` and `upgrade` all assume the data survives a restart.
+MONGO_VOLUME_GB = 8
+
+APPLY_TIMEOUT = 120.0
+INSTALL_TIMEOUT = 900.0
+
+
+def namespace_for(name: str) -> str:
+    return f"{NAMESPACE_PREFIX}{name}"
+
+
+def _labels(name: str, owner: str = "") -> dict[str, str]:
+    """The labels every resource rc-repro creates carries.
+
+    `managed-by` is what teardown selects on. `workspace` and `owner` are what make
+    a refusal specific -- "the cluster still holds 2 namespaces" is actionable only
+    if it can say whose.
+    """
+    out = {OWNER_LABEL_KEY: OWNER_LABEL_VALUE, WORKSPACE_LABEL: name}
+    if owner:
+        out[OWNER_OF_LABEL] = owner
+    return out
+
+
+def ensure_repo(emit: Emit = null_emit) -> None:
+    """Add and refresh the Rocket.Chat chart repo in rc-repro's own Helm home."""
+    run(["helm", "repo", "add", HELM_REPO, HELM_REPO_URL, "--force-update"],
+        timeout=APPLY_TIMEOUT, own=True)
+    res = run(["helm", "repo", "update", HELM_REPO], timeout=APPLY_TIMEOUT, own=True)
+    if res.returncode != 0:
+        raise CreateFailedError(
+            "could not read the Rocket.Chat chart repository "
+            f"({HELM_REPO_URL}): " + (res.stderr or res.stdout or "").strip()[:200])
+
+
+def _version_key(text: str) -> tuple:
+    """Sort key for a semver-ish string. Non-numeric parts sort low."""
+    out = []
+    for part in str(text).split("."):
+        digits = re.match(r"(\d+)", part)
+        out.append(int(digits.group(1)) if digits else -1)
+    return tuple(out)
+
+
+def resolve_chart_version(rc_version: str, emit: Emit = null_emit) -> str:
+    """Pin a chart version for a Rocket.Chat version.
+
+    Taken from PR #3, whose rule is right and whose reasoning the official guide
+    does not give: most Rocket.Chat releases have no chart with a matching
+    appVersion, so an exact match cannot be required. Exact match if one exists,
+    else the newest chart whose appVersion is at or BELOW the request -- a floor,
+    so the chart is never newer than the app it deploys -- else the newest, warned.
+
+    An unreadable index is terminal rather than falling back to an unpinned chart.
+    For a tool whose whole job is version-matching, `helm install` without
+    `--version` deploys different software after the next chart release, which
+    quietly destroys the only property the workspace was created to have.
+    """
+    res = run(["helm", "search", "repo", CHART, "--versions", "-o", "json"],
+              timeout=APPLY_TIMEOUT, own=True)
+    if res.returncode != 0:
+        raise CreateFailedError("could not read the Rocket.Chat chart index: "
+                                + (res.stderr or res.stdout or "").strip()[:200])
+    try:
+        entries = json.loads(res.stdout or "[]")
+    except ValueError as exc:
+        raise CreateFailedError(
+            "the Rocket.Chat chart index was not valid JSON") from exc
+    if not isinstance(entries, list) or not entries:
+        raise CreateFailedError(f"no versions found for the chart {CHART!r}")
+    want = _version_key(rc_version)
+    exact = [e for e in entries if str(e.get("app_version") or "") == rc_version]
+    if exact:
+        return str(exact[0]["version"])
+    at_or_below = [e for e in entries
+                   if _version_key(str(e.get("app_version") or "0")) <= want]
+    if at_or_below:
+        best = max(at_or_below, key=lambda e: _version_key(str(e.get("version"))))
+        return str(best["version"])
+    newest = max(entries, key=lambda e: _version_key(str(e.get("version"))))
+    warn(emit, f"no chart deploys Rocket.Chat {rc_version} or older; using "
+               f"{newest.get('version')} (appVersion {newest.get('app_version')})",
+         phase="plan")
+    return str(newest["version"])
+
+
+def mongo_manifest(name: str, tag: str, *, owner: str = "",
+                   storage_class: str = "") -> str:
+    """A single-node MongoDB replica set with a PVC.
+
+    A replica set rather than a standalone mongod because Rocket.Chat needs change
+    streams. `volumeClaimTemplates` rather than nothing, so the data survives a
+    pod reschedule -- see MONGO_VOLUME_GB.
+
+    `storageClassName` is omitted when empty, which makes Kubernetes use the
+    cluster's default. That is what keeps this working unchanged on kind
+    (`standard`), k3s (`local-path`) and a real cluster.
+    """
+    labels = _labels(name, owner)
+
+    def at(indent: int) -> str:
+        """Label block at a given indent. Every nesting level needs its own: the
+        first version reused one 4-space block everywhere, and inside
+        `volumeClaimTemplates` that put the labels at the same level as `metadata`,
+        so they became keys of the template item. The result is valid YAML and an
+        invalid manifest -- which a `yaml.safe_load` test cannot see, and the API
+        server rejected with "unknown field
+        spec.volumeClaimTemplates[0].app.kubernetes.io/managed-by".
+        """
+        pad = " " * indent
+        return "\n".join(f"{pad}{k}: {v}" for k, v in labels.items())
+
+    label_yaml = at(4)
+    pod_labels = at(8)
+    pvc_labels = at(8)
+    sc_line = f"\n        storageClassName: {storage_class}" if storage_class else ""
+    return f"""apiVersion: v1
+kind: Service
+metadata:
+  name: {MONGO_SERVICE}
+  labels:
+{label_yaml}
+spec:
+  clusterIP: None
+  selector:
+    app: {MONGO_SERVICE}
+  ports:
+  - port: 27017
+    name: mongo
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {MONGO_SERVICE}
+  labels:
+{label_yaml}
+spec:
+  serviceName: {MONGO_SERVICE}
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {MONGO_SERVICE}
+  template:
+    metadata:
+      labels:
+        app: {MONGO_SERVICE}
+{pod_labels}
+    spec:
+      containers:
+      - name: mongod
+        image: mongo:{tag}
+        args: ["--replSet", "rs0", "--bind_ip_all"]
+        ports:
+        - containerPort: 27017
+        volumeMounts:
+        - name: data
+          mountPath: /data/db
+        readinessProbe:
+          exec:
+            command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+          initialDelaySeconds: 10
+          periodSeconds: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+{pvc_labels}
+    spec:
+      accessModes: ["ReadWriteOnce"]{sc_line}
+      resources:
+        requests:
+          storage: {MONGO_VOLUME_GB}Gi
+"""
+
+
+def split_image(rc_image: str, rc_version: str) -> tuple[str, str]:
+    """(repository, tag) for the chart, which wants them separately.
+
+    `versions.resolve()` returns the REPOSITORY only -- compose composes it as
+    f"{rc_image}:{rc_tag}" -- so a naive rpartition(":") on a tagless string
+    returns the whole repository as the tag. That is truthy, so an `or rc_version`
+    fallback does not save it, and the chart fed it to `semverCompare`, which
+    failed the install with "invalid semantic version" rather than anything naming
+    the image.
+
+    A colon only introduces a tag when nothing after it looks like a path segment:
+    `registry:5000/org/img` is a host with a port, not a tag. `--rc-image` lets a
+    user pass either shape, so both are handled.
+    """
+    head, sep, tail = rc_image.rpartition(":")
+    if sep and "/" not in tail:
+        return head, tail
+    return rc_image, rc_version
+
+
+def values_for(*, rc_version: str, rc_image: str, microservices: bool,
+               replicas: int = 1, root_url: str = "", oplog: bool = False) -> dict:
+    """Chart values for one workspace.
+
+    MongoDB is ALWAYS external, never the chart's bundled subchart. PR #3's reason
+    holds and is worth keeping: the bundled path is Bitnami, which publishes
+    amd64-only images so it cannot work on arm64 at all, and chart 7.0.2 declares
+    appVersion 8.6.1 while defaulting MongoDB to 6.0.10, which Rocket.Chat 8.6.1
+    rejects outright. One external path that works everywhere beats two where one
+    is broken on half the hosts.
+    """
+    repo, tag = split_image(rc_image, rc_version)
+    values: dict = {
+        "image": {"repository": repo, "tag": tag},
+        "replicaCount": max(1, int(replicas or 1)),
+        "microservices": {"enabled": bool(microservices)},
+        "mongodb": {"enabled": False},
+        "externalMongodbUrl": MONGO_URL,
+        "extraEnv": [],
+    }
+    if oplog:
+        # Rocket.Chat below 8.x still wants the oplog URL; 8.x deprecates it.
+        values["externalMongodbOplogUrl"] = MONGO_OPLOG_URL
+    if root_url:
+        values["host"] = root_url
+    return values
+
+
+def ensure_namespace(name: str, *, context: str, owner: str = "",
+                     emit: Emit = null_emit) -> str:
+    """Create the workspace's namespace with its ownership labels.
+
+    Labels are applied on every call, not only at creation, so a namespace made by
+    an older rc-repro gains them and becomes visible to teardown. A resource that
+    exists but cannot be selected is worse than one that does not exist.
+    """
+    ns = namespace_for(name)
+    run(["kubectl", "--context", context, "create", "namespace", ns],
+        timeout=APPLY_TIMEOUT, own=is_ours(context))
+    labels = [f"{k}={v}" for k, v in _labels(name, owner).items()]
+    res = run(["kubectl", "--context", context, "label", "namespace", ns,
+               *labels, "--overwrite"], timeout=APPLY_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        raise CreateFailedError(
+            f"could not label namespace {ns}: "
+            + (res.stderr or res.stdout or "").strip()[:200]
+            + " — without the label it would be invisible to teardown")
+    info(emit, f"namespace {ns}", phase="provision")
+    return ns
+
+
+def apply(manifest: str, *, namespace: str, context: str) -> None:
+    """`kubectl apply` a manifest from stdin, so no temp file is left behind."""
+    argv = ["kubectl", "--context", context, "-n", namespace, "apply", "-f", "-"]
+    try:
+        res = subprocess.run(argv, input=manifest, capture_output=True, text=True,
+                             timeout=APPLY_TIMEOUT, check=False,
+                             env=owned_env() if is_ours(context) else None)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DockerError(f"kubectl apply failed: {exc}") from exc
+    if res.returncode != 0:
+        raise CreateFailedError("kubectl apply failed: "
+                                + (res.stderr or res.stdout or "").strip()[:300])
+
+
+def install(*, namespace: str, context: str, values: dict,
+            chart_version: str = "") -> None:
+    """`helm install` with values on stdin, so nothing is written to disk.
+
+    The release is `rocketchat` -- the official docs' own name -- so every command
+    in them works here by substituting the namespace.
+    """
+    argv = ["helm", "install", RELEASE, CHART, "--kube-context", context,
+            "-n", namespace, "--values", "-"]
+    if chart_version:
+        argv += ["--version", chart_version]
+    try:
+        res = subprocess.run(argv, input=json.dumps(values), capture_output=True,
+                             text=True, timeout=INSTALL_TIMEOUT, check=False,
+                             env=owned_env() if is_ours(context) else None)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DockerError(f"helm install failed: {exc}") from exc
+    if res.returncode != 0:
+        raise CreateFailedError("helm install failed: "
+                                + (res.stderr or res.stdout or "").strip()[:400])
+
+
+def delete_namespace(name: str, *, context: str, volumes: bool = False,
+                     emit: Emit = null_emit) -> bool:
+    """Remove a workspace. Returns False if there was nothing there.
+
+    **`helm uninstall` does not delete the PVCs a StatefulSet created.** Kubernetes
+    retains them deliberately. Deleting the NAMESPACE does remove them -- which is
+    why `down` without `--volumes` cannot just delete the namespace, or it would
+    silently destroy data that Compose's `down` keeps.
+
+    So the two paths differ, matching Compose exactly:
+      down            uninstall the release, keep the namespace and its PVCs
+      down --volumes  delete the namespace, taking the PVCs with it
+    """
+    ns = namespace_for(name)
+    own = is_ours(context)
+    if ns not in workspace_namespaces(context):
+        return False
+    if volumes:
+        info(emit, f"deleting namespace {ns} and its volumes", phase="teardown")
+        res = run(["kubectl", "--context", context, "delete", "namespace", ns,
+                   "--wait=false"], timeout=APPLY_TIMEOUT, own=own)
+        if res.returncode != 0:
+            raise DockerError(f"could not delete namespace {ns}: "
+                              + (res.stderr or res.stdout or "").strip()[:200])
+        return True
+    info(emit, f"uninstalling {RELEASE} from {ns} — the volume is kept",
+         phase="teardown")
+    run(["helm", "uninstall", RELEASE, "--kube-context", context, "-n", ns],
+        timeout=APPLY_TIMEOUT, own=own)
+    # The hand-written MongoDB is not part of the release, so it is removed by
+    # label rather than by helm -- and its PVC is deliberately left behind.
+    run(["kubectl", "--context", context, "-n", ns, "delete",
+         "statefulset,service", "-l", OWNER_SELECTOR], timeout=APPLY_TIMEOUT, own=own)
+    return True
+
+
+def workspace_pvcs(name: str, *, context: str) -> list[str]:
+    """PVCs belonging to a workspace, so `prune` can prove what it reclaimed."""
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "pvc", "-l", OWNER_SELECTOR, "-o", "name"],
+              own=is_ours(context))
+    if res.returncode != 0:
+        return []
+    return [ln.split("/", 1)[-1].strip()
+            for ln in (res.stdout or "").splitlines() if ln.strip()]
+
+
+#: Rocket.Chat needs change streams, which need a replica set. `--replSet rs0`
+#: only puts mongod IN replica-set mode; without `rs.initiate()` there is no
+#: primary, so nothing can write and Rocket.Chat waits forever. Compose has a
+#: `mongo-init` service for exactly this; the first cut of this module had no
+#: equivalent, and a real workspace sat at 5 pods for 540s with Rocket.Chat never
+#: becoming ready and nothing in its logs naming MongoDB.
+RS_INITIATE = ('rs.initiate({_id:"rs0",members:[{_id:0,'
+               f'host:"{MONGO_SERVICE}-0.{MONGO_SERVICE}:27017"}}]}})')
+MONGO_READY_TRIES = 60
+MONGO_READY_INTERVAL = 5.0
+
+
+def _mongo_exec(context: str, namespace: str, script: str):
+    return run(["kubectl", "--context", context, "-n", namespace, "exec",
+                f"{MONGO_SERVICE}-0", "--", "mongosh", "--quiet", "--eval", script],
+               timeout=APPLY_TIMEOUT, own=is_ours(context))
+
+
+def init_replica_set(*, namespace: str, context: str, emit: Emit = null_emit,
+                     sleep=time.sleep) -> None:
+    """Wait for MongoDB, initiate the single-node replica set, and VERIFY it.
+
+    Structure taken from PR #3, whose docstring records the failure this shape
+    exists to avoid: `kubectl wait` called the instant after `apply`, before the
+    pod existed, so it failed immediately and `rs.initiate` then ran against
+    nothing -- with both errors discarded and the repro reported as created.
+
+    So: poll for the pod, initiate, tolerate an already-initiated set, and check
+    `rs.status().ok` rather than trusting an exit code. A failure here is
+    CreateFailedError -- exit 7, known dead -- because every second spent waiting
+    afterwards is spent waiting for something that cannot happen.
+    """
+    for attempt in range(MONGO_READY_TRIES):
+        res = run(["kubectl", "--context", context, "-n", namespace, "get", "pod",
+                   f"{MONGO_SERVICE}-0", "-o",
+                   "jsonpath={.status.containerStatuses[0].ready}"],
+                  own=is_ours(context))
+        if (res.stdout or "").strip() == "true":
+            break
+        if attempt % 6 == 0:
+            info(emit, "waiting for MongoDB", phase="wait")
+        sleep(MONGO_READY_INTERVAL)
+    else:
+        raise CreateFailedError(
+            "MongoDB did not become ready, and Rocket.Chat cannot work without it "
+            f"(kubectl -n {namespace} describe pod {MONGO_SERVICE}-0)")
+
+    info(emit, "initiating the replica set", phase="boot", pct=45)
+    res = _mongo_exec(context, namespace, RS_INITIATE)
+    combined = f"{res.stdout or ''}{res.stderr or ''}".lower()
+    if res.returncode != 0 and "already initialized" not in combined:
+        raise CreateFailedError("could not initiate the MongoDB replica set: "
+                                + combined.strip()[:300])
+    ok = _mongo_exec(context, namespace, "rs.status().ok")
+    if (ok.stdout or "").strip() != "1":
+        raise CreateFailedError(
+            "the MongoDB replica set is not initiated, so Rocket.Chat's change "
+            "streams cannot work: " + (ok.stdout or ok.stderr or "").strip()[:300])
+    info(emit, "replica set ready", phase="boot")

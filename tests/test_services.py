@@ -2256,3 +2256,91 @@ def test_deleting_a_cluster_that_is_not_there_is_not_an_error(monkeypatch, tmp_p
     monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
     monkeypatch.setattr(k8s, "run", _fake_run({"get clusters": (0, "somebody-else\n")}))
     assert k8s.delete_cluster() is False
+
+
+def test_the_replica_set_is_initiated_and_verified_not_assumed(monkeypatch, tmp_path):
+    """`--replSet rs0` only puts mongod IN replica-set mode. Without rs.initiate()
+    there is no primary, nothing can write, and Rocket.Chat waits forever -- which
+    is what a real workspace did for 540 seconds, at 5 pods, with nothing in
+    Rocket.Chat's logs naming MongoDB.
+
+    The verification matters as much as the call: this is the step whose silent
+    failure produces a workspace that looks created and can never become ready.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    scripts = []
+
+    def spy(argv, timeout=None, own=False):
+        import subprocess as sp
+        j = " ".join(argv)
+        if "jsonpath" in j:
+            return sp.CompletedProcess(argv, 0, "true", "")
+        if "--eval" in argv:
+            script = argv[argv.index("--eval") + 1]
+            scripts.append(script)
+            out = "1" if script == "rs.status().ok" else ""
+            return sp.CompletedProcess(argv, 0, out, "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", spy)
+    k8s.init_replica_set(namespace="rc-repro-t", context=k8s.CONTEXT,
+                         sleep=lambda _s: None)
+    assert any("rs.initiate" in s for s in scripts), scripts
+    assert "rs.status().ok" in scripts, "it must verify, not trust the exit code"
+
+    # A set that is already initiated is success, not failure.
+    def already(argv, timeout=None, own=False):
+        import subprocess as sp
+        j = " ".join(argv)
+        if "jsonpath" in j:
+            return sp.CompletedProcess(argv, 0, "true", "")
+        if "--eval" in argv:
+            script = argv[argv.index("--eval") + 1]
+            if script == "rs.status().ok":
+                return sp.CompletedProcess(argv, 0, "1", "")
+            return sp.CompletedProcess(argv, 1, "", "already initialized")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", already)
+    k8s.init_replica_set(namespace="rc-repro-t", context=k8s.CONTEXT,
+                         sleep=lambda _s: None)
+
+
+def test_an_uninitiated_replica_set_is_reported_as_dead_not_left_to_time_out(
+        monkeypatch, tmp_path):
+    """Exit 7, known dead. Every second waited after this is spent waiting for
+    something that cannot happen, and the readiness timeout would blame
+    Rocket.Chat."""
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    def never_ok(argv, timeout=None, own=False):
+        import subprocess as sp
+        if "jsonpath" in " ".join(argv):
+            return sp.CompletedProcess(argv, 0, "true", "")
+        if "--eval" in argv:
+            return sp.CompletedProcess(argv, 0, "0", "")   # rs.status().ok == 0
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", never_ok)
+    with pytest.raises(errors.CreateFailedError) as caught:
+        k8s.init_replica_set(namespace="rc-repro-t", context=k8s.CONTEXT,
+                             sleep=lambda _s: None)
+    assert "change streams" in str(caught.value), "say WHY Rocket.Chat needs it"
+    assert caught.value.exit_code == 7
+
+    # And MongoDB never becoming ready is equally terminal, naming the command
+    # that shows why.
+    def never_ready(argv, timeout=None, own=False):
+        import subprocess as sp
+        return sp.CompletedProcess(argv, 0, "false", "")
+
+    monkeypatch.setattr(k8s, "run", never_ready)
+    monkeypatch.setattr(k8s, "MONGO_READY_TRIES", 2)
+    with pytest.raises(errors.CreateFailedError) as caught2:
+        k8s.init_replica_set(namespace="rc-repro-t", context=k8s.CONTEXT,
+                             sleep=lambda _s: None)
+    assert "describe pod" in str(caught2.value), "name what to run next"
