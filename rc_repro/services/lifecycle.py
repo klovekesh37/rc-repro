@@ -1874,4 +1874,10 @@ def kubernetes_state(name: str, meta) -> str:
     context = str((getattr(meta, "extra", None) or {}).get("context") or k8s.CONTEXT)
     if k8s.namespace_for(name) not in k8s.workspace_namespaces(context):
         return "down"
+    # The namespace EXISTING is not the workspace running. A plain `down` keeps the
+    # namespace and its PVC on purpose and uninstalls the release, so a torn-down
+    # workspace reported "starting" -- and would have reported it forever, because
+    # nothing was coming. Ask for the workload instead.
+    if not k8s.workload_exists(name, context=context):
+        return "down"
     return "running" if k8s.workspace_ready(name, context=context) else "starting"

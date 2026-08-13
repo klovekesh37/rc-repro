@@ -3035,3 +3035,38 @@ def test_the_install_is_idempotent_so_bringing_one_back_works(monkeypatch):
                         __import__("subprocess").CompletedProcess(argv, 0, "", ""))
     k8s.install(namespace="ns", context=k8s.CONTEXT, values={}, chart_version="7.0.0")
     assert seen[0][1:3] == ["upgrade", "--install"], seen[0][:4]
+
+
+def test_a_downed_workspace_is_down_not_perpetually_starting(monkeypatch, tmp_path):
+    """A plain `down` keeps the namespace and its PVC on purpose and uninstalls the
+    release. Asking only whether the namespace exists reported such a workspace as
+    "starting" -- and it would have said so forever, because nothing was coming.
+
+    Seen on a real box: `rc-repro list` showed `starting` for a workspace the user
+    had just torn down.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="u", host_port=3000,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+
+    monkeypatch.setattr(k8s, "workspace_namespaces", lambda *a, **kw: ["rc-repro-k"])
+    # Namespace kept, release gone -- exactly what `down` leaves behind.
+    monkeypatch.setattr(k8s, "workload_exists", lambda *a, **kw: False)
+    assert lc.kubernetes_state("k", m) == "down"
+
+    # Workload back but not serving yet.
+    monkeypatch.setattr(k8s, "workload_exists", lambda *a, **kw: True)
+    monkeypatch.setattr(k8s, "workspace_ready", lambda *a, **kw: False)
+    assert lc.kubernetes_state("k", m) == "starting"
+    monkeypatch.setattr(k8s, "workspace_ready", lambda *a, **kw: True)
+    assert lc.kubernetes_state("k", m) == "running"
+
+    # And no namespace at all is still down.
+    monkeypatch.setattr(k8s, "workspace_namespaces", lambda *a, **kw: [])
+    assert lc.kubernetes_state("k", m) == "down"

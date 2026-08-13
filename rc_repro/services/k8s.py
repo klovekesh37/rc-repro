@@ -1352,3 +1352,16 @@ def ensure_port_forward(name: str, *, namespace: str, context: str, host_port: i
         return int(pid)
     return port_forward(name, namespace=namespace, context=context,
                         host_port=host_port, bind_host=bind_host, emit=emit)
+
+
+def workload_exists(name: str, *, context: str) -> bool:
+    """Whether the Rocket.Chat deployment is present in the workspace's namespace.
+
+    Distinct from the namespace existing, which survives a plain `down` along with
+    the PVC. Without this a torn-down workspace reported "starting" indefinitely,
+    because the only thing being asked was whether the namespace was there.
+    """
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "deployment", f"{RELEASE}-rocketchat", "-o", "name"],
+              own=is_ours(context))
+    return res.returncode == 0 and bool((res.stdout or "").strip())
