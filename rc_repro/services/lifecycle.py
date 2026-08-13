@@ -161,6 +161,7 @@ KUBE_CHART_MB = 500
 # under-charging lets through a create that OOMs a swapless host, where the kernel
 # picks its own victim and destroys somebody else's work.
 MICROSERVICES_MB = 800
+
 #: Left unspent: for the OS, Docker, the page cache -- and, mostly, for GROWTH.
 #: A fifth of the host, never below 1 GB.
 #:
@@ -1639,9 +1640,22 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
             if volumes:
                 shutil.rmtree(runner.workspace(target), ignore_errors=True)
                 _clear_default_if(target)
-            info(emit, f"{target!r} "
-                       f"{'removed' if volumes else 'down (data kept)'}",
-                 phase="done")
+            # Docker's nouns are wrong here. "containers, data volume, and
+            # record" for a workspace that has a namespace and a PVC says nothing
+            # about what actually went away -- and `helm uninstall` does NOT delete
+            # a PVC, so the difference between these two paths is precisely the
+            # thing the user needs told.
+            if volumes:
+                info(emit, f"{target!r} removed — namespace "
+                           f"{k8s.namespace_for(target)}, its "
+                           "PersistentVolumeClaim and the local record",
+                     phase="done")
+            else:
+                info(emit, f"{target!r} down — the {k8s.RELEASE} release is "
+                           f"uninstalled; namespace {k8s.namespace_for(target)} "
+                           "and its PersistentVolumeClaim are KEPT, so `up` again "
+                           "reuses the data. `down --volumes` deletes it.",
+                     phase="done")
             return {"name": target, "removed": volumes, "found": found,
                     "runtime": topology.KUBERNETES}
         # BEFORE `down`, not after: compose cannot remove a network that still has
@@ -1762,10 +1776,23 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         meta.extra["instances"] = req.replicas
     if req.actor:
         meta.extra["created_by"] = req.actor
+    # rc-repro keeps its OWN kubeconfig so creating a cluster cannot move the user's
+    # current-context. The cost is that a bare `kubectl` sees nothing, which is
+    # confusing rather than safe unless we say so -- so the export comes FIRST and
+    # every command below it works once pasted.
+    kubeconfig = k8s.owned_kubeconfig()
+    ns = out["namespace"]
+    pods = 9 if microservices else 5
     meta.extra["notes"] = [
-        f"namespace {out['namespace']} on cluster {out['context']}",
-        f"kubectl -n {out['namespace']} get pods",
-        f"helm -n {out['namespace']} list",
+        f"{'microservices' if microservices else 'monolith'} on "
+        f"{out['context']} — about {pods} pods, namespace {ns}",
+        "rc-repro keeps its own kubeconfig; a bare kubectl will not see this:",
+        f"    export KUBECONFIG={kubeconfig}",
+        f"    kubectl -n {ns} get pods",
+        f"    kubectl -n {ns} logs -l app.kubernetes.io/name=rocketchat -f",
+        f"    helm -n {ns} get values {out['release']}",
+        "stop/start/restart, logs, stats and backup have no Kubernetes path yet — "
+        "each refuses and names the kubectl command that does the job.",
     ]
     # No compose document, so `write` is given an empty one rather than a fake:
     # a file that looks like a compose project but is not would be worse than none.

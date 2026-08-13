@@ -2690,3 +2690,54 @@ def test_the_microservices_surcharge_matches_the_pods_that_were_observed():
     # And it is charged ON TOP of the chart baseline, not instead of it -- NATS is
     # in KUBE_CHART_MB because a monolith runs it too.
     assert lc.KUBE_CHART_MB > 0 and lc.CLUSTER_MB > 0
+
+
+def test_a_cluster_that_outlived_its_kubeconfig_is_reconnected(monkeypatch, tmp_path):
+    """`kind get clusters` reads Docker, so it sees clusters rc-repro's OWN kubeconfig
+    knows nothing about. That happens whenever the cluster outlives the config: a
+    fresh or different RC_REPRO_HOME, a deleted config, a cluster made by hand.
+
+    Without an export, "reusing cluster" was followed by every kubectl call going to
+    localhost:8080 and the create failing with "the API server is not answering"
+    about a cluster that was perfectly healthy. Observed exactly that way: a
+    workspace left running from an earlier session broke the next run.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    seen = []
+
+    def spy(argv, timeout=None, own=False):
+        import subprocess as sp
+        joined = " ".join(argv)
+        seen.append(joined)
+        if "get clusters" in joined:
+            return sp.CompletedProcess(argv, 0, f"{k8s.CLUSTER_NAME}\n", "")
+        if "current-context" in joined:
+            return sp.CompletedProcess(argv, 0, k8s.CONTEXT, "")
+        if "/readyz" in joined:
+            return sp.CompletedProcess(argv, 0, "ok", "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", spy)
+    assert k8s.ensure_cluster() == k8s.CONTEXT
+    assert any("export kubeconfig" in c for c in seen), \
+        "it reused a cluster without writing it into rc-repro's kubeconfig"
+    assert not any("create cluster" in c for c in seen), "it recreated an existing one"
+
+    # A failed export is terminal and says so, rather than leaving every later
+    # kubectl call to fail against localhost:8080.
+    def broken(argv, timeout=None, own=False):
+        import subprocess as sp
+        joined = " ".join(argv)
+        if "get clusters" in joined:
+            return sp.CompletedProcess(argv, 0, f"{k8s.CLUSTER_NAME}\n", "")
+        if "export kubeconfig" in joined:
+            return sp.CompletedProcess(argv, 1, "", "permission denied")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", broken)
+    with pytest.raises(errors.CreateFailedError) as caught:
+        k8s.ensure_cluster()
+    assert "kubeconfig could not be read" in str(caught.value)

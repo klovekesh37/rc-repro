@@ -552,6 +552,22 @@ def ensure_cluster(emit: Emit = null_emit) -> str:
                     raise CreateFailedError(
                         f"could not create the cluster {CLUSTER_NAME}: "
                         + (detail[-1][:200] if detail else "kind gave no reason"))
+    # ALWAYS export, not only after creating. `kind get clusters` reads Docker, so
+    # it sees a cluster that rc-repro's OWN kubeconfig knows nothing about -- which
+    # happens whenever the cluster outlives the kubeconfig: a different or fresh
+    # RC_REPRO_HOME, a deleted config, or a cluster someone made by hand. Then
+    # "reusing cluster" is followed by every kubectl call going to localhost:8080
+    # and the create failing with "the API server is not answering" about a cluster
+    # that is perfectly healthy.
+    #
+    # PR #3 does this and says why: "refresh the owned kubeconfig for both new and
+    # pre-existing clusters". I ported the create and left the export behind.
+    export = run(["kind", "export", "kubeconfig", "--name", CLUSTER_NAME,
+                  "--kubeconfig", str(kubeconfig)], timeout=APPLY_TIMEOUT, own=True)
+    if export.returncode != 0:
+        raise CreateFailedError(
+            f"cluster {CLUSTER_NAME} exists but its kubeconfig could not be read: "
+            + (export.stderr or export.stdout or "").strip()[:200])
     context = cluster_context()
     if not reachable(context):
         raise CreateFailedError(
