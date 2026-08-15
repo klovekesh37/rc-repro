@@ -4031,3 +4031,77 @@ def test_a_half_configured_preset_says_so_instead_of_reporting_success():
     assert "RUNNING" in joined and "partly configured" in joined, joined
     assert "saml_idp_cert" in joined, joined
     assert "rc-repro ready --name w" in joined, joined
+
+
+def test_a_scenario_forward_targets_the_deployment_not_the_service(monkeypatch):
+    """A live OIDC workspace: Keycloak 1/1 Running, the recorded forward pid gone,
+    nothing answering on 8085.
+
+    `kubectl port-forward svc/...` dies when the Service's endpoint churns. The
+    workspace's own forward learned this and uses `deployment/`; scenario UIs then
+    reintroduced it. It also has to publish the CONTAINER port -- a deployment
+    forward cannot use the Service's port, and for SAML those differ (8081 -> 8080).
+    """
+    import subprocess
+
+    from rc_repro.services import k8s
+
+    spawned = []
+
+    def fake_run(argv, **kw):
+        if "get" in argv and "svc" in argv:
+            out = "keycloak 8081 8080\n"
+        elif "endpoints" in argv:
+            out = "10.244.0.9"
+        else:
+            out = ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    class _P:
+        pid = 4242
+
+    monkeypatch.setattr(k8s, "run", fake_run)
+    monkeypatch.setattr(k8s.subprocess, "Popen",
+                        lambda argv, **kw: (spawned.append(argv), _P())[1])
+    monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: True)
+
+    out = k8s.scenario_ui_forwards("w", namespace="rc-repro-w", context=k8s.CONTEXT,
+                                   sleep=lambda _s: None)
+    assert out == {8081: 4242}, out
+    argv = spawned[0]
+    assert "deployment/keycloak" in argv, argv
+    assert not any(a.startswith("svc/") for a in argv), argv
+    # host:container, so the CONTAINER port is what it maps to.
+    assert "8081:8080" in argv, argv
+
+
+def test_what_was_deployed_is_written_next_to_repro_json(tmp_path, monkeypatch):
+    """A Compose workspace has a docker-compose.yml you can read; a Kubernetes one
+    had only repro.json, because values go to `helm --values -` and manifests to
+    `kubectl apply -f -` on stdin. Good for secrets, bad for answering "what did it
+    actually deploy" -- especially once the cluster is gone and `helm get values` is
+    no longer there to ask.
+
+    Written for READING: re-running `up` regenerates them, exactly as it regenerates
+    docker-compose.yml.
+    """
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from rc_repro.services import k8s
+
+    written = k8s.record_rendered(
+        "w",
+        values={"image": {"tag": "8.5.1"}, "existingMongodbSecret": "rocketchat-mongodb-url"},
+        manifests={"mongodb": "kind: StatefulSet\n", "scenario": "kind: Deployment\n"})
+
+    base = tmp_path / "repros" / "w" / "kubernetes"
+    assert (base / "values.yaml").exists()
+    assert (base / "mongodb.yaml").read_text() == "kind: StatefulSet\n"
+    assert (base / "scenario.yaml").read_text() == "kind: Deployment\n"
+    assert len(written) == 3, written
+
+    # The values name the Secret; they must never CONTAIN the password. Moving the
+    # MongoDB URL off `helm get values` was the point of v0.49.0, and writing it to
+    # a file here would undo exactly that.
+    body = (base / "values.yaml").read_text()
+    assert "existingMongodbSecret" in body
+    assert "mongodb://" not in body, body

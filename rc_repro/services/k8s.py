@@ -1351,7 +1351,7 @@ def scenario_ui_forwards(name: str, *, namespace: str, context: str,
                "-l", UI_PORT_LABEL, "-o",
                "jsonpath={range .items[*]}{.metadata.name}{\" \"}"
                "{.metadata.labels.rc-repro\\.io/ui-port}{\" \"}"
-               "{.spec.ports[0].port}{\"\\n\"}{end}"],
+               "{.spec.ports[0].targetPort}{\"\\n\"}{end}"],
               own=is_ours(context))
     forwards: dict[int, int] = {}
     for line in (res.stdout or "").splitlines():
@@ -1389,7 +1389,14 @@ def scenario_ui_forwards(name: str, *, namespace: str, context: str,
         argv = ["kubectl", "--context", context, "-n", namespace, "port-forward"]
         if bind_host and bind_host not in ("127.0.0.1", "localhost"):
             argv += ["--address", bind_host]
-        argv += [f"svc/{svc}", f"{host_p}:{target_p}"]
+        # deployment/, NOT svc/. A Service forward dies when its endpoint churns --
+        # which is exactly what happened to a live OIDC workspace: Keycloak was
+        # 1/1 Running, the recorded pid was gone, and nothing answered on 8085. The
+        # workspace's own forward learned this and uses deployment/; scenarios then
+        # reintroduced it. Our adapters name the Deployment and the Service
+        # identically, which `test_a_scenario_names_its_deployment_and_service_alike`
+        # holds them to.
+        argv += [f"deployment/{svc}", f"{host_p}:{target_p}"]
         try:
             proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL, start_new_session=True,
@@ -1407,6 +1414,40 @@ def scenario_ui_forwards(name: str, *, namespace: str, context: str,
                        f"svc/{svc} {host_p}:{target_p}` re-establishes it",
                  phase="boot")
     return forwards
+
+
+def record_rendered(name: str, *, values: dict, manifests: dict) -> list[str]:
+    """Write what was sent to helm and kubectl into the workspace directory.
+
+    A Compose workspace has a docker-compose.yml you can read; a Kubernetes one had
+    nothing but repro.json, because values go to `helm --values -` and manifests to
+    `kubectl apply -f -` on stdin. That is good for secrets and bad for answering
+    "what did it actually deploy" -- especially once the cluster is gone, when the
+    live `helm get values` is no longer there to ask.
+
+    So they are written for READING. Re-running `up` regenerates them, exactly as it
+    regenerates docker-compose.yml, and editing them changes nothing -- the same
+    contract the Compose file already has.
+
+    SECRETS ARE NOT WRITTEN. The MongoDB URL carries a generated SCRAM password and
+    lives only in a Kubernetes Secret; putting it here would undo the whole point of
+    moving it off `helm get values`. `values.yaml` names the Secret instead, which is
+    what the running release does too.
+    """
+    import yaml as _yaml
+    ws = config.repros_dir() / name
+    out = ws / "kubernetes"
+    out.mkdir(parents=True, exist_ok=True)
+    written = [str(out / "values.yaml")]
+    runner.atomic_write(out / "values.yaml",
+                        _yaml.safe_dump(values, sort_keys=False))
+    for label, manifest in manifests.items():
+        if not manifest:
+            continue
+        path = out / f"{label}.yaml"
+        runner.atomic_write(path, manifest)
+        written.append(str(path))
+    return written
 
 
 def create_workspace(*, name: str, resolved, host_port: int, microservices: bool,
@@ -1452,6 +1493,8 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
         # versions rc-repro pairs, so the hand-written StatefulSet stays for those.
         mongo_url = MONGO_URL
         oplog_url = MONGO_OPLOG_URL
+        # Everything sent to kubectl, kept so it can be written next to repro.json.
+        rendered: dict[str, str] = {}
         # Recorded rather than inferred. `mongo_flavor` is a COMPOSE concept
         # ("official" / "bitnami-legacy") and this runtime honours neither value, so
         # reporting it here made `rc-repro list` print "8.0 (official)" for a
@@ -1477,8 +1520,10 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
             apply(mongo_secret_manifest(name, admin_password=secrets.token_urlsafe(24),
                                         app_password=app_password, owner=owner),
                   namespace=namespace, context=context)
-            apply(mongodb_community_manifest(name, resolved.mongo_tag, owner=owner),
-                  namespace=namespace, context=context)
+            operator_doc = mongodb_community_manifest(name, resolved.mongo_tag,
+                                                      owner=owner)
+            rendered["mongodb"] = operator_doc
+            apply(operator_doc, namespace=namespace, context=context)
             wait_for_mongodb(namespace=namespace, context=context, emit=emit)
             mongo_url = operator_mongo_url(namespace, app_password)
             oplog_url = operator_mongo_url(namespace, app_password, oplog=True)
@@ -1498,9 +1543,10 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
         if manifests:
             info(emit, f"scenario {getattr(preset, 'scenario', '') or preset.name}: "
                        f"{len(manifests)} resource(s)", phase="provision", pct=25)
-            for manifest in manifests:
-                apply(render_scenario_manifest(manifest, name),
-                      namespace=namespace, context=context)
+            for i, manifest in enumerate(manifests):
+                body = render_scenario_manifest(manifest, name)
+                rendered[f"scenario-{i}" if i else "scenario"] = body
+                apply(body, namespace=namespace, context=context)
         apply(mongo_url_secret_manifest(name, mongo_url=mongo_url,
                                         oplog_url=oplog_url, owner=owner),
               namespace=namespace, context=context)
@@ -1557,6 +1603,9 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
                    f"deployment/{RELEASE}-rocketchat {host_port}:3000 "
                    f"— or `rc-repro ready --name {name}` to re-establish it.",
              phase="boot")
+    # Written after a successful install, so the directory never describes something
+    # that failed halfway.
+    record_rendered(name, values=values, manifests=rendered)
     ui = scenario_ui_forwards(name, namespace=namespace, context=context,
                               bind_host=bind_host, emit=emit)
     return {"scenario_forwards": {str(k): v for k, v in ui.items()},
