@@ -946,7 +946,7 @@ def split_image(rc_image: str, rc_version: str) -> tuple[str, str]:
 def values_for(*, rc_version: str, rc_image: str, microservices: bool,
                replicas: int = 1, root_url: str = "", oplog: bool = False,
                mongo_url: str = "", oplog_url: str = "",
-               mongo_secret: str = "") -> dict:
+               mongo_secret: str = "", preset_env=None) -> dict:
     """Chart values for one workspace.
 
     MongoDB is ALWAYS external, never the chart's bundled subchart. PR #3's reason
@@ -986,6 +986,15 @@ def values_for(*, rc_version: str, rc_image: str, microservices: bool,
         {"name": "ADMIN_PASS", "value": config.ADMIN_PASSWORD},
         {"name": "ALLOW_UNSAFE_QUERY_AND_FIELDS_API_PARAMS", "value": "true"},
     ]
+    # A scenario's Rocket.Chat settings are the SHARED half of the Scenario
+    # contract: `OVERWRITE_SETTING_LDAP_*` is byte-identical on both runtimes, so it
+    # rides extraEnv here exactly as it rides the service environment on Compose.
+    # Only the backing service differs, and that is the manifests the caller applies.
+    #
+    # AFTER the base list, so a preset can override a default rather than being
+    # overridden by one -- the same precedence compose.py gives it ("Preset env wins
+    # over base defaults").
+    env.extend({"name": str(k), "value": str(v)} for k, v in (preset_env or {}).items())
     values: dict = {
         # pullPolicy and the NATS cluster name are the guide's own values.yaml.
         # IfNotPresent also matters here specifically: a repro box re-creates
@@ -1298,10 +1307,22 @@ def port_forward(name: str, *, namespace: str, context: str, host_port: int,
     return proc.pid
 
 
+def render_scenario_manifest(manifest: str, name: str) -> str:
+    """Bind a scenario's native resources to this namespace-local workspace.
+
+    PR #3's substitution, kept verbatim: a scenario adapter cannot know the
+    workspace name when it renders, so it writes a placeholder and the lifecycle
+    fills it in. The label it feeds -- `rc-repro.io/repro` -- is what makes the
+    resource show up under this workspace's ownership rather than floating in the
+    namespace unattributed.
+    """
+    return manifest.replace("__RC_REPRO_NAME__", name)
+
+
 def create_workspace(*, name: str, resolved, host_port: int, microservices: bool,
                      replicas: int = 1, owner: str = "", root_url: str = "",
                      bind_host: str = "", use_operator: bool = False,
-                     emit: Emit = null_emit) -> dict:
+                     preset=None, emit: Emit = null_emit) -> dict:
     """Build a Kubernetes workspace, and return what repro.json needs.
 
     A PARALLEL path to lifecycle's compose one rather than a refactor of it, which
@@ -1380,6 +1401,16 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
                   namespace=namespace, context=context)
             init_replica_set(namespace=namespace, context=context, emit=emit)
 
+        # A scenario's backing services go in BEFORE Rocket.Chat, so its settings
+        # point at something that already exists. The chart is what waits for
+        # readiness; a Deployment that is still pulling is fine here.
+        manifests = list(getattr(preset, "kubernetes_manifests", None) or [])
+        if manifests:
+            info(emit, f"scenario {getattr(preset, 'scenario', '') or preset.name}: "
+                       f"{len(manifests)} resource(s)", phase="provision", pct=25)
+            for manifest in manifests:
+                apply(render_scenario_manifest(manifest, name),
+                      namespace=namespace, context=context)
         apply(mongo_url_secret_manifest(name, mongo_url=mongo_url,
                                         oplog_url=oplog_url, owner=owner),
               namespace=namespace, context=context)
@@ -1387,7 +1418,8 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
                             rc_image=resolved.rc_image,
                             microservices=microservices, replicas=replicas,
                             root_url=root_url, oplog=resolved.oplog,
-                            mongo_secret=MONGO_URL_SECRET)
+                            mongo_secret=MONGO_URL_SECRET,
+                            preset_env=getattr(preset, "env", None))
         values.update(container_security_context(chart_version))
         info(emit, f"installing {CHART} as {RELEASE}", phase="boot", pct=60)
         install(namespace=namespace, context=context, values=values,

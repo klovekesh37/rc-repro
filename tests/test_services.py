@@ -3849,8 +3849,9 @@ def test_kubernetes_refuses_what_it_would_silently_drop(monkeypatch, tmp_path):
         (req(https="local"), "--https"),
         (req(domain="x.example"), "--domain"),
         (req(reg_token="abc"), "--reg-token"),
-        (req(preset="ldap"), "preset 'ldap'"),
-        (req(params={"host": "x"}), "--set"),
+        # A preset with no Kubernetes adapter is still refused -- recorded and
+        # never applied is what this guard exists to prevent.
+        (req(preset="saml"), "preset 'saml'"),
     ]
     for creq, expected in cases:
         with pytest.raises(errors.ValidationError) as caught:
@@ -3861,6 +3862,13 @@ def test_kubernetes_refuses_what_it_would_silently_drop(monkeypatch, tmp_path):
     lc._refuse_unsupported_on_kubernetes(req(preset="default", name="x", pin=True,
                                              monitor=True, seed=True, wait=True,
                                              mongo_operator=True, replicas=3))
+    # And `ldap` passes now BECAUSE it has an adapter -- the refusal is per preset,
+    # not a blanket "presets do not work here". That is what slice 4 bought.
+    lc._refuse_unsupported_on_kubernetes(req(preset="ldap", params={"users": "3"}))
+    # The refusal names the ones that DO work, so the answer is actionable.
+    with pytest.raises(errors.ValidationError) as caught:
+        lc._refuse_unsupported_on_kubernetes(req(preset="oidc"))
+    assert "ldap" in str(caught.value), caught.value
 
 
 def test_the_kubernetes_refusals_are_reached_from_the_create_path():
@@ -3872,3 +3880,36 @@ def test_the_kubernetes_refusals_are_reached_from_the_create_path():
     call = src.index("_refuse_unsupported_on_kubernetes")
     dispatch = src.index("_create_kubernetes(req")
     assert call < dispatch, "the refusal must run BEFORE the workspace is built"
+
+
+def test_a_scenarios_settings_reach_the_rocket_chat_container(monkeypatch):
+    """The SHARED half of the Scenario contract, and the half that silently did not
+    arrive.
+
+    `values_for` took `preset_env`, threaded it from `create_workspace`, and then
+    never used it -- the parameter was declared, passed, and dropped on the floor.
+    The live run showed the symptom exactly: OpenLDAP deployed, ready and labelled,
+    and Rocket.Chat with no LDAP setting on it at all. A backing service nothing is
+    configured to use is the same silent-drop shape as the rest of this runtime,
+    one level further in.
+
+    Appended AFTER the base list so a preset can override a default rather than be
+    overridden by one -- the precedence compose.py already gives it.
+    """
+    from rc_repro import presets
+    from rc_repro.services import k8s, topology
+
+    preset = presets.resolve("ldap", topology.KUBERNETES, {"users": "7"})
+    values = k8s.values_for(rc_version="8.5.1", rc_image="i", microservices=False,
+                            preset_env=preset.env)
+    got = {e["name"]: e["value"] for e in values["extraEnv"]}
+    assert got.get("OVERWRITE_SETTING_LDAP_Host") == "openldap", got
+    assert got.get("OVERWRITE_SETTING_LDAP_Enable") in ("true", "True"), got
+    # The workspace's own admin env must survive alongside it.
+    assert got["ADMIN_USERNAME"] and got["INITIAL_USER"] == "yes"
+
+    # A preset wins over a base default, rather than the other way round.
+    override = k8s.values_for(rc_version="8.5.1", rc_image="i", microservices=False,
+                              preset_env={"ADMIN_NAME": "Scenario"})
+    names = [e["value"] for e in override["extraEnv"] if e["name"] == "ADMIN_NAME"]
+    assert names[-1] == "Scenario", names

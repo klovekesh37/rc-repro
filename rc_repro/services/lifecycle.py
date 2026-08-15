@@ -1833,19 +1833,34 @@ def _refuse_unsupported_on_kubernetes(req: CreateReq) -> None:
             raise ValidationError(
                 f"--{name.replace('_', '-')} is not supported on Kubernetes yet: "
                 f"{why}. Use --runtime docker for a workspace that needs it.")
-    # Presets are a Compose construct today -- side-service containers and
-    # OVERWRITE_SETTING_* env, neither of which this path builds. `default` is the
-    # only one it can honestly claim, and it is what it already loads.
+    # A preset reaches Kubernetes when it has an adapter for it -- the Scenario
+    # contract from #3. Those that do not are still refused, because being recorded
+    # and not applied is what this guard exists to prevent; but the refusal is now
+    # per preset rather than a blanket "not supported", and it names the ones that
+    # DO work so the answer is actionable.
     if req.preset and req.preset != "default":
-        raise ValidationError(
-            f"preset {req.preset!r} is not supported on Kubernetes yet — presets add "
-            "side services and settings through the Compose document, which this "
-            "runtime does not build. It would have been recorded and not applied. "
-            "Use --preset default here, or --runtime docker for the scenario.")
-    if req.params:
-        raise ValidationError(
-            "--set belongs to a preset, and presets are not supported on Kubernetes "
-            "yet, so these values would be recorded and never applied.")
+        works = ", ".join(sorted(presets.scenario_names())) or "none yet"
+        try:
+            resolved_preset = presets.resolve(req.preset, topology.KUBERNETES,
+                                              req.params or {})
+        except ValueError as exc:
+            raise ValidationError(
+                f"preset {req.preset!r} cannot be resolved for Kubernetes: {exc}. "
+                f"Presets with a Kubernetes adapter: {works}. Or use "
+                f"--runtime docker, where every preset works.") from exc
+        # RESOLVING is not the same as WORKING. A preset with no scenario adapter
+        # comes back with its Compose `services` intact -- Keycloak, Mailpit, MinIO
+        # -- and this runtime builds no compose document, so those containers would
+        # simply never exist while the settings pointing at them were applied. That
+        # is the silent-drop shape again, one level further in: the workspace boots,
+        # the preset is recorded, and the scenario it names is not there.
+        if resolved_preset.services and not resolved_preset.kubernetes_manifests:
+            raise ValidationError(
+                f"preset {req.preset!r} needs backing services "
+                f"({', '.join(sorted(resolved_preset.services))}) and has no "
+                f"Kubernetes adapter to create them, so they would be missing while "
+                f"Rocket.Chat was configured to use them. Presets with an adapter: "
+                f"{works}. Or use --runtime docker, where every preset works.")
 
 
 def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
@@ -1904,7 +1919,14 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         name=repro_name, resolved=resolved, host_port=host_port,
         microservices=microservices, replicas=req.replicas or 1,
         owner=req.actor, bind_host=bind_host,
-        use_operator=req.mongo_operator, emit=emit)
+        use_operator=req.mongo_operator,
+        # Resolved through the KUBERNETES adapter, so a scenario yields native
+        # manifests here and a compose service on the other runtime -- one intent,
+        # two renderings. `_refuse_unsupported_on_kubernetes` has already proved
+        # this resolves, so a failure here would be a bug rather than bad input.
+        preset=presets.resolve(req.preset or "default", topology.KUBERNETES,
+                               req.params or {}),
+        emit=emit)
 
     meta = runner.Metadata(
         name=repro_name, project=out["namespace"], rc_version=resolved.rc_version,

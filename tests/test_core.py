@@ -2615,3 +2615,70 @@ def test_both_spellings_of_multi_instance_build_the_same_compose_file():
     assert len(rc) == 3, f"expected 3 Rocket.Chat services, got {rc}"
     assert len([s for s in _yaml.safe_load(built(deployment="multi-instance"))["services"]
                 if s.startswith("rocketchat")]) == 2
+
+
+def test_preset_and_topology_agree_on_what_the_runtimes_are_called():
+    """One vocabulary for the same two things.
+
+    `services/topology.py` is the registry every other layer reads -- repro.json,
+    the CLI, the GUI and the HTTP API all say "docker"/"kubernetes". PR #3's preset
+    layer said "compose"/"kubernetes" for the same pair. A second set of words for
+    one concept is how `mongo_flavor` ended up being reported for a runtime that
+    does not honour it, so the preset layer speaks the same words.
+
+    `presets` is the LOWER layer and must not import `services`, so the constant is
+    spelled out there and this test is what an import would have guaranteed.
+    """
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    assert presets._RUNTIME_DEFAULT == topology.DOCKER
+    ldap = presets._scenario_definitions()["ldap"]
+    assert set(ldap.adapters) <= topology.REGISTERED, sorted(ldap.adapters)
+    assert topology.DOCKER in ldap.adapters and topology.KUBERNETES in ldap.adapters
+
+
+def test_one_ldap_intent_renders_for_both_runtimes():
+    """The whole point of the Scenario contract, and the reason it was worth taking.
+
+    One deployment-neutral intent, one small adapter per runtime. The Rocket.Chat
+    settings are SHARED -- `OVERWRITE_SETTING_LDAP_*` is identical either way --
+    and only the backing service differs: a compose service on one side, native
+    manifests on the other. That is what makes a preset a single thing rather than
+    two implementations that drift.
+    """
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    params = {"users": "7", "domain": "example.org"}
+    compose = presets.resolve("ldap", topology.DOCKER, params)
+    kube = presets.resolve("ldap", topology.KUBERNETES, params)
+
+    assert compose.scenario == kube.scenario == "ldap"
+    assert compose.scenario_params == kube.scenario_params
+    # The settings Rocket.Chat needs are the same on both; that is the shared half.
+    for key in ("OVERWRITE_SETTING_LDAP_BaseDN", "OVERWRITE_SETTING_LDAP_Host"):
+        assert compose.env[key] == kube.env[key], key
+    # The backing service is where they differ, and only there.
+    assert compose.services and not compose.kubernetes_manifests
+    assert kube.kubernetes_manifests and not kube.services
+
+
+def test_deployments_are_not_presets_on_this_branch():
+    """PR #3 modelled `microservices` as a PRESET that implies Kubernetes, so the
+    runtime was inferred from the scenario name. This branch models it as a
+    DEPLOYMENT under an explicit `--runtime`, which is why `resolve_selection`,
+    `DEPLOYMENT_PRESETS` and the alias map were left behind rather than taken.
+
+    Keeping both would have given two answers to "what runs where" -- and the one
+    that infers would have quietly won, because it needs no flag.
+    """
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    assert not hasattr(presets, "resolve_selection")
+    assert not hasattr(presets, "DEPLOYMENT_PRESETS")
+    # Deployments live in exactly one place.
+    assert topology.MICROSERVICES in topology.DEPLOYMENTS[topology.KUBERNETES]
+    assert topology.MULTI_INSTANCE in topology.DEPLOYMENTS[topology.DOCKER]
+    assert "microservices" not in presets.scenario_names()
