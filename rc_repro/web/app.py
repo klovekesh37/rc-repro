@@ -1254,7 +1254,18 @@ def create_app(allow_hosts: list[str] | None = None, *,
                 # everybody and failing the create.
                 "may_set_privileged": lc.may_set_privileged_fields(
                     getattr(request.state, "actor", "") or ""),
-                "privileged_fields": list(lc.PRIVILEGED_CREATE_FIELDS)}
+                "privileged_fields": list(lc.PRIVILEGED_CREATE_FIELDS),
+                # The runtime/deployment axes, from the one table that defines them,
+                # so the dialog cannot offer a combination the service layer refuses.
+                # The same reasoning as `privileged_fields` directly above: two
+                # places deciding the same thing is how the form ends up rendering a
+                # field the API rejects, which is exactly what happened there.
+                "runtimes": [
+                    {"name": rt, "deployments": list(deps),
+                     "default_deployment": deps[0]}
+                    for rt, deps in topology.DEPLOYMENTS.items()
+                ],
+                "default_runtime": topology.DOCKER}
 
     @app.get("/api/machine")
     def machine():

@@ -797,6 +797,18 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
         # compose up` -- and two front-ends depend on it behaving exactly as it
         # does. Handing Kubernetes off here keeps the Docker default byte-identical
         # and puts the Kubernetes sequence in the module that owns it.
+        #
+        # TLS is refused rather than ignored. `_resolve_tls` runs BELOW this line,
+        # so `--https` on a Kubernetes workspace did nothing at all and said nothing
+        # about it -- the workspace came up on plain http and the flag evaporated.
+        # Silently doing less than asked is the failure this whole runtime split has
+        # produced most often, so it is named here rather than discovered later.
+        if getattr(req, "tls", "") or getattr(req, "domain", ""):
+            raise ValidationError(
+                "HTTPS is not implemented on Kubernetes yet — it needs an ingress "
+                "controller and cert-manager, not the Traefik edge Compose uses. "
+                "Create it without --https, or use --runtime docker for a workspace "
+                "that needs TLS.")
         return _create_kubernetes(req, emit=emit)
     require_docker()
     cfg = config.load_config()
