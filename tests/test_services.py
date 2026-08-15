@@ -3822,3 +3822,53 @@ def test_ready_confirms_the_socket_not_just_the_pid(monkeypatch, tmp_path):
     monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: True)
     out = lc._wait_serving_kubernetes(m, lc.null_emit, timeout=5.0)
     assert out == {"ready": True, "url": "http://localhost:3999"}, out
+
+
+def test_kubernetes_refuses_what_it_would_silently_drop(monkeypatch, tmp_path):
+    """Five create options were ACCEPTED and then ignored on this runtime.
+
+    `--preset ldap` is the clearest: the Kubernetes path's only `presets.load` is a
+    hardcoded "default", so the name was written into repro.json and nothing else
+    happened -- `rc-repro list` showed "ldap" for a workspace with no LDAP in it. A
+    create that reports success and produces something else is the worst outcome
+    available, and it is the failure mode this whole runtime split keeps producing:
+    --seed, --https, mongo_flavor and mongo_shell were all the same shape.
+
+    `--fresh` is the one that matters most and is reported first: it means DELETE
+    this workspace's data, and the Kubernetes path keeps the PersistentVolumeClaim.
+    """
+    from rc_repro.services import topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    def req(**kw):
+        return lc.CreateReq(version="8.5.1", runtime=topology.KUBERNETES, **kw)
+
+    cases = [
+        (req(fresh=True), "--fresh"),
+        (req(https="local"), "--https"),
+        (req(domain="x.example"), "--domain"),
+        (req(reg_token="abc"), "--reg-token"),
+        (req(preset="ldap"), "preset 'ldap'"),
+        (req(params={"host": "x"}), "--set"),
+    ]
+    for creq, expected in cases:
+        with pytest.raises(errors.ValidationError) as caught:
+            lc._refuse_unsupported_on_kubernetes(creq)
+        assert expected in str(caught.value), f"{expected}: {caught.value}"
+
+    # What IS supported must still pass straight through, or this becomes a wall.
+    lc._refuse_unsupported_on_kubernetes(req(preset="default", name="x", pin=True,
+                                             monitor=True, seed=True, wait=True,
+                                             mongo_operator=True, replicas=3))
+
+
+def test_the_kubernetes_refusals_are_reached_from_the_create_path():
+    """Wired at the dispatch, not merely defined. A guard nothing calls is worse
+    than no guard, because the docstring says it is handled."""
+    import inspect
+
+    src = inspect.getsource(lc._create_repro_locked)
+    call = src.index("_refuse_unsupported_on_kubernetes")
+    dispatch = src.index("_create_kubernetes(req")
+    assert call < dispatch, "the refusal must run BEFORE the workspace is built"

@@ -803,12 +803,7 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
         # about it -- the workspace came up on plain http and the flag evaporated.
         # Silently doing less than asked is the failure this whole runtime split has
         # produced most often, so it is named here rather than discovered later.
-        if getattr(req, "tls", "") or getattr(req, "domain", ""):
-            raise ValidationError(
-                "HTTPS is not implemented on Kubernetes yet — it needs an ingress "
-                "controller and cert-manager, not the Traefik edge Compose uses. "
-                "Create it without --https, or use --runtime docker for a workspace "
-                "that needs TLS.")
+        _refuse_unsupported_on_kubernetes(req)
         return _create_kubernetes(req, emit=emit)
     require_docker()
     cfg = config.load_config()
@@ -1795,6 +1790,62 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         removed.append(name)
         info(emit, f"pruned {name!r}", phase="done")
     return {"targets": targets, "removed": removed}
+
+
+#: What `up` accepts on Compose and cannot honour on Kubernetes, with the reason.
+#: Each of these was ACCEPTED and silently dropped: the create succeeded, said
+#: nothing, and produced a workspace that was not what was asked for. `--preset ldap`
+#: is the clearest -- the Kubernetes path's only `presets.load` is a hardcoded
+#: "default", so the preset name was written into repro.json and nothing else
+#: happened. `rc-repro list` then showed "ldap" for a workspace with no LDAP in it.
+#:
+#: This is the failure mode of the whole runtime split, and it has now produced
+#: `--seed`, `--https`, `mongo_flavor`, `mongo_shell` and these. A refusal that names
+#: the missing thing is worth more than a create that quietly does less.
+_KUBERNETES_UNSUPPORTED: tuple[tuple[str, str], ...] = (
+    # `https`, not `tls`. The first cut of this guard read `getattr(req, "tls", "")`
+    # -- a field CreateReq does not have -- so it returned "" every time and the
+    # refusal never fired once. It was shipped, described in a commit message, and
+    # was dead code: `--https` went on being silently dropped exactly as before. A
+    # guard keyed on a name nobody checks is worse than no guard, because the
+    # docstring then says the case is handled. Hence the loop reads real fields and
+    # the test drives it through CreateReq rather than a hand-made object.
+    ("https", "HTTPS needs an ingress controller and cert-manager, not the Traefik "
+              "edge Compose uses"),
+    ("domain", "a public domain needs the ingress that HTTPS needs"),
+    ("reg_token", "the EE registration token is injected through the preset "
+                  "environment, which this runtime does not apply yet"),
+    ("fresh", "--fresh means DELETE this workspace's data, and the Kubernetes path "
+              "keeps the PersistentVolumeClaim — use `rc-repro down --name <n> "
+              "--volumes` first, which does delete it"),
+)
+
+
+def _refuse_unsupported_on_kubernetes(req: CreateReq) -> None:
+    """Refuse what this runtime cannot honour, rather than accepting and dropping it.
+
+    Ordered so the most consequential is reported first when several are set: being
+    told about `--fresh` matters more than being told about `--reg-token`, because
+    one of them is about data.
+    """
+    for name, why in _KUBERNETES_UNSUPPORTED:
+        if getattr(req, name, None):
+            raise ValidationError(
+                f"--{name.replace('_', '-')} is not supported on Kubernetes yet: "
+                f"{why}. Use --runtime docker for a workspace that needs it.")
+    # Presets are a Compose construct today -- side-service containers and
+    # OVERWRITE_SETTING_* env, neither of which this path builds. `default` is the
+    # only one it can honestly claim, and it is what it already loads.
+    if req.preset and req.preset != "default":
+        raise ValidationError(
+            f"preset {req.preset!r} is not supported on Kubernetes yet — presets add "
+            "side services and settings through the Compose document, which this "
+            "runtime does not build. It would have been recorded and not applied. "
+            "Use --preset default here, or --runtime docker for the scenario.")
+    if req.params:
+        raise ValidationError(
+            "--set belongs to a preset, and presets are not supported on Kubernetes "
+            "yet, so these values would be recorded and never applied.")
 
 
 def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
