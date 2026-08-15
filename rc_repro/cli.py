@@ -577,6 +577,14 @@ def prune(
         typer.echo("Nothing to prune.")
 
 
+def _say_reattach(target: str) -> None:
+    """Tell a Kubernetes workspace's owner how to get its URL answering again."""
+    from rc_repro.services import topology
+    if topology.of_repro(target) != topology.KUBERNETES:
+        return
+    ui.note(f"the URL needs its port-forward back: rc-repro ready --name {target}")
+
+
 @app.command()
 def start(name: str = typer.Option("", "--name", "-n")) -> None:
     """Resume a stopped repro (fast, no rebuild)."""
@@ -590,6 +598,11 @@ def start(name: str = typer.Option("", "--name", "-n")) -> None:
         ui.die(f"could not start {target!r} — if it was `down`ed, use "
                "`rc-repro up` to recreate it", exit_code=exc.exit_code)
     ui.ok(f"✓ {target!r} started.")
+    # On Kubernetes the published port is a port-forward, and it died with the pod
+    # that `stop` scaled away. Compose republishes its ports itself; this does not,
+    # so a `start` that said nothing here would leave a URL that answers nothing and
+    # no clue why.
+    _say_reattach(target)
 
 
 @app.command()
@@ -612,6 +625,7 @@ def restart(name: str = typer.Option("", "--name", "-n")) -> None:
     except errors.ReproError as exc:
         _fail(exc)
     ui.ok(f"✓ {target!r} restarted.")
+    _say_reattach(target)
 
 
 @app.command()

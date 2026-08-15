@@ -2540,17 +2540,18 @@ def test_down_removes_a_kubernetes_workspace_instead_of_asking_docker(monkeypatc
         lc.teardown("k", volumes=True, confirm=False)
 
 
-def test_start_stop_and_logs_refuse_a_kubernetes_workspace_with_a_way_forward(
+def test_stop_and_start_scale_a_kubernetes_workspace_rather_than_calling_compose(
         monkeypatch, tmp_path):
-    """Guarded in `set_state`, not in each front-end: the CLI's stop/start/restart
-    and the GUI's always-enabled buttons both arrive through that one function, so
-    one guard covers both and cannot drift.
+    """Kubernetes has no pause, so stop/start is scale-to-zero and back.
 
-    Kubernetes has no pause -- the plan is to scale to 0, which maps onto this
-    contract exactly -- but it is not written. Reaching for `docker compose stop`
-    against a workspace with no compose project fails with "no configuration file
-    provided", which tells the user nothing. A refusal that names the kubectl
-    command is worth more than an implementation that does not exist.
+    What has to match is COMPOSE'S CONTRACT, not Kubernetes' vocabulary: `stop`
+    gives the memory back and keeps the data, `start` brings the same workspace back
+    on the same port. Scaling leaves the PersistentVolumeClaim untouched, which is
+    what puts this as far from `down --volumes` as `docker compose stop` is.
+
+    Dispatched in `set_state` rather than in each front-end: the CLI's
+    stop/start/restart and the GUI's always-enabled buttons both arrive through this
+    one function, so one branch covers both and cannot drift.
     """
     from rc_repro.services import k8s, topology
 
@@ -2563,26 +2564,71 @@ def test_start_stop_and_logs_refuse_a_kubernetes_workspace_with_a_way_forward(
     m.extra["context"] = k8s.CONTEXT
     lc.runner.write("k", "", m)
 
-    monkeypatch.setattr(lc.runner, "stop",
-                        lambda *a, **kw: pytest.fail("it called docker compose stop"))
-    for action in ("start", "stop", "restart"):
-        with pytest.raises(errors.ValidationError) as caught:
-            lc.set_state("k", action)
-        assert "kubectl" in str(caught.value), f"{action}: name the way forward"
-        assert caught.value.exit_code == 2
+    for name in ("stop", "start", "restart"):
+        monkeypatch.setattr(lc.runner, name,
+                            lambda *a, **kw: pytest.fail("it called docker compose"))
+    calls = []
+    monkeypatch.setattr(k8s, "stop_workspace",
+                        lambda n, **kw: calls.append(("stop", n)))
+    monkeypatch.setattr(k8s, "start_workspace",
+                        lambda n, **kw: calls.append(("start", n)))
 
-    # And a Compose workspace is untouched by the guard.
-    plain = lc.runner.Metadata(name="d", project="rcrepro-d", rc_version="8.5.1",
-                               rc_image="i", mongo_tag="8.0", mongo_flavor="official",
-                               preset="default", root_url="u", host_port=3011,
-                               version_source="t")
-    topology.stamp(plain.extra, topology.DOCKER)
-    lc.runner.write("d", "services: {}\n", plain)
-    called = []
-    monkeypatch.setattr(lc.runner, "stop", lambda *a, **kw: called.append(1) or 0)
-    monkeypatch.setattr(lc.runner, "exists", lambda _n: True)
-    lc.set_state("d", "stop")
-    assert called, "the guard fired on a Compose workspace"
+    lc.set_state("k", "stop")
+    assert calls == [("stop", "k")], calls
+
+    calls.clear()
+    lc.set_state("k", "start")
+    assert calls == [("start", "k")], calls
+
+    # restart is both, in that order -- not a no-op and not a start-then-stop.
+    calls.clear()
+    lc.set_state("k", "restart")
+    assert calls == [("stop", "k"), ("start", "k")], calls
+
+    # A bad action is still rejected the same way on both runtimes.
+    with pytest.raises(errors.ValidationError):
+        lc.set_state("k", "pause")
+
+
+def test_a_stopped_kubernetes_workspace_remembers_what_to_scale_back_to(monkeypatch):
+    """Kubernetes has no "stopped" state -- 0 replicas IS the mechanism -- so the
+    number that was there has to be written down or `start` cannot restore it.
+
+    Recorded BEFORE scaling, or the value read back is the zero just written. Stored
+    on the namespace rather than in repro.json because scaling by hand is a
+    legitimate thing to do and the cluster should carry its own truth -- and a
+    workspace stopped by hand carries no annotation at all, which is why the
+    fallback is 1 rather than a refusal.
+    """
+    from rc_repro.services import k8s
+
+    scaled, annotated = [], []
+
+    def fake_run(argv, **kw):
+        import subprocess
+        if "get" in argv and "deployment,statefulset" in argv:
+            out = "deployment.apps/rocketchat-rocketchat\nstatefulset.apps/mongodb\n"
+        elif "annotate" in argv:
+            annotated.append(argv)
+            out = ""
+        elif "get" in argv and any(a.startswith("jsonpath={.spec.replicas}")
+                                   for a in argv):
+            out = "2"
+        elif "scale" in argv:
+            scaled.append(argv)
+            out = ""
+        else:
+            out = ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(k8s, "run", fake_run)
+    k8s.stop_workspace("w", context=k8s.CONTEXT)
+
+    payload = [a for a in annotated[0] if a.startswith(k8s.SCALE_ANNOTATION)][0]
+    assert '"deployment.apps/rocketchat-rocketchat": "2"' in payload, payload
+    assert "statefulset.apps/mongodb" in payload, \
+        "MongoDB scales too -- a workspace holding its database resident is not stopped"
+    assert any("--replicas=0" in a for argv in scaled for a in argv), scaled
 
 
 def test_the_port_forward_targets_the_deployment_not_the_service(monkeypatch, tmp_path):
@@ -3204,6 +3250,10 @@ def test_ready_asks_kubernetes_not_docker(monkeypatch, tmp_path):
     monkeypatch.setattr(lc.runner, "rc_state",
                         lambda *a, **kw: pytest.fail("it asked docker"))
     monkeypatch.setattr(k8s, "workspace_ready", lambda *a, **kw: True)
+    # `ready` now also confirms the socket answers, not just that a pid came back --
+    # see test_ready_confirms_the_socket_not_just_the_pid. Stubbed true here so this
+    # test stays about which RUNTIME is asked, which is what it is named for.
+    monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: True)
     established: list = []
     monkeypatch.setattr(k8s, "ensure_port_forward",
                         lambda *a, **kw: established.append(kw) or 4242)
@@ -3732,3 +3782,44 @@ def test_the_chart_fix_is_applied_only_where_the_chart_needs_it(monkeypatch):
         {"containerSecurityContext": {"fsGroup": None}}
     assert k8s.container_security_context("7.0.0") == {}, \
         "a chart without the field must get no override at all"
+
+
+def test_ready_confirms_the_socket_not_just_the_pid(monkeypatch, tmp_path):
+    """`ready` exited 0 on a workspace whose URL answered nothing, after `restart`.
+
+    The pod being Ready is Kubernetes' answer to a different question. `kubectl
+    port-forward` returns a pid before it has bound the socket, so declaring ready
+    on the strength of the pid is a guess -- and the live run caught it being wrong:
+    `ready` returned success and the very next request to the URL it had just
+    confirmed got nothing.
+
+    So the loop keeps going until something actually answers on the port. This is
+    the same defect as the Grafana URL, in the place it was fixed second.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="http://localhost:3999",
+                           host_port=3999, version_source="t")
+    from rc_repro.services import topology
+    topology.stamp(m.extra, topology.KUBERNETES)
+
+    monkeypatch.setattr(k8s, "workspace_ready", lambda *a, **kw: True)
+    monkeypatch.setattr(k8s, "ensure_port_forward", lambda *a, **kw: 4242)
+    monkeypatch.setattr(lc.runner, "update_meta", lambda *a, **kw: None)
+
+    # Never reachable -> must NOT report ready, must raise the timeout instead.
+    monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: False)
+    try:
+        lc._wait_serving_kubernetes(m, lc.null_emit, timeout=0.2)
+    except errors.NotReadyError:
+        pass
+    else:
+        raise AssertionError("a URL that answers nothing must not report ready")
+
+    # Reachable -> ready.
+    monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: True)
+    out = lc._wait_serving_kubernetes(m, lc.null_emit, timeout=5.0)
+    assert out == {"ready": True, "url": "http://localhost:3999"}, out

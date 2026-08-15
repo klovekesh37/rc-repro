@@ -1503,21 +1503,17 @@ def set_state(name: str, action: str) -> None:
     # and the GUI's always-enabled buttons both arrive through this one function, so
     # one guard covers both and cannot drift between them.
     #
-    # Kubernetes has no pause. The plan is to scale the Deployments and the
-    # StatefulSet to 0, which maps onto this contract exactly -- but it is not
-    # written, and reaching for `docker compose stop` on a workspace with no compose
-    # project fails with "no configuration file provided", which tells the user
-    # nothing about what to do.
-    topology.require_compose(
-        target, action,
-        instead=f"Kubernetes scale-to-zero is not implemented yet; for now "
-                f"`kubectl -n rc-repro-{target} scale deploy --all --replicas=0`.")
     # Looked up by a hashable key: `action` arrives from a JSON body, and a dict or
     # list reached .get() and raised "unhashable type" -- a 500 rather than the
-    # "unknown action" this already knows how to say.
+    # "unknown action" this already knows how to say. Validated BEFORE the runtime
+    # split so a bad action is rejected the same way on both.
     if not isinstance(action, str):
         raise ValidationError(f"action must be a string (want start|stop|restart), "
                               f"got {type(action).__name__}")
+    if action not in ("start", "stop", "restart"):
+        raise ValidationError(f"unknown action {action!r} (want start|stop|restart)")
+    if topology.of_repro(target) == topology.KUBERNETES:
+        return _set_state_kubernetes(target, action)
     fn = {"start": runner.start, "stop": runner.stop, "restart": runner.restart}.get(action)
     if fn is None:
         raise ValidationError(f"unknown action {action!r} (want start|stop|restart)")
@@ -1538,6 +1534,35 @@ def set_state(name: str, action: str) -> None:
                 hint = (f" - {target!r} was `down`ed, so it has no containers to "
                         "start; recreate them from its stored metadata instead")
             raise DockerError(f"`docker compose {action}` failed for {target!r}{hint}")
+
+
+def _set_state_kubernetes(target: str, action: str) -> None:
+    """stop/start/restart by scaling, which is the nearest true thing Kubernetes has.
+
+    Compose's contract is what this has to match, not Kubernetes' vocabulary: `stop`
+    gives the memory back and keeps the data, `start` brings the same workspace back
+    on the same port. Scaling to 0 does exactly that -- the PersistentVolumeClaim is
+    untouched, so this is as far from `down --volumes` as `docker compose stop` is.
+
+    The port-forward is a real difference and is handled rather than ignored: it dies
+    with the pod, so `stop` kills it deliberately (leaving it would publish a port
+    that answers nothing) and `start` hands back to `ready`, which re-establishes it.
+    """
+    from rc_repro.services import k8s
+
+    meta = runner.read_meta(target)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    context = str(extra.get("context") or k8s.CONTEXT)
+    with runner.repro_lock(target, timeout=_INTERACTIVE_LOCK_WAIT):
+        if action in ("stop", "restart"):
+            k8s.stop_workspace(target, context=context)
+            pid = extra.get("port_forward_pid")
+            if pid:
+                _stop_port_forward(int(pid))
+                runner.update_meta(target,
+                                   lambda m: m.extra.pop("port_forward_pid", None))
+        if action in ("start", "restart"):
+            k8s.start_workspace(target, context=context)
 
 
 def _clear_default_if(name: str) -> None:
@@ -1976,6 +2001,12 @@ def kubernetes_state(name: str, meta) -> str:
     # nothing was coming. Ask for the workload instead.
     if not k8s.workload_exists(name, context=context):
         return "down"
+    # Scaled to zero is STOPPED, not starting. `stop` is implemented as scale-to-zero
+    # -- there is no other "stopped" on this runtime -- and without this the column
+    # said "starting" for a workspace that had been deliberately stopped and was
+    # never going to move. The word has to match the verb the user just used.
+    if k8s.desired_replicas(name, context=context) == 0:
+        return "stopped"
     return "running" if k8s.workspace_ready(name, context=context) else "starting"
 
 
@@ -2007,9 +2038,18 @@ def _wait_serving_kubernetes(meta: runner.Metadata, emit: Emit,
             if pid and pid != extra.get("port_forward_pid"):
                 runner.update_meta(meta.name,
                                    lambda m: m.extra.update({"port_forward_pid": pid}))
-            info(emit, f"{meta.name!r} is serving at {meta.root_url}",
-                 phase="ready", pct=100)
-            return {"ready": True, "url": meta.root_url}
+            # The pod being Ready is not the URL answering. `kubectl port-forward`
+            # returns a pid before it binds the socket, so declaring ready here on
+            # the strength of the pid alone is a guess -- and after `restart` it was
+            # a wrong one: `ready` exited 0 and the very next request to the URL it
+            # had just confirmed got nothing at all. Confirm the socket, and if it
+            # is not up yet go round again rather than reporting a workspace the
+            # caller cannot reach.
+            if k8s.forward_reachable(meta.host_port):
+                info(emit, f"{meta.name!r} is serving at {meta.root_url}",
+                     phase="ready", pct=100)
+                return {"ready": True, "url": meta.root_url}
+            extra = dict(extra, port_forward_pid=pid)
         now = _time.monotonic()
         if now - last > 15:
             last = now

@@ -292,6 +292,13 @@ function card(r) {
   if (r.default) r1.append(el("span", { class: "star", title: "used by CLI commands with no --name" }, "★"));
   r1.append(el("span", { class: "ver" }, r.rc_version || "?"));
   const bits = [r.preset, ":" + r.host_port, r.created_by].filter(Boolean);
+  // Runtime is shown only when it is NOT the default. Compose is the overwhelming
+  // majority, so labelling every row "docker" would be noise on the common case and
+  // make the rare one harder to spot rather than easier. What matters is that a
+  // Kubernetes workspace never looks like a Compose one: which commands refuse,
+  // where the data lives and how to reach it all differ, and the list was the one
+  // place the two were indistinguishable.
+  if (r.runtime && r.runtime !== "docker") bits.push(r.runtime === "kubernetes" ? "k8s" : r.runtime);
   if (r.monitoring) bits.push("monitored");
   row.append(r1, el("span", { class: "meta" }, bits.join(" · ")));
   row.append(el("span", { class: "r3" },

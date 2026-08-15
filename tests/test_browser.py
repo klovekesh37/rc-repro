@@ -1483,3 +1483,33 @@ def test_a_placeholder_url_in_a_link_row_is_left_alone(serve_public, public_page
         shown = public_page.locator(".linkrow").first.locator(".l-u").inner_text().strip()
         assert shown == "<repro-url>/livechat", shown
         assert public_page.errors == [], public_page.errors
+
+
+def test_the_workspace_row_says_kubernetes_and_stays_quiet_about_docker(
+        serve, page, monkeypatch):
+    """A Kubernetes workspace must never look like a Compose one in the list.
+
+    Which commands refuse, where the data lives and how to reach it all differ, and
+    the row was the one place the two were indistinguishable. Shown only when it is
+    NOT the default: Compose is the overwhelming majority, so labelling every row
+    "docker" would be noise on the common case and make the rare one HARDER to spot.
+    """
+    from rc_repro.services import lifecycle as lc
+
+    rows = [dict(_fake_detail(name="kube-one"), runtime="kubernetes"),
+            dict(_fake_detail(name="compose-one"), runtime="docker")]
+    monkeypatch.setattr(lc, "list_repros", lambda: [dict(r) for r in rows])
+    monkeypatch.setattr(lc, "detail", lambda name: dict(rows[0]))
+    monkeypatch.setattr(lc, "resolve_name", lambda name: name)
+    usersvc.add("alice", PASSWORD, role="admin")
+
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.wait_for_function(
+            "() => document.querySelector('#repros').textContent.includes('kube-one')")
+        kube = page.locator(".wrow", has_text="kube-one").locator(".meta").inner_text()
+        compose = page.locator(".wrow", has_text="compose-one").locator(".meta").inner_text()
+
+    assert "k8s" in kube, kube
+    assert "docker" not in compose and "k8s" not in compose, compose

@@ -32,7 +32,7 @@ from pathlib import Path
 
 from rc_repro import config, runner
 from rc_repro.errors import (ConflictError, CreateFailedError, DockerError,
-                            PreflightError)
+                            NotFoundError, PreflightError)
 from rc_repro.services.events import Emit, info, null_emit, warn
 
 #: The cluster rc-repro creates and owns. One cluster with a namespace per
@@ -945,7 +945,8 @@ def split_image(rc_image: str, rc_version: str) -> tuple[str, str]:
 
 def values_for(*, rc_version: str, rc_image: str, microservices: bool,
                replicas: int = 1, root_url: str = "", oplog: bool = False,
-               mongo_url: str = "", oplog_url: str = "") -> dict:
+               mongo_url: str = "", oplog_url: str = "",
+               mongo_secret: str = "") -> dict:
     """Chart values for one workspace.
 
     MongoDB is ALWAYS external, never the chart's bundled subchart. PR #3's reason
@@ -995,12 +996,18 @@ def values_for(*, rc_version: str, rc_image: str, microservices: bool,
         "replicaCount": max(1, int(replicas or 1)),
         "microservices": {"enabled": bool(microservices)},
         "mongodb": {"enabled": False},
-        "externalMongodbUrl": mongo_url or MONGO_URL,
         "extraEnv": env,
     }
-    if oplog:
-        # Rocket.Chat below 8.x still wants the oplog URL; 8.x deprecates it.
-        values["externalMongodbOplogUrl"] = oplog_url or MONGO_OPLOG_URL
+    if mongo_secret:
+        # The URL goes in a Secret and its NAME goes in the values, so
+        # `helm get values rocketchat` no longer prints the password to anyone who
+        # can read the release. The chart reads both keys from it itself.
+        values["existingMongodbSecret"] = mongo_secret
+    else:
+        values["externalMongodbUrl"] = mongo_url or MONGO_URL
+        if oplog:
+            # Rocket.Chat below 8.x still wants the oplog URL; 8.x deprecates it.
+            values["externalMongodbOplogUrl"] = oplog_url or MONGO_OPLOG_URL
     if root_url:
         values["host"] = root_url
     return values
@@ -1373,11 +1380,14 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
                   namespace=namespace, context=context)
             init_replica_set(namespace=namespace, context=context, emit=emit)
 
+        apply(mongo_url_secret_manifest(name, mongo_url=mongo_url,
+                                        oplog_url=oplog_url, owner=owner),
+              namespace=namespace, context=context)
         values = values_for(rc_version=resolved.rc_version,
                             rc_image=resolved.rc_image,
                             microservices=microservices, replicas=replicas,
                             root_url=root_url, oplog=resolved.oplog,
-                            mongo_url=mongo_url, oplog_url=oplog_url)
+                            mongo_secret=MONGO_URL_SECRET)
         values.update(container_security_context(chart_version))
         info(emit, f"installing {CHART} as {RELEASE}", phase="boot", pct=60)
         install(namespace=namespace, context=context, values=values,
@@ -1501,9 +1511,21 @@ OPERATOR_CHART = f"{OPERATOR_REPO}/mongodb-kubernetes"
 #: MongoDB versions (3.0 through 8.2) because "the customer's exact version" is the
 #: product's promise, and the operator's window does not reach the old half.
 #:
-#: 6.0 is deliberately conservative and SHOULD BE VERIFIED against the operator's own
-#: documentation before anyone relies on the boundary -- picking it too low means a
-#: workspace that never starts, which is a worse failure than falling back.
+#: 6.0 was a guess, and this is what came of checking it rather than leaving the
+#: guess in place:
+#:
+#:   - The operator's own documentation states NO minimum server version. Its
+#:     supported-features list covers replica sets, SCRAM, TLS and scaling with no
+#:     version window attached, so there is nothing there to copy.
+#:   - Its image repository, quay.io/mongodb/mongodb-community-server, publishes
+#:     tags back to 4.4 -- so the pullable floor is 4.4, not 6.0.
+#:   - 6.0 is verified live, via the operator, end to end.
+#:
+#: So 6.0 stays: deliberately conservative, now evidenced rather than invented.
+#: Nothing rc-repro supports goes near it -- Rocket.Chat 7.x and 8.x pair with
+#: MongoDB 7.0, 8.0 and 8.2, and all three are verified live -- so the cost of being
+#: conservative here is zero and the cost of being wrong the other way is a
+#: workspace that never starts.
 OPERATOR_MIN_MONGO = (6, 0)
 
 #: SCRAM users, matching the guide's names so its commands transfer.
@@ -1746,6 +1768,38 @@ spec:
           resources:
             requests:
               storage: 2Gi
+"""
+
+
+#: The Secret the chart reads its MongoDB URL from, instead of the URL sitting in
+#: the release's values where `helm get values rocketchat` prints it in full --
+#: password included -- to anyone with read access to the namespace. The workspace
+#: credentials are deliberately weak, but the operator's are generated per workspace
+#: and are the thing SCRAM auth exists to protect.
+MONGO_URL_SECRET = "rocketchat-mongodb-url"
+
+
+def mongo_url_secret_manifest(name: str, *, mongo_url: str, oplog_url: str,
+                              owner: str = "") -> str:
+    """A Secret holding the connection strings, for `existingMongodbSecret`.
+
+    BOTH keys, always. Chart 6.26.0 reads `mongo-uri` and `mongo-oplog-uri` from
+    this Secret unconditionally once `existingMongodbSecret` is set -- there is no
+    `if oplog` around the second one -- so omitting it on a chart that wants it
+    leaves the pod unable to start on a missing key.
+    """
+    labels = _labels(name, owner)
+    lab = "\n".join(f"    {k}: {v}" for k, v in labels.items())
+    return f"""apiVersion: v1
+kind: Secret
+metadata:
+  name: {MONGO_URL_SECRET}
+  labels:
+{lab}
+type: Opaque
+stringData:
+  mongo-uri: {mongo_url}
+  mongo-oplog-uri: {oplog_url}
 """
 
 
@@ -2061,3 +2115,137 @@ def grafana_forward(*, context: str, host_port: int, bind_host: str = "") -> int
     except (OSError, subprocess.SubprocessError):
         return 0
     return proc.pid
+
+
+# --- stop / start: scale to zero and back ----------------------------------------
+
+#: Where the replica count lives while a workspace is stopped. Kubernetes has no
+#: "stopped" state -- scaling to 0 is the whole mechanism -- so the number that was
+#: there has to be written down or `start` cannot put it back. An annotation on the
+#: namespace rather than repro.json, because `kubectl scale` by hand is a legitimate
+#: thing for someone to do and the cluster should carry its own truth.
+SCALE_ANNOTATION = "rc-repro.io/replicas-before-stop"
+
+
+def _scalables(namespace: str, context: str) -> list[str]:
+    """Every workload in the namespace that has a replica count, as `kind/name`.
+
+    The MongoDB StatefulSet is included deliberately. `docker compose stop` stops the
+    database too, and a workspace that keeps 8Gi of MongoDB resident while claiming
+    to be stopped is not stopped in the sense anyone means -- the whole reason to
+    stop one on a laptop is to get the memory back.
+    """
+    res = run(["kubectl", "--context", context, "-n", namespace, "get",
+               "deployment,statefulset", "-o", "name"], own=is_ours(context))
+    return [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
+
+
+def scale_workspace(name: str, *, replicas: int, context: str,
+                    emit: Emit = null_emit) -> int:
+    """Scale every workload in a workspace to `replicas`. Returns how many it moved.
+
+    `--all` is not used: it would also catch anything a preset or a person added,
+    and scaling something back up to a number it never had is worse than leaving it.
+    """
+    namespace = namespace_for(name)
+    targets = _scalables(namespace, context)
+    if not targets:
+        raise NotFoundError(
+            f"{name!r} has no workloads to scale -- it was `down`ed, so there is "
+            f"nothing to stop or start. Recreate it with `rc-repro up --name {name}`")
+    res = run(["kubectl", "--context", context, "-n", namespace, "scale",
+               f"--replicas={replicas}", *targets],
+              timeout=APPLY_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        raise DockerError(f"could not scale {name!r}: " + why(res))
+    return len(targets)
+
+
+def desired_replicas(name: str, *, context: str) -> int:
+    """The Rocket.Chat Deployment's DESIRED replica count, or -1 if unknown.
+
+    `.spec.replicas`, not `.status`: the question is what was asked for, so that a
+    workspace scaled to zero reads as stopped the instant `stop` returns rather than
+    once the pods have finished terminating.
+    """
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name), "get",
+               "deployment", f"{RELEASE}-rocketchat", "-o",
+               "jsonpath={.spec.replicas}"], own=is_ours(context))
+    try:
+        return int((res.stdout or "").strip())
+    except ValueError:
+        return -1
+
+
+#: Up to a minute for pods to terminate. MongoDB gets a grace period and uses it.
+POD_GONE_TRIES = 30
+POD_GONE_INTERVAL = 2.0
+
+
+def stop_workspace(name: str, *, context: str, emit: Emit = null_emit,
+                   sleep=time.sleep) -> int:
+    """Scale to zero, remembering what to come back to, and wait for it."""
+    namespace = namespace_for(name)
+    # Recorded BEFORE scaling, or the number read back is the zero we just wrote.
+    before = {}
+    for target in _scalables(namespace, context):
+        res = run(["kubectl", "--context", context, "-n", namespace, "get", target,
+                   "-o", "jsonpath={.spec.replicas}"], own=is_ours(context))
+        count = (res.stdout or "").strip()
+        if count and count != "0":
+            before[target] = count
+    if before:
+        run(["kubectl", "--context", context, "-n", namespace, "annotate",
+             "--overwrite", "namespace", namespace,
+             f"{SCALE_ANNOTATION}={json.dumps(before)}"], own=is_ours(context))
+    moved = scale_workspace(name, replicas=0, context=context, emit=emit)
+    # WAIT for the pods to actually go, rather than returning on the API call.
+    # `restart` is stop-then-start, so returning early scales back up while the old
+    # pods are still Terminating -- and the readiness check then finds one of THOSE,
+    # reports ready, and the port-forward attaches to a pod on its way out. The URL
+    # answers nothing. This is the fourth time on this runtime that trusting a
+    # readiness signal over the actual state has produced a workspace that looks up
+    # and is not.
+    for _ in range(POD_GONE_TRIES):
+        res = run(["kubectl", "--context", context, "-n", namespace, "get", "pods",
+                   "-o", "name"], own=is_ours(context))
+        if not (res.stdout or "").strip():
+            break
+        sleep(POD_GONE_INTERVAL)
+    info(emit, f"scaled {moved} workload(s) to zero", phase="done")
+    return moved
+
+
+def start_workspace(name: str, *, context: str, emit: Emit = null_emit) -> int:
+    """Scale back to whatever was recorded, or to 1 if nothing was.
+
+    A workspace stopped by hand (`kubectl scale ... --replicas=0`) carries no
+    annotation, and refusing to start it would be pedantry -- 1 is what `up` would
+    have given it.
+    """
+    namespace = namespace_for(name)
+    # The annotation key contains a `/`, which jsonpath treats as a path separator
+    # unless it is escaped -- so the escape is built outside the f-string, where
+    # Python 3.11 allows a backslash at all.
+    key = SCALE_ANNOTATION.replace("/", "\\/")
+    res = run(["kubectl", "--context", context, "-n", namespace, "get", "namespace",
+               namespace, "-o", "jsonpath={.metadata.annotations." + key + "}"],
+              own=is_ours(context))
+    try:
+        before = json.loads((res.stdout or "").strip() or "{}")
+    except ValueError:
+        before = {}
+    targets = _scalables(namespace, context)
+    if not targets:
+        raise NotFoundError(
+            f"{name!r} has no workloads to start -- it was `down`ed. Recreate it "
+            f"with `rc-repro up --name {name}`")
+    for target in targets:
+        count = str(before.get(target, "1"))
+        res = run(["kubectl", "--context", context, "-n", namespace, "scale",
+                   f"--replicas={count}", target],
+                  timeout=APPLY_TIMEOUT, own=is_ours(context))
+        if res.returncode != 0:
+            raise DockerError(f"could not scale {target}: " + why(res))
+    info(emit, f"scaled {len(targets)} workload(s) back up", phase="done")
+    return len(targets)
