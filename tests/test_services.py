@@ -3274,7 +3274,7 @@ def test_every_compose_only_command_refuses_with_a_way_forward(monkeypatch, tmp_
     implementation that does not exist yet, and it can ship first. Each refusal
     names the namespace, so it is copy-pasteable rather than a hint.
     """
-    from rc_repro.services import backup, envvars, k8s, topology, upgrade
+    from rc_repro.services import envvars, k8s, topology, upgrade
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
@@ -3286,10 +3286,9 @@ def test_every_compose_only_command_refuses_with_a_way_forward(monkeypatch, tmp_
     lc.runner.write("k", "", m)
 
     cases = [
-        # `monitor` used to be here. It is implemented now -- the shared stack in
-        # rc-repro-system plus a Grafana forward -- so it is covered by the
-        # monitoring tests below instead. The list shrinks as the gaps close.
-        (lambda: backup.create("k"), "mongodump"),
+        # `monitor` and `backup` used to be here -- monitoring through the shared
+        # stack, backup through `kubectl exec mongodump`. The list shrinks as the
+        # gaps close, and each is covered by its own tests instead.
         (lambda: envvars.set_env("k", {"A": "b"}), "helm"),
         (lambda: upgrade.run("k", "8.6.1"), "image.tag"),
     ]

@@ -2249,3 +2249,87 @@ def start_workspace(name: str, *, context: str, emit: Emit = null_emit) -> int:
             raise DockerError(f"could not scale {target}: " + why(res))
     info(emit, f"scaled {len(targets)} workload(s) back up", phase="done")
     return len(targets)
+
+
+# --- backup/restore: the same five shapes, through kubectl ------------------------
+#
+# `backup.py` needs exactly five things from a runtime, and its logic -- the bundle
+# format, the manifest, the safety checks -- is runtime-agnostic. So these mirror
+# runner's compose_exec_* signatures rather than inventing a shape, and backup.py
+# picks between them. Anything else there stays shared.
+
+def exec_capture(name: str, argv: list[str], *, context: str,
+                 timeout: float | None = None) -> tuple[int, str]:
+    """Run a command in the MongoDB pod, capturing stdout. Mirrors
+    runner.compose_exec_capture, including its (1, "") on failure."""
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name), "exec",
+               f"{MONGO_SERVICE}-0", "-c", "mongod", "--", *argv],
+              timeout=timeout or APPLY_TIMEOUT, own=is_ours(context))
+    return res.returncode, (res.stdout or "")
+
+
+def exec_to_file(name: str, argv: list[str], dest: Path, *, context: str,
+                 timeout: float | None = None) -> tuple[int, str]:
+    """Run a command in the MongoDB pod, writing its RAW stdout to `dest`.
+
+    Binary-safe, and that is the whole point: `mongodump --archive` emits BSON, and
+    a text-mode decode would corrupt it silently -- the dump would restore with
+    errors nobody could trace back here. So stdout goes straight to the file handle
+    and never through Python's text layer.
+
+    `kubectl exec` without `-t`, deliberately: a TTY translates newlines and would
+    do the same damage from the other end.
+    """
+    argv_full = ["kubectl", "--context", context, "-n", namespace_for(name), "exec",
+                 f"{MONGO_SERVICE}-0", "-c", "mongod", "--", *argv]
+    try:
+        with dest.open("wb") as handle:
+            proc = subprocess.run(argv_full, stdout=handle, stderr=subprocess.PIPE,
+                                  timeout=timeout or INSTALL_TIMEOUT, check=False,
+                                  env=owned_env() if is_ours(context) else None)
+        return proc.returncode, (proc.stderr or b"").decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+
+
+def exec_from_file(name: str, argv: list[str], src: Path, *, context: str,
+                   timeout: float | None = None) -> tuple[int, str]:
+    """Run a command in the MongoDB pod with `src` piped to its stdin.
+
+    `-i` is required and easy to forget: without it kubectl closes stdin
+    immediately and `mongorestore --archive` reads an empty archive, reports
+    success, and restores nothing at all.
+    """
+    argv_full = ["kubectl", "--context", context, "-n", namespace_for(name), "exec",
+                 "-i", f"{MONGO_SERVICE}-0", "-c", "mongod", "--", *argv]
+    try:
+        with src.open("rb") as handle:
+            proc = subprocess.run(argv_full, stdin=handle,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  timeout=timeout or INSTALL_TIMEOUT, check=False,
+                                  env=owned_env() if is_ours(context) else None)
+        return proc.returncode, (proc.stdout or b"").decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+
+
+def scale_rocketchat(name: str, *, replicas: int, context: str) -> int:
+    """Scale ONLY Rocket.Chat, leaving MongoDB up.
+
+    What `stop_workspace` does is wrong for a backup: a dump needs the database
+    running and only its writers quiesced. This is the Kubernetes counterpart of
+    runner.stop_services, and the same distinction runner draws between `stop()` and
+    `stop_services()`.
+    """
+    namespace = namespace_for(name)
+    targets = [ln.strip() for ln in
+               (run(["kubectl", "--context", context, "-n", namespace, "get",
+                     "deployment", "-l", "app.kubernetes.io/name=rocketchat",
+                     "-o", "name"], own=is_ours(context)).stdout or "").splitlines()
+               if ln.strip()]
+    if not targets:
+        return 0
+    res = run(["kubectl", "--context", context, "-n", namespace, "scale",
+               f"--replicas={replicas}", *targets],
+              timeout=APPLY_TIMEOUT, own=is_ours(context))
+    return res.returncode
