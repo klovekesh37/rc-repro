@@ -3956,3 +3956,78 @@ def test_a_scenario_forward_waits_for_a_ready_endpoint(monkeypatch):
     assert out == {}, out
     assert sum("endpoints" in a for argv in calls for a in argv) >= 10, \
         "it must actually retry rather than check once"
+
+
+def test_a_preset_configures_itself_through_the_runtime_that_owns_it(monkeypatch):
+    """`no configuration file provided: not found` in the middle of a Kubernetes
+    create, followed by "starting".
+
+    That is docker compose's own wording for "there is no compose project here", and
+    it appeared because a post_ready handler -- a preset configuring ITSELF -- called
+    `runner.compose_exec` on a Kubernetes workspace. Presets exist on both runtimes
+    now, so the one call that reaches into a container had to stop being a Compose
+    call.
+    """
+    from rc_repro.services import postready, topology
+
+    m = postready.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
+                                  rc_image="i", mongo_tag="8.0",
+                                  mongo_flavor="official", preset="saml",
+                                  root_url="u", host_port=3000, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+
+    monkeypatch.setattr(postready.runner, "compose_exec",
+                        lambda *a, **kw: pytest.fail("it reached for docker compose"))
+    from rc_repro.services import k8s
+    seen = []
+
+    class _R:
+        returncode, stdout, stderr = 0, "keycloak-abc", ""
+
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: (seen.append(argv), _R())[1])
+    assert postready._exec_in(m, "keycloak", ["bash", "-lc", "true"]) == 0
+    assert any("kubectl" in a for argv in seen for a in argv), seen
+    assert any("exec" in argv for argv in seen), seen
+
+    # A Compose workspace must still go the other way -- this is a fork, not a swap.
+    c = postready.runner.Metadata(name="c", project="rcrepro-c", rc_version="8.5.1",
+                                  rc_image="i", mongo_tag="8.0",
+                                  mongo_flavor="official", preset="saml",
+                                  root_url="u", host_port=3001, version_source="t")
+    monkeypatch.setattr(postready.runner, "compose_exec", lambda *a, **kw: 0)
+    monkeypatch.setattr(k8s, "run",
+                        lambda *a, **kw: pytest.fail("it reached for kubectl"))
+    assert postready._exec_in(c, "keycloak", ["true"]) == 0
+
+
+def test_a_half_configured_preset_says_so_instead_of_reporting_success():
+    """The create printed "could not fetch/apply IdP cert", then "starting", and
+    left the reader to work out whether SAML actually worked.
+
+    The DEPLOYMENT succeeding and the CONFIGURATION succeeding are different answers
+    to different questions, and a workspace that is running with a half-applied
+    preset has to say which one it is -- naming what failed and the command that
+    retries it.
+    """
+    from rc_repro.services import postready
+
+    m = postready.runner.Metadata(name="w", project="p", rc_version="8.5.1",
+                                  rc_image="i", mongo_tag="8.0",
+                                  mongo_flavor="official", preset="saml",
+                                  root_url="u", host_port=3000, version_source="t")
+    m.extra["post_ready"] = [{"action": "saml_idp_cert"},
+                             {"action": "keycloak_master_ssl_off"}]
+    said: list = []
+    postready._POST_READY_ACTIONS["saml_idp_cert"] = lambda *a, **kw: False
+    postready._POST_READY_ACTIONS["keycloak_master_ssl_off"] = lambda *a, **kw: True
+    try:
+        failed = postready.run_post_ready(m, object(), lambda e: said.append(e.message))
+    finally:
+        import importlib
+        importlib.reload(postready)
+
+    assert failed == ["saml_idp_cert"], failed
+    joined = " ".join(said)
+    assert "RUNNING" in joined and "partly configured" in joined, joined
+    assert "saml_idp_cert" in joined, joined
+    assert "rc-repro ready --name w" in joined, joined
