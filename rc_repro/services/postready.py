@@ -13,10 +13,10 @@ from rc_repro import config, rcapi, runner
 from rc_repro.services.events import Emit, info, warn
 
 
-#: Up to a minute for Keycloak to serve its SAML descriptor. It imports a realm on
-#: first boot and spends most of that time doing it.
-IDP_CERT_TRIES = 20
-IDP_CERT_INTERVAL = 3.0
+#: How long to wait for Keycloak to serve its SAML descriptor. Passed INTO
+#: `fetch_saml_idp_cert`, which owns the retrying -- not layered on top of it.
+#: Generous because on Kubernetes the image is pulled before the realm is imported.
+IDP_CERT_DEADLINE = 180.0
 
 
 def _exec_in(meta: runner.Metadata, service: str, argv: list[str]) -> int:
@@ -47,19 +47,17 @@ def _exec_in(meta: runner.Metadata, service: str, argv: list[str]) -> int:
 
 def _pr_saml_idp_cert(meta: runner.Metadata, auth: rcapi.Auth, action: dict, emit: Emit) -> None:
     info(emit, "fetching IdP cert (Keycloak first boot can take ~30s)...", phase="post_ready")
-    # RETRIED, because the message above says why it would fail and then did not act
-    # on it: a single attempt against a Keycloak that is still importing its realm
-    # warns "could not fetch/apply IdP cert" and leaves SAML unconfigured on a
-    # workspace that reports success.
-    cert = ""
-    for attempt in range(IDP_CERT_TRIES):
-        cert = rcapi.fetch_saml_idp_cert(action["descriptor_url"])
-        if cert:
-            break
-        if attempt == 2:
-            info(emit, "  still waiting for the IdP to serve its descriptor...",
-                 phase="post_ready")
-        time.sleep(IDP_CERT_INTERVAL)
+    # ONE call. `fetch_saml_idp_cert` already retries to its own deadline -- its
+    # docstring says "Retries until the IdP (e.g. Keycloak, which boots slowly) is
+    # serving" -- and v0.54.1 wrapped it in a second 20-attempt loop without reading
+    # that. 20 x 90s is thirty minutes of a create that looks hung, which is how the
+    # operational audit found it: the SAML workspace sat in "still waiting for the
+    # IdP to serve its descriptor" for half an hour.
+    #
+    # The deadline is raised instead, and only here: Keycloak on Kubernetes has to
+    # pull its image before it can boot, which the Compose default did not allow for.
+    cert = rcapi.fetch_saml_idp_cert(action["descriptor_url"],
+                                     timeout=IDP_CERT_DEADLINE)
     if cert and rcapi.set_setting(meta.root_url, auth, config.ADMIN_PASSWORD, action["setting"], cert):
         enable = action.get("enable_setting")
         if enable:

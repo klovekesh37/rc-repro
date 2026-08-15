@@ -4116,3 +4116,39 @@ def test_what_was_deployed_is_written_next_to_repro_json(tmp_path, monkeypatch):
     body = (base / "values.yaml").read_text()
     assert "existingMongodbSecret" in body
     assert "mongodb://" not in body, body
+
+
+def test_the_idp_cert_is_fetched_once_not_retried_around_a_retrier(monkeypatch):
+    """A SAML create that sat for THIRTY MINUTES, found by the operational audit.
+
+    `rcapi.fetch_saml_idp_cert` retries to its own deadline -- its docstring says
+    "Retries until the IdP (e.g. Keycloak, which boots slowly) is serving" -- and
+    v0.54.1 wrapped it in a second 20-attempt loop without reading that. 20 x 90s is
+    half an hour of a create that looks hung and cannot be told from one that is.
+
+    The deadline is passed IN instead, so there is one place that decides how long to
+    wait.
+    """
+    import inspect
+
+    from rc_repro.services import postready
+
+    src = inspect.getsource(postready._pr_saml_idp_cert)
+    # The CALL, not the prose: the comment above it names the function to explain
+    # why it is only called once, so counting the name counts the explanation too.
+    assert src.count("rcapi.fetch_saml_idp_cert(") == 1, src
+    assert "for attempt in range" not in src, "no loop around a function that loops"
+    assert "timeout=IDP_CERT_DEADLINE" in src, src
+
+    calls = []
+    monkeypatch.setattr(postready.rcapi, "fetch_saml_idp_cert",
+                        lambda url, **kw: (calls.append(kw), "")[1])
+    postready._pr_saml_idp_cert(
+        postready.runner.Metadata(name="w", project="p", rc_version="8.5.1",
+                                  rc_image="i", mongo_tag="8.0",
+                                  mongo_flavor="official", preset="saml",
+                                  root_url="u", host_port=3000, version_source="t"),
+        object(), {"descriptor_url": "http://localhost:8081/x", "setting": "s"},
+        lambda e: None)
+    assert len(calls) == 1, calls
+    assert calls[0].get("timeout") == postready.IDP_CERT_DEADLINE, calls
