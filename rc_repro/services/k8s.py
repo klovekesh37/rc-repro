@@ -649,6 +649,36 @@ MONGO_SERVICE = "mongodb"
 MONGO_URL = f"mongodb://{MONGO_SERVICE}-0.{MONGO_SERVICE}:27017/rocketchat?replicaSet=rs0"
 MONGO_OPLOG_URL = f"mongodb://{MONGO_SERVICE}-0.{MONGO_SERVICE}:27017/local?replicaSet=rs0"
 
+#: The image the hand-written StatefulSet runs, and the reasoning, because there is
+#: no upstream answer to copy: the official Kubernetes guide documents ONLY the
+#: operator, and the chart's bundled option is the Bitnami subchart it tells you to
+#: migrate away from. This path is rc-repro's own, so the choice has to defend itself.
+#:
+#: `mongo` is the Docker Official Image, and it is picked over MongoDB Inc's
+#: `mongodb/mongodb-community-server` for one decisive reason: COVERAGE. This
+#: StatefulSet exists to serve the versions the operator cannot reach, and
+#: community-server has no tag below 4.4 -- 3.6, 4.0 and 4.2 are all 404 -- while
+#: rc-repro's map goes down to MongoDB 3.6 for Rocket.Chat < 3.0. Switching to it
+#: would break precisely the versions this code was written for.
+#:
+#: Two lesser reasons that still matter: `mongo` publishes amd64 AND arm64 across
+#: that whole range, where `bitnamilegacy` is amd64-only; and it takes ownership of
+#: /data/db itself, so this needs none of the fix-permission init container that
+#: compose.py carries for community-server's different UID.
+#:
+#: What it is NOT is a different MongoDB. `mongo:8.0` and
+#: `mongodb/mongodb-community-server:8.0-ubi8` are the same source, version, storage
+#: engine and wire protocol; they differ in base OS and packaging. That distinction
+#: is worth stating because `mongo_flavor` -- a Compose concept -- used to be
+#: reported for this path as though it applied.
+MONGO_IMAGE_REPO = "mongo"
+
+
+def mongo_image(tag: str) -> str:
+    """The image this runtime's StatefulSet actually runs. See MONGO_IMAGE_REPO."""
+    return f"{MONGO_IMAGE_REPO}:{tag}"
+
+
 #: The volume a workspace's data lives on. PR #3 runs MongoDB with no volume at
 #: all, so its data lives in the pod's writable layer and dies with a reschedule --
 #: while `--fresh` tells the user it deleted a PVC that never existed. `backup`,
@@ -826,7 +856,7 @@ spec:
     spec:
       containers:
       - name: mongod
-        image: mongo:{tag}
+        image: {mongo_image(tag)}
         args: ["--replSet", "rs0", "--bind_ip_all"]
         ports:
         - containerPort: 27017
@@ -1263,8 +1293,20 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
         # versions rc-repro pairs, so the hand-written StatefulSet stays for those.
         mongo_url = MONGO_URL
         oplog_url = MONGO_OPLOG_URL
+        # Recorded rather than inferred. `mongo_flavor` is a COMPOSE concept
+        # ("official" / "bitnami-legacy") and this runtime honours neither value, so
+        # reporting it here made `rc-repro list` print "8.0 (official)" for a
+        # workspace running Docker Hub's `mongo:8.0`. What is true is which of the
+        # two mechanisms built the database and what it actually runs.
+        managed_by = "statefulset"
+        image = mongo_image(resolved.mongo_tag)
         if (use_operator or operator_enabled()) and \
                 operator_supports(resolved.mongo_tag, forced=use_operator):
+            managed_by = "operator"
+            # The operator chooses the image from `spec.version`, so this names the
+            # version it was asked for rather than guessing a repository that is the
+            # operator's to change.
+            image = f"mongodb-community-server {operator_version(resolved.mongo_tag)} (operator's choice)"
             ensure_operator(context=context, emit=emit)
             # Generated per workspace, never reused, never written to disk here:
             # the manifest goes to `kubectl apply` on stdin.
@@ -1343,7 +1385,8 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
              phase="boot")
     return {"context": context, "namespace": namespace, "bind_host": bind_host,
             "chart_version": chart_version, "release": RELEASE,
-            "port_forward_pid": pid, "microservices": microservices}
+            "port_forward_pid": pid, "microservices": microservices,
+            "mongo_managed_by": managed_by, "mongo_image": image}
 
 
 def workspace_ready(name: str, *, context: str) -> bool:

@@ -3594,3 +3594,60 @@ def test_the_grafana_url_is_not_handed_over_before_the_forward_answers(monkeypat
     assert k8s.forward_reachable(1, tries=3, interval=0.01,
                                  sleep=slept.append) is False
     assert len(slept) == 3, "must actually retry rather than check once"
+
+
+def test_the_statefulset_image_covers_the_versions_the_operator_cannot():
+    """Why `mongo:` and not MongoDB Inc's own image, pinned so it is not "fixed".
+
+    This StatefulSet exists to serve what the operator cannot reach, and
+    `mongodb/mongodb-community-server` publishes NO tag below 4.4 -- 3.6, 4.0 and
+    4.2 are 404 on Docker Hub -- while rc-repro pairs Rocket.Chat < 3.0 with MongoDB
+    3.6. "Make it consistent with compose.py" looks like a tidy-up and would break
+    precisely the versions this code was written for.
+
+    Same MongoDB either way: same source, version, storage engine and wire protocol,
+    differing in base OS and packaging.
+    """
+    import yaml
+
+    from rc_repro.services import k8s
+
+    assert k8s.mongo_image("3.6") == "mongo:3.6"
+    docs = list(yaml.safe_load_all(k8s.mongo_manifest("t", "3.6")))
+    sts = [d for d in docs if d and d.get("kind") == "StatefulSet"][0]
+    assert sts["spec"]["template"]["spec"]["containers"][0]["image"] == "mongo:3.6"
+
+
+def test_kubernetes_records_what_built_the_database_not_a_compose_flavour():
+    """`mongo_flavor` is "official" / "bitnami-legacy" -- a COMPOSE image choice.
+
+    The Kubernetes StatefulSet honours neither value, so reporting it made
+    `rc-repro list` print "8.0 (official)" for a workspace running Docker Hub's
+    `mongo:8.0`. A label describing an image the workspace does not run is worse
+    than no label, because it is the field someone checks when a version-specific
+    bug will not reproduce.
+    """
+    import inspect
+
+    from rc_repro.services import k8s
+
+    src = inspect.getsource(k8s.create_workspace)
+    assert '"mongo_managed_by"' in src and '"mongo_image"' in src
+    # Both branches must set them, or the record is right only half the time.
+    assert src.count("managed_by = ") == 2, "operator and statefulset must both record"
+
+
+def test_the_notes_say_the_operator_is_shared_when_it_is_used():
+    """The deviation from the official guide has to be visible where someone reads it.
+
+    The guide installs the operator INTO the Rocket.Chat namespace. rc-repro runs
+    several workspaces, its CRDs are cluster-scoped, so it installs once in
+    rc-repro-system watching everything. Undocumented, the first person to run the
+    guide's `kubectl -n <ns> get pods` finds no operator and concludes it was never
+    installed.
+    """
+    import inspect
+
+    src = inspect.getsource(lc._create_kubernetes)
+    assert "SHARED" in src and "official guide" in src
+    assert "monitoring is shared the same way" in src

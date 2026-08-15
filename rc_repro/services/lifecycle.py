@@ -1848,9 +1848,40 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
              f"reachable at {root} and, from other machines, at "
              f"http://<this-box>:{host_port} — it publishes on {bind_host} and the "
              "workspace runs admin/admin123, so keep it off untrusted networks")
+    # What is IN the namespace versus what is shared by the cluster, stated rather
+    # than left to be discovered. The guide installs the MongoDB operator into the
+    # Rocket.Chat namespace because it assumes one Rocket.Chat per cluster; rc-repro
+    # runs several, its CRDs are cluster-scoped, and a second per-namespace install
+    # collides on them. So the deviation is deliberate and has to be visible here --
+    # otherwise the first person to run the guide's `kubectl -n <ns> get pods` finds
+    # no operator and reasonably concludes it was never installed.
+    if out.get("mongo_managed_by") == "operator":
+        mongo_note = (
+            f"MongoDB {resolved.mongo_tag} via the official operator, with SCRAM "
+            f"auth — {out.get('mongo_image', '')}")
+        shared = [
+            f"the operator itself is SHARED: one install in {k8s.OPERATOR_NAMESPACE} "
+            f"watching every namespace, not one per workspace as the official guide "
+            f"shows. Its CRDs are cluster-scoped, so a per-workspace install would "
+            f"collide at the second workspace. Nothing of it lives in {ns} except "
+            f"the database, its Secrets and its ServiceAccount:",
+            f"    kubectl -n {k8s.OPERATOR_NAMESPACE} get pods    # the operator",
+            f"    kubectl -n {ns} get mongodbcommunity              # this workspace's DB",
+        ]
+    else:
+        mongo_note = (
+            f"MongoDB {resolved.mongo_tag} as a plain StatefulSet — "
+            f"{out.get('mongo_image', '')}, NO authentication. This path is "
+            f"rc-repro's own: the official guide documents only the operator, which "
+            f"needs MongoDB "
+            f"{'.'.join(str(n) for n in k8s.OPERATOR_MIN_MONGO)}+. Add "
+            f"--mongo-operator for the documented path with auth.")
+        shared = []
     meta.extra["notes"] = [
         f"{'microservices' if microservices else 'monolith'} on "
         f"{out['context']} — about {pods} pods, namespace {ns}",
+        mongo_note,
+        *shared,
         reach,
         "the port-forward dies with its pod; bring it back with:",
         f"    kubectl -n {ns} port-forward {addr}"
@@ -1860,6 +1891,10 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         f"    kubectl -n {ns} get pods",
         f"    kubectl -n {ns} logs -l app.kubernetes.io/name=rocketchat -f",
         f"    helm -n {ns} get values {out['release']}",
+        "monitoring is shared the same way: `rc-repro monitor --name "
+        f"{repro_name}` installs one Prometheus + Grafana in "
+        f"{k8s.OPERATOR_NAMESPACE} for the whole cluster, and `--off` leaves it up "
+        "while any other workspace still wants it.",
         "stop/start/restart, logs, stats and backup have no Kubernetes path yet — "
         "each refuses and names the kubectl command that does the job.",
     ]

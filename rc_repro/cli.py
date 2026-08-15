@@ -209,9 +209,16 @@ def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | No
     followed by multi-instance URLs. Title is the repro name only — kept pure
     ASCII so box-drawing alignment can't be thrown off by wide/emoji glyphs
     (status like "✓ ready" is printed on its own line by the caller)."""
+    # `mongo_flavor` describes a COMPOSE image choice, and the Kubernetes path makes
+    # its own -- so printing it there claimed an image that workspace does not run.
+    # Where the runtime recorded what it actually built, say that instead.
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    managed_by = extra.get("mongo_managed_by", "")
+    mongo = (f"{meta.mongo_tag} (via the {managed_by})" if managed_by
+             else f"{meta.mongo_tag} ({meta.mongo_flavor})")
     rows = [
         ("Rocket.Chat", meta.rc_version),
-        ("MongoDB", f"{meta.mongo_tag} ({meta.mongo_flavor})"),
+        ("MongoDB", mongo),
         ("Preset", meta.preset),
         # external_url, not root_url: with --https the browser wants the https URL,
         # while root_url stays the plain http one rc-repro's own API calls use.
