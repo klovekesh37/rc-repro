@@ -1918,6 +1918,26 @@ def set_monitoring_label(namespace: str, *, context: str, wanted: bool) -> None:
          else "rc-repro.io/monitoring-"], own=is_ours(context))
 
 
+def forward_reachable(host_port: int, *, tries: int = 20, interval: float = 0.5,
+                      sleep=time.sleep) -> bool:
+    """Whether something is actually listening on the host port yet.
+
+    `kubectl port-forward` returns a pid long before it has bound the socket, so a
+    URL printed straight after spawning it is a guess. The workspace path learned
+    this the hard way; the Grafana path repeated it and the matrix caught it --
+    `monitor` reported attached and exit 0, and a curl a moment later got nothing.
+    """
+    import socket
+
+    for _ in range(tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.0)
+            if sock.connect_ex(("127.0.0.1", int(host_port))) == 0:
+                return True
+        sleep(interval)
+    return False
+
+
 def grafana_forward(*, context: str, host_port: int, bind_host: str = "") -> int:
     """Publish Grafana on a host port. Returns the pid, or 0.
 

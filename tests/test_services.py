@@ -3578,3 +3578,19 @@ def test_monitor_at_create_time_waits_for_the_workspace_first():
     monitor_at = src.index("req.monitor")
     assert "wait_serving" in src[monitor_at:monitor_at + 400], \
         "--monitor must wait for the workspace before attaching"
+
+
+def test_the_grafana_url_is_not_handed_over_before_the_forward_answers(monkeypatch):
+    """`kubectl port-forward` returns a pid before it binds the socket.
+
+    The workspace path already carries a test named for this mistake. The Grafana
+    path repeated it and the deployment matrix caught it: `rc-repro monitor`
+    reported attached and exited 0, and a curl to the URL it printed got nothing at
+    all -- a link handed over that quietly did not work.
+    """
+    from rc_repro.services import k8s
+
+    slept = []
+    assert k8s.forward_reachable(1, tries=3, interval=0.01,
+                                 sleep=slept.append) is False
+    assert len(slept) == 3, "must actually retry rather than check once"

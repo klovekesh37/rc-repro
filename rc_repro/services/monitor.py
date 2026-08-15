@@ -110,6 +110,14 @@ def _attach_kubernetes(target: str, emit: Emit = null_emit) -> dict:
     runner.update_meta(m.name, lambda meta: meta.extra.update(
         {"monitoring": True, "monitoring_ports": [port], "grafana_pid": pid}))
     grafana = f"http://localhost:{port}"
+    # Don't hand over a URL that has not answered yet. `port-forward` returns a pid
+    # before it binds the socket, and the workspace path already carries a test
+    # named for this exact mistake -- so this waits, and says so rather than
+    # printing a link that quietly does not work.
+    if not k8s.forward_reachable(port):
+        warn(emit, f"Grafana is installed but {grafana} is not answering yet; "
+                   f"re-run `rc-repro monitor --name {m.name}` if it stays quiet",
+             phase="monitor")
     info(emit, f"monitoring attached to {m.name!r}", phase="done",
          data={"grafana_url": grafana})
     return {"name": m.name, "monitoring": True, "grafana_url": grafana,
