@@ -3849,9 +3849,6 @@ def test_kubernetes_refuses_what_it_would_silently_drop(monkeypatch, tmp_path):
         (req(https="local"), "--https"),
         (req(domain="x.example"), "--domain"),
         (req(reg_token="abc"), "--reg-token"),
-        # A preset with no Kubernetes adapter is still refused -- recorded and
-        # never applied is what this guard exists to prevent.
-        (req(preset="email"), "preset 'email'"),
     ]
     for creq, expected in cases:
         with pytest.raises(errors.ValidationError) as caught:
@@ -3866,14 +3863,28 @@ def test_kubernetes_refuses_what_it_would_silently_drop(monkeypatch, tmp_path):
     # not a blanket "presets do not work here". That is what slice 4 bought.
     lc._refuse_unsupported_on_kubernetes(req(preset="ldap", params={"users": "3"}))
     # The refusal names the ones that DO work, so the answer is actionable.
-    # saml and oidc pass now too -- they carry Kubernetes manifests alongside their
-    # compose services, so the backing Keycloak really is created.
-    for ok in ("ldap", "saml", "oidc"):
-        lc._refuse_unsupported_on_kubernetes(req(preset=ok))
-    # The ones still without an adapter name what IS available.
+    # EVERY preset reaches Kubernetes now, each with its own backing workload:
+    # openldap, keycloak (twice), mailpit, minio, nginx. The guard stays because it
+    # is what keeps a future preset from being recorded and never applied.
+    from rc_repro import presets
+    for p in presets.list_presets():
+        # `multi-instance` is a DEPLOYMENT on this branch, not a scenario -- the
+        # legacy YAML still exists in the catalogue and correctly refuses here,
+        # because its nats/traefik pair is what --deployment provides natively.
+        if p.name == "multi-instance":
+            with pytest.raises(errors.ValidationError):
+                lc._refuse_unsupported_on_kubernetes(req(preset=p.name))
+            continue
+        lc._refuse_unsupported_on_kubernetes(req(preset=p.name))
+
+    # And it still bites: a preset with backing services and no manifests is refused,
+    # naming the services that would have been missing.
+    import dataclasses
+    broken = dataclasses.replace(presets.load("email"), kubernetes_manifests=[])
+    monkeypatch.setattr(presets, "resolve", lambda *a, **kw: broken)
     with pytest.raises(errors.ValidationError) as caught:
-        lc._refuse_unsupported_on_kubernetes(req(preset="livechat"))
-    assert "widget-site" in str(caught.value), caught.value
+        lc._refuse_unsupported_on_kubernetes(req(preset="email"))
+    assert "mailpit" in str(caught.value), caught.value
 
 
 def test_the_kubernetes_refusals_are_reached_from_the_create_path():

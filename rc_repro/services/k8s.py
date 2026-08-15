@@ -1351,14 +1351,16 @@ def scenario_ui_forwards(name: str, *, namespace: str, context: str,
                "-l", UI_PORT_LABEL, "-o",
                "jsonpath={range .items[*]}{.metadata.name}{\" \"}"
                "{.metadata.labels.rc-repro\\.io/ui-port}{\" \"}"
-               "{.spec.ports[0].targetPort}{\"\\n\"}{end}"],
+               "{.spec.ports[0].targetPort}{\" \"}"
+               "{.metadata.labels.rc-repro\\.io/ui-deployment}{\"\\n\"}{end}"],
               own=is_ours(context))
     forwards: dict[int, int] = {}
     for line in (res.stdout or "").splitlines():
         parts = line.split()
-        if len(parts) != 3:
+        if len(parts) not in (3, 4):
             continue
-        svc, host, target = parts
+        svc, host, target = parts[:3]
+        deploy = parts[3] if len(parts) == 4 else svc
         try:
             host_p, target_p = int(host), int(target)
         except ValueError:
@@ -1396,7 +1398,7 @@ def scenario_ui_forwards(name: str, *, namespace: str, context: str,
         # reintroduced it. Our adapters name the Deployment and the Service
         # identically, which `test_a_scenario_names_its_deployment_and_service_alike`
         # holds them to.
-        argv += [f"deployment/{svc}", f"{host_p}:{target_p}"]
+        argv += [f"deployment/{deploy}", f"{host_p}:{target_p}"]
         try:
             proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL, start_new_session=True,

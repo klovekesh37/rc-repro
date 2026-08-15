@@ -140,6 +140,17 @@ def build(params: dict) -> Preset:
             "presigned-URL behaviour: --set presigned=true (reproduces that ticket class).",
         ]
 
+    kube = _common._k8s_manifests(
+        name="minio", image=f"docker.io/minio/minio:{_MINIO_TAG}",
+        ports=[(_S3_PORT, _S3_PORT), (_CONSOLE_PORT, _CONSOLE_PORT)],
+        env={"MINIO_ROOT_USER": _USER, "MINIO_ROOT_PASSWORD": _PASSWORD},
+        args=["server", "/data", "--console-address", f":{_CONSOLE_PORT}"],
+        # TWO Services, one Deployment: MinIO serves the S3 API and the console from
+        # the same process, and a Kubernetes label value cannot contain a comma --
+        # so each Service names the workload through `rc-repro.io/ui-deployment`
+        # instead of carrying a list of ports it is not allowed to spell.
+        ui={"minio": (_S3_PORT, _S3_PORT),
+            "minio-console": (_CONSOLE_PORT, _CONSOLE_PORT)})
     return Preset(
         name="s3_minio",
         description=(
@@ -158,5 +169,6 @@ def build(params: dict) -> Preset:
         },
         volumes={"minio_data": {"driver": "local"}},
         ports=list(config.PRESET_PORTS["s3_minio"]),
+        kubernetes_manifests=[kube],
         notes=notes,
     )
