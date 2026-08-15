@@ -2796,3 +2796,42 @@ def test_the_realm_lands_as_a_file_not_a_directory():
     mount = dep["spec"]["template"]["spec"]["containers"][0]["volumeMounts"][0]
     assert mount["subPath"] == "rcrepro-realm.json", mount
     assert mount["mountPath"].endswith("/import/rcrepro-realm.json"), mount
+
+
+def test_every_scenario_workload_declares_when_it_is_ready():
+    """The audit's root cause, in one assertion.
+
+    Without a readiness probe a pod is Ready the instant its container starts --
+    about forty seconds before Keycloak serves HTTP. Everything downstream then
+    trusts a signal that has not been earned: the Service publishes a "ready"
+    endpoint, the port-forward attaches to a backend that is not listening, and
+    post_ready fetches the IdP descriptor from a port with nothing behind it.
+
+    The operational audit caught exactly that -- SAML came up with an empty
+    SAML_Custom_Default_cert and both post_ready actions failed, on a workspace that
+    reported itself running.
+    """
+    import yaml
+
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    for name in ("ldap", "saml", "oidc", "email", "s3_minio", "livechat"):
+        # resolve(..., KUBERNETES): `ldap` is a Scenario whose two adapters return
+        # DIFFERENT Presets, so `load` gives the Compose one with no manifests at all.
+        kube = presets.resolve(name, topology.KUBERNETES, {})
+        docs = [d for d in yaml.safe_load_all(kube.kubernetes_manifests[0]) if d]
+        deployments = [d for d in docs if d["kind"] == "Deployment"]
+        assert deployments, name
+        for dep in deployments:
+            container = dep["spec"]["template"]["spec"]["containers"][0]
+            probe = container.get("readinessProbe")
+            assert probe, f"{name}/{dep['metadata']['name']} has no readinessProbe"
+            # It must test the thing that actually serves. httpGet where the
+            # workload speaks HTTP; LDAP does not, so slapd gets a tcpSocket check --
+            # which is meaningful there because slapd binds 389 only after its
+            # bootstrap import finishes.
+            assert "httpGet" in probe or "tcpSocket" in probe, f"{name}: {probe}"
+            # Long enough for an image pull plus a slow boot; the cost of being wrong
+            # is a workspace that looks healthy and is not configured.
+            assert probe.get("failureThreshold", 3) >= 30, f"{name}: {probe}"

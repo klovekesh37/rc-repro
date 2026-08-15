@@ -67,6 +67,9 @@ def build(params: dict) -> Preset:
         env={"MP_SMTP_AUTH_ACCEPT_ANY": "1", "MP_SMTP_AUTH_ALLOW_INSECURE": "1"},
         # Only the web UI is published to the host; SMTP is reached in-cluster by
         # Rocket.Chat, exactly as it is over the compose network.
+        readiness={"httpGet": {"path": "/", "port": 8025},
+                   "initialDelaySeconds": 3, "periodSeconds": 3,
+                   "failureThreshold": 40},
         ui={"mailpit": (_MAILPIT_WEB_PORT, 8025)})
     return Preset(
         name="email",

@@ -35,7 +35,8 @@ def str_param(params: dict, key: str, default: str) -> str:
 def _k8s_manifests(*, name: str, image: str, ports: list[tuple[int, int]],
                    env: dict | None = None, args: list | None = None,
                    files: dict | None = None, mounts: list | None = None,
-                   ui: dict | None = None, workspace: str = "__RC_REPRO_NAME__") -> str:
+                   ui: dict | None = None, readiness: dict | None = None,
+                   workspace: str = "__RC_REPRO_NAME__") -> str:
     """One Deployment + one Service per exposed port, from the same shape every
     scenario adapter needs. Written once here rather than five times.
 
@@ -62,6 +63,12 @@ def _k8s_manifests(*, name: str, image: str, ports: list[tuple[int, int]],
         container["env"] = [{"name": k, "value": str(v)} for k, v in env.items()]
     if args:
         container["args"] = [str(a) for a in args]
+    # A readiness probe is what makes "ready endpoint" mean anything. Without one a
+    # pod is Ready as soon as its container starts, and every consumer downstream --
+    # the Service's endpoints, the port-forward, post_ready -- trusts a signal that
+    # has not been earned.
+    if readiness:
+        container["readinessProbe"] = readiness
     pod = {"containers": [container]}
     if mounts:
         container["volumeMounts"] = mounts

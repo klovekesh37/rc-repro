@@ -149,6 +149,10 @@ def build(params: dict) -> Preset:
         # the same process, and a Kubernetes label value cannot contain a comma --
         # so each Service names the workload through `rc-repro.io/ui-deployment`
         # instead of carrying a list of ports it is not allowed to spell.
+        readiness={"httpGet": {"path": "/minio/health/ready",
+                               "port": _S3_PORT},
+                   "initialDelaySeconds": 3, "periodSeconds": 3,
+                   "failureThreshold": 40},
         ui={"minio": (_S3_PORT, _S3_PORT),
             "minio-console": (_CONSOLE_PORT, _CONSOLE_PORT)})
     return Preset(
