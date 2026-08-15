@@ -3651,3 +3651,84 @@ def test_the_notes_say_the_operator_is_shared_when_it_is_used():
     src = inspect.getsource(lc._create_kubernetes)
     assert "SHARED" in src and "official guide" in src
     assert "monitoring is shared the same way" in src
+
+
+def test_the_oplog_user_can_actually_read_the_oplog(monkeypatch):
+    """Two faults in one line, on the only versions that use it.
+
+    Rocket.Chat below 8.x tails the oplog; 8.x dropped it. The operator's oplog URL
+    addressed the `local` DATABASE while the user is defined in `rocketchat`, and
+    carried no authSource -- so the driver authenticated against `local`, looking for
+    a user that has never existed there. Even past that, reading `local` needs a role
+    `readWrite` on the app database does not confer.
+
+    The role is not an invention: Rocket.Chat's own chart grants exactly this to its
+    bundled MongoDB, in templates/mongodb-init-configmap.yaml --
+    `grantRolesToUser('<user>', [{ role: 'clusterMonitor', db: 'admin' }])`.
+
+    This survived every live run because they all used 8.5.1, where the URL is never
+    emitted at all.
+    """
+    import yaml
+
+    from rc_repro.services import k8s
+
+    oplog = k8s.operator_mongo_url("rc-repro-x", "PW", oplog=True)
+    assert "/local?" in oplog, oplog
+    assert f"authSource={k8s.MONGO_APP_DB}" in oplog, \
+        "without authSource the driver authenticates against `local`"
+
+    doc = yaml.safe_load(k8s.mongodb_community_manifest("t", "7.0"))
+    app = {u["name"]: u for u in doc["spec"]["users"]}[k8s.MONGO_APP_USER]
+    roles = {(r["name"], r["db"]) for r in app["roles"]}
+    assert ("readWrite", k8s.MONGO_APP_DB) in roles, roles
+    assert ("clusterMonitor", "admin") in roles, \
+        "readWrite on the app db cannot read `local`"
+
+
+def test_the_oplog_url_is_only_emitted_for_the_versions_that_use_it():
+    """RC 8.x dropped oplog tailing, so emitting it there is wrong in the other
+    direction. The rule lives in versions.py and applies to both runtimes; this
+    checks the Kubernetes chart values honour it."""
+    from rc_repro.services import k8s
+
+    with_oplog = k8s.values_for(rc_version="7.10.0", rc_image="i", microservices=False,
+                                oplog=True, mongo_url="m", oplog_url="o")
+    without = k8s.values_for(rc_version="8.5.1", rc_image="i", microservices=False,
+                             oplog=False, mongo_url="m")
+    assert with_oplog["externalMongodbOplogUrl"] == "o"
+    assert "externalMongodbOplogUrl" not in without
+
+
+def test_the_chart_fix_is_applied_only_where_the_chart_needs_it(monkeypatch):
+    """Rocket.Chat 7.x could not install on Kubernetes at all, and no test saw it
+    because every live run used 8.5.1.
+
+    Chart 6.26.0 -- the exact-match chart for RC 7.10.0 -- ships
+    `containerSecurityContext: {runAsUser: 999, fsGroup: 999}` and renders it onto
+    the CONTAINER, where `fsGroup` does not exist. Helm 3 applied client-side and
+    dropped it silently; Helm 4 applies server-side and the API server refuses the
+    whole Deployment: ".spec.template.spec.containers[name=\\"rocketchat\\"]
+    .securityContext.fsGroup: field not declared in schema".
+
+    `null` is the override because Helm MERGES values -- passing a replacement map
+    leaves the chart's own fsGroup underneath and changes nothing. And it is applied
+    only where the chart has the field: injecting it into chart 7.0.0, which fixed
+    the bug upstream, put a literal `fsGroup: null` onto the container instead --
+    the same undeclared field from the other direction.
+    """
+    from rc_repro.services import k8s
+
+    def fake_run(argv, **kw):
+        import subprocess
+        has_fsgroup = "6.26.0" in argv
+        body = ("containerSecurityContext:\n  runAsUser: 999\n  fsGroup: 999\n"
+                if has_fsgroup else
+                "containerSecurityContext:\n  runAsUser: 65533\n")
+        return subprocess.CompletedProcess(argv, 0, stdout=body, stderr="")
+
+    monkeypatch.setattr(k8s, "run", fake_run)
+    assert k8s.container_security_context("6.26.0") == \
+        {"containerSecurityContext": {"fsGroup": None}}
+    assert k8s.container_security_context("7.0.0") == {}, \
+        "a chart without the field must get no override at all"

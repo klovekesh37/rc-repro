@@ -784,6 +784,47 @@ def resolve_chart_version(rc_version: str, emit: Emit = null_emit) -> str:
     return str(newest["version"])
 
 
+def container_security_context(chart_version: str) -> dict:
+    """Drop `fsGroup` from the chart's CONTAINER securityContext, if it puts one there.
+
+    `fsGroup` is a POD-level field. Chart 6.26.0 -- the exact-match chart for
+    Rocket.Chat 7.10.0 -- ships `containerSecurityContext: {{runAsUser: 999,
+    fsGroup: 999}}` and renders it onto the container, where the field does not
+    exist. Helm 3 applied client-side and silently dropped it; Helm 4 applies
+    server-side, and the API server refuses the whole Deployment:
+
+        Error: server-side apply failed ... Kind=Deployment: failed to create typed
+        patch object: .spec.template.spec.containers[name="rocketchat"]
+        .securityContext.fsGroup: field not declared in schema
+
+    That makes every Rocket.Chat 7.x install fail on this runtime, which went unseen
+    because every live run so far used 8.5.1: chart 7.0.0 fixed it upstream.
+
+    `null` rather than a replacement map, because Helm MERGES values: passing
+    `{{runAsUser: 999}}` leaves the chart's `fsGroup: 999` in place underneath, and
+    the render is unchanged. `null` is Helm's delete.
+
+    And it is applied only where the chart actually has the field, which is why this
+    reads the chart's own values first. Injecting `fsGroup: null` unconditionally put
+    a literal `fsGroup: null` onto chart 7.0.0's container -- the same undeclared
+    field, arrived at from the other direction. The UIDs differ too (999 in 6.26.0,
+    65533 in 7.0.0), so nothing about this map is safe to write down here.
+    """
+    res = run(["helm", "show", "values", CHART, "--version", chart_version],
+              timeout=APPLY_TIMEOUT, own=True)
+    if res.returncode != 0:
+        return {}
+    import yaml
+    try:
+        values = yaml.safe_load(res.stdout or "") or {}
+    except yaml.YAMLError:
+        return {}
+    current = values.get("containerSecurityContext")
+    if not isinstance(current, dict) or "fsGroup" not in current:
+        return {}
+    return {"containerSecurityContext": {"fsGroup": None}}
+
+
 def mongo_manifest(name: str, tag: str, *, owner: str = "",
                    storage_class: str = "") -> str:
     """A single-node MongoDB replica set with a PVC.
@@ -1337,6 +1378,7 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
                             microservices=microservices, replicas=replicas,
                             root_url=root_url, oplog=resolved.oplog,
                             mongo_url=mongo_url, oplog_url=oplog_url)
+        values.update(container_security_context(chart_version))
         info(emit, f"installing {CHART} as {RELEASE}", phase="boot", pct=60)
         install(namespace=namespace, context=context, values=values,
                 chart_version=chart_version)
@@ -1666,6 +1708,16 @@ spec:
     roles:
     - name: readWrite
       db: {MONGO_APP_DB}
+    # clusterMonitor is what makes MONGO_OPLOG_URL work, and it is what Rocket.Chat's
+    # OWN chart grants: templates/mongodb-init-configmap.yaml runs
+    #   db.getSiblingDB('<db>').grantRolesToUser('<user>',
+    #       [{{ role: 'clusterMonitor', db: 'admin' }}])
+    # against its bundled MongoDB, commenting "having clusterMonitor role shouldn't
+    # hurt". readWrite on the app database alone cannot read `local`, so Rocket.Chat
+    # below 8.x -- the only versions that still tail the oplog -- could authenticate
+    # and then fail to tail. This is upstream's answer, not an invention.
+    - name: clusterMonitor
+      db: admin
   statefulSet:
     spec:
       volumeClaimTemplates:
@@ -1703,12 +1755,22 @@ def operator_mongo_url(namespace: str, password: str, *, oplog: bool = False) ->
     The operator names its service `<name>-svc`, not `<name>` -- a detail worth
     stating, because the hand-written path uses the bare name and the two are not
     interchangeable.
+
+    `authSource` is on BOTH forms, and the oplog one is where it was missing. The
+    oplog URL addresses the `local` DATABASE, but the user is defined in
+    `{MONGO_APP_DB}` -- and without authSource the driver authenticates against the
+    database in the path, so it looked for a `{MONGO_APP_USER}` in `local` that has
+    never existed there. Two faults in one line: even once authentication succeeded,
+    reading `local` needs clusterMonitor, which the user now carries.
+
+    Only Rocket.Chat below 8.x uses this at all; 8.x dropped oplog tailing. That is
+    also why it survived so long unnoticed -- every live run of the operator path
+    used 8.5.1, where the URL is never emitted.
     """
     db = "local" if oplog else MONGO_APP_DB
-    auth = "" if oplog else f"&authSource={MONGO_APP_DB}"
     return (f"mongodb://{MONGO_APP_USER}:{password}@"
             f"{MONGO_SERVICE}-0.{MONGO_SERVICE}-svc.{namespace}.svc.cluster.local:27017/"
-            f"{db}?replicaSet={MONGO_SERVICE}{auth}")
+            f"{db}?replicaSet={MONGO_SERVICE}&authSource={MONGO_APP_DB}")
 
 
 def ensure_operator(*, context: str, emit: Emit = null_emit) -> None:
