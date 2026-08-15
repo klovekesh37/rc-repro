@@ -2743,3 +2743,56 @@ def test_the_ldap_directory_can_be_looked_at_on_both_runtimes():
     assert ("Deployment", "phpldapadmin") in kinds, kinds
     assert ("Deployment", "openldap") in kinds, kinds
     assert ("ConfigMap", "openldap-bootstrap") in kinds, kinds
+
+
+def test_keycloak_carries_both_renderings_on_one_preset():
+    """Deliberately NOT a Scenario with two adapters like `ldap`.
+
+    Keycloak's intent survives the crossing untouched: the realm JSON is
+    byte-identical, the settings Rocket.Chat needs are identical, and the post_ready
+    actions are REST calls that do not care where the IdP runs. Only the container's
+    packaging differs -- so one Preset carries both renderings and each runtime reads
+    the half it understands. Two adapters would have been two copies of the same
+    realm to keep in step.
+    """
+    import yaml
+
+    from rc_repro import config, presets
+    from rc_repro.presets import _keycloak
+
+    for name in ("saml", "oidc"):
+        p = presets.load(name, {"users": "3"})
+        assert "keycloak" in p.services, name
+        docs = [d for d in yaml.safe_load_all(p.kubernetes_manifests[0]) if d]
+        kinds = {d["kind"]: d for d in docs}
+        assert set(kinds) == {"ConfigMap", "Deployment", "Service"}, sorted(kinds)
+
+        # The realm the two renderings ship must be the SAME bytes, or a ticket
+        # reproduced on one runtime is not the ticket reproduced on the other.
+        compose_realm = dict(p.files)[f"{name}/keycloak-realm.json"]
+        assert kinds["ConfigMap"]["data"]["rcrepro-realm.json"] == compose_realm
+
+        # `keycloak` on both, because RC's backend and the browser must resolve the
+        # same hostname -- OIDC uses one URL for the authorize redirect AND the
+        # token exchange.
+        assert kinds["Service"]["metadata"]["name"] == "keycloak"
+        want = config.PRESET_PORTS[name][0]
+        assert kinds["Service"]["spec"]["ports"][0]["port"] == want
+        assert kinds["Service"]["metadata"]["labels"][_keycloak.UI_PORT_LABEL] == str(want)
+
+
+def test_the_realm_lands_as_a_file_not_a_directory():
+    """A ConfigMap mounted at a file path WITHOUT subPath becomes a directory of
+    that name, and Keycloak's `--import-realm` would find no realm to import. The
+    LDAP adapter got this right; this asserts the Keycloak one does too, because
+    the failure is silent -- the container starts happily with an empty realm."""
+    import yaml
+
+    from rc_repro import presets
+
+    docs = [d for d in yaml.safe_load_all(
+        presets.load("oidc", {}).kubernetes_manifests[0]) if d]
+    dep = [d for d in docs if d["kind"] == "Deployment"][0]
+    mount = dep["spec"]["template"]["spec"]["containers"][0]["volumeMounts"][0]
+    assert mount["subPath"] == "rcrepro-realm.json", mount
+    assert mount["mountPath"].endswith("/import/rcrepro-realm.json"), mount

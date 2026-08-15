@@ -3851,7 +3851,7 @@ def test_kubernetes_refuses_what_it_would_silently_drop(monkeypatch, tmp_path):
         (req(reg_token="abc"), "--reg-token"),
         # A preset with no Kubernetes adapter is still refused -- recorded and
         # never applied is what this guard exists to prevent.
-        (req(preset="saml"), "preset 'saml'"),
+        (req(preset="email"), "preset 'email'"),
     ]
     for creq, expected in cases:
         with pytest.raises(errors.ValidationError) as caught:
@@ -3866,9 +3866,14 @@ def test_kubernetes_refuses_what_it_would_silently_drop(monkeypatch, tmp_path):
     # not a blanket "presets do not work here". That is what slice 4 bought.
     lc._refuse_unsupported_on_kubernetes(req(preset="ldap", params={"users": "3"}))
     # The refusal names the ones that DO work, so the answer is actionable.
+    # saml and oidc pass now too -- they carry Kubernetes manifests alongside their
+    # compose services, so the backing Keycloak really is created.
+    for ok in ("ldap", "saml", "oidc"):
+        lc._refuse_unsupported_on_kubernetes(req(preset=ok))
+    # The ones still without an adapter name what IS available.
     with pytest.raises(errors.ValidationError) as caught:
-        lc._refuse_unsupported_on_kubernetes(req(preset="oidc"))
-    assert "ldap" in str(caught.value), caught.value
+        lc._refuse_unsupported_on_kubernetes(req(preset="livechat"))
+    assert "widget-site" in str(caught.value), caught.value
 
 
 def test_the_kubernetes_refusals_are_reached_from_the_create_path():
@@ -3913,3 +3918,41 @@ def test_a_scenarios_settings_reach_the_rocket_chat_container(monkeypatch):
                               preset_env={"ADMIN_NAME": "Scenario"})
     names = [e["value"] for e in override["extraEnv"] if e["name"] == "ADMIN_NAME"]
     assert names[-1] == "Scenario", names
+
+
+def test_a_scenario_forward_waits_for_a_ready_endpoint(monkeypatch):
+    """Binding a local socket is not the same as the backend answering.
+
+    `kubectl port-forward svc/...` binds immediately and only then dials a pod, so a
+    forward started while the workload is still booting passes a TCP check on the
+    local side, fails upstream and exits. Keycloak takes about forty seconds to
+    import its realm, and the live run showed exactly that: "keycloak published at
+    http://localhost:8081", then connection refused a minute later.
+
+    So the endpoint is waited for first. Third kind of forward, third time this
+    lesson: the workspace URL needed the pod Running, Grafana needed the socket
+    confirmed, and this needs a ready endpoint before either check means anything.
+    """
+    import subprocess
+
+    from rc_repro.services import k8s
+
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        if "svc" in argv and "get" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="kc 8081 8080\n", stderr="")
+        if "endpoints" in argv:
+            # Never ready -- the forward must NOT be started at all.
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(k8s, "run", fake_run)
+    monkeypatch.setattr(k8s.subprocess, "Popen",
+                        lambda *a, **kw: pytest.fail("forwarded before it was ready"))
+    out = k8s.scenario_ui_forwards("w", namespace="rc-repro-w", context=k8s.CONTEXT,
+                                   sleep=lambda _s: None)
+    assert out == {}, out
+    assert sum("endpoints" in a for argv in calls for a in argv) >= 10, \
+        "it must actually retry rather than check once"

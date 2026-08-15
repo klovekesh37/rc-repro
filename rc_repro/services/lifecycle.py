@@ -2024,6 +2024,12 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     # `meta.extra["notes"] = pre.notes`. This path builds its own list, so without
     # this the preset's UI URL and credentials existed and were never printed --
     # exactly the "it works and nobody can tell" shape.
+    # A preset's self-configuration actions, recorded exactly as the Compose path
+    # records them. Without this the OIDC preset would create no OAuth provider and
+    # the SAML preset no provider settings -- both recorded and neither applied,
+    # which is the silent-drop shape this runtime keeps producing.
+    if getattr(preset_for_notes, "post_ready", None):
+        meta.extra["post_ready"] = preset_for_notes.post_ready
     scenario_notes = list(getattr(preset_for_notes, "notes", None) or [])
     if scenario_notes:
         meta.extra["notes"] = scenario_notes + list(meta.extra["notes"])
@@ -2038,8 +2044,14 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     # forces wait=True when seeding; this path simply never read it.
     result = {"name": repro_name, "meta": asdict(meta), "url": root,
               "reused": reused, "runtime": topology.KUBERNETES}
-    if req.wait or req.seed:
-        wait_serving(meta, emit, timeout=600.0)
+    # A preset with post_ready actions MUST wait, or there is nothing to configure
+    # against -- the same rule the Compose path applies at `wait = req.wait or
+    # bool(pre.post_ready) or req.seed`.
+    if req.wait or req.seed or bool(meta.extra.get("post_ready")):
+        # wait_and_finalize, not bare wait_serving: it also finalizes the setup
+        # wizard over REST and runs the preset's post_ready actions. Waiting and
+        # stopping there left every self-configuring preset half-applied.
+        result.update(wait_and_finalize(meta, emit, timeout=600.0))
         result["ready"] = True
     if req.seed:
         result["seed"] = run_seed_inline(meta, req.seed_profile, req.stats, emit)

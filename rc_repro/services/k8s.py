@@ -1326,8 +1326,15 @@ def render_scenario_manifest(manifest: str, name: str) -> str:
 UI_PORT_LABEL = "rc-repro.io/ui-port"
 
 
+#: Up to two minutes for a scenario's workload to have a ready endpoint. Keycloak
+#: imports a realm on first boot and takes about forty seconds of it.
+ENDPOINT_WAIT_TRIES = 60
+ENDPOINT_WAIT_INTERVAL = 2.0
+
+
 def scenario_ui_forwards(name: str, *, namespace: str, context: str,
-                         bind_host: str = "", emit: Emit = null_emit) -> dict:
+                         bind_host: str = "", emit: Emit = null_emit,
+                         sleep=time.sleep) -> dict:
     """Publish every scenario Service that asks to be published. Returns {port: pid}.
 
     Compose gives a preset's UI a host port for free; here it is a port-forward, for
@@ -1355,6 +1362,29 @@ def scenario_ui_forwards(name: str, *, namespace: str, context: str,
         try:
             host_p, target_p = int(host), int(target)
         except ValueError:
+            continue
+        # WAIT FOR A READY ENDPOINT FIRST. `kubectl port-forward svc/...` binds the
+        # local socket immediately and only then dials a pod -- so a forward started
+        # while the workload is still booting passes a TCP check on the local side,
+        # fails upstream, and exits. Keycloak takes ~40s to import its realm, and
+        # that is exactly what happened: "keycloak published at http://localhost:8081"
+        # followed by a connection refused a minute later.
+        #
+        # Binding a socket is not the same as the backend answering, which is the
+        # same lesson as `svc/` needing ready endpoints -- learned here for the
+        # third time, on the third kind of forward.
+        for _ in range(ENDPOINT_WAIT_TRIES):
+            ep = run(["kubectl", "--context", context, "-n", namespace, "get",
+                      "endpoints", svc, "-o",
+                      "jsonpath={.subsets[0].addresses[0].ip}"],
+                     own=is_ours(context))
+            if (ep.stdout or "").strip():
+                break
+            sleep(ENDPOINT_WAIT_INTERVAL)
+        else:
+            warn(emit, f"{svc} has no ready endpoint yet; publish it when it is up: "
+                       f"kubectl -n {namespace} port-forward svc/{svc} "
+                       f"{host_p}:{target_p}", phase="boot")
             continue
         argv = ["kubectl", "--context", context, "-n", namespace, "port-forward"]
         if bind_host and bind_host not in ("127.0.0.1", "localhost"):
