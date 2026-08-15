@@ -1277,6 +1277,7 @@ _PRESET_LINKS = {
     "saml": [("Keycloak", 0)],
     "oidc": [("Keycloak", 0)],
     "livechat": [("Widget site", 0)],
+    "ldap": [("phpLDAPadmin", 0)],
 }
 
 
@@ -1701,6 +1702,14 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
             pid = (meta.extra or {}).get("port_forward_pid")
             if pid:
                 _stop_port_forward(int(pid))
+            # A preset's UI forwards too, or `down` leaves 8082 bound to a namespace
+            # that no longer exists -- and the NEXT workspace using that preset finds
+            # the port taken by a corpse.
+            for ui_pid in (meta.extra or {}).get("scenario_forwards", {}).values():
+                try:
+                    _stop_port_forward(int(ui_pid))
+                except (TypeError, ValueError):
+                    pass
             found = k8s.delete_namespace(target, context=context, volumes=volumes,
                                          emit=emit)
             if volumes:
@@ -1915,6 +1924,10 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     bind_host = req.bind or cfg.get("bind_host") or config.DEFAULT_BIND_HOST
     root = f"http://localhost:{host_port}"
     microservices = req.deployment == topology.MICROSERVICES
+    # Resolved ONCE: the same object builds the workspace and supplies its notes,
+    # so what was applied and what is printed cannot disagree.
+    preset_for_notes = presets.resolve(req.preset or "default", topology.KUBERNETES,
+                                       req.params or {})
     out = k8s.create_workspace(
         name=repro_name, resolved=resolved, host_port=host_port,
         microservices=microservices, replicas=req.replicas or 1,
@@ -1924,8 +1937,7 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         # manifests here and a compose service on the other runtime -- one intent,
         # two renderings. `_refuse_unsupported_on_kubernetes` has already proved
         # this resolves, so a failure here would be a bug rather than bad input.
-        preset=presets.resolve(req.preset or "default", topology.KUBERNETES,
-                               req.params or {}),
+        preset=preset_for_notes,
         emit=emit)
 
     meta = runner.Metadata(
@@ -2005,9 +2017,16 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         f"{repro_name}` installs one Prometheus + Grafana in "
         f"{k8s.OPERATOR_NAMESPACE} for the whole cluster, and `--off` leaves it up "
         "while any other workspace still wants it.",
-        "stop/start/restart, logs, stats and backup have no Kubernetes path yet — "
-        "each refuses and names the kubectl command that does the job.",
+        "logs, stats and backup have no Kubernetes path yet — each refuses and "
+        "names the kubectl command that does the job.",
     ]
+    # A preset's own notes, which the Compose path already surfaces via
+    # `meta.extra["notes"] = pre.notes`. This path builds its own list, so without
+    # this the preset's UI URL and credentials existed and were never printed --
+    # exactly the "it works and nobody can tell" shape.
+    scenario_notes = list(getattr(preset_for_notes, "notes", None) or [])
+    if scenario_notes:
+        meta.extra["notes"] = scenario_notes + list(meta.extra["notes"])
     # No compose document, so `write` is given an empty one rather than a fake:
     # a file that looks like a compose project but is not would be worse than none.
     ws = runner.workspace(repro_name)

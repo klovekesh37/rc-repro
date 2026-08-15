@@ -19,7 +19,23 @@ from typing import Mapping
 import yaml
 
 from rc_repro.presets import Preset, _common
+from rc_repro import config
 from rc_repro.presets.scenario import Scenario
+
+#: phpLDAPadmin's host port, from the ONE registry both runtimes read. Compose
+#: publishes it directly; Kubernetes declares it on the Service (see UI_PORT_LABEL)
+#: and the lifecycle forwards it. Same number either way, so a ticket's instructions
+#: do not depend on where the workspace happens to run.
+_UI_PORT = config.PRESET_PORTS["ldap"][0]
+
+#: Multi-arch (amd64/arm/arm64), and the standard pairing with osixia/openldap.
+_UI_IMAGE = "osixia/phpldapadmin:0.9.0"
+
+#: A Service wearing this label is published on the host port it names. One
+#: convention for every scenario, so the four presets still to be adapted need no
+#: new mechanism -- and no second place to declare a port that could disagree with
+#: config.PRESET_PORTS.
+UI_PORT_LABEL = "rc-repro.io/ui-port"
 
 # osixia imports custom LDIF from here on first boot (with `--copy-service`).
 _BOOTSTRAP_PATH = "/container/service/slapd/assets/config/bootstrap/ldif/custom/50-rc-users.ldif"
@@ -125,7 +141,22 @@ def _compose(intent: LDAPIntent) -> Preset:
             },
             "volumes": [f"./ldap/50-rc-users.ldif:{_BOOTSTRAP_PATH}:ro"],
             "restart": "unless-stopped",
-        }
+        },
+        # A directory you cannot look at is hard to reproduce against: "is the user
+        # there, and what attributes does it have" is the first question of nearly
+        # every LDAP ticket, and answering it meant `docker exec ... ldapsearch`.
+        "phpldapadmin": {
+            "image": _UI_IMAGE,
+            "environment": {
+                "PHPLDAPADMIN_LDAP_HOSTS": "openldap",
+                # The directory is on a private network with a fixed throwaway
+                # password; HTTPS here would only add a certificate warning.
+                "PHPLDAPADMIN_HTTPS": "false",
+            },
+            "ports": [f"{_UI_PORT}:80"],
+            "depends_on": ["openldap"],
+            "restart": "unless-stopped",
+        },
     }
     return Preset(
         name="ldap",
@@ -139,6 +170,15 @@ def _compose(intent: LDAPIntent) -> Preset:
         requires_license=False,
         source="built-in (dynamic)",
         files=[("ldap/50-rc-users.ldif", ldif)],
+        # Declared so port allocation and the capacity preflight can SEE it --
+        # `test_preset_ports_match_registry` is the invariant, and it caught this
+        # being missing the moment phpLDAPadmin gained a port.
+        ports=list(config.PRESET_PORTS["ldap"]),
+        notes=[
+            f"phpLDAPadmin: http://localhost:{_UI_PORT}",
+            f"    log in with DN  cn=admin,{intent.base_dn}  /  {intent.admin_password}",
+            f"    Rocket.Chat users are user1..user{intent.users}, password same as name",
+        ],
         params_help=dict(_PARAMS_HELP),
         scenario="ldap",
         scenario_params=intent.as_params(),
@@ -204,8 +244,49 @@ def _kubernetes_manifest(intent: LDAPIntent) -> str:
             "ports": [{"name": "ldap", "port": 389, "targetPort": 389}],
         },
     }
+    # phpLDAPadmin, and the label that gets it published. A Service carrying
+    # `rc-repro.io/ui-port` is forwarded to that host port by the Kubernetes
+    # lifecycle -- the declaration lives on the Service that defines the thing,
+    # rather than in a second registry the adapter would have to be kept in step
+    # with. The NUMBER still comes from config.PRESET_PORTS, so both runtimes
+    # publish the same one.
+    ui_labels = dict(labels)
+    ui_labels["app"] = "rc-repro-phpldapadmin"
+    ui_labels[UI_PORT_LABEL] = str(_UI_PORT)
+    ui_deployment = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "phpldapadmin", "labels": ui_labels},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": ui_labels["app"]}},
+            "template": {
+                "metadata": {"labels": ui_labels},
+                "spec": {
+                    "containers": [{
+                        "name": "phpldapadmin",
+                        "image": _UI_IMAGE,
+                        "env": [
+                            {"name": "PHPLDAPADMIN_LDAP_HOSTS", "value": "openldap"},
+                            {"name": "PHPLDAPADMIN_HTTPS", "value": "false"},
+                        ],
+                        "ports": [{"containerPort": 80}],
+                    }],
+                },
+            },
+        },
+    }
+    ui_service = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "phpldapadmin", "labels": ui_labels},
+        "spec": {
+            "selector": {"app": ui_labels["app"]},
+            "ports": [{"name": "http", "port": 80, "targetPort": 80}],
+        },
+    }
     return "---\n".join(yaml.safe_dump(doc, sort_keys=False) for doc in (
-        config_map, deployment, service))
+        config_map, deployment, service, ui_deployment, ui_service))
 
 
 def _kubernetes(intent: LDAPIntent) -> Preset:
@@ -216,6 +297,11 @@ def _kubernetes(intent: LDAPIntent) -> Preset:
             f"OpenLDAP (osixia) seeded with {intent.users} user(s) + group "
             f"'{_GROUP_CN}'; RC wired for LDAP login. Log in as user1 / user1."
         ),
+        notes=[
+            f"phpLDAPadmin: http://localhost:{_UI_PORT}",
+            f"    log in with DN  cn=admin,{intent.base_dn}  /  {intent.admin_password}",
+            f"    Rocket.Chat users are user1..user{intent.users}, password same as name",
+        ],
         topology="kubernetes",
         # The scenario changes the backing service and Rocket.Chat settings; it
         # does not make the microservices deployment cease to be an Enterprise

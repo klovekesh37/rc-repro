@@ -2682,3 +2682,64 @@ def test_deployments_are_not_presets_on_this_branch():
     assert topology.MICROSERVICES in topology.DEPLOYMENTS[topology.KUBERNETES]
     assert topology.MULTI_INSTANCE in topology.DEPLOYMENTS[topology.DOCKER]
     assert "microservices" not in presets.scenario_names()
+
+
+def test_a_scenario_ui_is_published_on_the_same_port_on_both_runtimes():
+    """A ticket's instructions must not depend on where the workspace runs.
+
+    Compose publishes phpLDAPadmin by mapping a host port; Kubernetes cannot, so the
+    Service carries a label naming the port and the lifecycle forwards it. Both read
+    the SAME number out of `config.PRESET_PORTS`, which is why "open
+    http://localhost:8082" is true either way.
+
+    NodePort was the obvious alternative and does not work: its range is 30000-32767
+    so the port would differ from Compose's, kind's nodes are unreachable from the
+    host on macOS and Windows, and `extraPortMappings` is fixed at cluster-create
+    time -- which for a cluster shared by every workspace means recreating it to add
+    a preset.
+    """
+    import yaml
+
+    from rc_repro import config, presets
+    from rc_repro.services import k8s, topology
+
+    want = config.PRESET_PORTS["ldap"][0]
+
+    compose = presets.resolve("ldap", topology.DOCKER, {})
+    published = compose.services["phpldapadmin"]["ports"]
+    assert published == [f"{want}:80"], published
+    assert compose.ports == [want], compose.ports
+
+    kube = presets.resolve("ldap", topology.KUBERNETES, {})
+    docs = [d for d in yaml.safe_load_all(kube.kubernetes_manifests[0]) if d]
+    svc = [d for d in docs
+           if d["kind"] == "Service" and d["metadata"]["name"] == "phpldapadmin"][0]
+    assert svc["metadata"]["labels"][k8s.UI_PORT_LABEL] == str(want)
+    assert svc["spec"]["ports"][0]["port"] == 80
+
+    # The label the lifecycle looks for and the label the adapter writes are the
+    # same constant, not two strings that happen to match today.
+    from rc_repro.presets import ldap as ldap_mod
+    assert ldap_mod.UI_PORT_LABEL == k8s.UI_PORT_LABEL
+
+
+def test_the_ldap_directory_can_be_looked_at_on_both_runtimes():
+    """"Is the user there, and what attributes does it have" is the first question
+    of nearly every LDAP ticket, and answering it used to mean `docker exec ...
+    ldapsearch`. Both renderings ship the browser now, and both keep the directory
+    itself -- a UI that reaches nothing is not worth the megabytes."""
+    import yaml
+
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    compose = presets.resolve("ldap", topology.DOCKER, {})
+    assert set(compose.services) == {"openldap", "phpldapadmin"}, sorted(compose.services)
+    assert compose.services["phpldapadmin"]["depends_on"] == ["openldap"]
+
+    kube = presets.resolve("ldap", topology.KUBERNETES, {})
+    kinds = [(d["kind"], d["metadata"]["name"])
+             for d in yaml.safe_load_all(kube.kubernetes_manifests[0]) if d]
+    assert ("Deployment", "phpldapadmin") in kinds, kinds
+    assert ("Deployment", "openldap") in kinds, kinds
+    assert ("ConfigMap", "openldap-bootstrap") in kinds, kinds

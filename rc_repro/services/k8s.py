@@ -1319,6 +1319,66 @@ def render_scenario_manifest(manifest: str, name: str) -> str:
     return manifest.replace("__RC_REPRO_NAME__", name)
 
 
+#: A scenario Service wearing this label is published on the host port it names.
+#: The label rather than a table here, because the adapter that creates the Service
+#: is the thing that knows it has a UI -- and a table would be a second place to
+#: declare a port, which is how two registries disagree. See presets/ldap.py.
+UI_PORT_LABEL = "rc-repro.io/ui-port"
+
+
+def scenario_ui_forwards(name: str, *, namespace: str, context: str,
+                         bind_host: str = "", emit: Emit = null_emit) -> dict:
+    """Publish every scenario Service that asks to be published. Returns {port: pid}.
+
+    Compose gives a preset's UI a host port for free; here it is a port-forward, for
+    the reasons NodePort cannot serve: its range is 30000-32767 so the port would not
+    MATCH the Compose one, kind's nodes are unreachable from the host on macOS and
+    Windows, and `extraPortMappings` is fixed when the cluster is created -- which
+    for a cluster shared by every workspace would mean recreating it to add a preset.
+
+    Forwarded to the SERVICE here, not a Deployment: by this point the workload is
+    installed and its endpoints are ready, and a Service is the stable name if the
+    pod is later replaced.
+    """
+    res = run(["kubectl", "--context", context, "-n", namespace, "get", "svc",
+               "-l", UI_PORT_LABEL, "-o",
+               "jsonpath={range .items[*]}{.metadata.name}{\" \"}"
+               "{.metadata.labels.rc-repro\\.io/ui-port}{\" \"}"
+               "{.spec.ports[0].port}{\"\\n\"}{end}"],
+              own=is_ours(context))
+    forwards: dict[int, int] = {}
+    for line in (res.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        svc, host, target = parts
+        try:
+            host_p, target_p = int(host), int(target)
+        except ValueError:
+            continue
+        argv = ["kubectl", "--context", context, "-n", namespace, "port-forward"]
+        if bind_host and bind_host not in ("127.0.0.1", "localhost"):
+            argv += ["--address", bind_host]
+        argv += [f"svc/{svc}", f"{host_p}:{target_p}"]
+        try:
+            proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True,
+                                    env=owned_env() if is_ours(context) else None)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        # Confirmed, not assumed -- the same rule the workspace URL and Grafana both
+        # had to learn: port-forward returns a pid before it binds the socket.
+        if forward_reachable(host_p, tries=20):
+            forwards[host_p] = proc.pid
+            info(emit, f"{svc} published at http://localhost:{host_p}", phase="boot")
+        else:
+            warn(emit, f"{svc} is running but http://localhost:{host_p} is not "
+                       f"answering yet; `kubectl -n {namespace} port-forward "
+                       f"svc/{svc} {host_p}:{target_p}` re-establishes it",
+                 phase="boot")
+    return forwards
+
+
 def create_workspace(*, name: str, resolved, host_port: int, microservices: bool,
                      replicas: int = 1, owner: str = "", root_url: str = "",
                      bind_host: str = "", use_operator: bool = False,
@@ -1467,7 +1527,10 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
                    f"deployment/{RELEASE}-rocketchat {host_port}:3000 "
                    f"— or `rc-repro ready --name {name}` to re-establish it.",
              phase="boot")
-    return {"context": context, "namespace": namespace, "bind_host": bind_host,
+    ui = scenario_ui_forwards(name, namespace=namespace, context=context,
+                              bind_host=bind_host, emit=emit)
+    return {"scenario_forwards": {str(k): v for k, v in ui.items()},
+            "context": context, "namespace": namespace, "bind_host": bind_host,
             "chart_version": chart_version, "release": RELEASE,
             "port_forward_pid": pid, "microservices": microservices,
             "mongo_managed_by": managed_by, "mongo_image": image}
