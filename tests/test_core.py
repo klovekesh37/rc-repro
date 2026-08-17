@@ -2835,3 +2835,78 @@ def test_every_scenario_workload_declares_when_it_is_ready():
             # Long enough for an image pull plus a slow boot; the cost of being wrong
             # is a workspace that looks healthy and is not configured.
             assert probe.get("failureThreshold", 3) >= 30, f"{name}: {probe}"
+
+
+def test_a_service_exposes_every_port_its_workload_listens_on():
+    """Reported from a live workspace: Rocket.Chat could not send mail.
+
+        SMTP_Host=mailpit  SMTP_Port=1025      (what RC was told)
+        containerPort 8025, 1025               (what Mailpit listened on)
+        Service ports: 8025                    (what was reachable)
+
+    On Compose, container-to-container traffic reaches ANY port directly, so
+    `mailpit:1025` just works. A Kubernetes Service forwards only its DECLARED
+    ports -- so publishing the web UI and nothing else produced a workspace whose
+    Mailpit answered the browser and refused Rocket.Chat, which is where the mail
+    has to come from. Both UIs worked, which is exactly why it was not noticed.
+
+    The Service speaks CONTAINER ports, as Compose's network does; the `ui-port`
+    label is what says which host port publishes one.
+    """
+    import yaml
+
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    def services(name):
+        docs = yaml.safe_load_all(
+            presets.resolve(name, topology.KUBERNETES, {}).kubernetes_manifests[0])
+        return {d["metadata"]["name"]: d for d in docs if d and d["kind"] == "Service"}
+
+    mailpit = services("email")["mailpit"]
+    ports = {p["port"] for p in mailpit["spec"]["ports"]}
+    assert ports == {8025, 1025}, f"SMTP must be reachable in-cluster: {ports}"
+    # The published one first: the forwarder reads .spec.ports[0].
+    assert mailpit["spec"]["ports"][0]["port"] == 8025, mailpit["spec"]["ports"]
+
+    # MinIO serves API and console from one process; both are published, so the
+    # second gets its own Service naming the workload it belongs to.
+    minio = services("s3_minio")
+    assert {p["port"] for p in minio["minio"]["spec"]["ports"]} == {9000, 9001}
+    assert minio["minio-console"]["metadata"]["labels"][
+        "rc-repro.io/ui-deployment"] == "minio"
+
+
+def test_every_port_a_preset_configures_rocket_chat_to_use_is_reachable():
+    """The general rule the Mailpit bug broke: if a preset points Rocket.Chat at
+    `<host>:<port>`, a Service must actually carry that port.
+
+    Asserted against the settings themselves rather than a hand-written list, so a
+    preset that gains a new backing port cannot quietly skip its Service.
+    """
+    import re
+
+    import yaml
+
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    for name in ("email", "s3_minio", "ldap", "oidc"):
+        kube = presets.resolve(name, topology.KUBERNETES, {})
+        svc_ports = {}
+        for doc in yaml.safe_load_all(kube.kubernetes_manifests[0]):
+            if doc and doc["kind"] == "Service":
+                svc_ports[doc["metadata"]["name"]] = {
+                    p["port"] for p in doc["spec"]["ports"]}
+
+        # Settings of the form Host=<service> paired with Port=<n>.
+        env = kube.env or {}
+        hosts = {k.rsplit("_", 1)[0]: v for k, v in env.items() if k.endswith("_Host")}
+        for prefix, host in hosts.items():
+            port_val = env.get(f"{prefix}_Port")
+            if not port_val or host not in svc_ports:
+                continue
+            port = int(re.sub(r"\D", "", str(port_val)) or 0)
+            assert port in svc_ports[host], (
+                f"{name}: Rocket.Chat is pointed at {host}:{port} but the {host} "
+                f"Service exposes {sorted(svc_ports[host])}")

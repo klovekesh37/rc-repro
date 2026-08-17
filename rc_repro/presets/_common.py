@@ -80,16 +80,45 @@ def _k8s_manifests(*, name: str, image: str, ports: list[tuple[int, int]],
         "spec": {"replicas": 1, "selector": {"matchLabels": {"app": app}},
                  "template": {"metadata": {"labels": labels}, "spec": pod}},
     })
-    for svc_name, (host, container_port) in (ui or {}).items():
+    # THE PRIMARY SERVICE CARRIES EVERY PORT THE WORKLOAD LISTENS ON, not only the
+    # ones published to the host. On Compose, container-to-container traffic reaches
+    # any port directly, so `mailpit:1025` just works. A Kubernetes Service forwards
+    # ONLY its declared ports -- so publishing the web UI and nothing else gave a
+    # workspace whose Mailpit was reachable from the browser and unreachable from
+    # Rocket.Chat, which is where the mail actually has to come from.
+    #
+    # Reported from a live workspace: SMTP_Host=mailpit, SMTP_Port=1025, container
+    # listening on 1025, Service exposing 8025 alone.
+    #
+    # The Service speaks CONTAINER ports, the way Compose's network does; the
+    # `ui-port` label is what says which host port publishes one.
+    ui = dict(ui or {})
+    primary_ui = ui.pop(name, None)
+    ordered = list(ports)
+    if primary_ui:
+        # The published port first: the lifecycle's forwarder reads .spec.ports[0].
+        ordered.sort(key=lambda hc: hc[1] != primary_ui[1])
+    primary_labels = dict(labels)
+    if primary_ui:
+        primary_labels["rc-repro.io/ui-port"] = str(primary_ui[0])
+    docs.append({
+        "apiVersion": "v1", "kind": "Service",
+        "metadata": {"name": name, "labels": primary_labels},
+        "spec": {"selector": {"app": app},
+                 "ports": [{"name": f"p{cport}", "port": cport, "targetPort": cport}
+                           for _host, cport in ordered]},
+    })
+    # Any REMAINING ui entry is a second published port on the same workload, which
+    # needs its own Service because a label value cannot carry a list.
+    for svc_name, (host, container_port) in ui.items():
         svc_labels = dict(labels)
         svc_labels["rc-repro.io/ui-port"] = str(host)
-        if svc_name != name:
-            svc_labels["rc-repro.io/ui-deployment"] = name
+        svc_labels["rc-repro.io/ui-deployment"] = name
         docs.append({
             "apiVersion": "v1", "kind": "Service",
             "metadata": {"name": svc_name, "labels": svc_labels},
             "spec": {"selector": {"app": app},
-                     "ports": [{"name": "http", "port": host,
+                     "ports": [{"name": "http", "port": container_port,
                                 "targetPort": container_port}]},
         })
     return "---\n".join(yaml.safe_dump(d, sort_keys=False) for d in docs)
