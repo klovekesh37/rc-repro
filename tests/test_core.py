@@ -2614,6 +2614,11 @@ def test_a_compose_only_command_refuses_cleanly_rather_than_traceback(monkeypatc
 
     This is the shape the whole taxonomy exists to prevent, so it is pinned at the
     process boundary where a script would see it.
+
+    It is driven through `env --set` now rather than `stats`, because `stats` gained
+    a Kubernetes path and no longer refuses. The property being pinned is the
+    refusal's SHAPE, not which command happens to raise it, so it follows whichever
+    command still does.
     """
     from typer.testing import CliRunner
 
@@ -2628,11 +2633,11 @@ def test_a_compose_only_command_refuses_cleanly_rather_than_traceback(monkeypatc
     runner_mod.write("k", "services: {}\n", m)
     monkeypatch.setattr(runner_mod, "docker_available", lambda **_k: True)
 
-    res = CliRunner().invoke(cli.app, ["stats", "--name", "k", "--for", "1"])
+    res = CliRunner().invoke(cli.app, ["env", "--name", "k", "--set", "A=b"])
     assert res.exit_code == 2, f"a compose-only refusal exited {res.exit_code}, expected 2"
     assert res.exception is None or isinstance(res.exception, SystemExit), (
         "the error escaped as an exception instead of being rendered")
-    assert "kubectl top" in res.output, "the alternative is stated to the user"
+    assert "helm" in res.output, "the alternative is stated to the user"
     assert "Traceback" not in res.output
 
 

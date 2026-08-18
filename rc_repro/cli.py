@@ -1554,11 +1554,30 @@ def stats(
     """Sample a repro's container CPU/RAM (peak over a window, or --watch live)."""
     _require_docker()
     m = runner.read_meta(_resolve_name(name))
-    try:
-        topology.require_compose(m.name, "stats",
-                                 instead="Install metrics-server and use `kubectl top`.")
-    except errors.ReproError as exc:
-        _fail(exc)
+    if topology.of_repro(m.name) == topology.KUBERNETES:
+        # `kubectl top`, per pod, which is the shape that means something here: a
+        # Compose repro has containers, a Kubernetes one has pods that come and go.
+        # ResourceMonitor samples docker and has nothing to sample, so this path is
+        # its own rather than a translation of it.
+        from rc_repro.services import k8s
+        context = str((m.extra or {}).get("context") or k8s.CONTEXT)
+        while True:
+            try:
+                rows = k8s.pod_metrics(m.name, context=context)
+            except errors.ReproError as exc:
+                _fail(exc)
+            typer.echo("")
+            for r in rows:
+                typer.echo(f"  {r['pod']:<44} CPU {r['cpu_millicores']:>6.0f}m"
+                           f"   RAM {r['mem_bytes'] / 1e6:>7.1f} MB")
+            if not rows:
+                ui.note("no Rocket.Chat pods are running")
+            if not watch:
+                return
+            try:
+                time.sleep(2)
+            except KeyboardInterrupt:
+                return
     if watch:
         typer.echo(f"Live stats for {m.name!r} (Ctrl-C to stop)…")
         try:

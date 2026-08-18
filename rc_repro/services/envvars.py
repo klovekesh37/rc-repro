@@ -119,23 +119,39 @@ def current(name: str) -> dict:
     """The RC service's effective environment, credentials masked, plus which keys
     are user overrides — so a caller can show what was changed versus inherited.
 
-    Guarded for the same reason `set_env` is, and it was missed here: this reads the
-    compose document, so on Kubernetes it raised a bare FileNotFoundError naming
-    `repros/<n>/docker-compose.yml` — a path, with no statement of what was wrong.
-    That escaped the ReproError contract entirely, so `serve` answered 500 to a
-    request that is merely unsupported, where `logs` and `stats` both answer cleanly.
-    The write path refusing while the read path crashed also meant `rc-repro env`
-    behaved one way and `rc-repro env --set` another on the same workspace.
+    Answered per runtime. On Compose that is the generated compose document; on
+    Kubernetes there is no such document, so the running container is asked -- which
+    is strictly more accurate, since the chart contributes variables rc-repro never
+    set and the helm values would not show them.
+
+    This path first raised a bare FileNotFoundError naming
+    `repros/<n>/docker-compose.yml` — a path, with no statement of what was wrong —
+    which escaped the ReproError contract so `serve` answered 500 to a request that
+    was merely unsupported. It then refused cleanly, and now answers.
     """
     from rc_repro.services import topology
     target = lifecycle.resolve_name(name)
-    topology.require_compose(
-        target, "env",
-        instead=f"Use `kubectl -n rc-repro-{target} set env --list "
-                f"deployment/rocketchat-rocketchat` for the effective environment, "
-                f"or `helm -n rc-repro-{target} get values rocketchat` for what "
-                f"rc-repro set.")
     meta = runner.read_meta(target)
+    if topology.of_repro(target) == topology.KUBERNETES:
+        # Read from the RUNNING CONTAINER, not from a document. Compose can answer
+        # this from the file it generated; there is no such file here, and the helm
+        # values are only what rc-repro asked for -- the chart adds its own on top,
+        # so they are not the answer to "what is Rocket.Chat running with". This
+        # path used to raise a bare FileNotFoundError naming a compose file that
+        # does not exist, and then refused outright; asking the container is both
+        # honest and strictly more accurate than the Compose answer.
+        from rc_repro.services import k8s
+        context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
+        env = k8s.container_env(target, context=context)
+        overrides = meta.extra.get("env") if isinstance(meta.extra, dict) else {}
+        overrides = overrides if isinstance(overrides, dict) else {}
+        return {
+            "name": target,
+            "env": [{"key": k, "value": lifecycle.redact_env(k, str(v)),
+                     "override": k in overrides}
+                    for k, v in sorted(env.items())],
+            "overrides": sorted(overrides),
+        }
     doc = runner.read_compose(target)
     svcs = doc.get("services", {})
     rc = svcs.get("rocketchat") or svcs.get("rocketchat-1") or {}

@@ -1484,6 +1484,72 @@ def test_orphaned_namespaces_are_found_but_never_swept_by_default(
     assert deleted == ["rc-repro-p3"], deleted
 
 
+def test_env_and_stats_answer_on_kubernetes_instead_of_refusing(
+        monkeypatch, tmp_path):
+    """The last two commands that had no Kubernetes path now have one.
+
+    `env` is answered from the RUNNING CONTAINER rather than a document. That is not
+    a translation of the Compose behaviour, it is better than it: the chart
+    contributes variables rc-repro never set, so the generated values would not show
+    them and the compose file has no equivalent here at all.
+
+    `stats` needs metrics-server, which kind does not ship. When it is missing the
+    refusal says so and how to install it -- a resource figure that is quietly zero
+    is worse than one that is missing, which is the same reasoning `stats` already
+    applies to a container it cannot find.
+    """
+    import json as _json
+    from dataclasses import asdict
+
+    from rc_repro import errors as errs
+    from rc_repro.services import envvars, k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="p", rc_version="8.5.1", rc_image="i",
+                           mongo_tag="8.0", mongo_flavor="official", preset="default",
+                           root_url="u", host_port=3000, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+    m.extra["env"] = {"MY_OVERRIDE": "set-by-me"}
+    ws = lc.runner.workspace("k")
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
+
+    # --- env: read from the container, credentials masked -------------------
+    monkeypatch.setattr(k8s, "container_env", lambda name, *, context: {
+        "ADMIN_PASS": "admin123", "MONGO_URL": "mongodb://mongodb:27017/rocketchat",
+        "MY_OVERRIDE": "set-by-me", "ROOT_URL": "http://localhost:3000"})
+    out = envvars.current("k")
+    keys = {row["key"]: row for row in out["env"]}
+    assert set(keys) == {"ADMIN_PASS", "MONGO_URL", "MY_OVERRIDE", "ROOT_URL"}
+    assert keys["MY_OVERRIDE"]["override"] is True, "a user override is marked as one"
+    assert keys["ROOT_URL"]["override"] is False
+    assert keys["ADMIN_PASS"]["value"] != "admin123", \
+        "credentials are masked here exactly as they are on Compose"
+
+    # --- stats: real numbers, parsed from `kubectl top` output --------------
+    import subprocess as sp
+
+    def top(argv, **kw):
+        if "top" in argv:
+            return sp.CompletedProcess(
+                argv, 0, "rocketchat-a   120m   500Mi\nrocketchat-b   80m   300Mi\n", "")
+        return sp.CompletedProcess(argv, 0, "", "")
+    monkeypatch.setattr(k8s, "run", top)
+    rows = k8s.pod_metrics("k", context="c")
+    assert sum(r["cpu_millicores"] for r in rows) == 200.0, "replicas are summed"
+    assert rows[0]["mem_bytes"] == 500 * 1024 ** 2, "Mi is binary, not 1e6"
+
+    # --- and a refusal that names the fix when metrics-server is absent ------
+    def no_metrics(argv, **kw):
+        return sp.CompletedProcess(argv, 1, "", "error: Metrics API not available")
+    monkeypatch.setattr(k8s, "run", no_metrics)
+    with pytest.raises(errs.NotReadyError) as caught:
+        k8s.pod_metrics("k", context="c")
+    assert "metrics-server" in str(caught.value)
+    assert "kubectl apply" in str(caught.value), "say how to install it"
+
+
 def test_prune_asks_kubernetes_whether_a_kubernetes_workspace_is_down(
         monkeypatch, tmp_path):
     """"Is it down" was answered by Docker for every workspace, on both runtimes.
@@ -1577,45 +1643,51 @@ def test_prune_removes_a_kubernetes_workspace_through_kubernetes(
     assert not lc.runner.workspace("k").exists(), "and the local record with it"
 
 
-def test_reading_env_refuses_a_kubernetes_workspace_instead_of_crashing(
-        monkeypatch, tmp_path):
-    """`env` with no --set reads the compose document, and a Kubernetes workspace has
-    none.
+def test_reading_env_answers_from_the_container_on_kubernetes(monkeypatch, tmp_path):
+    """`env` with no --set went through three states, and this pins the last one.
 
-    Found by an operational audit, not by the suite: `rc-repro env -n <k8s>` exited 1
-    printing only `.../repros/<n>/docker-compose.yml` -- a path, with no statement of
-    what was wrong or what to do. A bare FileNotFoundError also escapes the
-    ReproError contract, so `serve` answered 500 to a request that is merely
-    unsupported, while `logs` and `stats` on the same workspace answered cleanly.
+    First it raised a bare FileNotFoundError naming
+    `repros/<n>/docker-compose.yml` -- a path, with no statement of what was wrong.
+    That escaped the ReproError contract, so `serve` answered 500 to a request that
+    is merely unsupported while `logs` and `stats` answered cleanly on the same
+    workspace. Then it refused cleanly. Now it answers.
 
-    The write path (`set_env`) had the guard from the start; the read path did not, so
-    `rc-repro env` and `rc-repro env --set` disagreed about the same workspace.
+    From the RUNNING CONTAINER, which is not a translation of the Compose behaviour
+    but better than it: the chart contributes variables rc-repro never set, so
+    neither the helm values nor any generated document would show them.
+
+    `env --set` still refuses -- an environment variable cannot be changed inside a
+    running container on either runtime, and here that means a helm upgrade.
     """
     import json as _json
+    from dataclasses import asdict
 
-    from rc_repro.services import envvars, topology
+    from rc_repro.services import envvars, k8s, topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     m = lc.runner.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
                            mongo_tag="8.0", mongo_flavor="official", preset="default",
                            root_url="u", host_port=3010, version_source="t")
     topology.stamp(m.extra, topology.KUBERNETES)
-    # Deliberately NOT runner.write(): that writes a docker-compose.yml, and the
-    # absence of one is the whole condition under test. This is the shape a real
-    # Kubernetes workspace has on disk -- repro.json, and no compose file.
+    m.extra["context"] = k8s.CONTEXT
     ws = lc.runner.workspace("k")
     ws.mkdir(parents=True, exist_ok=True)
-    from dataclasses import asdict
     (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
-    assert not (ws / "docker-compose.yml").exists()
+    assert not (ws / "docker-compose.yml").exists(), \
+        "the absence of a compose file is the condition under test"
 
+    monkeypatch.setattr(k8s, "container_env", lambda name, *, context: {
+        "ROOT_URL": "http://localhost:3010", "ADMIN_PASS": "admin123"})
+    out = envvars.current("k")
+    keys = {r["key"]: r["value"] for r in out["env"]}
+    assert keys["ROOT_URL"] == "http://localhost:3010"
+    assert keys["ADMIN_PASS"] != "admin123", "credentials masked, as on Compose"
+
+    # The WRITE path still refuses, and names the command that does the job.
     with pytest.raises(errors.ValidationError) as caught:
-        envvars.current("k")
-    text = str(caught.value)
-    assert "Kubernetes" in text, "the refusal names the runtime"
-    assert "kubectl" in text, "and hands over a command that does the job"
-    assert "docker-compose.yml" not in text, "a raw path is not an explanation"
-    assert caught.value.http_status == 400, "unsupported, not a server fault"
+        envvars.set_env("k", {"A": "b"})
+    assert "helm" in str(caught.value)
+    assert caught.value.http_status == 400
 
 
 def test_stop_says_so_when_the_operator_keeps_mongodb_running(monkeypatch):
@@ -3764,13 +3836,16 @@ def test_every_compose_only_command_refuses_with_a_way_forward(monkeypatch, tmp_
     lc.runner.write("k", "", m)
 
     cases = [
-        # `monitor`, `backup`, `logs` and `upgrade` used to be here -- monitoring
-        # through the shared stack, backup through `kubectl exec mongodump`, logs
-        # through `kubectl logs -l`, and upgrade through a chart-pinned
-        # `helm upgrade`. The list shrinks as the gaps close, and each is covered by
-        # its own tests instead. `env` and `stats` are what is left.
+        # This list has shrunk to one. `monitor`, `backup`, `logs`, `upgrade`,
+        # `stats` and reading `env` all used to be here and now have Kubernetes
+        # paths of their own, each covered by its own test.
+        #
+        # `env --set` is the one that stays, and not for want of effort: an
+        # environment variable cannot be changed inside a running container on
+        # either runtime. Compose rewrites its file and recreates the service; here
+        # that is a helm upgrade, which is a different operation with different
+        # consequences, so it hands the command over rather than guessing.
         (lambda: envvars.set_env("k", {"A": "b"}), "helm"),
-        (lambda: envvars.current("k"), "kubectl"),
     ]
     for call, expect in cases:
         with pytest.raises(errors.ValidationError) as caught:

@@ -245,102 +245,63 @@ def test_detail_and_stats_endpoints(monkeypatch):
     assert r.status_code == 200 and j["cpu"] == 120.0 and j["mem_mb"] > 900
 
 
-def test_stats_refuses_a_workspace_that_has_no_compose_project(monkeypatch, tmp_path):
-    """The topology socket, proven through real HTTP rather than as a function call.
+def test_stats_answers_a_kubernetes_workspace_over_http(monkeypatch, tmp_path):
+    """`stats` refused this runtime and now answers it, in the same shape.
 
-    `stats` shells out to `docker stats` against a compose project. A workspace on
-    another runtime has none, so the route must refuse with 400 and say what to use
-    instead -- rather than running `docker stats` on nothing and answering 200 with
-    a plausible-looking zero, which is the failure that would be believed.
+    The refusal was right while there was nothing behind it -- running `docker stats`
+    on nothing and returning a plausible zero is the failure that would be believed.
+    It is `kubectl top` now, summed over every Rocket.Chat pod so replicas count the
+    way compose instances do, and the payload keys are unchanged because the GUI
+    renders from them.
+
+    Docker must not be reached for it: that was the original defect.
     """
     from rc_repro import runner as R
-    from rc_repro.services import topology
+    from rc_repro.services import k8s, topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     m = R.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
                    mongo_tag="8.0", mongo_flavor="official", preset="default",
                    root_url="u", host_port=3010, version_source="t")
     topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
     R.write("k", "services: {}\n", m)
 
     monkeypatch.setattr(lc, "resolve_name", lambda n: n)
     monkeypatch.setattr(lc.runner, "container_ids",
-                        lambda n: pytest.fail("docker was reached for a non-compose workspace"))
+                        lambda n: pytest.fail("docker was reached for a Kubernetes "
+                                              "workspace"))
+    monkeypatch.setattr(k8s, "pod_metrics", lambda name, *, context: [
+        {"pod": "rocketchat-a", "cpu_millicores": 150.0, "mem_bytes": 400e6},
+        {"pod": "rocketchat-b", "cpu_millicores": 50.0, "mem_bytes": 200e6}])
+
     r = client().get("/api/repros/k/stats", headers=H)
-    assert r.status_code == 400, f"expected a refusal, got {r.status_code}"
+    assert r.status_code == 200, r.text
     body = r.json()
-    assert "kubectl top" in body.get("error", ""), "the alternative is stated"
-    assert body.get("kind") == "ValidationError"
-    assert body.get("code") == "VALIDATION_FAILED", "the STABLE identifier, not the class name"
+    assert set(body) == {"cpu", "mem_mb"}, "the GUI renders from these keys"
+    assert body["mem_mb"] == 600.0, "every Rocket.Chat pod counts, not just the first"
+    assert body["cpu"] == 20.0, "millicores rendered on the same scale as docker's %"
 
 
-def test_reading_env_over_http_refuses_a_kubernetes_workspace_with_400(
+def test_reading_env_over_http_answers_for_a_kubernetes_workspace(
         monkeypatch, tmp_path):
-    """The same topology socket as `stats` above, on the route that did not have it.
+    """This route raised a bare FileNotFoundError, so `serve` answered 500.
 
-    `GET /api/repros/{name}/env` reached for the compose document with no runtime
-    guard, so on a Kubernetes workspace it raised a bare FileNotFoundError. That
-    escapes the ReproError contract entirely, and the web layer maps only ReproError
-    -- so the GUI answered **500** to a request that is merely unsupported, while
-    `stats` on the very same workspace answered a clean 400.
+    A path in a stack trace, for a request that was merely unsupported, while
+    `stats` on the same workspace answered cleanly. It then refused with 400, and now
+    answers -- read out of the running container, which shows variables the chart
+    contributes that no document rc-repro writes would ever list.
 
-    Asserted through real HTTP rather than at the service function, because 500 versus
-    400 is the whole defect: one is "rc-repro is broken", the other is "not on this
-    runtime, here is what to use". Found by an operational audit; the suite had no
-    Kubernetes coverage on this route at all.
+    Asserted through real HTTP because 500 versus 400 versus 200 is the whole
+    history of this endpoint.
     """
-    from rc_repro import runner as R
-    from rc_repro.services import topology
-
-    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    m = R.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
-                   mongo_tag="8.0", mongo_flavor="official", preset="default",
-                   root_url="u", host_port=3010, version_source="t")
-    topology.stamp(m.extra, topology.KUBERNETES)
-    # No compose file: that absence IS the condition, so this writes the record the
-    # way a real Kubernetes workspace has it.
-    import json as _json
-    from dataclasses import asdict
-    ws = R.workspace("k")
-    ws.mkdir(parents=True, exist_ok=True)
-    (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
-
-    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
-    r = client().get("/api/repros/k/env", headers=H)
-    assert r.status_code == 400, \
-        f"unsupported must not be a server fault, got {r.status_code}"
-    body = r.json()
-    assert body.get("kind") == "ValidationError"
-    assert "kubectl" in body.get("error", ""), "the alternative is stated"
-    assert "docker-compose.yml" not in body.get("error", ""), \
-        "a raw path is not an explanation"
-
-
-def test_the_log_stream_serves_a_kubernetes_workspace_over_the_socket(
-        monkeypatch, tmp_path):
-    """The GUI's biggest Kubernetes gap: it used to refuse and say "use kubectl".
-
-    `serve` exists so a support engineer can be handed a browser and no shell, and
-    logs are the first artefact anyone reads when reproducing a ticket -- so telling
-    that person to run kubectl was advice they had no way to take. Now the socket
-    streams `kubectl logs -l app.kubernetes.io/name=rocketchat` instead.
-
-    Asserted at the seam rather than against a cluster: what matters is that the
-    Kubernetes path is chosen and its lines reach the socket, and that Compose is
-    NOT what gets run for it.
-    """
-    import io
     import json as _json
     from dataclasses import asdict
 
     from rc_repro import runner as R
-    from rc_repro.services import k8s, sessions, topology
-    from rc_repro.services import users as usersvc
-    from rc_repro.web import app as webapp
+    from rc_repro.services import k8s, topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    usersvc.add("alice", "correct-horse-battery", role="admin")
-
     m = R.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
                    mongo_tag="8.0", mongo_flavor="official", preset="default",
                    root_url="u", host_port=3010, version_source="t")
@@ -349,40 +310,17 @@ def test_the_log_stream_serves_a_kubernetes_workspace_over_the_socket(
     ws = R.workspace("k")
     ws.mkdir(parents=True, exist_ok=True)
     (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
+    assert not (ws / "docker-compose.yml").exists()
 
-    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
-    monkeypatch.setattr(lc, "detail", lambda n: {"name": n})
-    monkeypatch.setattr(webapp, "open_log_process",
-                        lambda *a, **kw: pytest.fail(
-                            "it ran `docker compose logs` for a Kubernetes workspace"))
+    monkeypatch.setattr(lc, "resolve_name", lambda n, actor="": n)
+    monkeypatch.setattr(k8s, "container_env", lambda name, *, context: {
+        "ROOT_URL": "http://localhost:3010", "ADMIN_PASS": "admin123"})
 
-    class _P:
-        stdout = io.StringIO("rocketchat-abc123 hello from the cluster\n")
-        def poll(self): return 0
-        def kill(self): pass
-        def terminate(self): pass
-        def wait(self, timeout=None): return 0
-
-    seen = {}
-    def fake_logs(name, *, context, tail, follow, selector=k8s.LOG_SELECTOR):
-        seen.update(name=name, context=context, tail=tail, follow=follow,
-                    selector=selector)
-        return _P()
-    monkeypatch.setattr(k8s, "log_process", fake_logs)
-
-    app = create_app(allow_hosts=["testserver"])
-    token = sessions.create("alice", label="test")
-    with TestClient(app).websocket_connect(
-        "/api/repros/k/logs/stream?tail=5",
-        headers={"Origin": "http://testserver"},
-        cookies={"rc_repro_session": token},
-    ) as sock:
-        first = sock.receive_text()      # log lines are text, not JSON envelopes
-
-    assert seen["name"] == "k" and seen["follow"] is True
-    assert seen["selector"] == "app.kubernetes.io/name=rocketchat", \
-        "every replica, and it follows a rollout -- not one pod by name"
-    assert "hello from the cluster" in first, first
+    r = client().get("/api/repros/k/env", headers=H)
+    assert r.status_code == 200, r.text
+    keys = {row["key"]: row["value"] for row in r.json()["env"]}
+    assert keys["ROOT_URL"] == "http://localhost:3010"
+    assert keys["ADMIN_PASS"] != "admin123", "credentials are masked over HTTP too"
 
 
 def test_an_error_payload_carries_the_stable_code_not_just_the_class_name(monkeypatch):

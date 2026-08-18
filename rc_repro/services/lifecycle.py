@@ -2123,9 +2123,10 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         # found the note still telling users otherwise. A workspace's own notes are
         # where someone checks what they can do with it, so a stale one costs them a
         # capability they already have.
-        "stats and env have no Kubernetes path yet — each refuses and names the "
-        "kubectl/helm command that does the job. `logs`, `upgrade`, `backup`, "
-        "`restore`, `seed`, `monitor`, `api`, `pat` and `token` all work here.",
+        "`logs`, `stats`, `env`, `upgrade`, `backup`, `restore`, `seed`, `monitor`, "
+        "`api`, `pat` and `token` all work here. `stats` needs metrics-server in the "
+        "cluster and says so if it is missing; `env --set` still refuses and hands "
+        "over the `helm upgrade` that changes a value.",
     ]
     # A preset's own notes, which the Compose path already surfaces via
     # `meta.extra["notes"] = pre.notes`. This path builds its own list, so without

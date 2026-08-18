@@ -33,7 +33,7 @@ from pathlib import Path
 
 from rc_repro import config, runner
 from rc_repro.errors import (ConflictError, CreateFailedError, DockerError,
-                            NotFoundError, PreflightError)
+                            NotFoundError, NotReadyError, PreflightError)
 from rc_repro.services.events import Emit, info, null_emit, warn
 
 #: The cluster rc-repro creates and owns. One cluster with a namespace per
@@ -1777,6 +1777,98 @@ def log_process(name: str, *, context: str, tail: int = 200, follow: bool = True
     return subprocess.Popen(argv, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1,
                             env=owned_env() if is_ours(context) else None)
+
+
+def container_env(name: str, *, context: str,
+                  selector: str = LOG_SELECTOR) -> dict[str, str]:
+    """Rocket.Chat's EFFECTIVE environment, read out of the running container.
+
+    Compose answers this from the generated compose file. There is no such document
+    here, and the helm values are only what rc-repro asked for -- the chart adds its
+    own, so the values are not the answer to "what is Rocket.Chat actually running
+    with". The container is, so it is asked directly.
+    """
+    pod = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "pod", "-l", selector, "-o",
+               "jsonpath={.items[0].metadata.name}"], own=is_ours(context))
+    target = (pod.stdout or "").strip()
+    if not target:
+        raise NotReadyError(
+            f"no Rocket.Chat pod in {namespace_for(name)} to read the environment "
+            f"from — is {name!r} running? (`rc-repro start --name {name}`)")
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "exec", target, "-c", LOG_CONTAINER, "--", "env"],
+              timeout=APPLY_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        raise NotReadyError(f"could not read the environment from {target}: "
+                            + why(res))
+    out: dict[str, str] = {}
+    for line in (res.stdout or "").splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            out[key.strip()] = value
+    return out
+
+
+def _parse_quantity(text: str) -> float:
+    """A Kubernetes CPU or memory quantity as a plain number.
+
+    CPU comes as millicores ("142m") or cores ("1"); memory as Ki/Mi/Gi. Returned as
+    millicores and BYTES respectively, so the caller does the same arithmetic it does
+    for Compose.
+    """
+    t = text.strip()
+    if t.endswith("m"):
+        return float(t[:-1] or 0)
+    for suffix, mult in (("Ki", 1024), ("Mi", 1024 ** 2), ("Gi", 1024 ** 3),
+                         ("K", 1000), ("M", 1000 ** 2), ("G", 1000 ** 3)):
+        if t.endswith(suffix):
+            return float(t[:-len(suffix)] or 0) * mult
+    try:
+        return float(t)
+    except ValueError:
+        return 0.0
+
+
+def pod_metrics(name: str, *, context: str,
+                selector: str = LOG_SELECTOR) -> list[dict]:
+    """Per-pod CPU and memory, via `kubectl top`.
+
+    Needs metrics-server, which kind does NOT ship. When it is absent the refusal
+    says so and how to install it, rather than reporting zero -- a resource figure
+    that is quietly wrong is worse than one that is missing, which is the same
+    reasoning `stats` already applies to a container it cannot find.
+    """
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "top", "pods", "-l", selector, "--no-headers"],
+              timeout=APPLY_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        blob = (res.stderr or "") + (res.stdout or "")
+        if "metrics" in blob.lower() or "not available" in blob.lower():
+            # Both commands, because the second is not optional on kind: its
+            # kubelet serves a self-signed certificate that metrics-server refuses
+            # by default, so the install succeeds and never reports a metric. The
+            # first version of this message mixed the helm flag into the kubectl
+            # route, which is syntax that does not apply to what it just told the
+            # user to run.
+            raise NotReadyError(
+                "this cluster has no metrics-server, so there is nothing to read "
+                "CPU and memory from. Install it with:\n"
+                "  kubectl apply -f https://github.com/kubernetes-sigs/"
+                "metrics-server/releases/latest/download/components.yaml\n"
+                "and on kind, let it accept the kubelet's self-signed certificate:\n"
+                "  kubectl -n kube-system patch deploy metrics-server --type=json "
+                "-p '[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0"
+                "/args/-\",\"value\":\"--kubelet-insecure-tls\"}]'")
+        raise NotReadyError("could not read pod metrics: " + why(res))
+    rows = []
+    for line in (res.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            rows.append({"pod": parts[0],
+                         "cpu_millicores": _parse_quantity(parts[1]),
+                         "mem_bytes": _parse_quantity(parts[2])})
+    return rows
 
 
 def workload_exists(name: str, *, context: str) -> bool:

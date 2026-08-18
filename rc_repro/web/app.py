@@ -1329,8 +1329,17 @@ def create_app(allow_hosts: list[str] | None = None, *,
     def stats(name: str):
         from rc_repro.perf import resources as R
         target = lc.resolve_name(name)
-        topology.require_compose(target, "stats",
-                                 instead="Install metrics-server and use `kubectl top`.")
+        if topology.of_repro(target) == topology.KUBERNETES:
+            # `kubectl top` for the same two numbers, summed over every Rocket.Chat
+            # pod so replicas are counted the way compose counts instances. It needs
+            # metrics-server, which kind does not ship -- pod_metrics refuses and
+            # says how to install it rather than reporting a confident zero.
+            from rc_repro.services import k8s
+            meta = runner.read_meta(target)
+            context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
+            rows = k8s.pod_metrics(target, context=context)
+            return {"cpu": round(sum(r["cpu_millicores"] for r in rows) / 10.0, 1),
+                    "mem_mb": round(sum(r["mem_bytes"] for r in rows) / 1e6, 1)}
         ids = runner.container_ids(target)
         prefix = f"{config.PROJECT_PREFIX}{target}-"
         cpu = mem = 0.0

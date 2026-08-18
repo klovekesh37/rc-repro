@@ -1198,6 +1198,63 @@ def test_a_failed_kubernetes_upgrade_leaves_the_record_where_the_cluster_is(
         "otherwise every listing reports a version that is not running")
 
 
+def test_explicit_rollback_works_on_kubernetes(monkeypatch, tmp_path):
+    """`upgrade --rollback` reached for a compose document that does not exist.
+
+    The automatic rollback-on-failure inside _run_locked was made runtime-aware; this
+    entry point -- the one a person actually types -- was not, and only running it
+    live showed that. It raised a bare FileNotFoundError naming
+    `repros/<n>/docker-compose.yml`, the same contract break the `env` read had, and
+    left the workspace on the NEW version with the old data still in place: the worst
+    of both, from the command whose whole job is undoing an upgrade.
+    """
+    import json as _json
+    from dataclasses import asdict
+
+    from rc_repro.services import k8s, topology
+    from rc_repro.services import upgrade as up
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    bundle = tmp_path / "pre.rcbak"
+    bundle.write_bytes(b"x")
+
+    m = bk.runner.Metadata(name="k", project="p", rc_version="8.6.1",
+                           rc_image="registry.rocket.chat/rocketchat/rocket.chat",
+                           mongo_tag="8.0", mongo_flavor="official", preset="default",
+                           root_url="http://localhost:3000", host_port=3000,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+    m.extra[up.LAST_BACKUP_KEY] = str(bundle)
+    m.extra[up.UPGRADE_FROM_KEY] = "8.5.1"
+    ws = bk.runner.workspace("k")
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
+    assert not (ws / "docker-compose.yml").exists()
+
+    monkeypatch.setattr(up.lifecycle, "require_docker", lambda: None)
+    monkeypatch.setattr(up.lifecycle, "resolve_name", lambda n: n)
+    monkeypatch.setattr(up.backupsvc, "read_manifest",
+                        lambda b: {"rc_version": "8.5.1",
+                                   "rc_image": "registry.rocket.chat/rocketchat/rocket.chat"})
+    monkeypatch.setattr(bk.runner, "read_compose",
+                        lambda *a, **kw: pytest.fail("it read a compose document"))
+    monkeypatch.setattr(bk.runner, "up",
+                        lambda *a, **kw: pytest.fail("it ran `docker compose up`"))
+
+    seen = {}
+    monkeypatch.setattr(up, "_rollback_kubernetes",
+                        lambda t, prev, b, e: seen.update(target=t, prev=prev, bundle=b))
+
+    out = up.rollback("k")
+    assert seen["target"] == "k"
+    assert seen["prev"]["rc_version"] == "8.5.1", "it goes back to the bundle's version"
+    assert seen["bundle"] == str(bundle), "and restores the pre-upgrade data"
+    assert out["rolled_back_to"] == "8.5.1"
+    # The "this was upgraded" marker must not survive the undo.
+    assert up.UPGRADE_FROM_KEY not in bk.runner.read_meta("k").extra
+
+
 def test_upgrade_runs_on_kubernetes_with_the_chart_pinned(monkeypatch, tmp_path):
     """`upgrade` refused this runtime entirely; the official guide makes it one command.
 

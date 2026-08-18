@@ -447,19 +447,35 @@ def rollback(name: str, *, bundle: str = "", emit: Emit = null_emit) -> dict:
     manifest = backupsvc.read_manifest(path)
     info(emit, f"rolling {target!r} back to {manifest.get('rc_version')}",
          phase="upgrade", pct=5)
+    from rc_repro.services import topology
+    kube = topology.of_repro(target) == topology.KUBERNETES
+    resolved = versions.resolve(str(manifest.get("rc_version") or ""), offline=True)
+    previous = {"rc_version": str(manifest.get("rc_version") or meta.rc_version),
+                "rc_image": str(manifest.get("rc_image") or resolved.rc_image)}
     with runner.repro_lock(target):
-        doc = runner.read_compose(target)
-        resolved = versions.resolve(str(manifest.get("rc_version") or ""), offline=True)
-        _apply_image(doc, manifest.get("rc_image") or resolved.rc_image,
-                     str(manifest.get("rc_version")), resolved.oplog)
-        meta.rc_version = str(manifest.get("rc_version") or meta.rc_version)
-        meta.rc_image = str(manifest.get("rc_image") or meta.rc_image)
-        meta.extra.pop(UPGRADE_FROM_KEY, None)
-        runner.write(target, compose.to_yaml(doc), meta)
-        if runner.up(target) != 0:
-            raise DockerError("`docker compose up` failed rolling back the image")
-        result = backupsvc._restore_locked(target, Path(path), manifest, emit,
-                                           allow_upgrade=False, force=True,
-                                           created=False)
-    return {"name": target, "rolled_back_to": meta.rc_version, "bundle": path,
+        if kube:
+            # This is the EXPLICIT `--rollback`, and it reached for a compose
+            # document a Kubernetes workspace does not have -- a bare
+            # FileNotFoundError naming a path, which is the same contract break the
+            # `env` read had. The automatic rollback-on-failure inside _run_locked
+            # was already runtime-aware; this entry point was not, and only running
+            # it live showed that. It leaves the workspace on the NEW version with
+            # the old data untouched, which is the worst of both.
+            _rollback_kubernetes(target, previous, path, emit)
+            result = {"restored": True}
+        else:
+            doc = runner.read_compose(target)
+            _apply_image(doc, previous["rc_image"], previous["rc_version"],
+                         resolved.oplog)
+            meta.rc_version = previous["rc_version"]
+            meta.rc_image = previous["rc_image"]
+            meta.extra.pop(UPGRADE_FROM_KEY, None)
+            runner.write(target, compose.to_yaml(doc), meta)
+            if runner.up(target) != 0:
+                raise DockerError("`docker compose up` failed rolling back the image")
+            result = backupsvc._restore_locked(target, Path(path), manifest, emit,
+                                               allow_upgrade=False, force=True,
+                                               created=False)
+    runner.update_meta(target, lambda m: m.extra.pop(UPGRADE_FROM_KEY, None))
+    return {"name": target, "rolled_back_to": previous["rc_version"], "bundle": path,
             "restore": result}
