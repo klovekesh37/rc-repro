@@ -1265,7 +1265,16 @@ def create_app(allow_hosts: list[str] | None = None, *,
                      "default_deployment": deps[0]}
                     for rt, deps in topology.DEPLOYMENTS.items()
                 ],
-                "default_runtime": topology.DOCKER}
+                "default_runtime": topology.DOCKER,
+                # What a workspace will publish ON if nobody says otherwise. The
+                # dialog needs it to tell a browser on ANOTHER machine the truth:
+                # with the default 127.0.0.1 the workspace it is about to create
+                # will be reachable from the server and from nowhere else, which is
+                # not something a GUI-only user can find out any other way. Not a
+                # secret -- `up` prints it, and it is an interface, not a
+                # credential.
+                "default_bind_host": (config.load_config().get("bind_host")
+                                      or config.DEFAULT_BIND_HOST)}
 
     @app.get("/api/machine")
     def machine():

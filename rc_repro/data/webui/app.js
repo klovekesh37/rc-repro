@@ -77,9 +77,42 @@ async function api(path, opts = {}) {
   const r = await fetch(path, Object.assign({ credentials: "same-origin" }, opts, { headers }));
   const data = await r.json().catch(() => ({}));
   if (r.status === 401) { toSignIn("expired"); throw new Error("signed out"); }
-  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  if (!r.ok) {
+    // The STATUS rides along, because "retry in three seconds" and "this will
+    // never work" are different answers and the message alone cannot tell them
+    // apart. errors.py assigns the code by class: 409 is a refusal (not running,
+    // no metrics-server), 502 is docker, 400 is the request itself.
+    const err = new Error(data.error || `HTTP ${r.status}`);
+    err.status = r.status;
+    throw err;
+  }
   return data;
 }
+
+// ---- where is this browser? -------------------------------------------------
+// Nothing is DETECTED here. Whether `serve` is on EC2, on a colleague's desktop or
+// on the reader's own laptop is not a question this needs answered -- the only thing
+// that matters is whether the browser and the workspaces are on the same machine,
+// and the browser already knows that: it is the address in its own URL bar. No cloud
+// metadata, no guessing from a hostname, no new endpoint.
+//
+// Loopback => `serve` and the browser are the same box, and every localhost link in
+// this UI is correct. Anything else => they are not, and "localhost" names the
+// READER'S machine, where nothing is running.
+// The whole of 127.0.0.0/8, not just 127.0.0.1: every address in it is this machine
+// talking to itself, so a GUI opened at 127.0.0.2 is no more remote than one opened
+// at 127.0.0.1 and must not be told otherwise.
+const LOOPBACK_HOSTS = ["localhost", "::1", "[::1]", ""];
+function isLoopbackHost(h) {
+  return LOOPBACK_HOSTS.includes(h) || /^127\.\d+\.\d+\.\d+$/.test(h);
+}
+function remoteHost() {
+  return isLoopbackHost(location.hostname) ? "" : location.hostname;
+}
+// A workspace bound to one of these is reachable from another machine; bound to
+// anything else it answers only on the box that runs it. "" means the workspace
+// predates the metadata key, so nothing is claimed either way.
+const WIDE_BINDS = ["0.0.0.0", "::", "*"];
 
 // ---- repro list (master) ----------------------------------------------------
 let ALL_REPROS = [];
@@ -370,14 +403,21 @@ function renderActionPane(d, busyLabel) {
     return;
   }
   const running = d.state === "running";
+  // A fourth element: false means "this runtime refuses it". The load test and the
+  // capacity search are Compose-only and the server says so with a 400 -- rendering
+  // them on a Kubernetes workspace could only produce a red toast, which is the same
+  // reason the logs and env tabs are kept off a readonly panel. Not "unimplemented":
+  // both would be measuring the `kubectl port-forward` rather than Rocket.Chat.
+  // See services/perf.require_compose_for_perf.
+  const kube = d.runtime === "kubernetes";
   const groups = [
     ["Put data in it", [
       ["Add sample data", () => openSeed(d.name), running],
       ["Import settings", () => openImport(d.name), running],
     ]],
     ["Measure it", [
-      ["Run a load test", () => openPerf(d.name, d.monitoring), running],
-      ["Find capacity", () => openCap(d.name), running],
+      ["Run a load test", () => openPerf(d.name, d.monitoring), running, !kube],
+      ["Find capacity", () => openCap(d.name), running, !kube],
       // Named for the thing rather than for one of its parts: it attaches
       // Prometheus, Grafana, Loki and the exporters, and "stream to Grafana"
       // described the last hop of it.
@@ -391,11 +431,19 @@ function renderActionPane(d, busyLabel) {
     ["Keep or move it", [
       ["Back up now", () => doBackup(d.name), running],
       ["Upgrade version", () => openUpgrade(d.name, d.rc_version), running],
-      ["Check the certificate", () => doTlsStatus(d.name), running && !!d.public_url],
+      // Greyed on Compose, GONE on Kubernetes: TLS is a runtime property there, so a
+      // Compose workspace can gain HTTPS later and this becomes available -- while
+      // `up --https` is refused outright on Kubernetes, so it never can.
+      ["Check the certificate", () => doTlsStatus(d.name), running && !!d.public_url,
+       !kube],
       ["Use for CLI commands", () => doDefault(d.name), !d.is_default],
     ]],
   ];
-  for (const [title, items] of groups) {
+  for (const [title, rawItems] of groups) {
+    // Dropped entirely, not disabled: a greyed button invites "why can't I?" about
+    // a thing that will never be available on this runtime, which is the same
+    // reasoning the create dialog gives for HIDING the privileged fields.
+    const items = rawItems.filter(([, , , supported]) => supported !== false);
     const usable = items.filter(([, , ok]) => ok !== false || running);
     if (!usable.length) continue;
     pane.append(el("div", { class: "apgroup" }, title));
@@ -407,6 +455,12 @@ function renderActionPane(d, busyLabel) {
     }
     pane.append(listEl);
   }
+  if (kube) {
+    pane.append(el("p", { class: "apnote" },
+      "Load testing and the capacity search are Compose-only: a Kubernetes "
+      + "workspace is reached through a port-forward, which would be what the "
+      + "numbers measured."));
+  }
   if (!running) {
     pane.append(el("p", { class: "apnote" },
       `Most of these need the workspace running. It is ${d.state === "?" ? "unreachable" : d.state}.`));
@@ -417,7 +471,9 @@ function renderActionPane(d, busyLabel) {
   const btn = el("button", { onclick: () => doDown(d.name) }, "Take this workspace down");
   if (busyLabel) btn.disabled = true;
   danger.append(btn, el("p", {},
-    "Removes its containers. You are asked separately before any data is deleted."));
+    (kube ? "Uninstalls its release and stops the port-forward. "
+          : "Removes its containers. ")
+    + "You are asked separately before any data is deleted."));
   pane.append(danger);
 }
 
@@ -670,8 +726,23 @@ function scenarioCard(d) {
   // works at all -- `oidc` is broken until 127.0.0.1 keycloak is in /etc/hosts.
   // A command that IS a url is just a place to go, and colouring that as a warning
   // would be crying wolf.
+  //
+  // But "not a url" was not narrow enough either, and this block makes two specific
+  // CLAIMS -- that the scenario cannot work until the line exists, and that it needs
+  // sudo. `ldap`'s notes indent a phpLDAPadmin credential, so the panel was telling
+  // an ldap reader to sudo their way through "log in with DN cn=admin,dc=example,
+  // dc=com / admin" before the scenario would work, which is not true of anything.
+  // The discriminator is the sentence that INTRODUCES the line, and it is already in
+  // the note above it: a hosts entry is the only setup step any preset has.
   const items = parseNotes(d.notes);
-  const setup = items.find((i) => i.kind === "cmd" && !/^https?:\/\//.test(i.value));
+  const introduced = (item) => {
+    const before = items[items.indexOf(item) - 1];
+    const text = before && before.kind === "prose" ? (before.lines || []).join(" ") : "";
+    return /\/etc\/hosts/i.test(text);
+  };
+  const setup = items.find((i) => i.kind === "cmd"
+                                  && !/^https?:\/\//.test(i.value)
+                                  && introduced(i));
   if (setup) {
     card.append(el("div", { class: "setup" },
       el("span", { class: "setup-i" }, "▲"),
@@ -865,6 +936,35 @@ function renderTab() {
         el("a", { href: d.root_url, target: "_blank" }, d.root_url)),
       el("button", { class: "copy", onclick: () => copy(d.root_url) }, "copy"));
     body.append(url);
+    // ADDITIVE, and deliberately so. The URL above is Rocket.Chat's own ROOT_URL and
+    // stays exactly as it is -- rc-repro's login, PAT, seeding and load-test calls
+    // all go through it, and RC advertises it to browsers for links, OAuth callbacks
+    // and CORS. Rewriting it for the convenience of a remote reader would change
+    // what the server tells every client about itself. So this is a NOTICE: it says
+    // what the address means from where you are standing, and changes nothing.
+    const remote = remoteHost();
+    if (remote) {
+      const wide = WIDE_BINDS.includes(String(d.bind_host || ""));
+      const port = d.host_port;
+      if (wide) {
+        body.append(el("p", { class: "banner" },
+          `You are reading this from ${remote}, and “localhost” above means `
+          + `YOUR machine. This workspace publishes on every interface, so from here `
+          + `it is at:`));
+        body.append(box2("From this machine", `http://${remote}:${port}`,
+                         `http://${remote}:${port}`));
+      } else {
+        body.append(el("p", { class: "banner warn" },
+          `You are reading this from ${remote}, and “localhost” above means YOUR `
+          + `machine — not the server. This workspace publishes on `
+          + `${d.bind_host || "127.0.0.1"}, so only the server itself can reach it. `
+          + `To reach a workspace from here, create it with Bind host 0.0.0.0 under `
+          + `Advanced options — or have an admin run `
+          + `\`rc-repro config set bind_host 0.0.0.0\` once for the whole box. `
+          + `Workspaces ship a fixed admin/admin123, so do that only on a network `
+          + `you trust.`));
+      }
+    }
     // The admin login was only ever shown in the create dialog's result box, so
     // once that was closed nothing in the GUI could tell you the password again --
     // even though it has always been in this very payload. (It is a fixed local
@@ -878,72 +978,142 @@ function renderTab() {
   } else if (dstate.tab === "logs") {
     renderLogs(body, d);
   } else if (dstate.tab === "containers") {
-    const t = el("table", { class: "dtable" }, el("tr", {}, el("th", {}, "service"), el("th", {}, "state"), el("th", {}, "status")));
+    const kube = d.runtime === "kubernetes";
+    const t = el("table", { class: "dtable" },
+      el("tr", {}, el("th", {}, kube ? "pod" : "service"), el("th", {}, "state"), el("th", {}, "status")));
     for (const c of (d.containers || [])) t.append(el("tr", {}, el("td", {}, c.service), el("td", {}, c.state), el("td", { class: "v" }, c.status || c.health || "")));
     body.append(t);
     if (!(d.containers || []).length) {
+      // "No containers — this repro is down." was printed under RUNNING Kubernetes
+      // workspaces, because the payload's empty list was the only thing this read
+      // and on that runtime it was always empty. It carries pods now, so an empty
+      // list here means what it says again — but only ever about the right runtime.
       body.append(el("p", { class: "empty" },
-        d.state === "?" ? "Docker is unavailable." : "No containers — this repro is down."));
+        d.state === "?" ? "Docker is unavailable."
+          : kube ? `No pods in rc-repro-${d.name} — this workspace is ${d.state}.`
+          : "No containers — this repro is down."));
+    }
+    if (kube) {
+      body.append(el("p", { class: "hint" },
+        "Pods, not containers: on Kubernetes this is every pod in the workspace's "
+        + "namespace — Rocket.Chat, MongoDB and any scenario service. A pod that "
+        + "cannot start says why here (ImagePullBackOff, CrashLoopBackOff)."));
     }
   } else if (dstate.tab === "env") {
-    const t = el("table", { class: "dtable" },
-      el("tr", {}, el("th", {}, "name"), el("th", {}, "value"), el("th", {}, "")));
-    for (const e of (d.env || [])) {
-      // Two kinds live in this list and they are not interchangeable: a Rocket.Chat
-      // SETTING only works with the OVERWRITE_SETTING_ prefix, a plain env var only
-      // works without it. Show the setting id itself and tag it, rather than a wall
-      // of OVERWRITE_SETTING_* that hides which is which.
-      const isSetting = e.key.startsWith(ENV_SETTING_PREFIX);
-      const shown = isSetting ? e.key.slice(ENV_SETTING_PREFIX.length) : e.key;
-      const name = el("td", {}, shown);
-      if (isSetting) name.append(el("span", { class: "pill small" }, "setting"));
-      if (e.override) name.append(el("span", { class: "yours" }, "*"));
-      t.append(el("tr", {}, name, el("td", { class: "v" }, e.value),
-        el("td", {}, el("button", {
-          class: "btn small danger",
-          title: e.override ? "Remove this override" : "Remove this variable from the workspace",
-          // The FULL key, not the displayed one — that is what compose holds.
-          onclick: () => doEnvChange(d.name, {}, {}, [e.key]),
-        }, "remove"))));
-    }
-    body.append(t);
-    if (!(d.env || []).length) body.append(el("p", { class: "empty" }, "No environment variables."));
-    body.append(el("p", { class: "hint" },
-      "* = set by you. Changing anything here recreates the Rocket.Chat container — "
-      + "MongoDB keeps running, so no data is lost."));
-
-    const kind = el("select", { class: "input", "aria-label": "kind" },
-      el("option", { value: "setting" }, "Rocket.Chat setting"),
-      el("option", { value: "env" }, "Plain env var"));
-    const key = el("input", { class: "input", placeholder: "Message_AllowEditing", "aria-label": "name" });
-    const val = el("input", { class: "input", placeholder: "false", "aria-label": "value" });
-    const why = el("p", { class: "hint" }, "");
-    const explain = () => {
-      const setting = kind.value === "setting";
-      key.placeholder = setting ? "Message_AllowEditing" : "MY_FLAG";
-      val.placeholder = setting ? "false" : "true";
-      why.textContent = setting
-        ? "Anything you would change in Admin → Settings. The OVERWRITE_SETTING_ prefix"
-          + " it needs is added for you — without it Rocket.Chat ignores the variable"
-          + " silently. Re-applied on every boot, but the admin UI can still change it"
-          + " while the container runs."
-        : "A real environment variable (MONGO_URL, NODE_ENV, a feature flag). Passed"
-          + " through exactly as typed.";
-    };
-    kind.addEventListener("change", explain);
-    explain();
-    const add = el("button", { class: "btn primary", onclick: () => {
-      const k = key.value.trim();
-      if (!k) { toast("enter a name"); return; }
-      const payload = { [k]: val.value };
-      doEnvChange(d.name, kind.value === "env" ? payload : {},
-                  kind.value === "setting" ? payload : {}, []);
-    } }, "Set + restart");
-    body.append(el("div", { class: "row2" }, kind, key, val, add), why);
+    renderEnv(body, d);
   } else if (dstate.tab === "backups") {
     renderBackups(body, d);
   }
 }
+
+// ---- env vars ----------------------------------------------------------------
+// FETCHED, not read out of the detail payload. detail() answers this from the
+// generated compose file, and a Kubernetes workspace has no such file -- there the
+// answer is read out of the running container, which can also legitimately refuse
+// ("it is not running"). Hanging that off detail() would let one unreadable
+// environment break the whole panel, so the tab asks for it itself and renders the
+// refusal in place of the table. Before this the tab simply rendered EMPTY on
+// Kubernetes, because the key it read was never in the payload.
+async function renderEnv(body, d) {
+  const kube = d.runtime === "kubernetes";
+  const list = el("div", {}, el("p", { class: "empty" }, "loading…"));
+  body.append(list);
+
+  let rows = null;
+  try {
+    rows = (await api(`/api/repros/${encodeURIComponent(d.name)}/env`)).env || [];
+  } catch (e) {
+    list.innerHTML = "";
+    list.append(el("p", { class: "empty pre" }, String(e.message || e)));
+    return;
+  }
+  list.innerHTML = "";
+  // No third column on Kubernetes: it held the remove button, and an empty column
+  // under a blank heading reads as a table that failed to render something.
+  const head = el("tr", {}, el("th", {}, "name"), el("th", {}, "value"));
+  if (!kube) head.append(el("th", {}, ""));
+  const t = el("table", { class: "dtable" }, head);
+  for (const e of rows) {
+    // Two kinds live in this list and they are not interchangeable: a Rocket.Chat
+    // SETTING only works with the OVERWRITE_SETTING_ prefix, a plain env var only
+    // works without it. Show the setting id itself and tag it, rather than a wall
+    // of OVERWRITE_SETTING_* that hides which is which.
+    const isSetting = e.key.startsWith(ENV_SETTING_PREFIX);
+    const shown = isSetting ? e.key.slice(ENV_SETTING_PREFIX.length) : e.key;
+    const name = el("td", {}, shown);
+    if (isSetting) name.append(el("span", { class: "pill small" }, "setting"));
+    if (e.override) name.append(el("span", { class: "yours" }, "*"));
+    const act = kube ? null : el("td", {});
+    // No remove button on Kubernetes: the server refuses every write here and says
+    // to use helm, so the button could only ever produce a red toast. A control
+    // that cannot succeed is worse than no control -- the same rule that keeps the
+    // logs and env TABS off a readonly user's panel.
+    if (act) {
+      act.append(el("button", {
+        class: "btn small danger",
+        title: e.override ? "Remove this override" : "Remove this variable from the workspace",
+        // The FULL key, not the displayed one — that is what compose holds.
+        onclick: () => doEnvChange(d.name, {}, {}, [e.key]),
+      }, "remove"));
+    }
+    const row = el("tr", {}, name, el("td", { class: "v" }, e.value));
+    if (act) row.append(act);
+    t.append(row);
+  }
+  list.append(t);
+  if (!rows.length) list.append(el("p", { class: "empty" }, "No environment variables."));
+
+  if (kube) {
+    // Read from the CONTAINER here, which is a different (and better) source than
+    // Compose's file -- the chart contributes variables rc-repro never set, and they
+    // are all in this list. Say so, because "* = set by you" would otherwise imply
+    // the rest came from rc-repro.
+    list.append(el("p", { class: "hint" },
+      "Read live out of the Rocket.Chat container, so this includes what the Helm "
+      + "chart sets as well as what rc-repro asked for. * = an override rc-repro "
+      + "recorded."));
+    list.append(el("p", { class: "hint pre" },
+      "Changing one is a Helm operation, not a container recreate:\n"
+      + `  helm -n rc-repro-${d.name} upgrade rocketchat --reuse-values --set extraEnv[0].name=KEY --set extraEnv[0].value=VALUE\n`
+      + "For a Rocket.Chat SETTING, use Send an API call instead — that takes effect "
+      + "without restarting anything."));
+    return;
+  }
+
+  list.append(el("p", { class: "hint" },
+    "* = set by you. Changing anything here recreates the Rocket.Chat container — "
+    + "MongoDB keeps running, so no data is lost."));
+
+  const kind = el("select", { class: "input", "aria-label": "kind" },
+    el("option", { value: "setting" }, "Rocket.Chat setting"),
+    el("option", { value: "env" }, "Plain env var"));
+  const key = el("input", { class: "input", placeholder: "Message_AllowEditing", "aria-label": "name" });
+  const val = el("input", { class: "input", placeholder: "false", "aria-label": "value" });
+  const why = el("p", { class: "hint" }, "");
+  const explain = () => {
+    const setting = kind.value === "setting";
+    key.placeholder = setting ? "Message_AllowEditing" : "MY_FLAG";
+    val.placeholder = setting ? "false" : "true";
+    why.textContent = setting
+      ? "Anything you would change in Admin → Settings. The OVERWRITE_SETTING_ prefix"
+        + " it needs is added for you — without it Rocket.Chat ignores the variable"
+        + " silently. Re-applied on every boot, but the admin UI can still change it"
+        + " while the container runs."
+      : "A real environment variable (MONGO_URL, NODE_ENV, a feature flag). Passed"
+        + " through exactly as typed.";
+  };
+  kind.addEventListener("change", explain);
+  explain();
+  const add = el("button", { class: "btn primary", onclick: () => {
+    const k = key.value.trim();
+    if (!k) { toast("enter a name"); return; }
+    const payload = { [k]: val.value };
+    doEnvChange(d.name, kind.value === "env" ? payload : {},
+                kind.value === "setting" ? payload : {}, []);
+  } }, "Set + restart");
+  list.append(el("div", { class: "row2" }, kind, key, val, add), why);
+}
+
 
 // ---- backup / restore / upgrade ------------------------------------------------
 // A backup is a bundle: the database PLUS the version, preset and parameters that
@@ -1355,7 +1525,19 @@ function startStats() {
       dstate.points.push({ cpu: s.cpu || 0, mem: s.mem_mb || 0 });
       if (dstate.points.length > 60) dstate.points.shift();
       drawChart();
-    } catch (_) { /* ignore transient */ }
+    } catch (e) {
+      // A refusal will not fix itself in three seconds. kind ships no
+      // metrics-server, so a Kubernetes workspace answers 409 to this forever --
+      // and swallowing it left an empty box under a title that says "live",
+      // repainting every 3s, while the server's own instructions for fixing it
+      // were thrown away. Stop asking and show them.
+      if (e && (e.status === 409 || e.status === 400)) {
+        if (dstate.statsTimer) { clearInterval(dstate.statsTimer); dstate.statsTimer = null; }
+        const box = $("#chart");
+        if (box) { box.innerHTML = ""; box.append(el("p", { class: "hint pre" }, e.message)); }
+      }
+      /* anything else is transient: keep polling */
+    }
   };
   poll();
   dstate.statsTimer = setInterval(poll, 3000);
@@ -2380,6 +2562,10 @@ let ACME_EMAIL_REMEMBERED = false;
 // reject.
 let MAY_SET_PRIVILEGED = false;
 let PRIVILEGED_FIELDS = ["rc_image", "reg_token", "bind"];
+// The box's own default, from the server -- not a guess and not a constant written
+// here. Starts at the shipped default so the notice is right before /api/settings
+// has answered.
+let DEFAULT_BIND_HOST = "127.0.0.1";
 
 async function openCreate(preset) {
   try { PRESETS = (await api("/api/presets")).presets; } catch (e) { toast(e.message); return; }
@@ -2390,6 +2576,7 @@ async function openCreate(preset) {
     const s = await api("/api/settings");
     ACME_EMAIL_REMEMBERED = s.acme_email_remembered;
     MAY_SET_PRIVILEGED = !!s.may_set_privileged;
+    if (s.default_bind_host) DEFAULT_BIND_HOST = s.default_bind_host;
     if (Array.isArray(s.privileged_fields) && s.privileged_fields.length) {
       PRIVILEGED_FIELDS = s.privileged_fields;
     }
@@ -2431,7 +2618,32 @@ async function openCreate(preset) {
       if (!MAY_SET_PRIVILEGED) input.value = "";
     }
   }
+  syncBindHint();
   $("#create-dialog").showModal();
+}
+
+// The one thing a browser-only user on a shared server cannot find out any other
+// way: a workspace publishes on 127.0.0.1 by default, so the one they are about to
+// create will answer on the server and nowhere else -- including not in the browser
+// they are creating it from. Shown only when that is actually true: not on a laptop
+// (loopback browser), and not on a box whose default bind host has already been
+// widened, where it would be noise about a problem that no longer exists.
+function syncBindHint() {
+  const hint = $("#create-bind-hint");
+  if (!hint) return;
+  const remote = remoteHost();
+  const wide = WIDE_BINDS.includes(String(DEFAULT_BIND_HOST || ""));
+  if (!remote || wide) { hint.hidden = true; hint.textContent = ""; return; }
+  hint.hidden = false;
+  hint.textContent =
+    `You are using this GUI from ${remote}, so it is not on the same machine as the `
+    + `workspaces. They publish on ${DEFAULT_BIND_HOST} by default, which is the `
+    + `server's own loopback — a workspace created as-is will not answer here. `
+    + (MAY_SET_PRIVILEGED
+        ? `Set Bind host to 0.0.0.0 under Advanced options to reach it from here.`
+        : `Ask an admin to run \`rc-repro config set bind_host 0.0.0.0\` once for `
+          + `this box.`)
+    + ` Workspaces ship a fixed admin/admin123, so only on a network you trust.`;
 }
 // ---- the three axes: where it runs, how it is arranged, how many -------------
 // Populated from /api/settings, never from a list written here. The same reasoning

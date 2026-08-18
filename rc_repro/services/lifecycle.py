@@ -943,6 +943,11 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
     # one thing: a workspace older than the key. See services/topology.py.
     topology.stamp(meta.extra, req.runtime or topology.DOCKER)
     meta.extra[config.EXTRA_DEPLOYMENT] = req.deployment or topology.MONOLITH
+    # Recorded so a reader can be told the truth about reaching this workspace from
+    # another machine. It was only ever written INTO the compose port mappings, which
+    # meant every caller that wanted to know had to parse the generated file --
+    # Kubernetes has recorded it in the metadata since its first workspace.
+    meta.extra["bind_host"] = bind_host
     if pre.post_ready:
         meta.extra["post_ready"] = pre.post_ready
     if pre.notes:
@@ -1276,6 +1281,12 @@ def _summary(meta: runner.Metadata) -> dict:
         "mongo_flavor": meta.mongo_flavor, "preset": meta.preset, "root_url": meta.root_url,
         "host_port": meta.host_port, "login": {"user": config.ADMIN_USERNAME, "password": config.ADMIN_PASSWORD},
         "pinned": meta.pinned, "notes": list(meta.extra.get("notes", []) if isinstance(meta.extra, dict) else []),
+        # Which runtime, and how Rocket.Chat is arranged inside it. `list_repros`
+        # has carried the runtime all along and the DETAIL payload had neither, so
+        # the panel rendered every workspace as though it were Compose -- and
+        # offered actions the Kubernetes path can only refuse.
+        "runtime": topology.of_meta(meta),
+        "deployment": topology.axes_of_meta(meta).get("deployment", ""),
     }
     n = meta.extra.get("instances") if isinstance(meta.extra, dict) else None
     if n:
@@ -1434,10 +1445,31 @@ _SECRET_KEY_HINTS = ("password", "pass", "secret", "token", "_key", "apikey",
 REDACTED = "********"
 
 
+#: A credential embedded in a URL: `scheme://user:password@host`. Matched on the
+#: VALUE, because the key that carries it says nothing -- `MONGO_URL`, `MONGO_URI`
+#: and `MONGO_OPLOG_URL` name no secret and hold one.
+_URL_USERINFO = re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^/\s:@]+):([^/\s@]+)@")
+
+
 def redact_env(key: str, value: str) -> str:
-    """Mask an env value whose KEY names a credential; pass anything else through."""
+    """Mask an env value that carries a credential; pass anything else through.
+
+    Two rules, because one was not enough. The KEY names a credential
+    (`*password*`, `*token*`, `*secret*`, ...) -- that catches REG_TOKEN, the LDAP
+    bind password and MinIO's secret key.
+
+    Or the VALUE carries one inside a URL. `MONGO_URL` matches no hint and on the
+    Kubernetes operator path holds `mongodb://rocketchat:<real SCRAM password>@...`,
+    resolved out of a Secret the moment the container's environment is read -- so the
+    env tab, which exists so that a debugging aid does not hand over credentials,
+    handed over the database password to every member. Only the userinfo goes: the
+    host, database and replicaSet in the rest of that string are exactly what a
+    reader is looking at it for.
+    """
     low = key.lower()
-    return REDACTED if value and any(h in low for h in _SECRET_KEY_HINTS) else value
+    if value and any(h in low for h in _SECRET_KEY_HINTS):
+        return REDACTED
+    return _URL_USERINFO.sub(rf"\1:{REDACTED}@", value or "")
 
 
 def _env_rows(doc: dict, overrides: dict | None = None) -> list[dict]:
@@ -1461,6 +1493,61 @@ def _env_rows(doc: dict, overrides: dict | None = None) -> list[dict]:
             for k, v in pairs]
 
 
+def _bind_host_of(m: runner.Metadata) -> str:
+    """The address this workspace publishes its ports ON, for the panel's
+    remote-access notice. "" means genuinely unknown.
+
+    Recorded in the metadata at create time. Read back out of the generated compose
+    file for workspaces made before it was recorded, so a workspace that already
+    exists gets the accurate notice rather than the hedged one -- the fact was always
+    on disk, just not where a reader could ask for it.
+    """
+    extra = m.extra if isinstance(m.extra, dict) else {}
+    recorded = str(extra.get("bind_host") or "")
+    if recorded:
+        return recorded
+    if topology.of_meta(m) == topology.KUBERNETES:
+        # Kubernetes has recorded it from the first workspace it ever made, so an
+        # absence here is not "older than the key" -- there is nothing to recover.
+        return ""
+    try:
+        doc = runner.read_compose(m.name)
+    except Exception:  # noqa: BLE001 - no file, or half-written; unknown is fine
+        return ""
+    svcs = doc.get("services", {}) if isinstance(doc, dict) else {}
+    rc = svcs.get("rocketchat") or svcs.get("rocketchat-1") or {}
+    for port in rc.get("ports") or []:
+        parts = str(port).split(":")
+        if len(parts) >= 3 and parts[0]:
+            return parts[0]
+    return ""
+
+
+def _since(iso: str) -> str:
+    """An ISO timestamp -> docker's phrasing for how long ago it was ("2 hours").
+
+    The panel's Uptime cell is filled from docker's own `Status` string on Compose;
+    on Kubernetes the same cell has to be built from a pod's startTime, and it has to
+    read the SAME way. Two vocabularies in one column is how a reader stops trusting
+    the column.
+    """
+    if not iso:
+        return ""
+    try:
+        then = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    secs = (datetime.now(timezone.utc) - then).total_seconds()
+    if secs < 0:
+        return ""
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        n = int(secs // size)
+        if n:
+            return f"{n} {unit}" + ("s" if n != 1 else "")
+    n = int(secs)
+    return f"{n} second" + ("s" if n != 1 else "")
+
+
 def detail(name: str) -> dict:
     """Rich detail for the GUI panel: summary + state/uptime/health + links +
     containers + the RC service's env vars."""
@@ -1479,10 +1566,57 @@ def detail(name: str) -> dict:
     d["owner"] = d["created_by"]
     d["made_by"] = _x.get("created_by", "")
     d["owner_history"] = list(_x.get("owner_history") or [])
+    # Which address this workspace's ports are bound to. The panel needs it to say
+    # anything true about reaching the workspace from ANOTHER machine: every link
+    # below is built from `localhost`, which for a browser on a different box than
+    # `serve` names that browser's own machine. Reported, never acted on -- ROOT_URL
+    # is what Rocket.Chat itself advertises and is deliberately left alone.
+    d["bind_host"] = _bind_host_of(m)
     # The panel keys its HTTPS row and its "Check TLS" action off these. list_repros()
     # carried them and detail() did not, so the feature was invisible in the panel.
     d["public_url"] = m.public_url
     d["tls"] = m.extra.get("tls", "") if isinstance(m.extra, dict) else ""
+    # ASKED FIRST, before docker is asked anything. A Kubernetes workspace's state
+    # does not depend on the local daemon, and the branch below reads the workspace's
+    # compose file -- which this runtime does not have, so a box whose docker was
+    # merely asleep answered the panel with a FileNotFoundError, i.e. 500, for a
+    # workspace that was running perfectly well in the cluster.
+    if topology.of_meta(m) == topology.KUBERNETES:
+        from rc_repro.services import k8s
+        context = str(_x.get("context") or k8s.CONTEXT)
+        d["state"] = kubernetes_state(target, m)
+        # Pods, in the containers tab's own three columns. This block used to be
+        # deliberately empty on the reasoning that invented rows would be a
+        # plausible wrong answer -- true, but these are not invented, and the empty
+        # list was itself a wrong answer: the tab reads it as "no containers" and
+        # printed "this repro is down" under a running workspace, with no way at all
+        # to see an ImagePullBackOff from the browser.
+        d["containers"] = ([] if d["state"] == "down"
+                           else k8s.pod_rows(target, context=context))
+        # Uptime from the earliest RUNNING pod, which is as close as this runtime
+        # gets to the workspace's own uptime. Left empty when nothing is running,
+        # because "—" is the honest cell for a stopped workspace.
+        started = sorted(r["started"] for r in d["containers"]
+                         if r["state"] == "running" and r["started"])
+        d["uptime"] = _since(started[0]) if started else ""
+        # Health stays empty on purpose: the kv falls back to the state, which here
+        # already distinguishes starting/running/stopped. A per-pod answer is in the
+        # containers tab, where it belongs.
+        d["health"] = ""
+        # LINKS ARE NOT COMPOSE-SHAPED, and leaving them out of this branch cost the
+        # panel every address a scenario publishes. A preset's UI answers on the SAME
+        # host port under both runtimes -- Compose binds it, Kubernetes port-forwards
+        # it to the same number deliberately (k8s.scenario_ui_forwards) -- so one
+        # list is right for both. Without it, phpLDAPadmin, Keycloak, MinIO, Mailpit
+        # and Grafana were unreachable from the GUI on Kubernetes while the CLI
+        # printed all of them.
+        d["links"] = repro_links(m)
+        # Named rather than reconstructed. Every message that mentions it builds it
+        # from `namespace_for`, and a browser rebuilding the same string from the
+        # workspace name is a second implementation of a naming rule.
+        d["namespace"] = str(_x.get("namespace") or "")
+        return d
+
     # `container_details` returns [] both for "no containers" AND for "docker could
     # not be asked", so deriving state from it alone asserted `down` whenever the
     # daemon was unreachable — while list_repros() reported "?" for the same repro.
@@ -1493,15 +1627,6 @@ def detail(name: str) -> dict:
         d["links"] = repro_links(m)
         d["env"] = _env_rows(runner.read_compose(target), m.extra.get("env")
                              if isinstance(m.extra, dict) else None)
-        return d
-    if topology.of_meta(m) == topology.KUBERNETES:
-        # Same reason as `list_repros`. The panel's containers/env/health blocks are
-        # compose-shaped and stay empty rather than being faked: an empty list is a
-        # readable absence, and invented rows would be a plausible wrong answer.
-        d["state"] = kubernetes_state(target, m)
-        d["containers"] = []
-        d["uptime"] = ""
-        d["health"] = ""
         return d
     containers = runner.container_details(target)
     rc = [c for c in containers if c["service"] == "rocketchat" or c["service"].startswith("rocketchat-")]

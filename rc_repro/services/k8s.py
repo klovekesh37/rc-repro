@@ -1913,6 +1913,75 @@ def pod_metrics(name: str, *, context: str,
     return rows
 
 
+def pod_rows(name: str, *, context: str) -> list[dict]:
+    """Every pod in this workspace's namespace, in the shape the panel's containers
+    tab already renders: [{service, state, status, health, restarts, started}].
+
+    A pod is not a container, but the question is the one Compose's list answers --
+    what is running, and is any of it unhappy -- so the tab renders the same three
+    columns rather than growing a second Kubernetes-only view. ALL pods, not just
+    Rocket.Chat's: the Compose tab lists Mongo and every sidecar too, and the pod
+    that is wrong is usually not the one you went looking for.
+
+    A waiting REASON outranks the phase in the status column. "Pending" says only
+    that something has not happened; `ImagePullBackOff`, `CrashLoopBackOff` and
+    `CreateContainerConfigError` say what, and that is the answer to "why is this
+    workspace not up" -- which the GUI previously had no way to show at all, because
+    this block was empty and the tab said "No containers -- this repro is down."
+    under a workspace that was running.
+    """
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "pods", "-o", "json"], own=is_ours(context))
+    if res.returncode != 0:
+        # An unreachable cluster is the panel's "docker is unavailable": an empty
+        # list, never a raise. detail() is on the path of every panel open, and a
+        # workspace whose cluster is asleep still has to render.
+        return []
+    try:
+        doc = json.loads(res.stdout or "{}")
+    except ValueError:
+        return []
+    rows = []
+    for item in doc.get("items") or []:
+        meta = item.get("metadata") or {}
+        st = item.get("status") or {}
+        # initContainerStatuses too: the MongoDB fix-permission and init containers
+        # are exactly where a Kubernetes workspace gets stuck, and a pod whose init
+        # container is in CrashLoopBackOff reports phase Pending and an EMPTY
+        # containerStatuses -- so reading only the main list showed "0/0 ready" and
+        # named nothing.
+        cs = list(st.get("initContainerStatuses") or []) + list(st.get("containerStatuses") or [])
+        main = list(st.get("containerStatuses") or [])
+        ready = sum(1 for c in main if c.get("ready"))
+        restarts = sum(int(c.get("restartCount") or 0) for c in cs)
+        reason = ""
+        for c in cs:
+            state = c.get("state") or {}
+            waiting = state.get("waiting") or {}
+            terminated = state.get("terminated") or {}
+            # A terminated init container that SUCCEEDED is not a reason -- that is
+            # the normal end of an init container, and reporting "Completed" as the
+            # pod's status hid a Rocket.Chat container that was crash-looping
+            # behind it.
+            if terminated.get("reason") == "Completed":
+                continue
+            reason = str(waiting.get("reason") or terminated.get("reason") or "")
+            if reason:
+                break
+        phase = str(st.get("phase") or "")
+        status = reason or f"{ready}/{len(main)} ready"
+        if restarts:
+            status += f" · {restarts} restart" + ("s" if restarts != 1 else "")
+        rows.append({"service": str(meta.get("name") or ""),
+                     "state": phase.lower(), "status": status,
+                     "health": "healthy" if main and ready == len(main) else "",
+                     "restarts": restarts,
+                     "started": str(st.get("startTime") or "")})
+    # Named order, so the tab does not reshuffle itself between two panel opens.
+    rows.sort(key=lambda r: r["service"])
+    return rows
+
+
 #: Waiting-state reasons a pod will never recover from on its own. Taken from PR #3,
 #: whose note is the important part: `ImagePullBackOff` alone is NOT terminal -- a slow
 #: or rate-limited registry looks identical while it is still making progress -- so it

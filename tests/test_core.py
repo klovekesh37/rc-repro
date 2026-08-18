@@ -1853,6 +1853,38 @@ def test_detail_redacts_secret_env_values():
     assert lcsvc.redact_env("REG_TOKEN", "") == ""      # empty stays empty
 
 
+def test_a_credential_inside_a_url_is_redacted_even_though_the_key_is_innocent():
+    """The key-name rule was not enough, and the gap opened the moment `env` started
+    reading the RUNNING CONTAINER on Kubernetes.
+
+    `MONGO_URL` matches no secret hint and, on the operator path, holds
+    `mongodb://rocketchat:<real SCRAM password>@...` -- resolved out of a Secret when
+    the container's environment is read. So the env tab, whose entire reason for
+    masking is that a debugging aid must not hand over credentials, handed the
+    database password to every member+ who opened it.
+
+    Only the userinfo goes. The host, database, replicaSet and authSource in the rest
+    of that string are what somebody is reading it FOR.
+    """
+    from rc_repro.services import lifecycle as lcsvc
+    url = ("mongodb://rocketchat:SuP3rS3cret@mongodb-0.mongodb-svc.rc-repro-k.svc"
+           ".cluster.local:27017/rocketchat?replicaSet=mongodb&authSource=rocketchat")
+    shown = lcsvc.redact_env("MONGO_URL", url)
+    assert "SuP3rS3cret" not in shown
+    assert lcsvc.REDACTED in shown
+    # ...and it is still a readable connection string.
+    for keep in ("mongodb://", "rocketchat:", "mongodb-svc", "replicaSet=mongodb",
+                 "authSource=rocketchat", ":27017"):
+        assert keep in shown, keep
+    # The oplog URL is the same shape and was the same leak.
+    assert "SuP3rS3cret" not in lcsvc.redact_env(
+        "MONGO_OPLOG_URL", "mongodb://rocketchat:SuP3rS3cret@mongodb-0:27017/local")
+    # A URL with no credentials in it is left completely alone.
+    plain = "mongodb://mongodb-0.mongodb:27017/rocketchat?replicaSet=rs0"
+    assert lcsvc.redact_env("MONGO_URL", plain) == plain
+    assert lcsvc.redact_env("ROOT_URL", "http://localhost:3000") == "http://localhost:3000"
+
+
 def test_k6_keeps_secrets_out_of_the_argv(tmp_path, monkeypatch):
     import types
     from rc_repro.perf import k6

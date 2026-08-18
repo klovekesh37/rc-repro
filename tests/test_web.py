@@ -1122,6 +1122,21 @@ def test_settings_says_whether_an_email_is_remembered_without_leaking_it(monkeyp
     assert "ops@rocket.chat" not in r.text, "the address itself must never be returned"
 
 
+def test_settings_reports_the_boxs_default_bind_host(monkeypatch, tmp_path):
+    """The create dialog cannot tell a browser on ANOTHER machine the truth without
+    it: with the default 127.0.0.1 the workspace it is about to make will answer on
+    the server and nowhere else, which a GUI-only user has no other way to find out.
+
+    An interface, not a credential -- `up` prints it on every create.
+    """
+    from rc_repro import config as cfgmod
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    c = client()
+    assert c.get("/api/settings", headers=H).json()["default_bind_host"] == "127.0.0.1"
+    cfgmod.update_config(lambda cfg: cfg.__setitem__("bind_host", "0.0.0.0"))
+    assert c.get("/api/settings", headers=H).json()["default_bind_host"] == "0.0.0.0"
+
+
 def test_settings_needs_a_session():
     assert client(sign_in=False).get("/api/settings").status_code == 401
 

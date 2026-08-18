@@ -267,7 +267,7 @@ def test_the_activity_page_opens_both_of_its_tabs(serve, page):
 # one path through each screen, enough to catch "it is blank" or "the button does
 # nothing".
 
-def _fake_detail(name="t1234", state="running"):
+def _fake_detail(name="t1234", state="running", **over):
     """A detail payload shaped like lc.detail()'s, so the panel renders offline.
 
     Every key the panel INDEXES INTO has to be here -- `d.containers.map` on an
@@ -283,11 +283,26 @@ def _fake_detail(name="t1234", state="running"):
         # getting it wrong renders an empty table rather than an error.
         "containers": [{"service": "rocketchat", "state": "running",
                         "status": "Up 2 hours", "health": "healthy"}],
-        "env": {"ROOT_URL": "http://localhost:3001"},
-        "links": [], "notes": "", "restarts": 0, "monitoring": False,
-        "tls": {}, "is_default": False, "created_by": "alice", "owner": "alice",
+        # THE SHAPES MATTER, and three of these were wrong for as long as this
+        # helper existed: `env` was a dict where detail() returns a list of rows,
+        # `notes` a string where it returns a list, `tls` a dict where it returns a
+        # string. Nothing caught it because no test opened the tab that iterates
+        # them -- `for (const e of {...})` throws "is not iterable", which is a blank
+        # panel. test_fake_detail_matches_the_real_payload below now compares the two
+        # so the next drift fails here instead of in production.
+        "env": [{"key": "ROOT_URL", "value": "http://localhost:3001", "override": False}],
+        "links": [], "notes": [], "restarts": 0, "monitoring": False,
+        "tls": "", "is_default": False, "created_by": "alice", "owner": "alice",
         "made_by": "alice", "owner_history": [], "workspace": "/tmp/ws", "default": False,
         "grafana_url": "", "diag": {},
+        # The three axes the panel now reads: which runtime it is, how it is
+        # arranged, and what address it publishes on.
+        "runtime": "docker", "deployment": "monolith", "bind_host": "127.0.0.1",
+        "pinned": False,
+        # Kubernetes-only, "" on Compose: the fixture is the UNION of what both
+        # branches of detail() return, so one fixture covers either runtime.
+        "namespace": "",
+        **over,
     }
 
 
@@ -1612,3 +1627,375 @@ def test_creating_a_kubernetes_workspace_sends_the_axes(serve, page, monkeypatch
     assert body["runtime"] == "kubernetes", body
     assert body["deployment"] == "microservices", body
     assert body["mongo_operator"] is True, body
+
+
+# --- reached from another machine ----------------------------------------------------
+#
+# The EC2 shape: one `serve` on a box everybody reaches over its address, and nobody
+# has a shell on it. Every link this GUI renders is built from `localhost`, which for
+# a browser somewhere else names the READER'S machine -- so the panel has to say what
+# the address means from where the reader is standing.
+#
+# Nothing is detected to work that out. `remoteHost()` reads location.hostname, which
+# is the address in the browser's own URL bar, and `serve_public`'s host-resolver rule
+# makes that a real name rather than 127.0.0.1 -- the same fixture the plain-http
+# sign-in defect needed, for the same reason.
+
+def test_the_panel_says_that_localhost_means_the_readers_own_machine(
+        serve_public, public_page, monkeypatch):
+    """And says how to fix it -- without touching the URL it is talking about.
+
+    ROOT_URL is Rocket.Chat's own advertised address and rc-repro's 71 internal API
+    calls go through it, so the notice is ADDITIVE: the URL row must still read
+    exactly what the workspace was built with.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail(bind_host="127.0.0.1"))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve_public() as s:
+        _sign_in(public_page, s.public_url)
+        public_page.wait_for_selector("#repros")
+        public_page.click("text=t1234")
+        public_page.wait_for_selector("#d-body")
+        public_page.wait_for_selector("#d-body .banner.warn")
+        said = public_page.text_content("#d-body .banner.warn")
+        assert PUBLIC_NAME in said, said
+        assert "0.0.0.0" in said, said
+        assert "admin/admin123" in said, said
+        # THE URL IS UNTOUCHED. This is the whole constraint on the feature.
+        assert public_page.text_content("#d-body .urlbox").find(
+            "http://localhost:3001") >= 0
+        assert public_page.errors == [], public_page.errors
+
+
+def test_a_wide_bound_workspace_is_given_the_address_that_works_from_here(
+        serve_public, public_page, monkeypatch):
+    """Bound to 0.0.0.0 there is nothing to warn about -- only an address to state.
+
+    Stated as text with a copy button rather than as a link: the links are built from
+    the workspace's own root_url and stay that way.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail(bind_host="0.0.0.0"))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve_public() as s:
+        _sign_in(public_page, s.public_url)
+        public_page.wait_for_selector("#repros")
+        public_page.click("text=t1234")
+        public_page.wait_for_selector("#d-body")
+        public_page.wait_for_function(
+            "() => document.querySelector('#d-body').textContent"
+            ".includes('From this machine')")
+        body = public_page.text_content("#d-body")
+        assert f"http://{PUBLIC_NAME}:3001" in body, body
+        # Not the amber one: nothing is being asked of the reader.
+        assert public_page.query_selector("#d-body .banner.warn") is None
+        assert public_page.errors == [], public_page.errors
+
+
+def test_a_local_browser_is_told_none_of_this(serve, page, monkeypatch):
+    """On a laptop every localhost link is correct, so the notice would be noise.
+
+    The same assertion proves the loopback branch of `remoteHost()`: this server is
+    reached at 127.0.0.1, which is exactly what must NOT count as remote.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail(bind_host="127.0.0.1"))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .urlbox")
+        assert page.query_selector("#d-body .banner.warn") is None
+        assert "From this machine" not in page.text_content("#d-body")
+        assert page.evaluate("remoteHost()") == ""
+        assert page.errors == [], page.errors
+
+
+def test_the_create_dialog_warns_a_remote_reader_about_the_default_bind(
+        serve_public, public_page, monkeypatch):
+    """The one fact a browser-only user cannot find out any other way: the workspace
+    they are about to create will answer on the server and nowhere else."""
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve_public() as s:
+        _sign_in(public_page, s.public_url)
+        public_page.wait_for_selector("#repros")
+        public_page.click("#btn-new")
+        public_page.wait_for_selector("#create-dialog[open]")
+        public_page.wait_for_selector("#create-bind-hint:not([hidden])")
+        said = public_page.text_content("#create-bind-hint")
+        assert "0.0.0.0" in said, said
+        assert PUBLIC_NAME in said, said
+        assert public_page.errors == [], public_page.errors
+
+
+def test_the_create_dialog_stays_quiet_on_a_laptop(serve, page, monkeypatch):
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("#btn-new")
+        page.wait_for_selector("#create-dialog[open]")
+        assert page.is_hidden("#create-bind-hint")
+        assert page.errors == [], page.errors
+
+
+# --- the panel against a Kubernetes workspace ---------------------------------------
+#
+# `serve` exists so a support engineer needs no shell, and on Kubernetes that is the
+# only way in for anybody without kubectl. Three of these tabs rendered a confident
+# wrong answer on that runtime and one rendered nothing at all.
+
+def _kube_detail(name="t1234", **over):
+    over.setdefault("containers", [])
+    return _fake_detail(name, runtime="kubernetes", deployment="microservices",
+                        namespace=f"rc-repro-{name}", **over)
+
+
+def test_the_env_tab_renders_on_kubernetes_where_it_used_to_be_blank(
+        serve, page, monkeypatch):
+    """It read `detail().env`, which the Kubernetes branch of detail() never set --
+    so the tab rendered an empty table and a hint, on a workspace whose environment
+    the CLI could print. It fetches /env now, which is the one seam both front-ends
+    share."""
+    from rc_repro.services import envvars as envsvc
+
+    _stub_lifecycle(monkeypatch, _kube_detail())
+    monkeypatch.setattr(envsvc, "current", lambda name: {
+        "name": name, "overrides": ["MY_FLAG"],
+        "env": [{"key": "ROOT_URL", "value": "http://localhost:3001", "override": False},
+                {"key": "MY_FLAG", "value": "1", "override": True},
+                {"key": "MONGO_URL", "value": "********", "override": False}]})
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        page.click("button.tab:has-text('Env vars')")
+        page.wait_for_function(
+            "() => document.querySelector('#d-body').textContent.includes('MY_FLAG')")
+        body = page.text_content("#d-body")
+        assert "ROOT_URL" in body and "MONGO_URL" in body
+        # Every write here is refused by the server with a helm hint, so the controls
+        # that could only produce a red toast are not rendered -- and the helm route
+        # is given instead.
+        assert page.query_selector("#d-body button.danger") is None
+        assert "Set + restart" not in body
+        assert "helm -n rc-repro-t1234 upgrade" in body, body
+        assert page.errors == [], page.errors
+
+
+def test_the_env_tab_still_offers_the_controls_on_compose(serve, page, monkeypatch):
+    from rc_repro.services import envvars as envsvc
+
+    _stub_lifecycle(monkeypatch)
+    monkeypatch.setattr(envsvc, "current", lambda name: {
+        "name": name, "overrides": [],
+        "env": [{"key": "ROOT_URL", "value": "http://localhost:3001", "override": False}]})
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        page.click("button.tab:has-text('Env vars')")
+        page.wait_for_function(
+            "() => document.querySelector('#d-body').textContent.includes('ROOT_URL')")
+        assert "Set + restart" in page.text_content("#d-body")
+        assert page.query_selector("#d-body button.danger") is not None
+        assert page.errors == [], page.errors
+
+
+def test_the_env_tab_shows_the_refusal_rather_than_an_empty_table(
+        serve, page, monkeypatch):
+    """A stopped Kubernetes workspace has no container to read the environment out
+    of, and the server says so. That message is the answer -- rendering an empty
+    table instead would look like a workspace with no environment."""
+    from rc_repro import errors as errs
+    from rc_repro.services import envvars as envsvc
+
+    def refuse(name):
+        raise errs.NotReadyError("no Rocket.Chat pod in rc-repro-t1234 to read the "
+                                 "environment from — is 't1234' running?")
+
+    _stub_lifecycle(monkeypatch, _kube_detail(state="stopped"))
+    monkeypatch.setattr(envsvc, "current", refuse)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        page.click("button.tab:has-text('Env vars')")
+        page.wait_for_function(
+            "() => document.querySelector('#d-body').textContent"
+            ".includes('no Rocket.Chat pod')")
+        assert page.errors == [], page.errors
+
+
+def test_the_containers_tab_shows_pods_and_says_so_on_kubernetes(
+        serve, page, monkeypatch):
+    """It printed "No containers — this repro is down." under a RUNNING Kubernetes
+    workspace, because the payload's list was always empty on that runtime."""
+    _stub_lifecycle(monkeypatch, _kube_detail(containers=[
+        {"service": "rocketchat-rocketchat-6d9-abc", "state": "running",
+         "status": "1/1 ready", "health": "healthy"},
+        {"service": "rocketchat-mongodb-0", "state": "pending",
+         "status": "ImagePullBackOff", "health": ""}]))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        page.click("button.tab:has-text('Containers')")
+        page.wait_for_selector("#d-body table.dtable")
+        body = page.text_content("#d-body")
+        assert "rocketchat-mongodb-0" in body
+        # The reason a pod cannot start, which the GUI had no way to show at all.
+        assert "ImagePullBackOff" in body
+        assert "No containers" not in body
+        assert "Pods, not containers" in body
+        # The column is named for what is in it.
+        assert page.text_content("#d-body table.dtable th") == "pod"
+        assert page.errors == [], page.errors
+
+
+def test_the_live_chart_stops_asking_when_the_answer_is_a_refusal(
+        serve, page, monkeypatch, tmp_path):
+    """kind ships no metrics-server, so /stats answers 409 forever. The chart used to
+    swallow it and repaint an empty box every three seconds under a title that says
+    "live", throwing away the server's own instructions for fixing it."""
+    import json as _json
+
+    from rc_repro import errors as errs
+    from rc_repro.services import k8s as k8ssvc
+
+    (tmp_path / "repros" / "t1234").mkdir(parents=True)
+    (tmp_path / "repros" / "t1234" / "repro.json").write_text(_json.dumps({
+        "name": "t1234", "project": "p", "rc_version": "7.4.1", "rc_image": "i",
+        "mongo_tag": "7.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3001", "host_port": 3001,
+        "version_source": "x", "extra": {"runtime": "kubernetes"}}))
+    _stub_lifecycle(monkeypatch, _kube_detail())
+
+    def no_metrics(name, **kw):
+        raise errs.NotReadyError("this cluster has no metrics-server, so there is "
+                                 "nothing to read CPU and memory from. Install it "
+                                 "with:\n  kubectl apply -f https://example/x.yaml")
+
+    monkeypatch.setattr(k8ssvc, "pod_metrics", no_metrics)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_function(
+            "() => document.querySelector('#chart')"
+            " && document.querySelector('#chart').textContent.includes('metrics-server')")
+        # And it stopped asking, rather than repainting the same refusal forever.
+        assert page.evaluate("dstate.statsTimer") is None
+        assert page.errors == [], page.errors
+
+
+def test_fake_detail_matches_the_real_payload(monkeypatch, tmp_path):
+    """The payload-shape trap, closed. Every browser test above renders from
+    `_fake_detail`, so a key that differs from what `lifecycle.detail()` really
+    returns breaks the panel in production with this whole file green. It had drifted
+    on three keys before this existed.
+
+    Both branches of detail() are compared, because they do not return the same set.
+    """
+    import json as _json
+
+    from rc_repro import runner
+    from rc_repro.services import k8s as k8ssvc
+    from rc_repro.services import lifecycle as lcsvc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    (tmp_path / "repros" / "cmp").mkdir(parents=True)
+    (tmp_path / "repros" / "cmp" / "repro.json").write_text(_json.dumps({
+        "name": "cmp", "project": "p", "rc_version": "7.4.1", "rc_image": "i",
+        "mongo_tag": "7.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3001", "host_port": 3001,
+        "version_source": "x", "extra": {}}))
+    (tmp_path / "repros" / "cmp" / "docker-compose.yml").write_text(
+        "services:\n  rocketchat:\n    image: i\n    ports:\n"
+        "    - 127.0.0.1:3001:3000\n    environment:\n      ROOT_URL: x\n")
+    (tmp_path / "repros" / "kub").mkdir(parents=True)
+    (tmp_path / "repros" / "kub" / "repro.json").write_text(_json.dumps({
+        "name": "kub", "project": "p", "rc_version": "7.4.1", "rc_image": "i",
+        "mongo_tag": "7.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3002", "host_port": 3002,
+        "version_source": "x",
+        "extra": {"runtime": "kubernetes", "namespace": "rc-repro-kub"}}))
+    # Neither branch may reach a daemon or a cluster from a unit test.
+    monkeypatch.setattr(runner, "docker_available", lambda **_k: False)
+    monkeypatch.setattr(lcsvc, "kubernetes_state", lambda name, meta: "running")
+    monkeypatch.setattr(k8ssvc, "pod_rows", lambda name, **kw: [])
+
+    fake = _fake_detail()
+    for name in ("cmp", "kub"):
+        real = lcsvc.detail(name)
+        missing = sorted(set(real) - set(fake))
+        assert not missing, (
+            f"detail({name!r}) returns keys the browser fixture does not have: "
+            f"{missing} — every test in this file renders from the fixture, so the "
+            f"panel can break in production with this file green")
+        for key in sorted(set(real) & set(fake)):
+            if real[key] is None or fake[key] is None:
+                continue
+            assert type(real[key]) is type(fake[key]), (
+                f"detail({name!r})[{key!r}] is {type(real[key]).__name__}, the "
+                f"fixture has {type(fake[key]).__name__}")
+
+
+def test_a_credential_note_is_not_labelled_a_sudo_setup_step(serve, page, monkeypatch):
+    """The setup block said "Do this once, on your machine … Needs sudo." over
+    whatever the first indented note happened to be.
+
+    For `ldap` that is a phpLDAPadmin CREDENTIAL, so the panel told an ldap reader to
+    sudo their way through "log in with DN cn=admin,dc=example,dc=com / admin" -- a
+    sentence that is not true of anything. `stopped`, so the live chart's /stats poll
+    stays out of a test about text.
+    """
+    from rc_repro import presets as presets_mod
+
+    notes = list(presets_mod.load("ldap").notes or [])
+    assert any(n.startswith("    ") for n in notes), \
+        "the indented credential is the condition under test"
+    usersvc.add("alice", PASSWORD, role="admin")
+    _stub_lifecycle(monkeypatch, _fake_detail(state="stopped", preset="ldap",
+                                              notes=notes))
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        body = page.text_content("#d-body")
+        assert "cn=admin,dc=example,dc=com" in body, "the credential is still shown"
+        assert "Needs sudo" not in body, \
+            "a credential was labelled a setup step that needs sudo"
+        assert page.errors == [], page.errors
+
+
+def test_the_one_preset_with_a_real_setup_step_keeps_it(serve, page, monkeypatch):
+    """`oidc` cannot log anyone in until `127.0.0.1  keycloak` is in /etc/hosts, and
+    the introducing sentence says exactly that -- which is what now qualifies a note
+    as a setup step."""
+    from rc_repro import presets as presets_mod
+
+    usersvc.add("alice", PASSWORD, role="admin")
+    _stub_lifecycle(monkeypatch, _fake_detail(
+        state="stopped", preset="oidc",
+        notes=list(presets_mod.load("oidc").notes or [])))
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .setup", timeout=15000)
+        setup = page.text_content("#d-body .setup")
+        assert "127.0.0.1  keycloak" in setup, setup
+        assert "Needs sudo" in setup
+        assert page.errors == [], page.errors

@@ -1983,6 +1983,18 @@ def loadtest(
         except ValueError as exc:
             _err(f"bad --slo: {exc}")
 
+    # Both front-ends ask the same question through the same function: a load test
+    # against a Kubernetes workspace would measure the port-forward, and the line
+    # below raised a bare FileNotFoundError naming a compose file that runtime does
+    # not have. See services/perf.require_compose_for_perf.
+    from rc_repro.services import perf as perfsvc
+    try:
+        perfsvc.require_compose_for_perf(_resolve_name(name), "loadtest")
+    except errors.ReproError as exc:
+        # Handled here because nothing else in this command is: `loadtest` and
+        # `capacity` have no ReproError handler of their own, so a domain error
+        # raised in the body prints a traceback instead of a red line.
+        _fail(exc)
     m = runner.read_meta(_resolve_name(name))
     doc = runner.read_compose(m.name)
     target = _loadtest_target(doc)
@@ -2281,6 +2293,14 @@ def capacity(
         except ValueError as exc:
             _err(f"bad --constrain: {exc}")
 
+    from rc_repro.services import perf as perfsvc
+    try:
+        perfsvc.require_compose_for_perf(_resolve_name(name), "capacity")
+    except errors.ReproError as exc:
+        # Handled here because nothing else in this command is: `loadtest` and
+        # `capacity` have no ReproError handler of their own, so a domain error
+        # raised in the body prints a traceback instead of a red line.
+        _fail(exc)
     m = runner.read_meta(_resolve_name(name))
     doc = runner.read_compose(m.name)
     target = _loadtest_target(doc)

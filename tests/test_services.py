@@ -4963,3 +4963,181 @@ def test_the_idp_cert_is_fetched_once_not_retried_around_a_retrier(monkeypatch):
         lambda e: None)
     assert len(calls) == 1, calls
     assert calls[0].get("timeout") == postready.IDP_CERT_DEADLINE, calls
+
+
+# --- the panel, against a Kubernetes workspace ---------------------------------------
+
+def _kube_workspace(tmp_path, monkeypatch, name="k", preset="ldap", extra=None):
+    """A recorded Kubernetes workspace on disk, with NO compose file.
+
+    The absence of the compose file is the condition every defect below shared: each
+    of these code paths reached for it, and each answered with something outside the
+    ReproError contract when it was not there.
+    """
+    import json as _json
+    from dataclasses import asdict
+
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name=name, project="p", rc_version="8.6.1", rc_image="i",
+                           mongo_tag="8.0", mongo_flavor="official", preset=preset,
+                           root_url="http://localhost:3010", host_port=3010,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra.update({"context": k8s.CONTEXT, "namespace": f"rc-repro-{name}",
+                    "bind_host": "127.0.0.1", **(extra or {})})
+    ws = lc.runner.workspace(name)
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
+    assert not (ws / "docker-compose.yml").exists()
+    return m
+
+
+def test_detail_gives_a_kubernetes_workspace_its_links_and_its_pods(
+        monkeypatch, tmp_path):
+    """The Kubernetes branch of detail() returned before it built either.
+
+    `links` are not compose-shaped and never were: a preset's UI answers on the SAME
+    host port under both runtimes, because k8s.scenario_ui_forwards forwards it to the
+    same number deliberately. Leaving them out meant phpLDAPadmin, Keycloak, MinIO,
+    Mailpit and Grafana were unreachable from the GUI on Kubernetes while the CLI
+    printed every one of them.
+
+    `containers` was empty on purpose, and the tab reads an empty list as "no
+    containers — this repro is down" — under a workspace that was running, with no
+    way at all to see an ImagePullBackOff from a browser.
+    """
+    from rc_repro.services import k8s
+
+    _kube_workspace(tmp_path, monkeypatch, preset="ldap")
+    monkeypatch.setattr(lc, "kubernetes_state", lambda name, meta: "running")
+    monkeypatch.setattr(k8s, "pod_rows", lambda name, **kw: [
+        {"service": "rocketchat-rocketchat-1", "state": "running",
+         "status": "1/1 ready", "health": "healthy", "restarts": 0,
+         "started": "2026-08-18T10:00:00Z"},
+        {"service": "rocketchat-mongodb-0", "state": "pending",
+         "status": "ImagePullBackOff", "health": "", "restarts": 0, "started": ""}])
+
+    d = lc.detail("k")
+    labels = {link["label"] for link in d["links"]}
+    assert "Rocket.Chat" in labels
+    assert "phpLDAPadmin" in labels, "the scenario's own UI, on the same port as Compose"
+    assert [c["service"] for c in d["containers"]] == [
+        "rocketchat-rocketchat-1", "rocketchat-mongodb-0"]
+    assert "ImagePullBackOff" in d["containers"][1]["status"]
+    # microservices, because that is what this runtime DEFAULTS to and the record
+    # names no deployment -- see topology.DEPLOYMENTS.
+    assert d["runtime"] == "kubernetes" and d["deployment"] == "microservices"
+    assert d["namespace"] == "rc-repro-k"
+    assert d["uptime"], "an uptime, from the earliest running pod"
+
+
+def test_detail_of_a_kubernetes_workspace_survives_docker_being_down(
+        monkeypatch, tmp_path):
+    """detail() asked docker first, and its docker-unavailable branch reads the
+    workspace's COMPOSE FILE. A Kubernetes workspace has none, so a box whose daemon
+    was merely asleep answered the panel with a FileNotFoundError -- a 500 -- for a
+    workspace running perfectly well in the cluster. The runtime is asked first now.
+    """
+    from rc_repro.services import k8s
+
+    _kube_workspace(tmp_path, monkeypatch, preset="default")
+    monkeypatch.setattr(lc.runner, "docker_available", lambda **_k: False)
+    monkeypatch.setattr(lc, "kubernetes_state", lambda name, meta: "running")
+    monkeypatch.setattr(k8s, "pod_rows", lambda name, **kw: [])
+
+    d = lc.detail("k")          # must not raise
+    assert d["state"] == "running", "docker's absence says nothing about a cluster"
+    assert d["links"], "and the links are still there"
+
+
+def test_detail_recovers_the_bind_host_of_a_workspace_older_than_the_key(
+        monkeypatch, tmp_path):
+    """The bind host was only ever written INTO the compose port mappings, so the
+    panel could not say anything true about reaching a workspace from another
+    machine. New workspaces record it; existing ones are read back out of the file
+    they already have, rather than being told "unknown"."""
+    import json as _json
+    from dataclasses import asdict
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="old", project="p", rc_version="8.5.1", rc_image="i",
+                           mongo_tag="8.0", mongo_flavor="official", preset="default",
+                           root_url="http://localhost:3001", host_port=3001,
+                           version_source="t")
+    ws = lc.runner.workspace("old")
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
+    (ws / "docker-compose.yml").write_text(
+        "services:\n  rocketchat:\n    image: i\n    ports:\n"
+        "    - 0.0.0.0:3001:3000\n    environment:\n      ROOT_URL: x\n")
+    monkeypatch.setattr(lc.runner, "docker_available", lambda **_k: False)
+
+    assert lc.detail("old")["bind_host"] == "0.0.0.0"
+
+
+def test_a_load_test_refuses_a_kubernetes_workspace_instead_of_crashing(
+        monkeypatch, tmp_path):
+    """Both perf entry points read the compose file, so on Kubernetes they raised a
+    bare FileNotFoundError: outside the ReproError contract, so `serve` answered 500
+    and the CLI printed a traceback. And the refusal is not "unimplemented" -- the
+    numbers would be measuring the `kubectl port-forward`.
+    """
+    from rc_repro.services import perf
+
+    _kube_workspace(tmp_path, monkeypatch, preset="default")
+    monkeypatch.setattr(perf.lifecycle.runner, "docker_available", lambda **_k: True)
+    with pytest.raises(errors.ValidationError) as caught:
+        perf.run_loadtest(perf.LoadtestReq(name="k", scenario="messages", vus=1))
+    assert "port-forward" in str(caught.value)
+    with pytest.raises(errors.ValidationError):
+        perf.run_capacity(perf.CapacityReq(name="k", scenario="messages"))
+
+
+def test_pod_rows_names_the_reason_a_pod_cannot_start(monkeypatch):
+    """The status column's job. A pod stuck on a bad image reports phase `Pending`,
+    which says only that something has not happened; the waiting REASON says what.
+
+    An init container is where a Kubernetes workspace most often wedges -- MongoDB
+    ships two -- and a pod whose init container is failing has an EMPTY
+    containerStatuses, so reading only that list showed "0/0 ready" and named nothing.
+    """
+    import json as _json
+
+    from rc_repro.services import k8s
+
+    pods = {"items": [
+        {"metadata": {"name": "rocketchat-mongodb-0"},
+         "status": {"phase": "Pending",
+                    "initContainerStatuses": [
+                        {"ready": False, "restartCount": 3,
+                         "state": {"waiting": {"reason": "CrashLoopBackOff"}}}],
+                    "containerStatuses": []}},
+        {"metadata": {"name": "rocketchat-rocketchat-x"},
+         "status": {"phase": "Running", "startTime": "2026-08-18T10:00:00Z",
+                    "initContainerStatuses": [
+                        {"ready": True, "restartCount": 0,
+                         "state": {"terminated": {"reason": "Completed"}}}],
+                    "containerStatuses": [{"ready": True, "restartCount": 0,
+                                           "state": {"running": {}}}]}}]}
+    monkeypatch.setattr(k8s, "run", lambda *a, **kw: type(
+        "R", (), {"returncode": 0, "stdout": _json.dumps(pods), "stderr": ""})())
+    rows = {r["service"]: r for r in k8s.pod_rows("k", context="c")}
+    assert rows["rocketchat-mongodb-0"]["status"].startswith("CrashLoopBackOff")
+    assert "3 restarts" in rows["rocketchat-mongodb-0"]["status"]
+    # A SUCCESSFUL init container is not a reason: reporting "Completed" as the pod's
+    # status would hide a Rocket.Chat container that was crash-looping behind it.
+    assert rows["rocketchat-rocketchat-x"]["status"] == "1/1 ready"
+    assert rows["rocketchat-rocketchat-x"]["health"] == "healthy"
+
+
+def test_pod_rows_answers_empty_rather_than_raising_when_the_cluster_is_asleep():
+    """detail() is on the path of every panel open, so this may never raise: a
+    workspace whose cluster is unreachable still has to render."""
+    from rc_repro.services import k8s
+
+    import unittest.mock as mock
+    with mock.patch.object(k8s, "run", return_value=type(
+            "R", (), {"returncode": 1, "stdout": "", "stderr": "connection refused"})()):
+        assert k8s.pod_rows("k", context="c") == []

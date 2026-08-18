@@ -95,6 +95,12 @@
   <dialog id="create-dialog">
     <form id="create-form" method="dialog">
       <h2>New workspace</h2>
+      <!-- Shown only when this GUI is open at a NON-loopback address, i.e. the
+           browser is not on the same machine as `serve`. Filled by app.js from
+           location.hostname and the box's default bind host; amber because it
+           wants something from you, and it is a notice -- it changes no field and
+           no URL. -->
+      <p id="create-bind-hint" class="banner warn" hidden></p>
       <label>Rocket.Chat version <input name="version" placeholder="8.5.1" required></label>
       <p id="version-hint" class="hint"></p>
       <div class="row2">
