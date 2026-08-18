@@ -1409,10 +1409,26 @@ def test_kubernetes_logs_do_not_mangle_rocketchats_own_formatting(monkeypatch):
     single = with_pods(1)
     assert "--prefix" not in single, \
         "one pod: the prefix identifies the only candidate and costs the formatting"
-    assert "-c" in single and "rocketchat" in single, \
-        "name the container, or a sidecar's output interleaves into Rocket.Chat's"
-    assert "--all-containers" not in single
+    assert "-c" not in single, (
+        "the selected pods have DIFFERENT container names -- rocketchat, "
+        "ddp-streamer, presence -- so naming one would fail on the others")
     assert "-f" in single and "--tail" in single
+
+    # THE SELECTOR IS THE POINT ON MICROSERVICES. It was the monolith deployment
+    # alone, so ddp-streamer -- which carries the WebSocket -- produced no output at
+    # all, and a realtime problem gave logs with nothing about realtime in them.
+    sel = single[single.index("-l") + 1]
+    assert f"app.kubernetes.io/instance={k8s.RELEASE}" in sel, \
+        "the whole release, so a microservice the chart adds later is included too"
+    assert "app.kubernetes.io/name!=nats" in sel, \
+        "but not the message bus, which would drown Rocket.Chat's own lines"
+    # And the narrow questions still ask the narrow one.
+    assert k8s.APP_SELECTOR == "app.kubernetes.io/name=rocketchat", \
+        "env means Rocket.Chat itself, not whichever pod sorted first"
+    import inspect
+    assert "LOG_SELECTOR" in inspect.signature(k8s.pod_metrics).parameters["selector"].default \
+        or k8s.LOG_SELECTOR == inspect.signature(k8s.pod_metrics).parameters["selector"].default, \
+        "stats sums every application pod, as Compose sums every rocketchat service"
 
     many = with_pods(3)
     assert "--prefix" in many, "several replicas are indistinguishable without it"
@@ -1548,6 +1564,68 @@ def test_env_and_stats_answer_on_kubernetes_instead_of_refusing(
         k8s.pod_metrics("k", context="c")
     assert "metrics-server" in str(caught.value)
     assert "kubectl apply" in str(caught.value), "say how to install it"
+
+
+def test_start_restores_the_replica_count_stop_recorded(monkeypatch):
+    """`--replicas 2` came back as 1 after stop/start, silently.
+
+    `stop` records the counts in a namespace annotation for exactly this, and `start`
+    read it back through jsonpath -- escaping the SLASH in
+    `rc-repro.io/replicas-before-stop` while leaving the DOT in `rc-repro.io`
+    unescaped. jsonpath then read `rc-repro` and `io/...` as separate path segments,
+    matched nothing and returned empty, so every restore fell through to the default
+    of 1. Measured on a live cluster: the slash-escaped form returns "" where the
+    dot-escaped form returns the annotation.
+
+    The annotation written to prevent this was therefore never once read back, and
+    nothing said so -- the workspace simply had half the Rocket.Chat it was asked for.
+    Found by running microservices with two replicas, which is the only shape where
+    the default and the truth differ.
+
+    Read as JSON and picked in Python now: a rule with no escaping in it cannot be
+    got subtly wrong.
+    """
+    import json as _json
+
+    from rc_repro.services import k8s
+
+    recorded = {"deployment/rocketchat-rocketchat": "2",
+                "deployment/rocketchat-presence": "1"}
+    scaled: list[str] = []
+
+    def fake_run(argv, **kw):
+        import subprocess as sp
+        joined = " ".join(argv)
+        if "get" in argv and "namespace" in argv and "json" in joined:
+            return sp.CompletedProcess(argv, 0, _json.dumps(
+                {"metadata": {"annotations": {k8s.SCALE_ANNOTATION:
+                                              _json.dumps(recorded)}}}), "")
+        if "scale" in argv:
+            scaled.append(next(a for a in argv if a.startswith("--replicas="))
+                          + " " + argv[-1])
+        return sp.CompletedProcess(argv, 0, "", "")
+    monkeypatch.setattr(k8s, "run", fake_run)
+    monkeypatch.setattr(k8s, "_scalables",
+                        lambda ns, ctx: ["deployment/rocketchat-rocketchat",
+                                         "deployment/rocketchat-presence"])
+
+    k8s.start_workspace("w", context="c")
+    assert "--replicas=2 deployment/rocketchat-rocketchat" in scaled, scaled
+    assert "--replicas=1 deployment/rocketchat-presence" in scaled, scaled
+
+    # A workspace stopped by hand carries no annotation; 1 is what `up` would give.
+    def no_annotation(argv, **kw):
+        import subprocess as sp
+        if "get" in argv and "namespace" in argv:
+            return sp.CompletedProcess(argv, 0, '{"metadata":{}}', "")
+        if "scale" in argv:
+            scaled.append(next(a for a in argv if a.startswith("--replicas="))
+                          + " " + argv[-1])
+        return sp.CompletedProcess(argv, 0, "", "")
+    scaled.clear()
+    monkeypatch.setattr(k8s, "run", no_annotation)
+    k8s.start_workspace("w", context="c")
+    assert all(x.startswith("--replicas=1") for x in scaled), scaled
 
 
 def test_an_interrupted_kubernetes_create_still_leaves_a_record(monkeypatch, tmp_path):

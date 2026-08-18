@@ -1731,11 +1731,30 @@ def ensure_port_forward(name: str, *, namespace: str, context: str, host_port: i
                         host_port=host_port, bind_host=bind_host, emit=emit)
 
 
-#: Rocket.Chat's own pods, by label. `-l` rather than a pod name so this follows a
-#: rollout, and covers every replica instead of whichever one happened to be first.
-LOG_SELECTOR = "app.kubernetes.io/name=rocketchat"
+#: Rocket.Chat's APPLICATION pods -- every replica of the monolith, and on
+#: microservices the account, authorization, ddp-streamer and presence deployments
+#: too. `-l` rather than a pod name so this follows a rollout.
+#:
+#: This was `app.kubernetes.io/name=rocketchat`, which is the MONOLITH deployment
+#: alone. On microservices that silently omitted the four services that make the
+#: deployment interesting -- ddp-streamer above all, since it carries the WebSocket,
+#: so a realtime problem produced logs with nothing about realtime in them. Compose
+#: has no service filter at all and shows everything, so the narrow selector was also
+#: the two runtimes disagreeing.
+#:
+#: Selected by RELEASE with nats excluded, rather than by listing the four names: a
+#: microservice the chart adds later is then included automatically, which a hardcoded
+#: list would quietly miss. nats is the message bus, not Rocket.Chat, and its output
+#: would drown the logs somebody opened to read Rocket.Chat's.
+LOG_SELECTOR = (f"app.kubernetes.io/instance={RELEASE},"
+                "app.kubernetes.io/name!=nats")
 
-#: Named explicitly so a sidecar's output is never interleaved into Rocket.Chat's.
+#: The MONOLITH Rocket.Chat deployment alone, and its container. Anything asking a
+#: question about "Rocket.Chat itself" -- readiness, its environment -- wants this and
+#: not the broad log selector: that one matches ddp-streamer and presence too, so
+#: `items[0]` under it could answer with a microservice's environment instead of
+#: Rocket.Chat's.
+APP_SELECTOR = "app.kubernetes.io/name=rocketchat"
 LOG_CONTAINER = "rocketchat"
 
 
@@ -1761,9 +1780,12 @@ def log_process(name: str, *, context: str, tail: int = 200, follow: bool = True
     because kubectl refuses to follow more than five pods by default and a
     microservices workspace has more than five.
     """
+    # No `-c`: the pods now selected have DIFFERENT container names (rocketchat,
+    # ddp-streamer, presence...), so naming one would fail on the others. Each pod
+    # here has a single container, so kubectl's default is the right one.
     argv = ["kubectl", "--context", context, "-n", namespace_for(name), "logs",
             "-l", selector, "--tail", str(int(tail)),
-            "--max-log-requests", "20", "-c", LOG_CONTAINER]
+            "--max-log-requests", "20"]
     # `--prefix` ONLY when there is more than one pod to tell apart. It was
     # unconditional and that was wrong: Rocket.Chat pretty-prints its own log lines
     # in columns, and stamping "[pod/rocketchat-rocketchat-<hash>/rocketchat] " onto
@@ -1780,7 +1802,7 @@ def log_process(name: str, *, context: str, tail: int = 200, follow: bool = True
 
 
 def container_env(name: str, *, context: str,
-                  selector: str = LOG_SELECTOR) -> dict[str, str]:
+                  selector: str = APP_SELECTOR) -> dict[str, str]:
     """Rocket.Chat's EFFECTIVE environment, read out of the running container.
 
     Compose answers this from the generated compose file. There is no such document
@@ -1833,6 +1855,12 @@ def _parse_quantity(text: str) -> float:
 def pod_metrics(name: str, *, context: str,
                 selector: str = LOG_SELECTOR) -> list[dict]:
     """Per-pod CPU and memory, via `kubectl top`.
+
+    Every Rocket.Chat application pod, which on microservices means the four services
+    as well as the monolith deployment -- the same set Compose sums when it adds up
+    `rocketchat`, `rocketchat-1`, `rocketchat-2`. Scoped to the monolith alone it
+    would report two pods out of six and call it the workspace's resource use, which
+    is the quietly-wrong number this function exists to avoid.
 
     Needs metrics-server, which kind does NOT ship. When it is absent the refusal
     says so and how to install it, rather than reporting zero -- a resource figure
@@ -2685,16 +2713,28 @@ def start_workspace(name: str, *, context: str, emit: Emit = null_emit) -> int:
     have given it.
     """
     namespace = namespace_for(name)
-    # The annotation key contains a `/`, which jsonpath treats as a path separator
-    # unless it is escaped -- so the escape is built outside the f-string, where
-    # Python 3.11 allows a backslash at all.
-    key = SCALE_ANNOTATION.replace("/", "\\/")
+    # Read as JSON and pick the key in Python, rather than through jsonpath.
+    #
+    # jsonpath was how this went wrong: the key is `rc-repro.io/replicas-before-stop`
+    # and the code escaped the SLASH while leaving the DOT in `rc-repro.io`
+    # unescaped -- so jsonpath read `rc-repro` and `io/...` as separate path segments,
+    # matched nothing, and returned empty. Measured against a live cluster: the
+    # slash-escaped form returns "" while the dot-escaped form returns the
+    # annotation. Every stop/start therefore restored the DEFAULT of 1, silently
+    # turning a `--replicas 2` workspace into a one-replica one, and the annotation
+    # written to prevent exactly that was never once read back.
+    #
+    # No escaping at all is a rule that cannot be got subtly wrong.
     res = run(["kubectl", "--context", context, "-n", namespace, "get", "namespace",
-               namespace, "-o", "jsonpath={.metadata.annotations." + key + "}"],
-              own=is_ours(context))
+               namespace, "-o", "json"], own=is_ours(context))
+    before = {}
     try:
-        before = json.loads((res.stdout or "").strip() or "{}")
+        annotations = (json.loads(res.stdout or "{}").get("metadata", {})
+                       .get("annotations") or {})
+        before = json.loads(annotations.get(SCALE_ANNOTATION) or "{}")
     except ValueError:
+        before = {}
+    if not isinstance(before, dict):
         before = {}
     targets = _scalables(namespace, context)
     if not targets:
