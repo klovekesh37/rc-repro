@@ -947,7 +947,8 @@ def split_image(rc_image: str, rc_version: str) -> tuple[str, str]:
 def values_for(*, rc_version: str, rc_image: str, microservices: bool,
                replicas: int = 1, root_url: str = "", oplog: bool = False,
                mongo_url: str = "", oplog_url: str = "",
-               mongo_secret: str = "", preset_env=None) -> dict:
+               mongo_secret: str = "", reg_token_secret: str = "",
+               preset_env=None) -> dict:
     """Chart values for one workspace.
 
     MongoDB is ALWAYS external, never the chart's bundled subchart. PR #3's reason
@@ -996,6 +997,13 @@ def values_for(*, rc_version: str, rc_image: str, microservices: bool,
     # overridden by one -- the same precedence compose.py gives it ("Preset env wins
     # over base defaults").
     env.extend({"name": str(k), "value": str(v)} for k, v in (preset_env or {}).items())
+    if reg_token_secret:
+        # By REFERENCE, so the token is never a value in this document. The chart
+        # renders extraEnv verbatim, so valueFrom survives -- verified against the
+        # published chart rather than assumed.
+        env.append({"name": "REG_TOKEN",
+                    "valueFrom": {"secretKeyRef": {"name": reg_token_secret,
+                                                   "key": REG_TOKEN_KEY}}})
     values: dict = {
         # pullPolicy and the NATS cluster name are the guide's own values.yaml.
         # IfNotPresent also matters here specifically: a repro box re-creates
@@ -1492,7 +1500,8 @@ def record_rendered(name: str, *, values: dict, manifests: dict) -> list[str]:
 def create_workspace(*, name: str, resolved, host_port: int, microservices: bool,
                      replicas: int = 1, owner: str = "", root_url: str = "",
                      bind_host: str = "", use_operator: bool = False,
-                     preset=None, emit: Emit = null_emit) -> dict:
+                     reg_token: str = "", preset=None,
+                     emit: Emit = null_emit) -> dict:
     """Build a Kubernetes workspace, and return what repro.json needs.
 
     A PARALLEL path to lifecycle's compose one rather than a refactor of it, which
@@ -1589,11 +1598,16 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
         apply(mongo_url_secret_manifest(name, mongo_url=mongo_url,
                                         oplog_url=oplog_url, owner=owner),
               namespace=namespace, context=context)
+        if reg_token:
+            info(emit, "installing the registration token Secret", phase="boot")
+            apply(reg_token_secret_manifest(name, token=reg_token, owner=owner),
+                  namespace=namespace, context=context)
         values = values_for(rc_version=resolved.rc_version,
                             rc_image=resolved.rc_image,
                             microservices=microservices, replicas=replicas,
                             root_url=root_url, oplog=resolved.oplog,
                             mongo_secret=MONGO_URL_SECRET,
+                            reg_token_secret=(REG_TOKEN_SECRET if reg_token else ""),
                             preset_env=getattr(preset, "env", None))
         values.update(container_security_context(chart_version))
         info(emit, f"installing {CHART} as {RELEASE}", phase="boot", pct=60)
@@ -1899,6 +1913,46 @@ def pod_metrics(name: str, *, context: str,
     return rows
 
 
+#: Waiting-state reasons a pod will never recover from on its own. Taken from PR #3,
+#: whose note is the important part: `ImagePullBackOff` alone is NOT terminal -- a slow
+#: or rate-limited registry looks identical while it is still making progress -- so it
+#: is the REASON that discriminates, not the phase.
+TERMINAL_POD_REASONS = (
+    "ErrImagePull", "ImagePullBackOff", "InvalidImageName",
+    "CreateContainerConfigError", "CreateContainerError", "RunContainerError",
+)
+
+
+def terminal_pod_failure(name: str, *, context: str) -> tuple[str, str, str] | None:
+    """The first pod condition that cannot succeed, as (pod, reason, message).
+
+    Without this, a create waits out its whole timeout on something already decided:
+    a mistyped version, an image the registry does not have, an unreachable registry.
+    Ten minutes of "waiting for Rocket.Chat" for an answer Kubernetes had in seconds,
+    and the eventual failure names the timeout rather than the cause.
+
+    Returns None when nothing is terminal, so the caller keeps waiting -- the default
+    has to be patience, or a slow pull becomes a failed create.
+    """
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "pods", "-o", "json"], own=is_ours(context))
+    if res.returncode != 0:
+        return None
+    try:
+        items = json.loads(res.stdout or "{}").get("items") or []
+    except ValueError:
+        return None
+    for item in items:
+        pod = item.get("metadata", {}).get("name", "")
+        for status in (item.get("status", {}).get("containerStatuses") or []) + \
+                      (item.get("status", {}).get("initContainerStatuses") or []):
+            waiting = (status.get("state") or {}).get("waiting") or {}
+            reason = str(waiting.get("reason") or "")
+            if reason in TERMINAL_POD_REASONS:
+                return pod, reason, str(waiting.get("message") or "").strip()
+    return None
+
+
 def workload_exists(name: str, *, context: str) -> bool:
     """Whether the Rocket.Chat deployment is present in the workspace's namespace.
 
@@ -2195,6 +2249,30 @@ spec:
 #: credentials are deliberately weak, but the operator's are generated per workspace
 #: and are the thing SCRAM auth exists to protect.
 MONGO_URL_SECRET = "rocketchat-mongodb-url"
+
+
+#: The EE registration token travels in its own Opaque Secret, referenced from the
+#: container env by `valueFrom`. NEVER in helm values or `extraEnv` as a literal:
+#: values are readable with `helm get values` by anyone who can reach the release, and
+#: rc-repro also writes them to `repros/<n>/kubernetes/values.yaml` for a human to
+#: read -- which is exactly the exposure the MongoDB password was moved out of. The
+#: manifest goes to `kubectl apply -f -` on stdin so the token never appears in argv
+#: either, where `ps` would show it to every user on the box.
+REG_TOKEN_SECRET = "rc-repro-reg-token"
+REG_TOKEN_KEY = "token"
+
+
+def reg_token_secret_manifest(name: str, *, token: str, owner: str = "") -> str:
+    """An Opaque Secret holding the cloud registration token."""
+    import yaml as _yaml
+    body = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {"name": REG_TOKEN_SECRET, "labels": _labels(name, owner)},
+        "type": "Opaque",
+        "stringData": {REG_TOKEN_KEY: token},
+    }
+    return _yaml.safe_dump(body, sort_keys=False)
 
 
 def mongo_url_secret_manifest(name: str, *, mongo_url: str, oplog_url: str,

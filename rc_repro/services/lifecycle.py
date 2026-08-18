@@ -21,9 +21,9 @@ from pathlib import Path
 
 from rc_repro import compose, config, presets, rcapi, runner, versions
 from rc_repro import seed as seeder
-from rc_repro.errors import (ConflictError, DockerError, NotFoundError,
-                             NotReadyError, PreflightError, ReproError,
-                             ValidationError)
+from rc_repro.errors import (ConflictError, CreateFailedError, DockerError,
+                            NotFoundError, NotReadyError, PreflightError,
+                            ReproError, ValidationError)
 from rc_repro.services import audit as auditsvc
 from rc_repro.services import edge as edgesvc
 from rc_repro.services import diagnose, postready, topology
@@ -1922,8 +1922,6 @@ _KUBERNETES_UNSUPPORTED: tuple[tuple[str, str], ...] = (
     ("https", "HTTPS needs an ingress controller and cert-manager, not the Traefik "
               "edge Compose uses"),
     ("domain", "a public domain needs the ingress that HTTPS needs"),
-    ("reg_token", "the EE registration token is injected through the preset "
-                  "environment, which this runtime does not apply yet"),
     ("fresh", "--fresh means DELETE this workspace's data, and the Kubernetes path "
               "keeps the PersistentVolumeClaim — use `rc-repro down --name <n> "
               "--volumes` first, which does delete it"),
@@ -2021,6 +2019,7 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     # Same resolution order Compose uses: the flag, then the box-level config, then
     # loopback. This was dropped entirely on the Kubernetes path.
     cfg = config.load_config()
+    reg_token = req.reg_token or cfg.get("reg_token") or ""
     bind_host = req.bind or cfg.get("bind_host") or config.DEFAULT_BIND_HOST
     root = f"http://localhost:{host_port}"
     microservices = req.deployment == topology.MICROSERVICES
@@ -2066,6 +2065,13 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         microservices=microservices, replicas=req.replicas or 1,
         owner=req.actor, bind_host=bind_host,
         use_operator=req.mongo_operator,
+        # Through a Secret referenced by `valueFrom`, never as a values literal:
+        # `helm get values` is readable by anyone who can reach the release, and
+        # rc-repro writes the values to disk for a human to read. This refusal used
+        # to say the token "is injected through the preset environment, which this
+        # runtime does not apply yet" -- preset env has been applied here for some
+        # time, so the reason had outlived itself while the flag stayed refused.
+        reg_token=reg_token,
         # Resolved through the KUBERNETES adapter, so a scenario yields native
         # manifests here and a compose service on the other runtime -- one intent,
         # two renderings. `_refuse_unsupported_on_kubernetes` has already proved
@@ -2307,6 +2313,17 @@ def _wait_serving_kubernetes(meta: runner.Metadata, emit: Emit,
                      phase="ready", pct=100)
                 return {"ready": True, "url": meta.root_url}
             extra = dict(extra, port_forward_pid=pid)
+        # Stop waiting for something Kubernetes has already decided cannot happen.
+        # A mistyped version or an unreachable registry used to cost the full timeout
+        # and then report the timeout rather than the cause.
+        doomed = k8s.terminal_pod_failure(meta.name, context=context)
+        if doomed:
+            pod, reason, message = doomed
+            raise CreateFailedError(
+                f"{meta.name!r} cannot start: pod {pod} is {reason}"
+                + (f" — {message}" if message else "")
+                + f". Nothing will change by waiting. `kubectl -n {namespace} "
+                  f"describe pod {pod}` has the detail.")
         now = _time.monotonic()
         if now - last > 15:
             last = now

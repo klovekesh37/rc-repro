@@ -4499,6 +4499,137 @@ def test_ready_confirms_the_socket_not_just_the_pid(monkeypatch, tmp_path):
     assert out == {"ready": True, "url": "http://localhost:3999"}, out
 
 
+def test_a_create_stops_waiting_for_a_pod_that_cannot_start(monkeypatch):
+    """A mistyped version cost the full timeout, then blamed the timeout.
+
+    Kubernetes knows within seconds that an image does not exist; the readiness loop
+    waited its whole 600s anyway and then reported "did not become ready", which names
+    the symptom and not the cause. Taken from PR #3.
+
+    The discrimination is the subtle part, and PR #3's note has it: `ImagePullBackOff`
+    is a REASON, not a phase, and a pod that is merely pulling slowly from a
+    rate-limited registry looks identical at the phase level. So the reason decides,
+    and anything unrecognised keeps waiting -- the default has to be patience, or a
+    slow pull becomes a failed create.
+    """
+    import json as _json
+
+    from rc_repro.services import k8s
+
+    def pods(*states):
+        return _json.dumps({"items": [
+            {"metadata": {"name": p},
+             "status": {"containerStatuses": [{"state": {"waiting": {
+                 "reason": r, "message": m}}}]}}
+            for p, r, m in states]})
+
+    def cluster(payload, rc=0):
+        def run(argv, **kw):
+            import subprocess as sp
+            return sp.CompletedProcess(argv, rc, payload, "")
+        return run
+
+    # An image that does not exist is decided; say so.
+    monkeypatch.setattr(k8s, "run", cluster(pods(
+        ("rocketchat-abc", "ErrImagePull", 'manifest for rocket.chat:9.9.9 not found'))))
+    found = k8s.terminal_pod_failure("w", context="c")
+    assert found is not None
+    pod, reason, message = found
+    assert pod == "rocketchat-abc" and reason == "ErrImagePull"
+    assert "9.9.9" in message, "carry the registry's own words, not a paraphrase"
+
+    # A pod still starting is NOT terminal -- this is the false positive that would
+    # turn every slow pull into a failed create.
+    monkeypatch.setattr(k8s, "run", cluster(pods(
+        ("rocketchat-abc", "ContainerCreating", ""),
+        ("mongodb-0", "PodInitializing", ""))))
+    assert k8s.terminal_pod_failure("w", context="c") is None
+
+    # Neither is a healthy pod with no waiting state at all.
+    monkeypatch.setattr(k8s, "run", cluster(
+        _json.dumps({"items": [{"metadata": {"name": "rc"},
+                                "status": {"containerStatuses": [
+                                    {"state": {"running": {}}}]}}]})))
+    assert k8s.terminal_pod_failure("w", context="c") is None
+
+    # An unreadable cluster is not evidence of failure either.
+    monkeypatch.setattr(k8s, "run", cluster("", rc=1))
+    assert k8s.terminal_pod_failure("w", context="c") is None
+    monkeypatch.setattr(k8s, "run", cluster("not json"))
+    assert k8s.terminal_pod_failure("w", context="c") is None
+
+    # An init container counts: MongoDB's fix-permission container runs there.
+    monkeypatch.setattr(k8s, "run", cluster(_json.dumps({"items": [
+        {"metadata": {"name": "mongodb-0"},
+         "status": {"initContainerStatuses": [{"state": {"waiting": {
+             "reason": "CreateContainerConfigError", "message": "secret missing"}}}]}}]})))
+    got = k8s.terminal_pod_failure("w", context="c")
+    assert got and got[1] == "CreateContainerConfigError"
+
+
+def test_the_registration_token_never_becomes_a_value_or_an_argument(monkeypatch):
+    """The EE licence token reaches Rocket.Chat by REFERENCE, never as a literal.
+
+    `--reg-token` was refused on this runtime, and the reason had outlived itself:
+    "injected through the preset environment, which this runtime does not apply yet"
+    -- preset env had been applied here for some time. Taken from PR #3, whose design
+    is better than the obvious one, and the reason is exposure:
+
+      * helm VALUES are readable with `helm get values` by anyone who can reach the
+        release, and rc-repro also writes them to `repros/<n>/kubernetes/values.yaml`
+        for a human to read. That is precisely where the MongoDB password was moved
+        out of, so putting a licence token there would undo the same lesson.
+      * The manifest goes to `kubectl apply -f -` on STDIN, so the token is never a
+        process argument either, where `ps` shows it to every user on the box.
+    """
+    import yaml as _yaml
+
+    from rc_repro.services import k8s
+
+    token = "SUPERSECRETTOKEN"
+
+    # 1. The Secret carries it; the values only name the Secret.
+    doc = _yaml.safe_load(k8s.reg_token_secret_manifest("w", token=token, owner="me"))
+    assert doc["kind"] == "Secret" and doc["type"] == "Opaque"
+    assert doc["stringData"][k8s.REG_TOKEN_KEY] == token
+    assert doc["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "rc-repro", \
+        "teardown selects on ownership, so the Secret has to carry it"
+
+    values = k8s.values_for(rc_version="8.5.1",
+                            rc_image="registry.rocket.chat/rocketchat/rocket.chat",
+                            microservices=False,
+                            mongo_url="mongodb://mongodb:27017/rocketchat",
+                            reg_token_secret=k8s.REG_TOKEN_SECRET)
+    assert token not in _yaml.safe_dump(values), \
+        "the token must not be in anything `helm get values` can print"
+    entry = next(e for e in values["extraEnv"] if e["name"] == "REG_TOKEN")
+    assert entry["valueFrom"]["secretKeyRef"] == {"name": k8s.REG_TOKEN_SECRET,
+                                                 "key": k8s.REG_TOKEN_KEY}
+    assert "value" not in entry, "by reference, never by value"
+
+    # 2. Without a token, nothing is referenced -- no dangling secretKeyRef.
+    plain = k8s.values_for(rc_version="8.5.1",
+                           rc_image="registry.rocket.chat/rocketchat/rocket.chat",
+                           microservices=False,
+                           mongo_url="mongodb://mongodb:27017/rocketchat")
+    assert not any(e["name"] == "REG_TOKEN" for e in plain["extraEnv"]), \
+        "a workspace with no token must not reference a Secret that does not exist"
+
+    # 3. Applied on stdin, so it is never visible in argv.
+    seen = {}
+    def fake_run(argv, **kw):
+        import subprocess as sp
+        seen["argv"] = argv
+        return sp.CompletedProcess(argv, 0, "", "")
+    monkeypatch.setattr(k8s.subprocess, "run",
+                        lambda argv, **kw: fake_run(argv, **kw))
+    k8s.apply(k8s.reg_token_secret_manifest("w", token=token), namespace="ns",
+              context="c")
+    assert token not in " ".join(seen["argv"]), \
+        "`ps` would show a token passed as an argument to every user on the box"
+    assert "-f" in seen["argv"] and "-" in seen["argv"], "applied from stdin"
+
+
 def test_kubernetes_refuses_what_it_would_silently_drop(monkeypatch, tmp_path):
     """Five create options were ACCEPTED and then ignored on this runtime.
 
@@ -4520,10 +4651,14 @@ def test_kubernetes_refuses_what_it_would_silently_drop(monkeypatch, tmp_path):
         return lc.CreateReq(version="8.5.1", runtime=topology.KUBERNETES, **kw)
 
     cases = [
+        # `--reg-token` used to be here, refused because "the EE registration token
+        # is injected through the preset environment, which this runtime does not
+        # apply yet". Preset env had been applied here for some time, so the reason
+        # had outlived itself while the flag stayed refused; it now travels in an
+        # Opaque Secret referenced by `valueFrom`, and is asserted below.
         (req(fresh=True), "--fresh"),
         (req(https="local"), "--https"),
         (req(domain="x.example"), "--domain"),
-        (req(reg_token="abc"), "--reg-token"),
     ]
     for creq, expected in cases:
         with pytest.raises(errors.ValidationError) as caught:
@@ -4533,7 +4668,8 @@ def test_kubernetes_refuses_what_it_would_silently_drop(monkeypatch, tmp_path):
     # What IS supported must still pass straight through, or this becomes a wall.
     lc._refuse_unsupported_on_kubernetes(req(preset="default", name="x", pin=True,
                                              monitor=True, seed=True, wait=True,
-                                             mongo_operator=True, replicas=3))
+                                             mongo_operator=True, replicas=3,
+                                             reg_token="abc"))
     # And `ldap` passes now BECAUSE it has an adapter -- the refusal is per preset,
     # not a blanket "presets do not work here". That is what slice 4 bought.
     lc._refuse_unsupported_on_kubernetes(req(preset="ldap", params={"users": "3"}))
