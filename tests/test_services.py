@@ -1550,6 +1550,48 @@ def test_env_and_stats_answer_on_kubernetes_instead_of_refusing(
     assert "kubectl apply" in str(caught.value), "say how to install it"
 
 
+def test_an_interrupted_kubernetes_create_still_leaves_a_record(monkeypatch, tmp_path):
+    """Killed part-way through, a create must leave something `down` can find.
+
+    `create_workspace` builds the namespace, MongoDB, the release, the scenario's
+    manifests and the port-forward -- minutes of work -- and the record used to be
+    written only after it returned. Stopping `serve` with a create job still running
+    does exactly that, and it was reported from real use: a full microservices
+    workspace with twelve pods left running and INVISIBLE, because `list`, `info`
+    and `down` all begin at the state directory and there was nothing in it.
+
+    Compose never had this. It writes the record first and starts containers after,
+    so an interrupted create is still listed and still removable. This is the same
+    guarantee for the other runtime.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr(lc, "check_capacity", lambda *a, **kw: None)
+    monkeypatch.setattr(lc.runner, "pick_port", lambda *a, **kw: 3999, raising=False)
+
+    # The kill, at the worst possible moment: everything built, nothing recorded.
+    def die(**kw):
+        raise KeyboardInterrupt("serve shut down mid-create")
+    monkeypatch.setattr(k8s, "create_workspace", die)
+
+    req = lc.CreateReq(version="8.5.1", name="interrupted", runtime="kubernetes",
+                       deployment="microservices")
+    with pytest.raises(BaseException):
+        lc.create_repro(req)
+
+    assert lc.runner.exists("interrupted"), (
+        "the workspace was left running with no record at all -- nothing in "
+        "rc-repro could see it, let alone remove it")
+    meta = lc.runner.read_meta("interrupted")
+    assert topology.of_meta(meta) == topology.KUBERNETES
+    assert meta.extra.get("namespace") == k8s.namespace_for("interrupted"), \
+        "teardown selects on the namespace, so it has to be recorded"
+    assert meta.extra.get("incomplete") is True, \
+        "and it must be distinguishable from a create that finished"
+
+
 def test_prune_asks_kubernetes_whether_a_kubernetes_workspace_is_down(
         monkeypatch, tmp_path):
     """"Is it down" was answered by Docker for every workspace, on both runtimes.

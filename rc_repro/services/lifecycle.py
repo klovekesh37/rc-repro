@@ -2028,6 +2028,39 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     # so what was applied and what is printed cannot disagree.
     preset_for_notes = presets.resolve(req.preset or "default", topology.KUBERNETES,
                                        req.params or {})
+    # A WRITE-AHEAD RECORD, before a single cluster resource exists.
+    #
+    # `create_workspace` below builds the namespace, MongoDB, the chart release, the
+    # scenario's manifests and the port-forward -- minutes of work -- and only after
+    # it returned was anything written down. Kill the process in that window (a
+    # `serve` shutdown with a create job still running does exactly this) and the
+    # workspace is left fully running with NO record: invisible to `list`, `info`
+    # and `down`, and unreachable by every command, because all of them start from
+    # the state directory. Two such orphans were found holding several GB between
+    # them, removable only with `kubectl delete namespace` by hand.
+    #
+    # Compose never had this: it writes the record at the top and starts containers
+    # afterwards, so an interrupted create leaves something to clean up with. This
+    # makes the runtimes agree. The namespace name is deterministic, so it can be
+    # recorded before it exists; everything learned later is merged in below.
+    provisional = runner.Metadata(
+        name=repro_name, project=k8s.namespace_for(repro_name),
+        rc_version=resolved.rc_version, rc_image=resolved.rc_image,
+        mongo_tag=resolved.mongo_tag, mongo_flavor=resolved.mongo_flavor,
+        preset=req.preset, root_url=root, host_port=host_port,
+        version_source=resolved.source, pinned=req.pin,
+        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    topology.stamp(provisional.extra, topology.KUBERNETES)
+    provisional.extra[config.EXTRA_DEPLOYMENT] = req.deployment or topology.MICROSERVICES
+    provisional.extra["namespace"] = k8s.namespace_for(repro_name)
+    provisional.extra["context"] = k8s.CONTEXT
+    provisional.extra["incomplete"] = True
+    if req.actor:
+        provisional.extra["created_by"] = req.actor
+    _ws = runner.workspace(repro_name)
+    _ws.mkdir(parents=True, exist_ok=True)
+    runner.atomic_write(_ws / "repro.json", json.dumps(asdict(provisional), indent=2))
+
     out = k8s.create_workspace(
         name=repro_name, resolved=resolved, host_port=host_port,
         microservices=microservices, replicas=req.replicas or 1,
