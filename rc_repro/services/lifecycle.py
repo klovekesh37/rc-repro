@@ -288,6 +288,24 @@ def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_em
     swap_note = ("\n  This host has NO SWAP, so there is no buffer at all: memory "
                  "pressure becomes an OOM kill rather than slowdown."
                  if swap_mb == 0 else "")
+    if getattr(req, "force", False):
+        # The docstring above has always said "Overridable with --force" and the
+        # refusal below has always told the user to pass it -- and nothing here ever
+        # read req.force, so the advertised way out did not exist. Following the
+        # message produced the identical refusal, and on `up` --force ALSO means
+        # "overwrite this repro", so obeying the advice risked destroying a workspace
+        # while still being blocked. Same shape as the --https guard that was shipped
+        # and dead: prose that describes behaviour nothing implements.
+        #
+        # It warns rather than passing silently, because this is the guard that
+        # exists after an OOM took out a 10 GB host: overriding it has to stay
+        # visible, especially on a shared server where the kernel picks the victim.
+        warn(emit, f"--force: creating anyway, though this workspace wants about "
+                   f"{need} MB and only {max(0, headroom)} MB is free to use."
+                   f"{swap_note} If the host runs out, the OOM killer chooses what "
+                   f"dies — which may be a colleague's workspace, not this one.",
+             phase="create")
+        return
     raise PreflightError(
         f"not enough memory: this workspace needs about {need} MB and only "
         f"{max(0, headroom)} MB is free to use "
@@ -1761,15 +1779,60 @@ def prunable() -> list[str]:
     if states is None:
         raise DockerError("couldn't query docker compose projects - not pruning (is Docker healthy?)")
     me = auditsvc.actor()
-    return [m.name for m in runner.list_meta()
-            if not m.pinned and m.project not in states
-            and may_destroy(m.name, me)[0]]
+    out: list[str] = []
+    for m in runner.list_meta():
+        if m.pinned or not may_destroy(m.name, me)[0]:
+            continue
+        if topology.of_meta(m) == topology.KUBERNETES:
+            # ASK KUBERNETES, not Docker. "Is it down" was decided by whether a
+            # compose PROJECT was running, and a Kubernetes workspace never has one
+            # -- so every Kubernetes workspace looked down, including a healthy one
+            # serving traffic. `prune` then offered to delete N "down" repros with a
+            # live workspace among them, and its compose teardown could not remove
+            # any of them anyway.
+            from rc_repro.services import k8s
+            context = str((m.extra or {}).get("context") or k8s.CONTEXT)
+            if k8s.workload_exists(m.name, context=context):
+                continue
+            out.append(m.name)
+            continue
+        if m.project not in states:
+            out.append(m.name)
+    return out
 
 
-def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
+
+def orphan_namespaces(context: str = "") -> list[str]:
+    """Namespaces labelled ours that NO local record can explain.
+
+    A workspace whose `repro.json` is gone -- an interrupted create, a wiped
+    RC_REPRO_HOME, a workspace made under a different one -- leaves its namespace,
+    its pods and its PersistentVolumeClaim running with nothing able to remove them:
+    every rc-repro command starts from the state directory, so the workspace is
+    simply invisible. One was found holding 8Gi and five CrashLoopBackOff pods with
+    no way to reach it short of `kubectl delete namespace` by hand.
+
+    Reported, never swept automatically. On a shared cluster an unrecorded namespace
+    may be a COLLEAGUE's workspace created from their own home, so deleting it
+    because this machine has no record of it would destroy their work. `prune
+    --orphans` is the opt-in.
+    """
+    from rc_repro.services import k8s
+    ctx = context or k8s.CONTEXT
+    try:
+        found = k8s.workspace_namespaces(ctx)
+    except Exception:  # noqa: BLE001 - no cluster is not an error here
+        return []
+    known = {k8s.namespace_for(m.name) for m in runner.list_meta()}
+    return sorted(ns for ns in found
+                  if ns not in known and ns != k8s.OPERATOR_NAMESPACE)
+
+def prune(*, confirm: bool = False, orphans: bool = False,
+          emit: Emit = null_emit) -> dict:
     targets = prunable()
-    if not targets:
-        return {"targets": [], "removed": []}
+    stray = orphan_namespaces() if orphans else []
+    if not targets and not stray:
+        return {"targets": [], "removed": [], "orphans": []}
     if not confirm:
         raise ValidationError(f"prune deletes {len(targets)} down repro(s) incl. data - pass confirm=true")
     auditsvc.record("prune", ",".join(targets))
@@ -1781,6 +1844,30 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         # waited on -- it is no longer idle, so it no longer qualifies for pruning.
         try:
             with runner.repro_lock(name, timeout=5.0):
+                if topology.of_repro(name) == topology.KUBERNETES:
+                    # The same dispatch `teardown` makes, for the same reason: this
+                    # called `docker compose down` on a workspace that has no compose
+                    # project, which always failed -- so a Kubernetes workspace could
+                    # be listed for pruning and never actually pruned, and its
+                    # namespace and PersistentVolumeClaim stayed on the cluster.
+                    from rc_repro.services import k8s
+                    meta = runner.read_meta(name)
+                    context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
+                    for ui_pid in (meta.extra or {}).get("scenario_forwards", {}).values():
+                        try:
+                            _stop_port_forward(int(ui_pid))
+                        except (TypeError, ValueError):
+                            pass
+                    pid = (meta.extra or {}).get("port_forward_pid")
+                    if pid:
+                        _stop_port_forward(int(pid))
+                    k8s.delete_namespace(name, context=context, volumes=True,
+                                         emit=emit)
+                    runner.remove(name)
+                    _clear_default_if(name)
+                    removed.append(name)
+                    info(emit, f"pruned {name!r}", phase="done")
+                    continue
                 # Detach BEFORE `down`: compose cannot remove a network that still
                 # has an active endpoint, and the attached edge is one.
                 edgesvc.detach(name)
@@ -1798,7 +1885,20 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         _clear_default_if(name)
         removed.append(name)
         info(emit, f"pruned {name!r}", phase="done")
-    return {"targets": targets, "removed": removed}
+    swept = []
+    if stray:
+        from rc_repro.services import k8s
+        for ns in stray:
+            res = k8s.run(["kubectl", "--context", k8s.CONTEXT, "delete", "namespace",
+                           ns, "--wait=false"], timeout=k8s.APPLY_TIMEOUT,
+                          own=k8s.is_ours(k8s.CONTEXT))
+            if res.returncode == 0:
+                swept.append(ns)
+                info(emit, f"removed orphaned namespace {ns}", phase="done")
+            else:
+                warn(emit, f"could not remove orphaned namespace {ns}: "
+                           f"{(res.stderr or '').strip()[:120]}", phase="done")
+    return {"targets": targets, "removed": removed, "orphans": swept}
 
 
 #: What `up` accepts on Compose and cannot honour on Kubernetes, with the reason.
@@ -2017,8 +2117,15 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         f"{repro_name}` installs one Prometheus + Grafana in "
         f"{k8s.OPERATOR_NAMESPACE} for the whole cluster, and `--off` leaves it up "
         "while any other workspace still wants it.",
-        "logs, stats and backup have no Kubernetes path yet — each refuses and "
-        "names the kubectl command that does the job.",
+        # This used to say "logs, stats and backup have no Kubernetes path yet". Two
+        # of the three were right and backup was not: it has run on this runtime
+        # since it learned to exec through `kubectl` instead of compose, and an audit
+        # found the note still telling users otherwise. A workspace's own notes are
+        # where someone checks what they can do with it, so a stale one costs them a
+        # capability they already have.
+        "stats and env have no Kubernetes path yet — each refuses and names the "
+        "kubectl/helm command that does the job. `logs`, `upgrade`, `backup`, "
+        "`restore`, `seed`, `monitor`, `api`, `pat` and `token` all work here.",
     ]
     # A preset's own notes, which the Compose path already surfaces via
     # `meta.extra["notes"] = pre.notes`. This path builds its own list, so without

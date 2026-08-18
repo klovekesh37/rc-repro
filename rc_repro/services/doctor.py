@@ -401,6 +401,8 @@ def run_checks() -> dict:
             line("ok", f"{len(others)} other kind cluster(s) on this box "
                        f"({', '.join(others)}) — rc-repro never deletes "
                        "a cluster it did not create")
+        for row in inotify_headroom(len(others) + 1):
+            line(row[0], row[1])
     except Exception:  # noqa: BLE001 - a check must never break the report
         line("warn", "Kubernetes status could not be determined")
 
@@ -420,3 +422,44 @@ def run_checks() -> dict:
             repros = None
 
     return {"checks": rows, "counts": counts, "verdict": verdict, "repros": repros}
+
+
+#: Roughly what one kind node plus the workloads on it consume. Measured, not
+#: guessed: a single-node cluster running Rocket.Chat, MongoDB, NATS and a preset
+#: sidecar sat around 40-60 instances, and the box below had five clusters' worth of
+#: history behind it.
+INOTIFY_PER_CLUSTER = 60
+
+
+def inotify_headroom(clusters: int = 1, path: str = "/proc/sys/fs/inotify/max_user_instances",
+                     in_use: int | None = None) -> list[tuple[str, str]]:
+    """Whether the kernel will let another watcher start.
+
+    This check exists because the symptom points nowhere near the cause. With
+    `fs.inotify.max_user_instances` exhausted, Traefik starts, stays up, logs
+    `Cannot start the provider *file.Provider ... too many open files`, and then
+    serves its OWN default certificate to every request -- which looks exactly like
+    a broken route or a bad certificate, and is neither. It cost three full runs to
+    find, and kind's own documentation raises these limits for multi-cluster use.
+
+    Linux-only by construction: the file does not exist elsewhere, and a missing
+    file is silence rather than a warning about a limit that does not apply.
+    """
+    try:
+        with open(path) as fh:
+            limit = int(fh.read().strip())
+    except (OSError, ValueError):
+        return []
+    need = max(1, clusters) * INOTIFY_PER_CLUSTER
+    if limit >= need * 2:
+        return [("ok", f"inotify instances: {limit} (kind and Traefik watch files; "
+                       f"~{need} needed here)")]
+    if limit >= need:
+        return [("warn", f"inotify instances: {limit}, and about {need} are needed for "
+                         f"{max(1, clusters)} cluster(s) — tight. Raise it with "
+                         f"`sudo sysctl -w fs.inotify.max_user_instances=1024`")]
+    return [("fail", f"inotify instances: only {limit}, about {need} needed for "
+                     f"{max(1, clusters)} cluster(s). Traefik will start, load NO "
+                     f"dynamic configuration and serve its own default certificate — "
+                     f"which looks like a broken route, not a kernel limit. "
+                     f"`sudo sysctl -w fs.inotify.max_user_instances=1024`")]

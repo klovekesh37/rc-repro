@@ -20,6 +20,7 @@ one that says "cannot reach it" -- `doctor` exists to answer quickly.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -1085,6 +1086,42 @@ def install(*, namespace: str, context: str, values: dict,
                                 + why(res))
 
 
+def upgrade_image(*, namespace: str, context: str, chart_version: str,
+                  image_repo: str, tag: str, oplog: bool) -> None:
+    """Move a release to a new Rocket.Chat image, the way the official guide does.
+
+    The guide says: change `image.tag` in your values and run `helm upgrade`. This is
+    that, with two differences it explicitly warns about or implies.
+
+    First, the chart version IS pinned. The guide's own note says its command "does
+    not pin a chart version, so it installs the latest Rocket.Chat Helm chart" --
+    which for a tool whose entire purpose is reproducing a customer's exact version
+    would quietly deploy different software than the one asked for.
+
+    Second, `--reuse-values` rather than a re-rendered values file: everything else
+    about the workspace -- the admin env, microservices, replica count, whether
+    MongoDB comes from a Secret or a URL, a preset's settings -- was decided at
+    create time, and rebuilding that set from scratch risks silently dropping a
+    piece of it. The one value that must NOT be carried over is the oplog URL:
+    Rocket.Chat 8 dropped oplog tailing and chart 7.0.0 removed the key, so it is
+    explicitly cleared when the target no longer wants it.
+    """
+    argv = ["helm", "upgrade", RELEASE, CHART, "--kube-context", context,
+            "-n", namespace, "--version", chart_version, "--reuse-values",
+            "--set", f"image.repository={image_repo}",
+            "--set", f"image.tag={tag}"]
+    if not oplog:
+        argv += ["--set", "externalMongodbOplogUrl=null"]
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True,
+                             timeout=INSTALL_TIMEOUT, check=False,
+                             env=owned_env() if is_ours(context) else None)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DockerError(f"helm upgrade failed: {exc}") from exc
+    if res.returncode != 0:
+        raise DockerError("helm upgrade failed: " + why(res))
+
+
 def delete_namespace(name: str, *, context: str, volumes: bool = False,
                      emit: Emit = null_emit, sleep=time.sleep) -> bool:
     """Remove a workspace. Returns False if there was nothing there.
@@ -1617,13 +1654,50 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
             "mongo_managed_by": managed_by, "mongo_image": image}
 
 
+#: The workloads whose readiness `ready` is entitled to speak for: the ones the
+#: official chart gives a real readinessProbe. `account`, `authorization` and
+#: `presence` are deliberately NOT here -- the chart ships them with no probe at all,
+#: so their pod-Ready is set the moment the container starts and attests nothing.
+#: Waiting on it would add delay and buy no confidence.
+READY_SELECTOR = ("app.kubernetes.io/name in "
+                  "(rocketchat,rocketchat-ddp-streamer)")
+
+
 def workspace_ready(name: str, *, context: str) -> bool:
-    """Whether the Rocket.Chat pod reports itself Ready."""
+    """Whether every probed Rocket.Chat workload reports itself Ready.
+
+    This used to read `items[0].status.containerStatuses[0].ready`, which over-claimed
+    twice, and an audit caught both:
+
+      * `items[0]` is ONE pod. With `--replicas 3` the workspace was called ready on
+        the strength of the first pod alone.
+      * Only the monolith container was consulted. On microservices, `ddp-streamer`
+        carries the WebSocket -- the realtime half of Rocket.Chat -- and it was
+        observed Running-but-not-Ready on a workspace `ready` had already reported as
+        serving. A caller told "ready" could open the URL and find messages not
+        arriving, which is the one failure this tool exists to reproduce, not cause.
+
+    A Pending pod has no containerStatuses at all, so counting pods and comparing is
+    what keeps "no statuses yet" from passing as "nothing failed".
+    """
     res = run(["kubectl", "--context", context, "-n", namespace_for(name),
-               "get", "pod", "-l", "app.kubernetes.io/name=rocketchat", "-o",
-               "jsonpath={.items[0].status.containerStatuses[0].ready}"],
+               "get", "pod", "-l", READY_SELECTOR, "-o", "json"],
               own=is_ours(context))
-    return (res.stdout or "").strip() == "true"
+    if res.returncode != 0:
+        return False
+    try:
+        pods = json.loads(res.stdout or "{}").get("items") or []
+    except ValueError:
+        return False
+    if not pods:
+        return False
+    for pod in pods:
+        statuses = (pod.get("status") or {}).get("containerStatuses") or []
+        if not statuses:                      # Pending/ContainerCreating
+            return False
+        if not all(c.get("ready") for c in statuses):
+            return False
+    return True
 
 
 def forward_alive(pid: int | None) -> bool:
@@ -1655,6 +1729,54 @@ def ensure_port_forward(name: str, *, namespace: str, context: str, host_port: i
         return int(pid)
     return port_forward(name, namespace=namespace, context=context,
                         host_port=host_port, bind_host=bind_host, emit=emit)
+
+
+#: Rocket.Chat's own pods, by label. `-l` rather than a pod name so this follows a
+#: rollout, and covers every replica instead of whichever one happened to be first.
+LOG_SELECTOR = "app.kubernetes.io/name=rocketchat"
+
+#: Named explicitly so a sidecar's output is never interleaved into Rocket.Chat's.
+LOG_CONTAINER = "rocketchat"
+
+
+def _pod_count(name: str, *, context: str, selector: str = LOG_SELECTOR) -> int:
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "pods", "-l", selector, "-o", "name"],
+              own=is_ours(context))
+    if res.returncode != 0:
+        return 1
+    return len([ln for ln in (res.stdout or "").splitlines() if ln.strip()])
+
+
+def log_process(name: str, *, context: str, tail: int = 200, follow: bool = True,
+                selector: str = LOG_SELECTOR) -> subprocess.Popen:
+    """Stream Rocket.Chat's logs out of the cluster, shaped like the Compose one.
+
+    A named function for the same reason `open_log_process` is one: it is the single
+    kubectl call the log path makes, so a test can stand here without a cluster.
+
+    `--prefix` matters more here than on Compose: with microservices or several
+    replicas the lines come from different pods and are otherwise indistinguishable,
+    which is exactly when someone is reading them. `--max-log-requests` is raised
+    because kubectl refuses to follow more than five pods by default and a
+    microservices workspace has more than five.
+    """
+    argv = ["kubectl", "--context", context, "-n", namespace_for(name), "logs",
+            "-l", selector, "--tail", str(int(tail)),
+            "--max-log-requests", "20", "-c", LOG_CONTAINER]
+    # `--prefix` ONLY when there is more than one pod to tell apart. It was
+    # unconditional and that was wrong: Rocket.Chat pretty-prints its own log lines
+    # in columns, and stamping "[pod/rocketchat-rocketchat-<hash>/rocketchat] " onto
+    # the front of every one of them destroys exactly the formatting somebody opened
+    # the logs to read. With a single pod the prefix names the only thing it could
+    # be, so it is pure noise; with several it is the only way to tell them apart.
+    if _pod_count(name, context=context, selector=selector) > 1:
+        argv.append("--prefix")
+    if follow:
+        argv.append("-f")
+    return subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            env=owned_env() if is_ours(context) else None)
 
 
 def workload_exists(name: str, *, context: str) -> bool:
@@ -1977,6 +2099,41 @@ stringData:
   mongo-uri: {mongo_url}
   mongo-oplog-uri: {oplog_url}
 """
+
+
+def mongo_tool_auth(name: str, *, context: str) -> list[str]:
+    """`mongodump`/`mongorestore` flags for an operator-managed MongoDB.
+
+    The operator enables SCRAM, so an unauthenticated `mongodump` fails with
+    "Command listCollections requires authentication" -- which is exactly what it did:
+    backup was broken on the operator path, the path the official guide recommends,
+    while working perfectly on the hand-written StatefulSet that has no auth. The
+    audit found it because it ran both.
+
+    The password is read back out of the Secret rather than kept anywhere: it is
+    generated at create time and deliberately never written to disk, which is a
+    property worth keeping (`repros/<n>/kubernetes/` is checked for exactly this).
+
+    Empty list when there is no operator, so the StatefulSet path is unchanged.
+    """
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "secret", "mongodb-rocketchat-password",
+               "-o", "jsonpath={.data.password}"], own=is_ours(context))
+    encoded = (res.stdout or "").strip()
+    if res.returncode != 0 or not encoded:
+        return []
+    try:
+        password = base64.b64decode(encoded).decode("utf-8").strip()
+    except (ValueError, UnicodeDecodeError):
+        return []
+    if not password:
+        return []
+    # authenticationDatabase is MONGO_APP_DB, not `admin`: the app user is DEFINED
+    # in the application database, and authenticating against admin looks for a user
+    # that was never created there. The same mistake, on authSource, is recorded in
+    # operator_mongo_url's docstring.
+    return ["--username", MONGO_APP_USER, "--password", password,
+            "--authenticationDatabase", MONGO_APP_DB]
 
 
 def operator_mongo_url(namespace: str, password: str, *, oplog: bool = False) -> str:
@@ -2375,6 +2532,25 @@ def stop_workspace(name: str, *, context: str, emit: Emit = null_emit,
              "--overwrite", "namespace", namespace,
              f"{SCALE_ANNOTATION}={json.dumps(before)}"], own=is_ours(context))
     moved = scale_workspace(name, replicas=0, context=context, emit=emit)
+    # An operator-managed MongoDB CANNOT be scaled to zero: the operator reconciles
+    # its StatefulSet straight back, and the Community operator has no way to pause
+    # reconciliation. So its pods are expected to survive `stop`, and two things
+    # follow that an audit caught this doing wrong.
+    #
+    # First, the wait below must not require them to go, or every stop and restart on
+    # the operator path burns POD_GONE_TRIES * POD_GONE_INTERVAL seconds waiting for
+    # something that will never happen, then continues anyway.
+    #
+    # Second and worse, `stop` documents itself as giving the memory back. On this
+    # path it gives back Rocket.Chat's and not MongoDB's, and said nothing -- so the
+    # user who ran `stop` to free the box was told it had worked. Say it instead.
+    survivors = mongo_pods_the_operator_keeps(name, context=context)
+    if survivors:
+        warn(emit, f"MongoDB stays up: it is operator-managed, and the operator "
+                   f"recreates it as fast as it is scaled down (there is no way to "
+                   f"pause its reconciliation). Rocket.Chat's memory is freed, "
+                   f"MongoDB's is not — `rc-repro down --name {name} --volumes` is "
+                   f"what reclaims it.", phase="done")
     # WAIT for the pods to actually go, rather than returning on the API call.
     # `restart` is stop-then-start, so returning early scales back up while the old
     # pods are still Terminating -- and the readiness check then finds one of THOSE,
@@ -2385,11 +2561,28 @@ def stop_workspace(name: str, *, context: str, emit: Emit = null_emit,
     for _ in range(POD_GONE_TRIES):
         res = run(["kubectl", "--context", context, "-n", namespace, "get", "pods",
                    "-o", "name"], own=is_ours(context))
-        if not (res.stdout or "").strip():
+        left = [p for p in (res.stdout or "").split() if p.strip()]
+        if not [p for p in left if p not in survivors]:
             break
         sleep(POD_GONE_INTERVAL)
     info(emit, f"scaled {moved} workload(s) to zero", phase="done")
     return moved
+
+
+def mongo_pods_the_operator_keeps(name: str, *, context: str) -> set[str]:
+    """Pod names (as `pod/<n>`) that an operator-managed MongoDB will not give up.
+
+    Empty for the hand-written StatefulSet, which scales to zero like anything else.
+    """
+    namespace = namespace_for(name)
+    res = run(["kubectl", "--context", context, "-n", namespace,
+               "get", "mongodbcommunity", "-o", "name"], own=is_ours(context))
+    if res.returncode != 0 or not (res.stdout or "").strip():
+        return set()
+    pods = run(["kubectl", "--context", context, "-n", namespace, "get", "pods",
+                "-l", f"app={MONGO_SERVICE}-svc", "-o", "name"],
+               own=is_ours(context))
+    return {p for p in (pods.stdout or "").split() if p.strip()}
 
 
 def start_workspace(name: str, *, context: str, emit: Emit = null_emit) -> int:

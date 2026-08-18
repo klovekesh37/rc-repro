@@ -271,6 +271,45 @@ def test_s3_minio_preset_shape():
     assert p.depends_on == ["minio"]
 
 
+def test_s3_minio_creates_its_bucket_on_both_runtimes():
+    """MinIO running is not the same as the bucket existing.
+
+    The test above asserts `minio-init` is in `services`, which is the COMPOSE half.
+    The Kubernetes adapter rendered only the MinIO Deployment and its Services, so on
+    that runtime the bucket was never created -- while the workspace's own notes said
+    "bucket '<name>' is created automatically; watch uploads land in it". Neither MinIO
+    nor Rocket.Chat creates a bucket on demand, so every upload had nowhere to go, and
+    `up` reported success. Found by an audit that looked in the namespace and saw a
+    minio Deployment with no init workload beside it.
+    """
+    import yaml
+
+    from rc_repro.services import topology
+
+    # Compose: the one-shot service, running the idempotent mc mb.
+    d = presets.resolve("s3_minio", topology.DOCKER, {"bucket": "tickets"})
+    init = d.services["minio-init"]
+    assert "mc mb -p local/tickets" in " ".join(init["entrypoint"])
+
+    # Kubernetes: the same thing, as a Job.
+    k = presets.resolve("s3_minio", topology.KUBERNETES, {"bucket": "tickets"})
+    docs = [doc for m in k.kubernetes_manifests for doc in yaml.safe_load_all(m) if doc]
+    jobs = [doc for doc in docs if doc.get("kind") == "Job"]
+    assert jobs, ("nothing creates the bucket on Kubernetes: "
+                  f"rendered {[doc['kind'] for doc in docs]}")
+    spec = jobs[0]["spec"]["template"]["spec"]
+    cmd = " ".join(spec["containers"][0]["command"])
+    assert "mc mb -p local/tickets" in cmd, cmd
+    assert "until mc alias set" in cmd, \
+        "it must wait for MinIO; the Job is applied alongside the Deployment"
+    # A Job, not an init container: an init container runs before its pod's main
+    # container, so it would wait for a MinIO that cannot start until it finishes.
+    assert spec["restartPolicy"] == "OnFailure"
+    assert jobs[0]["spec"]["backoffLimit"] >= 1, "the first attempt races MinIO starting"
+    assert (jobs[0]["metadata"]["labels"]["app.kubernetes.io/managed-by"]
+            == "rc-repro"), "teardown and ownership select on this"
+
+
 def test_s3_minio_presigned_mode_and_bucket():
     p = presets.load("s3_minio", {"presigned": "true", "bucket": "tickets"})
     assert p.env["OVERWRITE_SETTING_FileUpload_S3_Proxy_Uploads"] == "false"
@@ -659,6 +698,29 @@ def test_preset_ports_match_registry():
         p = presets.load(name)
         assert p.ports == list(expected), f"{name} declares {p.ports}, registry says {expected}"
     assert presets.load("default").ports == []
+
+
+def test_preset_ports_match_registry_on_every_runtime():
+    """The registry ports are per PRESET, not per runtime, so both adapters declare them.
+
+    The test above resolves through `presets.load`, which is the DOCKER adapter -- so a
+    Kubernetes adapter that forgot `ports=` was invisible to the very invariant written
+    to catch a missing port. The ldap adapter had, and an audit found it: phpLDAPadmin
+    is published on the same fixed 8082 there (a port-forward rather than a compose
+    mapping), but with an empty list `check_sidecar_ports` returns immediately and
+    `sidecar_ports` is never recorded. A second Kubernetes workspace on that preset
+    therefore got no refusal and its forward silently failed to bind, where Compose
+    refuses up front and names the workspace already holding the port.
+    """
+    from rc_repro.services import topology
+
+    for name, expected in config.PRESET_PORTS.items():
+        for runtime in (topology.DOCKER, topology.KUBERNETES):
+            p = presets.resolve(name, runtime, {})
+            assert p.ports == list(expected), (
+                f"{name} on {runtime} declares {p.ports}, registry says "
+                f"{list(expected)} — port allocation and the collision pre-flight "
+                f"both read this list, and skip entirely when it is empty")
 
 
 def test_used_ports_includes_sidecars_and_monitoring(tmp_path, monkeypatch):

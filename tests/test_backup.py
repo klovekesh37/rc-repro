@@ -429,6 +429,57 @@ def test_restore_new_creates_the_repro_from_the_manifest(restorable, monkeypatch
     assert created["version"] == "8.5.1" and created["preset"] == "default"
 
 
+def test_restore_new_rebuilds_the_preset_the_bundle_came_from(fake_docker, monkeypatch):
+    """`restore --new` has to reproduce the workspace, and a preset IS the workspace.
+
+    The three-axis branch of _create_from_manifest hardcoded preset="default" while
+    reading runtime and deployment from the manifest. Every modern bundle records
+    `deployment`, so that branch is the one always taken -- and `restore --new` on an
+    ldap or s3_minio bundle produced a VANILLA workspace holding that preset's data:
+    LDAP users with no directory to bind against, S3 file records with no bucket.
+
+    Two things made it hard to notice. The progress line already printed
+    "(preset ldap)" before discarding it, and `compatibility()` then warned that the
+    dump came from a different preset -- which reads as a mismatch to be aware of
+    rather than something rc-repro had just done itself.
+
+    The test above this one passes either way: its bundle's preset IS "default".
+    """
+    # _create_from_manifest is exercised directly: it is the whole defect, and
+    # driving it through bk.restore on a Kubernetes bundle would drag in real
+    # kubectl execs and a 300s readiness poll for nothing.
+    seen = {}
+
+    def fake_create(req, emit=None, **kw):
+        seen.update(preset=req.preset, runtime=req.runtime,
+                    deployment=req.deployment, version=req.version,
+                    params=req.params)
+        return {}
+
+    monkeypatch.setattr(bk.lifecycle, "create_repro", fake_create)
+
+    # Exactly the shape `backup` writes today -- every modern bundle records
+    # `deployment`, which is what selects the branch that dropped the preset.
+    manifest = {"rc_version": "8.5.1", "mongo_tag": "8.0", "preset": "ldap",
+                "runtime": "kubernetes", "deployment": "microservices",
+                "params": {"users": "5"}, "env_overrides": {}}
+    bk._create_from_manifest("rebuilt", manifest, bk.null_emit)
+
+    assert seen["preset"] == "ldap", (
+        "restore --new threw the preset away: the workspace comes back without the "
+        "sidecars and settings its restored data depends on")
+    assert seen["runtime"] == "kubernetes", "and it must land on the same runtime"
+    assert seen["deployment"] == "microservices"
+    assert seen["params"] == {"users": "5"}, "the preset's parameters travel too"
+
+    # A pre-three-axis bundle has no `deployment`; that branch always read the
+    # preset and must keep doing so.
+    seen.clear()
+    bk._create_from_manifest("legacy", {"rc_version": "8.5.1", "preset": "email"},
+                             bk.null_emit)
+    assert seen["preset"] == "email" and not seen["runtime"]
+
+
 def test_restore_new_refuses_to_clobber_an_existing_repro(restorable):
     write_repro("taken")
     with pytest.raises(errors.ConflictError, match="already exists"):
@@ -1027,6 +1078,350 @@ def test_quiescing_a_kubernetes_workspace_leaves_mongodb_running():
     quiesce = inspect.getsource(bk._Quiesced)
     assert "k8s.scale_rocketchat(" in quiesce, quiesce
     assert "k8s.stop_workspace(" not in quiesce, "MongoDB must keep running for a dump"
+
+
+def test_a_bundle_from_an_earlier_workspace_of_the_same_name_is_marked(
+        monkeypatch, tmp_path, fake_docker):
+    """Bundles outlive their workspace, and are matched to one by NAME.
+
+    `down --volumes` deliberately does not delete backups -- surviving the thing
+    they backed up is the point. But rc-repro DERIVES names from the version, so
+    `up -v 8.5.1` produces `<user>-rc8-5-1` every time, and a freshly created
+    workspace immediately shows the destroyed one's bundles as its own.
+
+    That was reported as "a backup file is generated automatically when I create a
+    Kubernetes workspace". Nothing creates one -- verified live, `backups/` is empty
+    after `up` -- but the listing said otherwise, and restoring one of those would
+    silently load a previous workspace's data.
+
+    Still listed, because hiding a real backup is worse. Marked, so it cannot be
+    mistaken for this workspace's own.
+    """
+    import datetime as _dt
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    # Both the bundle FILENAME and its manifest carry a timestamp. Stepping a fake
+    # clock is what lets two bundles straddle the workspace's creation without the
+    # test depending on the real one.
+    stamps = iter(["20260815-080000", "20260818-091500"])
+    monkeypatch.setattr(bk, "_utc_stamp", lambda: next(stamps))
+    made = iter([_dt.datetime(2026, 8, 15, 8, 0, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2026, 8, 18, 9, 15, tzinfo=_dt.timezone.utc)])
+
+    class _Clock:
+        @staticmethod
+        def now(tz=None):
+            return next(made)
+    monkeypatch.setattr(bk, "datetime", _Clock)
+
+    # A bundle made by an earlier workspace of this name...
+    write_repro("rc8-5-1", meta=make_meta(name="rc8-5-1",
+                                          created_at="2026-08-15T07:00:00+00:00"))
+    old_bundle = bk.create("rc8-5-1")["path"]
+
+    # ...then that workspace is destroyed and a NEW one takes the same name.
+    write_repro("rc8-5-1", meta=make_meta(name="rc8-5-1",
+                                          created_at="2026-08-16T00:00:00+00:00"))
+    rows = bk.list_backups("rc8-5-1")
+    assert rows, "the bundle must still be listed"
+    assert Path(old_bundle).name in [Path(r["path"]).name for r in rows]
+    assert rows[0]["predates_workspace"] is True, (
+        "a bundle older than the workspace bearing its name came from a previous "
+        "one, and restoring it would load that workspace's data")
+
+    # A bundle taken by the workspace that is running now is NOT marked.
+    fresh = bk.create("rc8-5-1")["path"]
+    rows = bk.list_backups("rc8-5-1")
+    mine = next(r for r in rows if Path(r["path"]).name == Path(fresh).name)
+    assert mine["predates_workspace"] is False
+
+    # And with no workspace to compare against, nothing is claimed either way.
+    import shutil as _sh
+    _sh.rmtree(bk.runner.workspace("rc8-5-1"))
+    assert all(r["predates_workspace"] is False for r in bk.list_backups("rc8-5-1"))
+
+
+def test_a_failed_kubernetes_upgrade_leaves_the_record_where_the_cluster_is(
+        monkeypatch, tmp_path):
+    """The record must never claim a version the cluster is not running.
+
+    It did. `rc_version` was advanced before `helm upgrade` was called, so when the
+    call failed the workspace kept serving the OLD release while `list`, `info` and
+    the GUI card all reported the new one. Reported from real use: the helm release
+    was still at revision 1 -- nothing had been applied at all -- and the only thing
+    wrong with the workspace was the note rc-repro had written about it.
+
+    A record that has to be corrected by hand is worse than an upgrade that simply
+    did not happen, so the cluster changes first and the record follows.
+    """
+    import json as _json
+    from dataclasses import asdict
+
+    from rc_repro.services import k8s, topology
+    from rc_repro.services import upgrade as up
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = bk.runner.Metadata(name="k", project="p", rc_version="8.5.1",
+                           rc_image="registry.rocket.chat/rocketchat/rocket.chat",
+                           mongo_tag="8.0", mongo_flavor="official", preset="default",
+                           root_url="http://localhost:3000", host_port=3000,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+    ws = bk.runner.workspace("k")
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
+
+    monkeypatch.setattr(k8s, "workload_exists", lambda name, *, context: True)
+    monkeypatch.setattr(up, "plan", lambda name, to, offline=False: {
+        "allowed": True, "mongo_blocked": "", "warnings": [],
+        "from_version": "8.5.1", "to_version": "8.6.1",
+        "rc_image": "registry.rocket.chat/rocketchat/rocket.chat", "oplog": False})
+    monkeypatch.setattr(up.backupsvc, "_create_locked",
+                        lambda *a, **kw: {"path": str(tmp_path / "b.rcbak")})
+    monkeypatch.setattr(k8s, "resolve_chart_version", lambda v, emit=None: "7.0.2")
+
+    # The exact failure that was hit: helm is never reached.
+    def boom(**kw):
+        raise AttributeError("module 'rc_repro.services.k8s' has no attribute "
+                             "'upgrade_image'")
+    monkeypatch.setattr(k8s, "upgrade_image", boom)
+    # Rolling back cannot help when the apply never happened; it must not mask the
+    # state either.
+    monkeypatch.setattr(up, "_rollback_kubernetes", lambda *a, **kw: None)
+
+    with pytest.raises(errors.DockerError):
+        up.run("k", "8.6.1")
+
+    assert bk.runner.read_meta("k").rc_version == "8.5.1", (
+        "the cluster was never touched, so the record must still say 8.5.1 -- "
+        "otherwise every listing reports a version that is not running")
+
+
+def test_upgrade_runs_on_kubernetes_with_the_chart_pinned(monkeypatch, tmp_path):
+    """`upgrade` refused this runtime entirely; the official guide makes it one command.
+
+    Two things the guide's own command does NOT do, and both matter here:
+
+      * It does not pin a chart version -- the docs warn it "installs the latest
+        Rocket.Chat Helm chart". For a tool whose whole purpose is reproducing a
+        customer's exact version, that quietly deploys different software than the
+        one asked for. The chart is resolved for the TARGET release instead, by the
+        same floor rule `up` uses.
+      * It carries every existing value forward, including `externalMongodbOplogUrl`.
+        Rocket.Chat 8 dropped oplog tailing and chart 7.0.0 removed the key, so an
+        upgrade across that line has to clear it rather than inherit it.
+
+    And nothing may reach for a compose document: a Kubernetes workspace has none,
+    which is what the old refusal was protecting against.
+    """
+    import json as _json
+    from dataclasses import asdict
+
+    from rc_repro.services import k8s, topology
+    from rc_repro.services import upgrade as up
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = bk.runner.Metadata(name="k", project="p", rc_version="7.9.3", rc_image="i",
+                           mongo_tag="7.0", mongo_flavor="official", preset="default",
+                           root_url="http://localhost:3000", host_port=3000,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+    m.extra["namespace"] = "rc-repro-k"
+    ws = bk.runner.workspace("k")
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
+    assert not (ws / "docker-compose.yml").exists()
+
+    # A running Kubernetes workspace is one whose workload exists -- not one Docker
+    # happens to know about.
+    monkeypatch.setattr(k8s, "workload_exists", lambda name, *, context: True)
+    assert up.require_running("k").name == "k", \
+        "it used to refuse this runtime outright"
+
+    monkeypatch.setattr(up, "plan", lambda name, to, offline=False: {
+        "allowed": True, "mongo_blocked": "", "warnings": [],
+        "from_version": "7.9.3", "to_version": "8.5.1",
+        "rc_image": "registry.rocket.chat/rocketchat/rocket.chat",
+        "oplog": False})
+    monkeypatch.setattr(up.backupsvc, "_create_locked",
+                        lambda *a, **kw: {"path": str(tmp_path / "b.rcbak")})
+    monkeypatch.setattr(up.lifecycle, "wait_and_finalize", lambda *a, **kw: {})
+    monkeypatch.setattr(up.rcapi, "api_info", lambda url: {"version": "8.5.1"})
+    monkeypatch.setattr(up, "_migration_errors", lambda *a, **kw: [])
+    monkeypatch.setattr(k8s, "resolve_chart_version", lambda v, emit=None: "7.0.0")
+    monkeypatch.setattr(bk.runner, "read_compose",
+                        lambda *a, **kw: pytest.fail("it read a compose document"))
+    monkeypatch.setattr(bk.runner, "up",
+                        lambda *a, **kw: pytest.fail("it ran `docker compose up`"))
+
+    seen = {}
+    monkeypatch.setattr(k8s, "upgrade_image",
+                        lambda **kw: seen.update(kw))
+
+    out = up.run("k", "8.5.1")
+    assert out["to_version"] == "8.5.1"
+    assert seen["chart_version"] == "7.0.0", "the chart moves WITH the app, pinned"
+    assert seen["tag"] == "8.5.1" and seen["namespace"] == "rc-repro-k"
+    assert seen["oplog"] is False, \
+        "Rocket.Chat 8 dropped oplog and chart 7.0.0 removed the key"
+    # The record moved on even though there is no compose file to rewrite.
+    assert bk.runner.read_meta("k").rc_version == "8.5.1"
+
+
+def test_the_database_tools_authenticate_when_the_operator_manages_mongodb(
+        monkeypatch, tmp_path):
+    """The operator enables SCRAM, so an unauthenticated mongodump cannot read.
+
+    Backup was BROKEN on the operator path -- the one the official Rocket.Chat guide
+    recommends -- and worked on the hand-written StatefulSet, which has no auth. Both
+    paths existed; only one was ever exercised, so `mongodump` failed with
+    "(Unauthorized) Command listCollections requires authentication" and the bundle
+    was never written. Found by running both.
+
+    The password is read back out of the Secret on demand, never stored: it is
+    generated at create time and deliberately kept off disk, which another test
+    pins by scanning `repros/<n>/kubernetes/`.
+    """
+    from rc_repro.services import backup as bk
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    def workspace(name, managed_by):
+        m = bk.runner.Metadata(name=name, project=f"p-{name}", rc_version="8.5.1",
+                               rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                               preset="default", root_url="u", host_port=3000,
+                               version_source="t")
+        topology.stamp(m.extra, topology.KUBERNETES)
+        m.extra["context"] = k8s.CONTEXT
+        if managed_by:
+            m.extra["mongo_managed_by"] = managed_by
+        bk.runner.write(name, "", m)
+
+    import base64 as _b64
+    secret = _b64.b64encode(b"s3cr3t-generated").decode()
+
+    def fake_run(argv, timeout=None, own=False):
+        import subprocess as sp
+        if "secret" in argv:
+            return sp.CompletedProcess(argv, 0, secret, "")
+        return sp.CompletedProcess(argv, 1, "", "")
+    monkeypatch.setattr(k8s, "run", fake_run)
+
+    # --- operator: credentials are supplied -------------------------------
+    workspace("op", "operator")
+    args = bk._mongo_auth("op")
+    assert args == ["--username", k8s.MONGO_APP_USER, "--password", "s3cr3t-generated",
+                    "--authenticationDatabase", k8s.MONGO_APP_DB], args
+    # authenticationDatabase is the APPLICATION db, not `admin`: the user is defined
+    # there, and authenticating against admin looks for a user never created in it.
+    assert "admin" not in args[-1], "the app user lives in the application database"
+
+    # --- plain StatefulSet: unchanged, because it has no auth at all -------
+    workspace("plain", None)
+    assert bk._mongo_auth("plain") == [], \
+        "the StatefulSet path runs without authentication; adding flags would break it"
+
+    # --- compose: never reaches Kubernetes at all --------------------------
+    c = bk.runner.Metadata(name="c", project="p-c", rc_version="8.5.1", rc_image="i",
+                           mongo_tag="8.0", mongo_flavor="official", preset="default",
+                           root_url="u", host_port=3001, version_source="t")
+    bk.runner.write("c", "", c)
+    assert bk._mongo_auth("c") == []
+
+    # --- and the flags actually reach mongodump AND mongorestore ----------
+    import inspect
+    src = inspect.getsource(bk)
+    for tool in ("mongodump", "mongorestore"):
+        idx = src.index(f'"{tool}"')
+        window = src[idx:idx + 320]
+        assert "_mongo_auth(" in window, \
+            f"{tool} is still invoked without credentials"
+
+
+def test_backup_leaves_a_kubernetes_workspace_reachable_on_its_own_port(
+        monkeypatch, tmp_path):
+    """Scaling Rocket.Chat to 0 kills the port-forward along with the pod.
+
+    Found by an operational audit, not by the suite. `backup` reported success and
+    left the workspace RUNNING but unreachable at its own URL: the new pod was
+    healthy and answered in-cluster, while the published port timed out. Nothing in
+    the failure pointed at the backup, which was the one part that had worked --
+    `rc-repro start` then "fixed" it, because start ends in `ready`.
+
+    `restore` never had this bug because it finishes with wait_and_finalize. This
+    asserts the CALL happens on the Kubernetes path, and that Compose -- where
+    start_services rebinds the published port itself -- does not pay for it.
+    """
+    from rc_repro.services import backup as bk
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    def workspace(name, runtime):
+        m = bk.runner.Metadata(name=name, project=f"p-{name}", rc_version="8.5.1",
+                               rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                               preset="default", root_url="u", host_port=3000,
+                               version_source="t")
+        topology.stamp(m.extra, runtime)
+        if runtime == topology.KUBERNETES:
+            m.extra["context"] = k8s.CONTEXT
+        bk.runner.write(name, "", m)
+        return m
+
+    waited: list[str] = []
+    monkeypatch.setattr(bk.lifecycle, "wait_serving",
+                        lambda meta, *a, **kw: waited.append(meta.name) or {})
+    monkeypatch.setattr(bk.lifecycle, "wait_and_finalize",
+                        lambda *a, **kw: pytest.fail(
+                            "a backup must not re-run finalize/post_ready and "
+                            "re-apply the workspace's configuration"))
+
+    # --- Kubernetes: the doomed forward is killed, a fresh one established ---
+    m = workspace("k", topology.KUBERNETES)
+    m.extra["port_forward_pid"] = 4242
+    bk.runner.write("k", "", m)
+    scaled: list[int] = []
+    killed: list[int] = []
+    monkeypatch.setattr(k8s, "scale_rocketchat",
+                        lambda n, *, replicas, context: scaled.append(replicas) or 0)
+    monkeypatch.setattr(bk.lifecycle, "_stop_port_forward", killed.append)
+    with bk._Quiesced("k", [], bk.null_emit):
+        pass
+    assert scaled == [0, 1], f"it must quiesce and restart Rocket.Chat, got {scaled}"
+    assert killed == [4242], (
+        "the forward whose pod was just deleted must be killed, not trusted to die: "
+        "ensure_port_forward only asks whether the PROCESS is alive, so a doomed "
+        "forward gets reused and can even serve one request before it exits")
+    assert bk.runner.read_meta("k").extra.get("port_forward_pid") is None, \
+        "a dead forward's pid must not stay in the record for the next caller to reuse"
+    assert waited == ["k"], (
+        "after scaling back up nothing was forwarding to the NEW pod, so the "
+        "workspace was left unreachable on its published port")
+
+    # --- Compose: STARTED is not SERVING there either ---------------------
+    # The container returns at once and Rocket.Chat needs ~30s more, so the next
+    # request got a connection reset. Compose healed itself, which is why only the
+    # Kubernetes half of this was noticed first.
+    waited.clear()
+    workspace("c", topology.DOCKER)
+    monkeypatch.setattr(bk.runner, "stop_services", lambda *a, **kw: 0)
+    monkeypatch.setattr(bk.runner, "start_services", lambda *a, **kw: 0)
+    monkeypatch.setattr(k8s, "scale_rocketchat",
+                        lambda *a, **kw: pytest.fail("it scaled a compose workspace"))
+    with bk._Quiesced("c", ["rocketchat"], bk.null_emit):
+        pass
+    assert waited == ["c"], "backup must not return before Rocket.Chat serves again"
+
+    # --- --live skips the whole dance ------------------------------------
+    waited.clear()
+    monkeypatch.setattr(k8s, "scale_rocketchat",
+                        lambda *a, **kw: pytest.fail("--live must not scale anything"))
+    with bk._Quiesced("k", [], bk.null_emit, skip=True):
+        pass
+    assert waited == [], "--live never stopped it, so there is nothing to wait for"
 
 
 def test_restoring_into_a_kubernetes_workspace_does_not_require_docker(

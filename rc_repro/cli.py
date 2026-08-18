@@ -551,13 +551,17 @@ def monitor(
 @app.command()
 def prune(
     yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt (for scripts/CI)"),
+    orphans: bool = typer.Option(False, "--orphans",
+                                 help="also delete Kubernetes namespaces rc-repro owns "
+                                      "that no local record explains"),
 ) -> None:
     """Delete every `down` repro — INCLUDING its data volume and record. Skips pinned and running ones."""
     try:
         targets = lcsvc.prunable()
+        stray = lcsvc.orphan_namespaces() if orphans else []
     except errors.ReproError as exc:
         _fail(exc)
-    if not targets:
+    if not targets and not stray:
         typer.echo("Nothing to prune.")
         return
     if not yes:
@@ -566,9 +570,19 @@ def prune(
         for t in targets:
             owner = lcsvc.owner_of(t)
             typer.echo(f"  - {t}" + (f"   (owned by {owner})" if owner and owner != me else ""))
+        if stray:
+            # Named individually and warned about: on a shared cluster one of these
+            # may be a colleague's workspace created from their own RC_REPRO_HOME,
+            # in which case this machine having no record of it means nothing.
+            typer.echo("")
+            typer.echo("These Kubernetes namespaces are labelled rc-repro's but no "
+                       "local record explains them — their PersistentVolumeClaims go too:")
+            for ns in stray:
+                typer.echo(f"  - {ns}")
+            typer.echo("  (on a shared cluster one of these may belong to a colleague)")
         typer.confirm("Continue?", abort=True)
     try:
-        res = lcsvc.prune(confirm=True, emit=_cli_emit)
+        res = lcsvc.prune(confirm=True, orphans=orphans, emit=_cli_emit)
     except errors.ReproError as exc:
         _fail(exc)
     if res["removed"]:
@@ -1413,6 +1427,12 @@ def backups_cmd(
         typer.echo(f"  {Path(r['path']).name}")
         typer.echo(f"      {r['repro']}  RC {r['rc_version']}  "
                    f"{_human_bytes(r['bytes'])}  {r['created_at']}{label}")
+        if r.get("predates_workspace"):
+            # Bundles outlive their workspace and are matched by NAME, and rc-repro
+            # derives names from the version -- so recreating a workspace inherits
+            # the old one's backups with nothing to say they are not its own.
+            ui.warn("      ^ from an EARLIER workspace of this name, not the one "
+                    "running now — restoring it loads that workspace's data")
 
 
 @app.command(name="restore")
@@ -2411,12 +2431,24 @@ def logs(
     """Tail a repro's logs."""
     _require_docker()
     target = _resolve_name(name)
-    try:
-        topology.require_compose(
-            target, "logs",
-            instead=f"Use `kubectl -n rc-repro-{target} logs -l app.kubernetes.io/name=rocketchat -f`.")
-    except errors.ReproError as exc:
-        _fail(exc)
+    # Logs are the first thing anyone reads when reproducing a ticket, so this
+    # dispatches rather than refusing. It used to send Kubernetes users away with a
+    # `kubectl` line -- workable in a terminal, and nothing at all in the browser,
+    # where `serve` exists precisely so a support engineer needs no shell.
+    if topology.of_repro(target) == topology.KUBERNETES:
+        from rc_repro.services import k8s
+        meta = runner.read_meta(target)
+        context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
+        proc = k8s.log_process(target, context=context, tail=tail or 200,
+                               follow=follow)
+        try:
+            for line in proc.stdout or []:
+                typer.echo(line.rstrip("\n"))
+        except KeyboardInterrupt:      # Ctrl-C on a follow is how you leave
+            pass
+        finally:
+            proc.terminate()
+        raise typer.Exit(proc.wait() or 0)
     runner.logs(target, follow=follow, tail=tail or None)
 
 

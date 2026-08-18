@@ -1037,6 +1037,38 @@ def test_the_refusal_says_what_to_stop_and_how(monkeypatch):
     assert "NO SWAP" in msg, "no swap means no buffer at all; say so"
 
 
+def test_the_advertised_force_override_actually_overrides(monkeypatch):
+    """The refusal tells the user to pass --force. It has to then work.
+
+    The test above pins the WORDS "--force" in the message; nothing pinned the
+    behaviour, and check_capacity never read req.force -- so the documented escape
+    hatch did not exist. Following the instruction produced the identical refusal,
+    and because `up --force` also means "overwrite this repro", obeying the advice
+    risked destroying a workspace while still being blocked.
+
+    Found by an audit that hit the refusal, did what it said, and was refused again.
+    The override also has to stay LOUD: this is the guard added after an OOM killer
+    took out a 10 GB host, so bypassing it is reported, not silent.
+    """
+    from rc_repro.services import lifecycle as lc
+    from rc_repro.services.events import Event
+
+    _mem(monkeypatch, available_mb=1000)          # 100 MB usable: nowhere near enough
+    seen: list[Event] = []
+    lc.check_capacity(lc.CreateReq(version="8.5.1", force=True), "",
+                      seen.append)                # must NOT raise
+
+    warnings = [e for e in seen if e.level == "warn"]
+    assert warnings, "an OOM guard must not be bypassed silently"
+    text = " ".join(e.message for e in warnings)
+    assert "--force" in text, "say which flag did this"
+    assert "OOM" in text, "and what the consequence is"
+
+    # Without it, the same host state still refuses -- this widens nothing else.
+    with pytest.raises(errors.PreflightError):
+        lc.check_capacity(lc.CreateReq(version="8.5.1"))
+
+
 def test_plenty_of_memory_is_not_refused(monkeypatch):
     from rc_repro.services import lifecycle as lc
 
@@ -1301,6 +1333,452 @@ def test_normalize_accepts_what_people_type_and_refuses_what_they_mistype():
         topology.normalize("nomad")
     assert caught.value.exit_code == 2, "a typo is a usage error, not a preflight one"
     assert "kubernetes" in str(caught.value), "the refusal lists what IS known"
+
+
+def test_doctor_warns_before_inotify_runs_out(tmp_path):
+    """The symptom of this one points nowhere near its cause.
+
+    With `fs.inotify.max_user_instances` exhausted, Traefik STARTS, stays up, logs
+    "Cannot start the provider *file.Provider ... too many open files", and then
+    serves its own default certificate to every request. That looks exactly like a
+    broken route or a bad certificate and is neither -- it cost three full runs of an
+    audit to find, which is precisely the kind of thing `doctor` exists to say first.
+
+    It is also not hypothetical on a developer box: the limit is per-user, kind's own
+    docs raise it for multi-cluster use, and it resets on reboot -- this host was
+    raised to 1024 during the audit and was back to the 128 default afterwards.
+    """
+    from rc_repro.services import doctor
+
+    def at(limit, clusters):
+        f = tmp_path / f"lim{limit}"
+        f.write_text(str(limit))
+        return doctor.inotify_headroom(clusters, path=str(f))
+
+    # Plenty of room: say so, so the number is visible before it bites.
+    assert at(4096, 1)[0][0] == "ok"
+
+    # The kind default with several clusters is the failure that was actually hit.
+    status, msg = at(128, 5)[0]
+    assert status == "fail"
+    assert "default certificate" in msg,         "name the symptom, or the reader cannot connect this to what they are seeing"
+    assert "sysctl" in msg and "max_user_instances" in msg, "and give the fix"
+
+    # Between need and 2x need is tight rather than broken.
+    assert at(128, 2)[0][0] == "warn"
+
+    # Not Linux: the file is absent, and a limit that does not apply is not a finding.
+    assert doctor.inotify_headroom(1, path=str(tmp_path / "absent")) == []
+    # An unreadable/garbage value is silence too, never a crash in a diagnostic.
+    bad = tmp_path / "garbage"
+    bad.write_text("not-a-number")
+    assert doctor.inotify_headroom(1, path=str(bad)) == []
+
+
+def test_kubernetes_logs_do_not_mangle_rocketchats_own_formatting(monkeypatch):
+    """Rocket.Chat pretty-prints its logs; the reader came for THAT.
+
+    `--prefix` was passed unconditionally, so every line arrived stamped with
+    "[pod/rocketchat-rocketchat-<hash>/rocketchat] " and the columns Rocket.Chat
+    lays out were pushed off the left of the screen -- destroying exactly the
+    formatting somebody opened the logs to read. Reported from real use.
+
+    With one pod the prefix names the only thing it could be, so it is pure noise.
+    With several it is the only way to tell replicas apart, so it comes back.
+    """
+    from rc_repro.services import k8s
+
+    seen = {}
+
+    def fake_popen(argv, **kw):
+        seen["argv"] = argv
+        class _P:
+            stdout = None
+            def terminate(self): pass
+            def wait(self, timeout=None): return 0
+        return _P()
+    monkeypatch.setattr(k8s.subprocess, "Popen", fake_popen)
+
+    def with_pods(n):
+        import subprocess as sp
+        monkeypatch.setattr(k8s, "run", lambda argv, **kw: sp.CompletedProcess(
+            argv, 0, "\n".join(f"pod/rc-{i}" for i in range(n)), ""))
+        k8s.log_process("w", context="c", tail=25, follow=True)
+        return seen["argv"]
+
+    single = with_pods(1)
+    assert "--prefix" not in single, \
+        "one pod: the prefix identifies the only candidate and costs the formatting"
+    assert "-c" in single and "rocketchat" in single, \
+        "name the container, or a sidecar's output interleaves into Rocket.Chat's"
+    assert "--all-containers" not in single
+    assert "-f" in single and "--tail" in single
+
+    many = with_pods(3)
+    assert "--prefix" in many, "several replicas are indistinguishable without it"
+
+    # A failed pod count must not decide the shape either way -- it falls back to
+    # the quiet form rather than guessing there are many.
+    import subprocess as sp
+    monkeypatch.setattr(k8s, "run",
+                        lambda argv, **kw: sp.CompletedProcess(argv, 1, "", "boom"))
+    k8s.log_process("w", context="c", tail=5, follow=False)
+    assert "--prefix" not in seen["argv"] and "-f" not in seen["argv"]
+
+
+def test_orphaned_namespaces_are_found_but_never_swept_by_default(
+        monkeypatch, tmp_path):
+    """A namespace with no local record is unreachable by every other command.
+
+    Every rc-repro command starts from the state directory, so a workspace whose
+    repro.json is gone -- interrupted create, wiped RC_REPRO_HOME, a different home
+    -- keeps its pods and its PersistentVolumeClaim running and simply cannot be
+    seen. One was found holding 8Gi and five CrashLoopBackOff pods, removable only
+    by hand with kubectl.
+
+    It is OPT-IN, and that is the point: on a shared cluster an unrecorded namespace
+    may be a colleague's workspace created from their own home, so "this machine has
+    no record of it" is not evidence that it is rubbish.
+    """
+    import json as _json
+    from dataclasses import asdict
+
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="known", project="p", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="u", host_port=3000,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    ws = lc.runner.workspace("known")
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
+
+    monkeypatch.setattr(k8s, "workspace_namespaces",
+                        lambda ctx=k8s.CONTEXT: ["rc-repro-known", "rc-repro-p3",
+                                                 k8s.OPERATOR_NAMESPACE])
+    found = lc.orphan_namespaces()
+    assert found == ["rc-repro-p3"], found
+    assert k8s.OPERATOR_NAMESPACE not in found, \
+        "the shared operator/monitoring namespace is not a workspace"
+
+    # Default prune leaves them entirely alone.
+    monkeypatch.setattr(lc, "prunable", lambda: [])
+    monkeypatch.setattr(lc.auditsvc, "record", lambda *a, **kw: None)
+    deleted: list[str] = []
+
+    def fake_run(argv, **kw):
+        import subprocess as sp
+        if "delete" in argv and "namespace" in argv:
+            deleted.append(argv[-2] if argv[-1].startswith("--") else argv[-1])
+        return sp.CompletedProcess(argv, 0, "", "")
+    monkeypatch.setattr(k8s, "run", fake_run)
+
+    assert lc.prune(confirm=True)["orphans"] == []
+    assert deleted == [], "a sweep nobody asked for could delete a colleague's work"
+
+    # Asked for explicitly, it removes exactly the unexplained one.
+    out = lc.prune(confirm=True, orphans=True)
+    assert out["orphans"] == ["rc-repro-p3"]
+    assert deleted == ["rc-repro-p3"], deleted
+
+
+def test_prune_asks_kubernetes_whether_a_kubernetes_workspace_is_down(
+        monkeypatch, tmp_path):
+    """"Is it down" was answered by Docker for every workspace, on both runtimes.
+
+    `prunable` listed a repro when no compose PROJECT was running. A Kubernetes
+    workspace never has one, so a healthy workspace serving traffic was reported as
+    down and offered up for deletion -- `prune` announces "deletes N down repro(s)
+    incl. data" with a live one counted among them. It could not then remove it
+    either: the loop ran `docker compose down` against a workspace with no compose
+    file, which always failed.
+
+    Found by an audit that went looking for why an orphaned namespace was still
+    running with no state file anywhere to manage it.
+    """
+    import json as _json
+    from dataclasses import asdict
+
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    def workspace(name, runtime, port):
+        m = lc.runner.Metadata(name=name, project=f"rcrepro-{name}",
+                               rc_version="8.5.1", rc_image="i", mongo_tag="8.0",
+                               mongo_flavor="official", preset="default",
+                               root_url=f"http://localhost:{port}", host_port=port,
+                               version_source="t")
+        if runtime == topology.KUBERNETES:
+            topology.stamp(m.extra, runtime)
+        ws = lc.runner.workspace(name)
+        ws.mkdir(parents=True, exist_ok=True)
+        (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
+
+    workspace("live-k8s", topology.KUBERNETES, 3000)
+    workspace("gone-k8s", topology.KUBERNETES, 3001)
+    workspace("down-docker", topology.DOCKER, 3002)
+
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr(lc.runner, "project_states", lambda: set())
+    monkeypatch.setattr(lc.auditsvc, "actor", lambda: "")
+    monkeypatch.setattr(lc, "may_destroy", lambda n, a: (True, ""))
+    # The live one still has its Rocket.Chat workload; the other does not.
+    monkeypatch.setattr(k8s, "workload_exists",
+                        lambda name, *, context: name == "live-k8s")
+
+    targets = lc.prunable()
+    assert "live-k8s" not in targets, (
+        "a RUNNING Kubernetes workspace was offered for deletion, because the "
+        "question was put to Docker and it has no compose project either way")
+    assert "gone-k8s" in targets, "a Kubernetes workspace with no workload IS down"
+    assert "down-docker" in targets, "and Compose must keep behaving as before"
+
+
+def test_prune_removes_a_kubernetes_workspace_through_kubernetes(
+        monkeypatch, tmp_path):
+    """And having listed one, it has to be able to remove it.
+
+    The loop called `runner.down` -- `docker compose down` -- for every target, so a
+    Kubernetes workspace was warned about and skipped every time, leaving its
+    namespace and PersistentVolumeClaim on the cluster indefinitely.
+    """
+    import json as _json
+    from dataclasses import asdict
+
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="rcrepro-k", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="http://localhost:3000",
+                           host_port=3000, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+    ws = lc.runner.workspace("k")
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
+
+    monkeypatch.setattr(lc, "prunable", lambda: ["k"])
+    monkeypatch.setattr(lc.auditsvc, "record", lambda *a, **kw: None)
+    monkeypatch.setattr(lc.runner, "down",
+                        lambda *a, **kw: pytest.fail(
+                            "it reached for `docker compose down` on Kubernetes"))
+    deleted: list[tuple] = []
+    monkeypatch.setattr(k8s, "delete_namespace",
+                        lambda name, *, context, volumes, emit=None:
+                            deleted.append((name, volumes)) or True)
+
+    out = lc.prune(confirm=True)
+    assert deleted == [("k", True)], "the namespace and its PVC must actually go"
+    assert out["removed"] == ["k"]
+    assert not lc.runner.workspace("k").exists(), "and the local record with it"
+
+
+def test_reading_env_refuses_a_kubernetes_workspace_instead_of_crashing(
+        monkeypatch, tmp_path):
+    """`env` with no --set reads the compose document, and a Kubernetes workspace has
+    none.
+
+    Found by an operational audit, not by the suite: `rc-repro env -n <k8s>` exited 1
+    printing only `.../repros/<n>/docker-compose.yml` -- a path, with no statement of
+    what was wrong or what to do. A bare FileNotFoundError also escapes the
+    ReproError contract, so `serve` answered 500 to a request that is merely
+    unsupported, while `logs` and `stats` on the same workspace answered cleanly.
+
+    The write path (`set_env`) had the guard from the start; the read path did not, so
+    `rc-repro env` and `rc-repro env --set` disagreed about the same workspace.
+    """
+    import json as _json
+
+    from rc_repro.services import envvars, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
+                           mongo_tag="8.0", mongo_flavor="official", preset="default",
+                           root_url="u", host_port=3010, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    # Deliberately NOT runner.write(): that writes a docker-compose.yml, and the
+    # absence of one is the whole condition under test. This is the shape a real
+    # Kubernetes workspace has on disk -- repro.json, and no compose file.
+    ws = lc.runner.workspace("k")
+    ws.mkdir(parents=True, exist_ok=True)
+    from dataclasses import asdict
+    (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
+    assert not (ws / "docker-compose.yml").exists()
+
+    with pytest.raises(errors.ValidationError) as caught:
+        envvars.current("k")
+    text = str(caught.value)
+    assert "Kubernetes" in text, "the refusal names the runtime"
+    assert "kubectl" in text, "and hands over a command that does the job"
+    assert "docker-compose.yml" not in text, "a raw path is not an explanation"
+    assert caught.value.http_status == 400, "unsupported, not a server fault"
+
+
+def test_stop_says_so_when_the_operator_keeps_mongodb_running(monkeypatch):
+    """An operator-managed MongoDB cannot be scaled to zero.
+
+    The operator reconciles its StatefulSet straight back, and the Community operator
+    has no way to pause reconciliation (checked upstream, not assumed). Two faults
+    followed from not knowing that, and an audit of the operator path found both:
+
+      * `stop` documents itself as giving the memory back. It gave back Rocket.Chat's
+        and not MongoDB's, and said nothing -- so someone who ran `stop` to free the
+        box was told it had worked.
+      * The wait-for-pods-gone loop required EVERY pod to disappear, so every stop and
+        every restart on this path burned the full POD_GONE_TRIES budget waiting for a
+        pod that was never going to leave, then carried on regardless.
+
+    The hand-written StatefulSet path is untouched: it scales to zero like anything
+    else, and must not start paying for this.
+    """
+    from rc_repro.services import k8s
+    from rc_repro.services.events import Event
+
+    def cluster(*, operator: bool, pods: list[str]):
+        """Stub kubectl for the handful of calls stop_workspace makes."""
+        def run(argv, timeout=None, own=False):
+            import subprocess as sp
+            joined = " ".join(argv)
+            if "mongodbcommunity" in joined:
+                out = "mongodbcommunity.mongodbcommunity.mongodb.com/mongodb" \
+                    if operator else ""
+                return sp.CompletedProcess(argv, 0 if operator else 1, out, "")
+            if "get pods" in joined or ("pods" in argv and "get" in argv):
+                if "-l" in argv:                       # the mongo-only selector
+                    keep = [p for p in pods if "mongodb" in p]
+                    return sp.CompletedProcess(argv, 0, " ".join(keep), "")
+                return sp.CompletedProcess(argv, 0, " ".join(pods), "")
+            if "jsonpath={.spec.replicas}" in joined:
+                return sp.CompletedProcess(argv, 0, "1", "")
+            return sp.CompletedProcess(argv, 0, "", "")
+        return run
+
+    # --- the operator path: mongo is expected to survive ------------------
+    monkeypatch.setattr(k8s, "run", cluster(operator=True, pods=["pod/mongodb-0"]))
+    monkeypatch.setattr(k8s, "scale_workspace", lambda *a, **kw: 1)
+    assert k8s.mongo_pods_the_operator_keeps("w", context="c") == {"pod/mongodb-0"}
+
+    slept: list[float] = []
+    seen: list[Event] = []
+    k8s.stop_workspace("w", context="c", emit=seen.append, sleep=slept.append)
+    assert not slept, (
+        "it waited for a pod the operator will never remove; on the operator path "
+        "every stop and restart paid the full timeout for nothing")
+    text = " ".join(e.message for e in seen if e.level == "warn")
+    assert "MongoDB stays up" in text, "stop must not claim memory it did not free"
+    assert "--volumes" in text, "and must name what actually reclaims it"
+
+    # --- the StatefulSet path: nothing survives, nothing is claimed --------
+    monkeypatch.setattr(k8s, "run", cluster(operator=False, pods=[]))
+    assert k8s.mongo_pods_the_operator_keeps("w", context="c") == set()
+    seen.clear()
+    k8s.stop_workspace("w", context="c", emit=seen.append, sleep=slept.append)
+    assert not [e for e in seen if e.level == "warn"], \
+        "the hand-written StatefulSet does scale to zero; do not warn about it"
+
+
+def test_ready_speaks_for_every_probed_pod_not_just_the_first(monkeypatch):
+    """`ready` used to read items[0].containerStatuses[0], which over-claimed twice.
+
+    Found by an operational audit of a live microservices workspace:
+
+      * With --replicas N it inspected ONE pod, so the workspace was declared ready
+        on the strength of the first.
+      * It only ever looked at the monolith container. `ddp-streamer` carries the
+        WebSocket -- the realtime half of Rocket.Chat -- and was seen
+        Running-but-not-Ready on a workspace `ready` had already called serving. A
+        caller told "ready" could open the URL and find messages not arriving, which
+        is the failure this tool exists to REPRODUCE, not to cause.
+
+    account/authorization/presence are excluded on purpose: the chart ships them with
+    no readinessProbe, so their pod-Ready flips as soon as the container starts and
+    attests nothing. Waiting on it would cost time and buy no confidence.
+    """
+    import json as _json
+
+    from rc_repro.services import k8s
+
+    def pods(*specs):
+        """specs: (name, [ready flags]) -- no flags means Pending, no statuses."""
+        items = []
+        for pod_name, flags in specs:
+            status = {"phase": "Pending" if flags is None else "Running"}
+            if flags is not None:
+                status["containerStatuses"] = [{"ready": f} for f in flags]
+            items.append({"metadata": {"name": pod_name}, "status": status})
+        return (0, _json.dumps({"items": items}))
+
+    seen: list[list[str]] = []
+
+    def stub(result):
+        """Answer whichever output form the caller asked for.
+
+        Deliberately format-aware, so this test is a real differential: the version
+        being replaced asked for `-o jsonpath={.items[0]...ready}` and the new one
+        asks for `-o json`. A stub that only spoke JSON would fail against the old
+        code for the wrong reason -- output it could not parse -- and would prove
+        nothing about the over-claiming this test is here to pin.
+        """
+        def run(argv, timeout=None, own=False):
+            import subprocess as sp
+            seen.append(argv)
+            rc, payload = result
+            if rc != 0:
+                return sp.CompletedProcess(argv, rc, "", "")
+            joined = " ".join(argv)
+            if "jsonpath" in joined:
+                items = _json.loads(payload).get("items") or []
+                first = ((items[0].get("status", {}).get("containerStatuses") or [{}])[0]
+                         if items else {})
+                got = first.get("ready")
+                return sp.CompletedProcess(
+                    argv, 0, "" if got is None else str(got).lower(), "")
+            return sp.CompletedProcess(argv, 0, payload, "")
+        return run
+
+    # One ready pod -- the monolith case, still true.
+    monkeypatch.setattr(k8s, "run", stub(pods(("rc-0", [True]))))
+    assert k8s.workspace_ready("w", context="c") is True
+
+    # The selector must name both probed workloads and NEITHER unprobed one.
+    argv = seen[-1]
+    sel = argv[argv.index("-l") + 1]
+    assert "rocketchat" in sel and "rocketchat-ddp-streamer" in sel, sel
+    for unprobed in ("account", "authorization", "presence"):
+        assert f"rocketchat-{unprobed}" not in sel, \
+            f"{unprobed} has no readinessProbe, so waiting on it proves nothing"
+
+    # THE items[0] BUG: three replicas, the third not ready.
+    monkeypatch.setattr(k8s, "run", stub(
+        pods(("rc-0", [True]), ("rc-1", [True]), ("rc-2", [False]))))
+    assert k8s.workspace_ready("w", context="c") is False, \
+        "a not-ready replica must not be hidden behind a ready first pod"
+
+    # THE MICROSERVICES BUG: Rocket.Chat ready, ddp-streamer not.
+    monkeypatch.setattr(k8s, "run", stub(
+        pods(("rc-0", [True]), ("rc-ddp-streamer-0", [False]))))
+    assert k8s.workspace_ready("w", context="c") is False, \
+        "realtime is not serving, so the workspace is not ready"
+
+    # A Pending pod has NO containerStatuses; "nothing failed" is not "ready".
+    monkeypatch.setattr(k8s, "run", stub(pods(("rc-0", [True]), ("rc-ddp-0", None))))
+    assert k8s.workspace_ready("w", context="c") is False
+
+    # No pods at all is not ready either -- that is a torn-down workspace.
+    monkeypatch.setattr(k8s, "run", stub(pods()))
+    assert k8s.workspace_ready("w", context="c") is False
+
+    # A sidecar that is not ready counts, even when the app container is.
+    monkeypatch.setattr(k8s, "run", stub(pods(("rc-0", [True, False]))))
+    assert k8s.workspace_ready("w", context="c") is False
+
+    # kubectl failing is not readiness.
+    monkeypatch.setattr(k8s, "run", stub((1, "")))
+    assert k8s.workspace_ready("w", context="c") is False
 
 
 def test_a_compose_only_operation_refuses_a_kubernetes_workspace(monkeypatch, tmp_path):
@@ -3274,7 +3752,7 @@ def test_every_compose_only_command_refuses_with_a_way_forward(monkeypatch, tmp_
     implementation that does not exist yet, and it can ship first. Each refusal
     names the namespace, so it is copy-pasteable rather than a hint.
     """
-    from rc_repro.services import envvars, k8s, topology, upgrade
+    from rc_repro.services import envvars, k8s, topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
@@ -3286,11 +3764,13 @@ def test_every_compose_only_command_refuses_with_a_way_forward(monkeypatch, tmp_
     lc.runner.write("k", "", m)
 
     cases = [
-        # `monitor` and `backup` used to be here -- monitoring through the shared
-        # stack, backup through `kubectl exec mongodump`. The list shrinks as the
-        # gaps close, and each is covered by its own tests instead.
+        # `monitor`, `backup`, `logs` and `upgrade` used to be here -- monitoring
+        # through the shared stack, backup through `kubectl exec mongodump`, logs
+        # through `kubectl logs -l`, and upgrade through a chart-pinned
+        # `helm upgrade`. The list shrinks as the gaps close, and each is covered by
+        # its own tests instead. `env` and `stats` are what is left.
         (lambda: envvars.set_env("k", {"A": "b"}), "helm"),
-        (lambda: upgrade.run("k", "8.6.1"), "image.tag"),
+        (lambda: envvars.current("k"), "kubectl"),
     ]
     for call, expect in cases:
         with pytest.raises(errors.ValidationError) as caught:

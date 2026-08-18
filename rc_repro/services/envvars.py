@@ -117,8 +117,24 @@ def check_names(keys: list[str]) -> None:
 
 def current(name: str) -> dict:
     """The RC service's effective environment, credentials masked, plus which keys
-    are user overrides — so a caller can show what was changed versus inherited."""
+    are user overrides — so a caller can show what was changed versus inherited.
+
+    Guarded for the same reason `set_env` is, and it was missed here: this reads the
+    compose document, so on Kubernetes it raised a bare FileNotFoundError naming
+    `repros/<n>/docker-compose.yml` — a path, with no statement of what was wrong.
+    That escaped the ReproError contract entirely, so `serve` answered 500 to a
+    request that is merely unsupported, where `logs` and `stats` both answer cleanly.
+    The write path refusing while the read path crashed also meant `rc-repro env`
+    behaved one way and `rc-repro env --set` another on the same workspace.
+    """
+    from rc_repro.services import topology
     target = lifecycle.resolve_name(name)
+    topology.require_compose(
+        target, "env",
+        instead=f"Use `kubectl -n rc-repro-{target} set env --list "
+                f"deployment/rocketchat-rocketchat` for the effective environment, "
+                f"or `helm -n rc-repro-{target} get values rocketchat` for what "
+                f"rc-repro set.")
     meta = runner.read_meta(target)
     doc = runner.read_compose(target)
     svcs = doc.get("services", {})

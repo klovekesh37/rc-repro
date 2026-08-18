@@ -1438,11 +1438,21 @@ def create_app(allow_hosts: list[str] | None = None, *,
         # A Kubernetes workspace has no compose project, so the stream would
         # open, produce nothing, and look like a quiet workspace rather than an
         # unsupported one. Refused before the socket carries anything.
-        try:
-            topology.require_compose(target, "logs", instead="Use kubectl logs.")
-        except ReproError as exc:
-            await ws.send_json(error_body(exc)); await ws.close(); return
-        proc = open_log_process(runner.workspace(target), _clamp_tail(tail))
+        # No refusal here any more. A Kubernetes workspace streams through
+        # `kubectl logs -l app.kubernetes.io/name=rocketchat`; telling a browser
+        # user to run kubectl was advice they had no way to take.
+        #
+        # Dispatched HERE rather than inside open_log_process, so each seam stays
+        # what it says it is: that one is the single docker call, k8s.log_process is
+        # the single kubectl one.
+        if topology.of_repro(target) == topology.KUBERNETES:
+            from rc_repro.services import k8s
+            _meta = runner.read_meta(target)
+            proc = k8s.log_process(
+                target, tail=_clamp_tail(tail), follow=True,
+                context=str((_meta.extra or {}).get("context") or k8s.CONTEXT))
+        else:
+            proc = open_log_process(runner.workspace(target), _clamp_tail(tail))
 
         dropped = [0]
         offer = make_log_offer(q, dropped)
