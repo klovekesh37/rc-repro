@@ -256,6 +256,13 @@ def test_docker_queries_behind_the_gui_poll_cannot_hang_or_raise(monkeypatch):
 
     from rc_repro import runner
 
+    # `project_states` memoises for _QUERY_TTL, so this test only sees the stubbed
+    # failure if the cache is cold -- and it is only cold by luck of test ORDER.
+    # Any earlier test that reaches a real docker (the `--json` contract tests run
+    # `list` and `doctor` for real, a file earlier in the alphabet) leaves a warm
+    # entry, and this passed on the cached answer instead of the one under test.
+    runner._query_cache.clear()
+
     for exc in (subprocess.TimeoutExpired(cmd="docker", timeout=30),
                 FileNotFoundError("docker"),
                 OSError("no fork")):
