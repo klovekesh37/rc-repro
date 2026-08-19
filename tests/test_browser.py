@@ -2433,3 +2433,46 @@ def test_the_panel_is_not_a_two_hundred_pixel_window_on_a_narrow_screen(
         assert t["scrolls"], "the strip should be scrollable, not squeezed"
         assert t["reachable"], f"{t['label']} cannot be scrolled into view"
         assert page.errors == [], page.errors
+
+
+def test_a_place_a_group_names_is_the_link_row_and_not_a_second_row(
+        serve, page, monkeypatch):
+    """The monitoring notes name Grafana and Prometheus, and both are already link
+    rows in the panel -- with the password, which is the part the link row does not
+    know. While every note lived in one card, that card merged the two; splitting the
+    notes into cards put the same two urls on screen twice, once as rows and again as
+    prose one card below, which is the exact duplication the merge was written for.
+
+    So the merge is across every group, not just the card that owns the prose.
+    """
+    groups = [
+        {"title": "Monitoring", "rows": [],
+         "body": ["Grafana:    http://localhost:5050  (admin/admin; anonymous view enabled)",
+                  "Dashboards auto-provisioned: Rocket.Chat Metrics, MongoDB."],
+         "commands": []},
+    ]
+    d = _kube_detail(note_groups=groups, notes=[], links=[
+        {"label": "Rocket.Chat", "url": "http://localhost:3001", "kind": "rc"},
+        {"label": "Grafana", "url": "http://localhost:5050", "kind": "monitor"}])
+    _stub_lifecycle(monkeypatch, d)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .linkrow")
+        m = page.evaluate("""() => {
+          const body = document.querySelector('#d-body');
+          const rows = [...body.querySelectorAll('.linkrow')].map(r => r.textContent);
+          return {
+            grafanaRows: rows.filter(t => t.includes('localhost:5050')).length,
+            // the password the note carries has to survive the merge
+            creds: rows.some(t => t.includes('admin/admin')),
+            // and what the note said BESIDES a place is still there
+            rest: body.textContent.includes('auto-provisioned'),
+          };
+        }""")
+        assert m["grafanaRows"] == 1, "Grafana is on screen twice"
+        assert m["creds"], "the merge dropped the credential the note carried"
+        assert m["rest"], "the rest of the group's prose was dropped with it"
+        assert page.errors == [], page.errors

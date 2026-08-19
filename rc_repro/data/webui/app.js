@@ -712,8 +712,12 @@ async function openScenarios() {
 //             line is still a copyable box.
 //   commands  what a reader has to PASTE. Its own block with a Copy button, never
 //             prose -- these were buried mid-paragraph.
-function noteGroupCard(g) {
-  const rows = g.rows || [], body = g.body || [], cmds = g.commands || [];
+function noteGroupCard(g, items, shown) {
+  const rows = g.rows || [], cmds = g.commands || [];
+  // A place this workspace's link table ALREADY lists is not a second place: the
+  // monitoring notes name Grafana and Prometheus, and both are link rows, so without
+  // this the same two urls appear once as rows and again as prose one card below.
+  const body = (items || []).filter((i) => !(shown && shown.has(i)));
   if (!rows.length && !body.length && !cmds.length) return null;
   const card = el("div", { class: "panelcard" });
   if (g.title) {
@@ -729,9 +733,9 @@ function noteGroupCard(g) {
   }
   if (body.length || cmds.length) {
     const box = el("div", { class: "panelcard-b notes" });
-    // The body goes through the SAME parser the ungrouped notes use, so the three
+    // The body went through the SAME parser the ungrouped notes use, so the three
     // shapes hold inside a group and nothing about that pattern is re-decided here.
-    if (body.length) renderNoteItems(box, parseNotes(body));
+    if (body.length) renderNoteItems(box, body);
     for (const c of cmds) {
       box.append(el("div", { class: "note-cmd" },
         el("code", {}, c),
@@ -742,19 +746,27 @@ function noteGroupCard(g) {
   return card;
 }
 
-// The scenario's own prose, whichever form this workspace records it in.
-function scenarioNotes(d) {
+// Every note this workspace has, parsed once, group by group. Parsed HERE rather
+// than inside each card because the link rows are enriched from these: a note naming
+// a place the links already list is the rest of what is known about that one row, not
+// a second row -- and the notes it can come from are no longer all in one group.
+function noteItemsByGroup(d) {
   const groups = d.note_groups || [];
-  if (!groups.length) return d.notes || [];
-  const sc = groups.find((g) => g.kind === "scenario");
-  return sc ? (sc.body || []) : [];
+  // A workspace whose record has no groups keeps its whole story in the scenario
+  // card, exactly as before groups existed.
+  if (!groups.length) {
+    return [{ g: { kind: "scenario" }, items: parseNotes(d.notes || []) }];
+  }
+  return groups.map((g) => ({ g, items: parseNotes(g.body || []) }));
 }
+
+
 
 // The Scenario card: what this workspace adds beyond a plain Rocket.Chat, where
 // those things are, and what you have to do to use them — in one block instead of
 // a "Where things are" list and a "Using this scenario" list that never referred
 // to each other.
-function scenarioCard(d) {
+function scenarioCard(d, parsed, shown) {
   const card = el("div", { class: "panelcard" });
   // Title it by what is actually IN it. A plain workspace with monitoring
   // attached has links and notes but no scenario, and calling that block
@@ -785,7 +797,8 @@ function scenarioCard(d) {
   // the whole flat list; grouped it is the one group marked as the scenario, and the
   // rest are cards of their own below. Reading d.notes in the grouped case would put
   // every Kubernetes fact through here a second time.
-  const items = parseNotes(scenarioNotes(d));
+  const own = parsed.find((x) => x.g.kind === "scenario");
+  const items = own ? own.items : [];
   const introduced = (item) => {
     const before = items[items.indexOf(item) - 1];
     const text = before && before.kind === "prose" ? (before.lines || []).join(" ") : "";
@@ -812,8 +825,12 @@ function scenarioCard(d) {
   // once as rows and once as prose.
   const key = (u) => String(u || "").replace(/\/+$/, "");
   const byUrl = new Map();
-  for (const it of items) if (it.kind === "place") byUrl.set(key(it.url), it);
-  const shown = new Set();
+  // Across EVERY group, not just this card's own prose. Monitoring's Grafana line
+  // lives in the Monitoring group now, and it is still the same row as the Grafana
+  // link -- password included, which is the part the link row does not know.
+  for (const { items: its } of parsed) {
+    for (const it of its) if (it.kind === "place") byUrl.set(key(it.url), it);
+  }
   for (const l of d.links || []) {
     const note = byUrl.get(key(l.url));
     if (note) shown.add(note);
@@ -980,15 +997,20 @@ function renderTab() {
         `Rocket.Chat has restarted ${d.restarts || 0}× — usually resource pressure `
         + `(free some repros, or raise Docker's CPU/RAM) or a boot error. Check the Logs tab.`));
     }
-    if ((d.links && d.links.length) || scenarioNotes(d).length) {
-      body.append(scenarioCard(d));
+    // Parsed once and shared: the links card merges a note that names a place it
+    // already lists, and records which notes it took, so no group below repeats one.
+    const parsed = noteItemsByGroup(d);
+    const shown = new Set();
+    const ownNotes = parsed.find((x) => x.g.kind === "scenario");
+    if ((d.links && d.links.length) || (ownNotes && ownNotes.items.length)) {
+      body.append(scenarioCard(d, parsed, shown));
     }
     // Everything else the workspace has to say, one card per group. A workspace made
     // before groups existed has none of these and its whole story stays in the card
     // above, unchanged.
-    for (const g of (d.note_groups || [])) {
+    for (const { g, items } of parsed) {
       if (g.kind === "scenario") continue;          // rendered by the card above
-      const card = noteGroupCard(g);
+      const card = noteGroupCard(g, items, shown);
       if (card) body.append(card);
     }
     if (d.state === "running") {
@@ -2195,6 +2217,11 @@ function placeRow(p) {
 
 function renderNoteItems(box, items) {
   let group = null;                       // consecutive places are one table
+  // A marker says "this is one point of several". A card holding ONE paragraph is not
+  // several, and the dot in front of it reads as a list with one item -- which is
+  // what every grouped note card became when the groups arrived and each took one
+  // paragraph with it.
+  const listed = items.filter((i) => i.kind === "prose").length > 1;
   for (const it of items) {
     if (it.kind !== "place") group = null;
     if (it.kind === "cmd") {
@@ -2205,7 +2232,7 @@ function renderNoteItems(box, items) {
       if (!group) { group = el("div", { class: "linkrows one" }); box.append(group); }
       group.append(placeRow(it));
     } else {
-      const para = el("p", { class: "note-p" });
+      const para = el("p", { class: "note-p" + (listed ? "" : " solo") });
       it.lines.forEach((l, i) => { if (i) para.append(" "); para.append(linkify(l)); });
       box.append(para);
     }

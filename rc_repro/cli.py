@@ -528,18 +528,70 @@ def _print_seed_result(s: dict, total: float, resources, meta: runner.Metadata) 
     _print_resources(resources or {}, meta.name)
 
 
+def _note_lines(line: str, width: int) -> list[str]:
+    """One note line, as terminal lines.
+
+    An INDENTED line is something to paste, and is never wrapped. It used to be, and
+    the box it was wrapped inside made it worse: `kubectl -n rc-repro-x port-forward
+    deployment/rocketchat-` on one line and `  rocketchat 3000:3000` on the next is a
+    command that fails when it is pasted, which is the only thing anybody does with
+    it. It overflows the width instead, and the terminal soft-wraps a line that is
+    still one line to select.
+    """
+    text = _ascii(line)
+    if text[:1] == " " and text.strip():
+        return ["      " + text.strip()]
+    # break_on_hyphens=False: the default splits "metrics-server" across two lines,
+    # and a reader who greps for the word it named does not find it.
+    return textwrap.wrap(text, width=width, initial_indent="    ",
+                         subsequent_indent="    ", break_on_hyphens=False) or [""]
+
+
 def _print_notes(meta: runner.Metadata) -> None:
-    notes = meta.extra.get("notes")
-    if not notes:
-        return
-    inner = min(shutil.get_terminal_size((90, 24)).columns, 88) - 4
-    lines: list[str] = []
-    for n in notes:
-        n = _ascii(n)
-        lead = len(n) - len(n.lstrip())               # keep a note's own indent
-        lines += textwrap.wrap(n, width=inner, subsequent_indent=" " * (lead + 2)) or [""]
-    typer.echo("")
-    ui.box("notes", lines, inner, title_color=typer.colors.CYAN)
+    """What is in this workspace, as sections rather than one wall of bullets.
+
+    Rendered from the GROUPS (see services/lifecycle.note_group), so the terminal and
+    the browser show the same structure from one definition -- facts as an aligned
+    two-column block, prose wrapped, and the things you have to paste set off on their
+    own and never wrapped.
+
+    No box. A box has to wrap its content to its own width, and the content here
+    includes commands that must survive a copy; the group titles already say where one
+    section ends and the next begins, which is the only thing the border was doing.
+    """
+    groups = lcsvc.note_groups_of(meta)
+    if not groups:
+        # A workspace with notes that no group accounts for: still shown, ungrouped,
+        # through the same renderer rather than a second one.
+        flat = list(meta.extra.get("notes") or []) if isinstance(meta.extra, dict) else []
+        if not flat:
+            return
+        groups = [lcsvc.note_group("", body=flat)]
+    width = min(shutil.get_terminal_size((90, 24)).columns, 88)
+    ui.line("")
+    # A dim divider, not a heading: the group titles below are the headings, and a
+    # second cyan bold line above them made the two read as peers.
+    head = "what is in this workspace "
+    ui.line("  " + typer.style(head + "-" * max(1, width - len(head) - 3),
+                               fg=typer.colors.BRIGHT_BLACK))
+    for g in groups:
+        rows = g.get("rows") or []
+        body = g.get("body") or []
+        cmds = g.get("commands") or []
+        if not (rows or body or cmds):
+            continue                      # a title with nothing under it is not a section
+        ui.line("")
+        if g.get("title"):
+            ui.note("  " + _ascii(str(g["title"])), bold=True)
+        if rows:
+            kw = max(len(str(k)) for k, _ in rows)
+            for k, v in rows:
+                ui.line(f"    {_ascii(str(k)).ljust(kw)}   {_ascii(str(v))}")
+        for line in body:
+            for out in _note_lines(line, width - 6):
+                ui.line(out)
+        for c in cmds:
+            ui.line("      " + _ascii(str(c)))
 
 
 @app.command()

@@ -420,16 +420,34 @@ def test_set_state_explains_a_downed_repro(monkeypatch):
     assert "no containers to start" in str(exc.value)
 
 
-def test_summary_carries_preset_notes():
-    # These are what the GUI renders from the create job's result and the CLI
-    # prints in a box after `up` -- the Keycloak realm, the /etc/hosts line, etc.
+def test_summary_carries_preset_notes_derived_and_not_the_frozen_copy():
+    """These are what the GUI renders from the create job's result and the CLI prints
+    after `up` -- the Keycloak realm, the /etc/hosts line.
+
+    DERIVED from the preset on every read, not read back out of the record. A note
+    written into `repro.json` at create time keeps its wording for the life of the
+    workspace, which is how a Kubernetes workspace went on telling people `backup`
+    had no path on that runtime for three releases after it grew one -- the fix
+    reached new workspaces and no existing one. So the stale copy in this record is
+    deliberately not what the preset says, and it is the preset's that has to come
+    out.
+    """
+    from rc_repro import presets
+
     m = lc.runner.Metadata(
         name="x", project="rcrepro-x", rc_version="8.5.1", rc_image="i",
         mongo_tag="8.0", mongo_flavor="official", preset="oidc",
         root_url="http://localhost:3000", host_port=3000, version_source="map",
-        extra={"notes": ["Add this to /etc/hosts:", "    127.0.0.1  keycloak"]})
-    assert lc._summary(m)["notes"] == ["Add this to /etc/hosts:",
-                                      "    127.0.0.1  keycloak"]
+        extra={"notes": ["a sentence some older release wrote down"]})
+    s = lc._summary(m)
+    assert s["notes"] == lc.flatten_notes([lc.note_group(
+        "Scenario · oidc", kind="scenario", body=presets.load("oidc").notes)])
+    assert "a sentence some older release wrote down" not in s["notes"]
+    # The grouped form is what the panel renders, and the scenario has to be MARKED
+    # as one -- the panel feeds that group back into its links card rather than
+    # giving it a card of its own.
+    assert [g["kind"] for g in s["note_groups"]] == ["scenario"]
+    assert any("/etc/hosts" in n for n in s["notes"])
 
 
 def test_compose_major_version_parsing():
@@ -4377,12 +4395,35 @@ def test_the_notes_say_the_operator_is_shared_when_it_is_used():
     guide's `kubectl -n <ns> get pods` finds no operator and concludes it was never
     installed.
     """
-    import inspect
+    # Asserted against the groups a real record produces rather than against the
+    # source of the function that builds them: the notes are derived on every read
+    # now, so the record is the input and the rendered groups are the output, and
+    # only the second of those is what anybody sees.
+    def groups_for(managed_by):
+        m = lc.runner.Metadata(
+            name="k", project="rc-repro-k", rc_version="8.5.1", rc_image="i",
+            mongo_tag="8.0", mongo_flavor="official", preset="default",
+            root_url="http://localhost:3000", host_port=3000, version_source="map",
+            extra={"runtime": "kubernetes", "deployment": "microservices",
+                   "namespace": "rc-repro-k", "context": "kind-rc-repro-local",
+                   "release": "rocketchat", "mongo_managed_by": managed_by,
+                   "mongo_image": "mongo:8.0"})
+        return {g["title"]: g for g in lc.note_groups_of(m)}
 
-    src = inspect.getsource(lc._create_kubernetes)
-    assert "The MongoDB operator is shared" in src and "official guide" in src
-    # Monitoring deviates the same way and for the same reason.
-    assert "shared by the cluster, not installed per" in src
+    op = groups_for("operator")
+    shared = op["The MongoDB operator is shared"]
+    assert "official guide" in " ".join(shared["body"])
+    # And it says where to look, not just that it is elsewhere.
+    assert any("get mongodbcommunity" in c for c in shared["commands"])
+    assert ("Managed by", "the official operator") in [tuple(r) for r in op["MongoDB"]["rows"]]
+    # Monitoring deviates the same way and for the same reason, on both paths.
+    assert "shared by the cluster, not installed per" in " ".join(op["Monitoring"]["body"])
+    # A plain StatefulSet has no operator to explain, and says so where the guide
+    # would have led someone to expect authentication.
+    sts = groups_for("statefulset")
+    assert "The MongoDB operator is shared" not in sts
+    assert ("Authentication", "none") in [tuple(r) for r in sts["MongoDB"]["rows"]]
+    assert "official guide" in " ".join(sts["MongoDB"]["body"])
 
 
 def test_the_oplog_user_can_actually_read_the_oplog(monkeypatch):
@@ -5342,3 +5383,140 @@ def test_an_empty_group_contributes_no_stray_heading():
     assert lc.flatten_notes([lc.note_group("Monitoring")]) == ["Monitoring:"]
     assert lc.flatten_notes([]) == []
     assert lc.flatten_notes([lc.note_group("", body=["a bare line"])]) == ["a bare line"]
+
+
+def _k8s_meta(**extra):
+    """A Kubernetes workspace record, as `repro.json` holds one."""
+    base = {"runtime": "kubernetes", "deployment": "microservices",
+            "namespace": "rc-repro-old", "context": "kind-rc-repro-local",
+            "release": "rocketchat", "bind_host": "127.0.0.1",
+            "mongo_managed_by": "statefulset", "mongo_image": "mongo:8.0"}
+    base.update(extra)
+    return lc.runner.Metadata(
+        name="old", project="rc-repro-old", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="default",
+        root_url="http://localhost:3000", host_port=3000, version_source="map",
+        extra=base)
+
+
+def test_a_workspace_made_before_groups_existed_still_renders_as_groups():
+    """The grouped notes were built at create time and written into `repro.json`, so
+    they only ever reached workspaces created after the release that added them. Every
+    existing workspace kept the flat eleven-bullet dump in `info` and in the GUI panel
+    for life, and the only way to see the new shape was to destroy the workspace and
+    build another -- which for a repro of a customer's issue is the one thing you
+    cannot do.
+
+    Notes are a pure function of the record (namespace, context, release, bind host,
+    preset), so they are derived on every read. This record is exactly what an older
+    release wrote: a flat list and no groups at all.
+    """
+    m = _k8s_meta()
+    m.extra["notes"] = [
+        "microservices on kind-rc-repro-local - about 9 pods, namespace rc-repro-old",
+        "reachable on this box at http://localhost:3000",
+    ]
+    s = lc._summary(m)
+    titles = [g["title"] for g in s["note_groups"]]
+    assert titles[:2] == ["Kubernetes", "MongoDB"]
+    assert "kubectl and helm" in titles
+    # The facts that were welded into a sentence are rows now, for this record too.
+    rows = dict((k, v) for k, v in s["note_groups"][0]["rows"])
+    assert rows == {"Cluster": "kind-rc-repro-local", "Namespace": "rc-repro-old",
+                    "Arrangement": "microservices", "Pods": "about 9"}
+    # And the flat list the CLI prints is the derived one, not the sentence above.
+    assert s["notes"] == lc.flatten_notes(s["note_groups"])
+    assert not any("about 9 pods, namespace" in n for n in s["notes"])
+
+
+def test_the_url_is_not_repeated_as_a_note_when_the_bind_is_loopback():
+    """"reachable on this box at http://localhost:3000" was the fourth copy of that
+    string on one screen -- the summary panel prints it, the panel's identity line
+    carries it, the links table lists it -- and the browser had to de-duplicate the
+    note against the link row to stop it appearing twice.
+
+    What is not said anywhere else is what a NON-loopback bind means, and that is the
+    only case the group appears in.
+    """
+    quiet = [g["title"] for g in lc.note_groups_of(_k8s_meta())]
+    assert "Reachable from other machines" not in quiet
+    assert not any("reachable on this box" in n
+                   for n in lc.flatten_notes(lc.note_groups_of(_k8s_meta())))
+
+    public = lc.note_groups_of(_k8s_meta(bind_host="0.0.0.0"))
+    warned = {g["title"]: g for g in public}["Reachable from other machines"]
+    assert "0.0.0.0" in " ".join(warned["body"])
+    assert "admin123" in " ".join(warned["body"])          # what it exposes
+    # The port-forward has to come back the same way it was published, or the
+    # workspace is unreachable from the machines the note just warned about.
+    forward = {g["title"]: g for g in public}["Port forward"]
+    assert "--address 0.0.0.0" in forward["commands"][0]
+
+
+def test_a_compose_workspaces_add_ons_are_groups_too():
+    """The edge lines and the monitoring block were appended to one flat list, so a
+    monitored workspace behind HTTPS had five unrelated bullets in a row. Same words,
+    three sections -- and derived, so an older record gets them as well.
+    """
+    m = lc.runner.Metadata(
+        name="c", project="rcrepro-c", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="default",
+        root_url="http://localhost:3000", host_port=3000, version_source="map",
+        public_url="https://c.example.test",
+        extra={"edge": True, "tls": "local", "monitoring": True})
+    groups = {g["title"]: g for g in lc.note_groups_of(m)}
+    assert list(groups) == ["HTTPS", "Monitoring"]
+    assert "https://c.example.test" in " ".join(groups["HTTPS"]["body"])
+    assert any("Grafana" in n for n in groups["Monitoring"]["body"])
+    # A plain workspace has nothing to add and gets no empty sections.
+    m.extra = {}
+    m.public_url = ""
+    assert lc.note_groups_of(m) == []
+
+
+def test_a_command_in_the_notes_is_never_wrapped_where_it_would_be_pasted(capsys):
+    """`_print_notes` wrapped every line to the box it drew, commands included. A
+    port-forward came out as `... port-forward deployment/rocketchat-` on one line and
+    `  rocketchat 3000:3000` on the next, so the one thing anyone does with that line
+    -- select it and paste it -- produced a broken command. The box is gone and an
+    indented line overflows the width instead.
+
+    Driven from a RECORDED flat note, which is both what an older workspace holds and
+    the shape the derived groups render commands in.
+    """
+    from rc_repro import cli
+
+    forward = ("kubectl -n rc-repro-a-fairly-long-workspace-name port-forward "
+               "deployment/rocketchat-rocketchat 3000:3000")
+    assert len(forward) > 88          # wider than anything `_print_notes` renders
+    m = lc.runner.Metadata(
+        name="c", project="rcrepro-c", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="default",
+        root_url="http://localhost:3000", host_port=3000, version_source="map",
+        extra={"notes": ["bring the forward back with:", "    " + forward,
+                         "`stats` needs metrics-server in the cluster " * 3]})
+    cli._print_notes(m)
+    out = capsys.readouterr().out.split("\n")
+    assert [ln for ln in out if forward in ln], "the command has to survive as one line"
+    assert not any(ln.rstrip().endswith("rocketchat-") for ln in out)
+    # Prose is still wrapped, and a hyphenated word is not broken across the wrap.
+    assert not any(ln.rstrip().endswith("metrics-") for ln in out)
+    prose = [ln for ln in out if ln[:5] == "    " + ln[4:5].strip()]
+    assert prose and max(len(ln) for ln in prose) <= 88
+
+
+def test_the_terminal_prints_the_same_sections_the_panel_draws(capsys):
+    """One definition, two renderings. The CLI used to print a flat list inside a box
+    while the browser drew cards, and the two could only be compared by eye.
+    """
+    from rc_repro import cli
+
+    m = _k8s_meta()
+    cli._print_notes(m)
+    out = capsys.readouterr().out
+    for group in lc.note_groups_of(m):
+        assert any(ln.strip() == group["title"] for ln in out.split("\n")), group["title"]
+        for k, v in group["rows"]:
+            assert any(k in ln and str(v) in ln for ln in out.split("\n")), k
+        for c in group["commands"]:
+            assert c in out

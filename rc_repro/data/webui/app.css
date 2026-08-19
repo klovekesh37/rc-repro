@@ -1110,6 +1110,9 @@ button.brand:hover { color: var(--blue); }
   color: var(--ink); opacity: .84; }
 .note-p::before { content: ""; position: absolute; left: .1rem; top: .68em;
   width: 4px; height: 4px; border-radius: 50%; background: var(--dim); }
+/* One paragraph is not a list of one -- see renderNoteItems. */
+.note-p.solo { padding-left: 0; }
+.note-p.solo::before { content: none; }
 .note-cmd { border-radius: var(--r-md); padding: .55rem .65rem; }
 .note-cmd code { font-size: .8rem; }
 /* The scenario card: a document, not a form. */
