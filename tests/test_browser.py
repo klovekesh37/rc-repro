@@ -2813,3 +2813,91 @@ def test_the_pane_never_offers_what_this_runtime_refuses(serve, page, monkeypatc
         assert "Check the certificate" not in labels, labels
         assert "Compose-only" in page.text_content("#actpane")
         assert page.errors == [], page.errors
+
+
+def test_the_top_links_become_one_menu_on_a_narrow_screen(serve, page, monkeypatch):
+    """Four links, a theme toggle and an account name wrapped onto a second row of
+    chrome below 760px -- on a 430px screen that is a quarter of the height spent
+    before anything has been said about a workspace.
+
+    The same four buttons move into a popover; there is no second copy of them, because
+    two sets of the same controls is two things to keep in step and they drift.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.set_viewport_size({"width": 430, "height": 780})
+        page.wait_for_timeout(200)
+        assert page.locator("#nav-toggle").is_visible(), "no way to reach the links"
+        assert not page.locator("#btn-jobs").is_visible(), "they are still on the bar"
+        # One set of buttons, not two.
+        assert page.locator("#btn-jobs").count() == 1
+        page.click("#nav-toggle")
+        page.wait_for_selector("#btn-jobs", state="visible")
+        assert page.get_attribute("#nav-toggle", "aria-expanded") == "true"
+        page.click("#btn-jobs")
+        page.wait_for_function(
+            "() => document.querySelector('#btn-jobs').hasAttribute('aria-current')")
+        # and choosing one puts the menu away
+        assert not page.locator("#btn-jobs").is_visible()
+        # Back on a wide screen they are links again, with no hamburger.
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.wait_for_timeout(200)
+        assert page.locator("#btn-jobs").is_visible()
+        assert not page.locator("#nav-toggle").is_visible()
+        assert page.errors == [], page.errors
+
+
+def test_the_narrow_layout_is_a_picker_a_panel_and_a_bar(serve, page, monkeypatch):
+    """Below 760px the layout was merely survivable: it stacked and nothing overlapped,
+    but nothing was designed for it. The rail was a capped vertical strip spending 38vh
+    of a phone on a list of four names, and the action pane was eleven items in a
+    wrapping grid at the bottom of the document -- which pushed the danger zone off the
+    end of a panel that can be several screens tall.
+
+    Three changes: the rail is a one-row chip picker, the state actions are a bar that
+    stays put while the panel scrolls, and the rest of the pane is one tap away.
+    """
+    _stub_list(monkeypatch, [_fake_detail(name=f"ws-{i}") for i in range(6)])
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros .wrow")
+        page.set_viewport_size({"width": 430, "height": 780})
+        page.click("#repros >> text=ws-2")
+        page.wait_for_selector("#d-body .factrows")
+        page.wait_for_timeout(250)
+        m = page.evaluate("""() => {
+          const rows = document.querySelector('#repros');
+          const chips = [...rows.querySelectorAll('.wrow')];
+          return {
+            sideways: document.body.scrollWidth > window.innerWidth + 2,
+            // one row of chips, not six stacked rows
+            railHeight: Math.round(rows.getBoundingClientRect().height),
+            oneRow: new Set(chips.map((c) => Math.round(
+              c.getBoundingClientRect().top))).size === 1,
+            railScrolls: rows.scrollWidth > rows.clientWidth + 2,
+            sticky: getComputedStyle(document.querySelector('#detail .d-actions')).position,
+            pane: getComputedStyle(document.querySelector('#actpane')).display,
+            toggle: getComputedStyle(document.querySelector('.panetoggle')).display,
+          };
+        }""")
+        assert not m["sideways"], "the page scrolls sideways"
+        assert m["oneRow"], "the chips are not on one row"
+        assert m["railHeight"] <= 60, f"the picker is {m['railHeight']}px tall"
+        assert m["railScrolls"], "six chips at 430px have to scroll, not wrap"
+        assert m["sticky"] == "sticky", "the action bar scrolls away with the panel"
+        assert m["pane"] == "none", "the whole pane is still open at the bottom"
+        assert m["toggle"] != "none", "and there is no way to get it back"
+        # The bar stays in the viewport with the panel scrolled to the end.
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(200)
+        assert page.evaluate("""() => {
+          const b = document.querySelector('#detail .d-actions').getBoundingClientRect();
+          return b.bottom > 0 && b.top < window.innerHeight;
+        }"""), "the action bar left the screen"
+        page.click("#detail .panetoggle")
+        page.wait_for_selector("#actpane .apdanger", state="visible")
+        assert page.errors == [], page.errors

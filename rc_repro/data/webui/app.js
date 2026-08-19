@@ -1170,6 +1170,17 @@ function renderDetail() {
     actions.append(dBtn("Stop", () => doState(d.name, "stop")));
     actions.append(dBtn("Restart", () => doState(d.name, "restart")));
   }
+  // Rendered always and shown only by the narrow layout, where the action pane is not
+  // a column. It scrolls the pane into view as well as revealing it: the pane follows
+  // the stage in the document, so revealing it silently would put it below a panel
+  // that can be several screens tall.
+  if (canWrite()) {
+    actions.append(el("button", { class: "btn small panetoggle", onclick: () => {
+      const open = !document.body.classList.contains("pane-open");
+      document.body.classList.toggle("pane-open", open);
+      if (open) $("#actpane").scrollIntoView({ block: "start", behavior: "smooth" });
+    } }, "Actions ⌄"));
+  }
   renderActionPane(d, busyLabel);
   // Above the TABS, not inside Overview: what is wrong with the workspace is not a
   // property of the tab you happen to be on, and it was invisible from Logs --
@@ -3538,6 +3549,23 @@ $("#whoami").addEventListener("click", (e) => {
   }
 });
 document.addEventListener("click", closeMe);
+// ---- the narrow layout's two disclosures ------------------------------------
+// Both are body classes rather than inline styles, so the CSS decides whether they
+// mean anything: above 760px the popover and the pane are laid out as columns and
+// these classes select nothing. A layout switched by JS is a layout that is wrong
+// until the next resize event.
+function closeNav() {
+  document.body.classList.remove("nav-open");
+  $("#nav-toggle").setAttribute("aria-expanded", "false");
+}
+$("#nav-toggle").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const open = !document.body.classList.contains("nav-open");
+  document.body.classList.toggle("nav-open", open);
+  $("#nav-toggle").setAttribute("aria-expanded", String(open));
+});
+document.addEventListener("click", closeNav);
+$("#toplinks").addEventListener("click", closeNav);
 $("#me-menu").addEventListener("click", (e) => e.stopPropagation());
 $("#me-sessions").addEventListener("click", () => { closeMe(); openSessions(); });
 $("#me-people").addEventListener("click", () => { closeMe(); openPeople(); });

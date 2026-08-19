@@ -124,7 +124,15 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
    The status bar takes the same token, so the two edges of the frame agree. */
 .brand { font-family: var(--mono); font-weight: 700; font-size: 1.05rem; letter-spacing: -.01em; }
 .brand .dollar { color: var(--green); }
-.topbar-actions { margin-left: auto; display: flex; gap: .5rem; }
+.topbar-actions { margin-left: auto; display: flex; align-items: center; gap: .5rem; }
+.toplinks { display: flex; align-items: center; gap: .5rem; }
+/* The hamburger exists only where the links would wrap onto a second row, and the
+   disclosure that reveals the action pane only where the pane is not a column. Both
+   qualified by the class that sets their `display`, because `.chip.iconbtn` and
+   `.btn.small` are two-class selectors and a bare `.navtoggle` loses to them --
+   which is how a hamburger came to sit on a 1440px bar next to the links it
+   replaces. */
+.chip.navtoggle, .btn.panetoggle { display: none; }
 
 /* ---- how everything you can touch behaves ----
    One rule, so a chip, a tab, a workspace row and a button all answer a pointer
@@ -531,7 +539,12 @@ input:focus, select:focus, textarea:focus {
    into the page it sits on. */
 .urlbox { border: 1px solid var(--line); border-radius: var(--r-md); padding: .8rem .9rem;
   background: var(--panel); box-shadow: var(--shadow-1), var(--edge);
-  display: flex; align-items: center; margin-top: 1.2rem; }
+  display: flex; align-items: center; gap: .6rem; margin-top: 1.2rem; }
+/* The value shrinks; the copy button does not. Without this the workspace path -- the
+   longest string on the panel -- ran UNDER the button on a narrow screen, which is
+   both unreadable and a click that copies while looking like it hit the text. */
+.urlbox > div:first-child { min-width: 0; }
+.urlbox .copy { flex: 0 0 auto; }
 .urlbox .k { font-family: var(--mono); font-size: .72rem; color: var(--muted); }
 .urlbox a { font-family: var(--mono); color: var(--blue); text-decoration: none; display: block; margin-top: .2rem; }
 /* A urlbox value that is text, not a link (admin login, workspace path). */
@@ -900,6 +913,61 @@ button.jobrow:hover { background: var(--panel2); }
   .forks { grid-template-columns: 1fr; }
   .statusbar { flex-wrap: wrap; gap: .5rem 1rem; }
   .grafana-embed { height: 240px; }
+
+  /* ---- D: designed for this width, rather than merely surviving it ---- */
+
+  /* The four top links become a popover off one button. Four links, a theme toggle
+     and an account name wrapped onto a second row of chrome here, which on a 430px
+     screen is a quarter of the height spent before anything is said about a
+     workspace. Same four buttons, moved -- not a second copy. */
+  .chip.navtoggle { display: inline-flex; }
+  .toplinks { position: absolute; top: calc(100% + .3rem); right: .6rem; z-index: 40;
+    display: none; flex-direction: column; align-items: stretch; gap: 0;
+    min-width: 11rem; padding: .3rem; background: var(--panel);
+    border: 1px solid var(--line2); border-radius: var(--r-md);
+    box-shadow: var(--shadow-2); }
+  body.nav-open .toplinks { display: flex; }
+  .toplinks .toplink { padding: .5rem .6rem; text-align: left; border-radius: var(--r-sm); }
+  .toplinks .toplink:hover { background: var(--panel2); }
+  /* The current-page marker is a 2px rule under a horizontal nav; stacked it would
+     be a line across the middle of the item below it. */
+  .toplinks .toplink::after { content: none; }
+  .topbar { position: relative; }
+
+  /* The rail becomes a horizontal picker, one row high. It is how you choose a
+     workspace so it cannot go, and a capped vertical strip spent 38vh of a phone on
+     a list of four names. */
+  .rail { max-height: none; }
+  .rail-controls { display: flex; flex-direction: row; align-items: center;
+    padding: .5rem .6rem .55rem; overflow-x: auto; scrollbar-width: thin; }
+  .rail-controls > * { flex: 0 0 auto; }
+  .rail-controls .input { width: 11rem; }
+  /* `.block` is width:100% -- in a row it took the whole strip and pushed the filter
+     and the three selects off the right edge of a scroller nothing said was one. */
+  .rail-controls .btn.block { width: auto; }
+  .rail-two { display: flex; gap: .4rem; }
+  .rows { display: flex; flex-direction: row; overflow-x: auto; scrollbar-width: thin;
+    padding: .5rem .55rem .6rem; }
+  .wrow { flex: 0 0 auto; width: auto; max-width: 15rem; border-radius: 999px;
+    padding: .35rem .8rem .35rem 1.35rem; }
+  .wrow::before { left: .65rem; top: 50%; bottom: auto; width: 6px; height: 6px;
+    margin-top: -3px; border-radius: 50%; }
+  .wrow .nm { min-width: 0; }
+  /* A chip has room for the name and, on the rows that want you, the reason. The
+     group headings do not survive a horizontal strip -- the ORDER survives, and
+     wants-you is still first. */
+  .rgrp { display: none; }
+  .wrow .ver, .wrow .meta:not(.warn):not(.working) { display: none; }
+
+  /* The state actions become a bar that stays put while the panel scrolls, and the
+     rest of the pane is one tap away rather than a screen and a half below. A
+     wrapping grid of eleven items pushed the danger zone off the bottom of the
+     document. */
+  .d-actions { position: sticky; bottom: 0; z-index: 20; margin: 0 -1.1rem;
+    padding: .6rem 1.1rem; background: var(--bar); border-top: 1px solid var(--line); }
+  .btn.panetoggle { display: inline-flex; margin-left: auto; }
+  .actpane { display: none; }
+  body.pane-open .actpane { display: flex; }
 }
 @media (max-width: 560px) {
   .bar, .toolbar-controls { flex-wrap: wrap; }

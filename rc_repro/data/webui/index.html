@@ -14,10 +14,20 @@
     <button id="docker-badge" class="chip" title="Run the environment check">docker: ?</button>
     <button id="edge-badge" class="chip" title="The shared Traefik serving every https name" hidden></button>
     <div class="topbar-actions">
-      <button id="btn-home" class="toplink">Home</button>
-      <button id="btn-jobs" class="toplink">Activity</button>
-      <button id="btn-scenarios" class="toplink">Scenarios</button>
-      <button id="btn-refresh" class="toplink">Refresh</button>
+      <!-- ONE set of links, in a wrapper the narrow layout turns into a popover. A
+           second copy behind a hamburger is two things to keep in step, and they
+           drift: this is the same four buttons either way, moved by CSS. -->
+      <div id="toplinks" class="toplinks">
+        <button id="btn-home" class="toplink">Home</button>
+        <button id="btn-jobs" class="toplink">Activity</button>
+        <button id="btn-scenarios" class="toplink">Scenarios</button>
+        <button id="btn-refresh" class="toplink">Refresh</button>
+      </div>
+      <!-- Shown only where the four links would wrap onto a second row of chrome,
+           which on a 430px screen is a quarter of the height before anything is said
+           about a workspace. -->
+      <button id="nav-toggle" class="chip iconbtn navtoggle" title="Menu"
+              aria-haspopup="menu" aria-expanded="false">☰</button>
       <button id="theme-toggle" class="chip iconbtn" title="Switch between the light and dark theme"></button>
       <!-- The account menu. Clicking the name used to open the sessions DIALOG,
            which meant "sign out" and "change your password" were behind a modal
