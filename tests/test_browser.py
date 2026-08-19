@@ -2346,10 +2346,9 @@ def test_the_overview_says_which_runtime_the_workspace_runs_on(
     tell whether it was Compose or Kubernetes -- which decides what half the actions
     in the pane will even do.
 
-    It takes Port's place: the port is already in the identity line under the name
-    and in the URL box below. The facts are one line each -- six cells spent the top
-    of the panel on four things that never change -- and the third column carries the
-    qualifier a cell had nowhere to put.
+    It takes Port's cell: the port is already in the identity line under the name and
+    in the URL box below, and the grid is deliberately exactly six so it fills two rows
+    of three with no hole.
     """
     _stub_lifecycle(monkeypatch, _kube_detail())
     usersvc.add("alice", PASSWORD, role="admin")
@@ -2357,17 +2356,14 @@ def test_the_overview_says_which_runtime_the_workspace_runs_on(
         _sign_in(page, s.url)
         page.wait_for_selector("#repros")
         page.click("text=t1234")
-        page.wait_for_selector("#d-body .factrows")
+        page.wait_for_selector("#d-body .kv-grid")
         cells = page.evaluate("""() => [...document.querySelectorAll(
-          '#d-body .factrows .fr')].map(c => [
-            c.querySelector('.fr-k').textContent, c.querySelector('.fr-v').textContent])""")
+          '#d-body .kv-grid .kv')].map(c => [
+            c.querySelector('.k').textContent, c.querySelector('.v').textContent])""")
         keys = [k for k, _ in cells]
         assert "Runs on" in keys, keys
         assert dict(cells)["Runs on"] == "Kubernetes · microservices"
-        # Health and uptime lead: they are the two that change, and they are what the
-        # panel is opened to look at.
-        assert keys[:2] == ["Health", "Uptime"], keys
-        assert len(cells) == 6, keys
+        assert len(cells) == 6, "the grid is six cells so two rows of three fill"
         assert page.errors == [], page.errors
 
 
@@ -2404,7 +2400,7 @@ def test_the_panel_is_not_a_two_hundred_pixel_window_on_a_narrow_screen(
           const cards = [...document.querySelectorAll('#d-body .panelcard')];
           const last = cards[cards.length - 1].getBoundingClientRect();
           const sb = document.querySelector('.statusbar').getBoundingClientRect();
-          const grid = document.querySelectorAll('#d-body .factrows .fr').length;
+          const grid = document.querySelectorAll('#d-body .kv-grid .kv').length;
           return {pageScrolls: document.documentElement.scrollHeight > window.innerHeight,
                   sideways: document.body.scrollWidth > window.innerWidth + 2,
                   // nothing hidden inside an internal scroller
@@ -2416,7 +2412,7 @@ def test_the_panel_is_not_a_two_hundred_pixel_window_on_a_narrow_screen(
         assert not m["sideways"], "and it must not scroll sideways"
         assert m["stageHidden"] <= 2, \
             f"{m['stageHidden']}px of the panel is hidden inside the stage's own scroller"
-        assert m["cells"] == 6, f"only {m['cells']} of the six Overview facts rendered"
+        assert m["cells"] == 6, f"only {m['cells']} of the six Overview cells rendered"
         assert m["cards"] >= 9, f"only {m['cards']} cards rendered of the 8 groups + scenario"
         assert m["lastBottom"] <= m["sbTop"] + 2, \
             "the status bar is drawn over the panel instead of below it"
@@ -2496,7 +2492,7 @@ def test_a_healthy_workspace_gets_no_triage_block_at_all(serve, page, monkeypatc
         _sign_in(page, s.url)
         page.wait_for_selector("#repros")
         page.click("text=t1234")
-        page.wait_for_selector("#d-body .factrows")
+        page.wait_for_selector("#d-body .kv-grid")
         assert page.locator("#detail .triage").count() == 0
         assert page.errors == [], page.errors
 
@@ -2668,13 +2664,13 @@ def test_one_state_gets_no_group_headings(serve, page, monkeypatch):
 
 def test_a_long_workspace_name_does_not_push_the_rail_sideways(serve, page, monkeypatch):
     """`.rows` was left on the implicit `auto` grid track, which is at least as wide as
-    its widest item's MIN-content -- and a one-line row whose name cannot wrap has a
-    min-content of the whole name. One long name made every row 484px wide inside a
-    287px rail, so the rail scrolled sideways and the state tags and group counts were
-    clipped off the right edge.
+    its widest item's MIN-content. That was survivable while a row could wrap, and it
+    made the rail scroll sideways -- clipping the state and the group counts off the
+    right edge -- the moment anything in a row could not.
 
-    The name is what the rail is for, so it keeps its characters and the TAG gives up
-    first; past that the name ellipsises and the full one stays in the row's title.
+    A guard, not a regression test: the row wraps again, so the track is no longer what
+    stops it. The narrow strip is where a name cannot wrap, and that is asserted here
+    too, because that is the layout the rule now protects.
     """
     long_name = "a-really-long-workspace-name-for-ticket-4821"
     _stub_list(monkeypatch, [
@@ -2685,33 +2681,37 @@ def test_a_long_workspace_name_does_not_push_the_rail_sideways(serve, page, monk
     with serve() as s:
         _sign_in(page, s.url)
         page.wait_for_selector("#repros .wrow")
-        m = page.evaluate("""() => {
-          const rows = document.querySelector('#repros');
-          const inside = [...rows.querySelectorAll('.wrow')].every(
-            (r) => r.scrollWidth <= r.clientWidth + 1);
-          const dana = [...rows.querySelectorAll('.wrow')].find(
-            (r) => r.querySelector('.nm').textContent.startsWith('dana'));
-          return {sideways: rows.scrollWidth > rows.clientWidth + 1, inside,
-                  // one line, not three: the row is no taller than its text
-                  height: Math.round(dana.getBoundingClientRect().height),
-                  // and the tag is the half that gave up
-                  name: dana.querySelector('.nm').textContent,
-                  tag: dana.querySelector('.meta').textContent,
-                  title: rows.querySelector('.wrow').title};
-        }""")
-        assert not m["sideways"], "the rail scrolls sideways"
-        assert m["inside"], "a row is wider than the rail"
-        assert m["height"] <= 34, f"a row is {m['height']}px; one line is about 28"
-        assert m["name"] == "dana-upgrade", "the name gave up its characters, not the tag"
-        assert m["tag"] == "4m · base", m["tag"]
-        assert m["title"] == long_name, "the full name has to stay reachable"
+        for width in (1440, 430):
+            page.set_viewport_size({"width": width, "height": 900})
+            page.wait_for_timeout(200)
+            m = page.evaluate("""() => {
+              const rows = document.querySelector('#repros');
+              return {sideways: rows.scrollWidth > rows.clientWidth + 1,
+                      inside: [...rows.querySelectorAll('.wrow')].every(
+                        (r) => r.scrollWidth <= r.clientWidth + 1),
+                      title: rows.querySelector('.wrow').title};
+            }""")
+            # At 430 the strip scrolls BY DESIGN -- it is a horizontal picker -- so what
+            # is asserted there is that no individual chip overflows its own box.
+            if width > 760:
+                assert not m["sideways"], f"the rail scrolls sideways at {width}px"
+            assert m["inside"], f"a row is wider than its own box at {width}px"
+            assert m["title"] == long_name, "the full name has to stay reachable"
+        # The wide row keeps every part: the port and the owner are what people search a
+        # shared box's rail by, and one line could not hold them.
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.wait_for_timeout(200)
+        meta = page.locator(".wrow", has_text="dana-upgrade").locator(".meta").inner_text()
+        assert ":3001" in meta and "alice" in meta and "monitored" in meta, meta
         assert page.errors == [], page.errors
 
 
 def _pane(page):
     return page.evaluate("""() => ({
+      // The label and nothing else: a reason written under each suggestion was a
+      // sentence to read before you could act on it.
       next: [...document.querySelectorAll('#actpane .apn')].map(
-        (b) => [b.querySelector('b').textContent, b.querySelector('span').textContent]),
+        (b) => [b.querySelector('b').textContent, b.textContent]),
       rest: [...document.querySelectorAll('#actpane .aplist button')].map(
         (b) => [b.textContent, b.disabled]),
       groups: [...document.querySelectorAll('#actpane .apgroup')].map((g) => g.textContent),
@@ -2726,8 +2726,8 @@ def test_the_action_pane_leads_with_what_this_state_admits(serve, page, monkeypa
     called "Keep or move it" does not answer it -- nor could a 30px row with a label
     carry the reason anything was worth doing.
 
-    Two at most, each with a fact about THIS workspace as its reason, and nothing
-    appears twice: a promoted item leaves the list below.
+    Two at most, chosen by a rule over facts about THIS workspace, and nothing appears
+    twice: a promoted item leaves the list below.
     """
     _stub_lifecycle(monkeypatch, _fake_detail())
     usersvc.add("alice", PASSWORD, role="admin")
@@ -2738,7 +2738,7 @@ def test_the_action_pane_leads_with_what_this_state_admits(serve, page, monkeypa
         page.wait_for_selector("#actpane .apn")
         m = _pane(page)
         assert [n[0] for n in m["next"]] == ["Add sample data", "Send an API call"], m["next"]
-        assert "no sample data yet" in m["next"][0][1], m["next"][0]
+        assert m["next"][0][1] == "Add sample data", "the card is the label, nothing else"
         assert m["groups"][:2] == ["Next, probably", "Everything else"], m["groups"]
         labels = [r[0] for r in m["rest"]]
         assert "Add sample data" not in labels and "Send an API call" not in labels, labels
@@ -2763,7 +2763,6 @@ def test_a_seeded_workspace_is_not_told_to_seed_itself(serve, page, monkeypatch)
         page.wait_for_selector("#actpane .apn")
         m = _pane(page)
         assert [n[0] for n in m["next"]] == ["Send an API call", "Back up now"], m["next"]
-        assert "restored into a new workspace" in m["next"][1][1], m["next"][1]
         assert "Add sample data" in [r[0] for r in m["rest"]]
         assert page.errors == [], page.errors
 
@@ -2867,7 +2866,7 @@ def test_the_narrow_layout_is_a_picker_a_panel_and_a_bar(serve, page, monkeypatc
         page.wait_for_selector("#repros .wrow")
         page.set_viewport_size({"width": 430, "height": 780})
         page.click("#repros >> text=ws-2")
-        page.wait_for_selector("#d-body .factrows")
+        page.wait_for_selector("#d-body .kv-grid")
         page.wait_for_timeout(250)
         m = page.evaluate("""() => {
           const rows = document.querySelector('#repros');
@@ -2891,7 +2890,20 @@ def test_the_narrow_layout_is_a_picker_a_panel_and_a_bar(serve, page, monkeypatc
         assert m["sticky"] == "sticky", "the action bar scrolls away with the panel"
         assert m["pane"] == "none", "the whole pane is still open at the bottom"
         assert m["toggle"] != "none", "and there is no way to get it back"
-        # The bar stays in the viewport with the panel scrolled to the end.
+        # PINNED, not merely on screen. This assertion used to pass for the wrong
+        # reason: the panel was short enough that the bar's natural position happened
+        # to be visible, so it said nothing about stickiness -- and stickiness was in
+        # fact not working at all, because `bottom` holds an element that would fall
+        # BELOW the scrollport and does not drag one down from above.
+        pin = page.evaluate("""() => {
+          const b = document.querySelector('#detail .d-actions').getBoundingClientRect();
+          const panel = document.querySelector('#detail').getBoundingClientRect();
+          return {gap: Math.round(window.innerHeight - b.bottom),
+                  taller: panel.height > window.innerHeight};
+        }""")
+        assert pin["taller"], "the panel has to be taller than the screen to pin anything"
+        assert pin["gap"] <= 2, f"the bar sits {pin['gap']}px above the bottom, not pinned"
+        # And it is still there with the panel scrolled to its end.
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(200)
         assert page.evaluate("""() => {
@@ -2900,4 +2912,52 @@ def test_the_narrow_layout_is_a_picker_a_panel_and_a_bar(serve, page, monkeypatc
         }"""), "the action bar left the screen"
         page.click("#detail .panetoggle")
         page.wait_for_selector("#actpane .apdanger", state="visible")
+        assert page.errors == [], page.errors
+
+
+def test_a_kubernetes_log_line_is_split_by_pod_like_a_compose_one(serve, page, monkeypatch):
+    """kubectl streams these workspaces' logs with `--prefix`, so every line arrives as
+    `[pod/<pod>/<container>] the actual line`. The viewer knew only Compose's
+    `service-1  | line`, so on the runtime where it matters most -- nine pods logging at
+    once on microservices -- the SERVICE column was empty, the service filter had nothing
+    to offer, and 55 characters of pod name sat in front of every message.
+
+    Worse when the line was JSON: the message was taken from the parsed object, so the
+    prefix was dropped entirely and nine pods' logs interleaved with no way to tell which
+    said what.
+
+    Lines below are verbatim from a live microservices workspace.
+    """
+    _stub_lifecycle(monkeypatch, _kube_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        parsed = page.evaluate("""() => [
+          parseLogLine('[pod/rocketchat-presence-7ffb7dc6f7-7v88f/presence-service] NetworkBroker started successfully.'),
+          parseLogLine('[pod/rocketchat-rocketchat-579c867b87-mclgv/rocketchat] {"level":50,"time":1755600000000,"msg":"You have not provided a mail URL."}'),
+          parseLogLine('rocketchat-1  | {"level":30,"time":1755600000000,"msg":"started"}'),
+        ]""")
+        # The CONTAINER, not the pod: a pod name carries a replicaset hash that changes
+        # on every rollout, and the container is the same word Compose calls a service.
+        assert parsed[0]["service"] == "presence", parsed[0]
+        assert parsed[0]["msg"] == "NetworkBroker started successfully.", parsed[0]
+        assert parsed[0]["pod"] == "rocketchat-presence-7ffb7dc6f7-7v88f", parsed[0]
+        # JSON still parses, and the pod is no longer lost with the prefix.
+        assert parsed[1]["service"] == "rocketchat", parsed[1]
+        assert parsed[1]["level"] == "error", parsed[1]
+        assert parsed[1]["msg"] == "You have not provided a mail URL.", parsed[1]
+        assert parsed[1]["pod"] == "rocketchat-rocketchat-579c867b87-mclgv", parsed[1]
+        # And the Compose shape is untouched.
+        assert parsed[2]["service"] == "rocketchat", parsed[2]
+        assert parsed[2]["msg"] == "started", parsed[2]
+        # The rendered row puts it in the service cell, with the pod on the tooltip --
+        # which is what tells two replicas of one service apart.
+        cell = page.evaluate("""() => {
+          const r = logRow(parseLogLine(
+            '[pod/rocketchat-ddp-streamer-768f896d7-2r7w7/ddp-streamer] hello'));
+          const s = r.querySelector('.ls');
+          return [s.textContent, s.title, r.querySelector('.lm').textContent];
+        }""")
+        assert cell == ["ddp-streamer", "rocketchat-ddp-streamer-768f896d7-2r7w7", "hello"], cell
         assert page.errors == [], page.errors

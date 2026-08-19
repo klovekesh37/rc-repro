@@ -1446,6 +1446,7 @@ def kubernetes_note_groups(meta: runner.Metadata) -> list[dict]:
     pods = 9 if micro else 5
     bind_host = str(extra.get("bind_host") or "")
     port = meta.host_port or 3000
+    root = meta.root_url or f"http://localhost:{port}"
     # The port-forward carries the bind host: a workspace created with
     # `--bind 0.0.0.0` needs `--address 0.0.0.0` to come back the same way.
     addr = ("" if bind_host in ("", "127.0.0.1", "localhost")
@@ -1511,23 +1512,36 @@ def kubernetes_note_groups(meta: runner.Metadata) -> list[dict]:
             ("Pods", f"about {pods}"),
         ]),
         mongo_group,
-        *shared,
         *reach,
-        note_group("Port forward", body=[
-            "The port-forward is tied to the Rocket.Chat pod and dies with it. If "
-            "the pod is replaced, start it again:"],
-            commands=[f"kubectl -n {ns} port-forward {addr}"
-                      f"deployment/{release}-rocketchat {port}:3000"]),
-        note_group("kubectl and helm", body=[
+        # THE ORDER IS THE SEQUENCE somebody has to perform, and it was wrong: the
+        # port-forward came first, so the first command anyone pasted ran against
+        # whatever cluster their own kubectl happened to be pointed at -- or at
+        # nothing. The export has to come before every other line here, and the
+        # port-forward before anything that reaches Rocket.Chat itself, so the three
+        # groups now read top to bottom as: point your tools here, open the way in,
+        # then look at what is inside.
+        note_group("1 · Point kubectl and helm at this cluster", body=[
             "rc-repro keeps its own kubeconfig so creating a cluster cannot move the "
             "context you were using. A bare `kubectl` will not see this workspace "
-            "until it is pointed here:"],
+            "until it is pointed here, and every command below assumes it:"],
+            commands=[f"export KUBECONFIG={k8s.owned_kubeconfig()}"]),
+        note_group("2 · Open the way in", body=[
+            f"Rocket.Chat is reached through a port-forward, which is tied to its pod "
+            f"and dies with it. This is the one rc-repro started, so run it again if "
+            f"{root} stops answering:"],
+            commands=[f"kubectl -n {ns} port-forward {addr}"
+                      f"deployment/{release}-rocketchat {port}:3000"]),
+        note_group("3 · Look at what is inside", body=[
+            "What is running, what Rocket.Chat is saying, and the values the release "
+            "was installed with:"],
             commands=[
-                f"export KUBECONFIG={k8s.owned_kubeconfig()}",
                 f"kubectl -n {ns} get pods",
                 f"kubectl -n {ns} logs -l app.kubernetes.io/name=rocketchat -f",
                 f"helm -n {ns} get values {release}",
             ]),
+        # After the three steps, not before them: it carries two `kubectl` lines, and
+        # nothing that needs the kubeconfig may appear above the export that sets it.
+        *shared,
         note_group("Monitoring", body=[
             f"Prometheus and Grafana are shared by the cluster, not installed per "
             f"workspace: this puts one stack in {k8s.OPERATOR_NAMESPACE}, and `--off` "

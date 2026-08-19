@@ -5419,7 +5419,10 @@ def test_a_workspace_made_before_groups_existed_still_renders_as_groups():
     s = lc._summary(m)
     titles = [g["title"] for g in s["note_groups"]]
     assert titles[:2] == ["Kubernetes", "MongoDB"]
-    assert "kubectl and helm" in titles
+    # The three steps read in the order somebody has to perform them.
+    assert titles[2:5] == ["1 · Point kubectl and helm at this cluster",
+                           "2 · Open the way in",
+                           "3 · Look at what is inside"], titles
     # The facts that were welded into a sentence are rows now, for this record too.
     rows = dict((k, v) for k, v in s["note_groups"][0]["rows"])
     assert rows == {"Cluster": "kind-rc-repro-local", "Namespace": "rc-repro-old",
@@ -5449,7 +5452,7 @@ def test_the_url_is_not_repeated_as_a_note_when_the_bind_is_loopback():
     assert "admin123" in " ".join(warned["body"])          # what it exposes
     # The port-forward has to come back the same way it was published, or the
     # workspace is unreachable from the machines the note just warned about.
-    forward = {g["title"]: g for g in public}["Port forward"]
+    forward = {g["title"]: g for g in public}["2 · Open the way in"]
     assert "--address 0.0.0.0" in forward["commands"][0]
 
 
@@ -5515,7 +5518,10 @@ def test_the_terminal_prints_the_same_sections_the_panel_draws(capsys):
     cli._print_notes(m)
     out = capsys.readouterr().out
     for group in lc.note_groups_of(m):
-        assert any(ln.strip() == group["title"] for ln in out.split("\n")), group["title"]
+        # `_ascii` first: the terminal renderer replaces the middle dot in a step
+        # heading, because a box-drawing or typographic glyph is not width-1 everywhere.
+        title = cli._ascii(group["title"])
+        assert any(ln.strip() == title for ln in out.split("\n")), title
         for k, v in group["rows"]:
             assert any(k in ln and str(v) in ln for ln in out.split("\n")), k
         for c in group["commands"]:

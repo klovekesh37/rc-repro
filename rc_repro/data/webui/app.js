@@ -349,11 +349,16 @@ function railGroups(list) {
     [live > 1 ? title : "", tone, buckets[i]]);
 }
 
-// One line. Three of them was right for a rail nobody had more than four rows in;
-// twelve rows of three lines is 620px of picker, and everything that made the third
-// line -- the port, the owner, the scenario -- is in the panel's identity line the
-// moment you click. What survives is what you SCAN for: the name, the version, and
-// the one thing that tells you whether this row is the problem.
+// A row, not a card. The old card was 130px tall and carried six buttons; six
+// workspaces meant 36 buttons on screen and 4.5 of them visible. This is 52px, has no
+// buttons at all, and shows the whole name -- which is the thing anyone is actually
+// scanning for. Everything you can DO lives in the stage, next to the workspace it
+// acts on.
+//
+// One line was tried and reverted. It fits more rows, and it pays for them with the
+// port, the owner and the scenario -- which is what people search a rail BY on a
+// shared box. The grouping above is what "which one is unhappy" needed; the row did
+// not have to shrink as well.
 function card(r) {
   const busy = pendingOn(r.name);
   const state = busy ? "working" : stateClass(r.state || "?");
@@ -364,54 +369,38 @@ function card(r) {
     title: r.name,
     onclick: () => selectRepro(r.name),
   });
-  const nm = el("span", { class: "nm" }, r.name);
-  row.append(nm);
-  if (r.default) row.append(el("span", { class: "star", title: "used by CLI commands with no --name" }, "★"));
-  row.append(el("span", { class: "ver" }, r.rc_version || "?"));
-  row.append(el("span", { class: "meta " + (busy ? "working" : wantsYou(r) ? "warn" : "") },
-                railTag(r, busy)));
+  const r1 = el("span", { class: "r1" }, el("span", { class: "nm" }, r.name));
+  if (r.default) r1.append(el("span", { class: "star", title: "used by CLI commands with no --name" }, "★"));
+  r1.append(el("span", { class: "ver" }, r.rc_version || "?"));
+  const bits = [r.preset, ":" + r.host_port, r.created_by].filter(Boolean);
+  // Runtime is shown only when it is NOT the default. Compose is the overwhelming
+  // majority, so labelling every row "docker" would be noise on the common case and
+  // make the rare one harder to spot rather than easier. What matters is that a
+  // Kubernetes workspace never looks like a Compose one: which commands refuse,
+  // where the data lives and how to reach it all differ, and the list was the one
+  // place the two were indistinguishable.
+  if (r.runtime && r.runtime !== "docker") bits.push(r.runtime === "kubernetes" ? "k8s" : r.runtime);
+  if (r.monitoring) bits.push("monitored");
+  row.append(r1, el("span", { class: "meta" }, bits.join(" · ")));
+  // The third line stays even under a group heading that names the same state: the
+  // heading is a boundary you scroll past, this is on the row you are looking at --
+  // and for the group that wants you it says WHY, which the heading cannot.
+  row.append(el("span", { class: "r3" },
+    el("span", { class: "wstate " + (busy ? "working" : stateClass(r.state)) },
+      busy ? (BUSY_VERB[busy] || busy) : (r.state === "?" ? "state unknown" : r.state)),
+    el("span", { class: "wage" }, railWhy(r) || r.uptime || "")));
   return row;
 }
 
-// What this row's group does not already say. In "wants you" that is the reason,
-// which is the whole point of the row being there; in "running" it is how long and
-// what kind; in "not running" it is that nothing was thrown away.
-// "2 hours" -> "2h". The panel spells it out; the rail has one line and the name is
-// what it is for, so the tag gives up its characters first. Docker's own phrasing is
-// what both runtimes produce (services/lifecycle._since), so this reads one
-// vocabulary -- and anything it does not recognise passes through unchanged rather
-// than being mangled.
-function shortAge(s) {
-  const m = /^(\d+)\s*(second|minute|hour|day|week|month|year)/.exec(String(s || ""));
-  return m ? m[1] + (m[2] === "month" ? "mo" : m[2][0]) : String(s || "");
-}
-
-function railTag(r, busy) {
-  if (busy) return BUSY_VERB[busy] || busy;
-  if (r.state === "?") return "state unknown";
+// What the state word does not say, on the rows where there is something: the reason
+// this row is in the group that wants you. Empty everywhere else, where the age it
+// replaces is the more useful thing.
+function railWhy(r) {
+  if (!wantsYou(r)) return "";
+  const route = ((EDGE && EDGE.routes) || []).find((x) => x.name === r.name);
   const bits = [];
-  if (wantsYou(r)) {
-    const route = ((EDGE && EDGE.routes) || []).find((x) => x.name === r.name);
-    if (r.state !== "running") bits.push(r.state);
-    else if (healthClass(r) === "bad") bits.push(r.health || "unhealthy");
-    if (route && route.reachable === false) bits.push("https 502");
-    return bits.join(" · ");
-  }
-  // "data kept" only for `down`. A stopped workspace obviously still has its data --
-  // the tag already says stopped -- and every character here is one the NAME does not
-  // get, which is what the rail is for.
-  if (r.state !== "running") return r.state === "down" ? "down · data kept" : r.state;
-  if (r.uptime) bits.push(shortAge(r.uptime));
-  if (r.preset && r.preset !== "default") bits.push(r.preset);
-  // Runtime only when it is NOT the default: Compose is the overwhelming majority, so
-  // labelling every row "docker" would be noise on the common case and make the rare
-  // one harder to spot rather than easier. What matters is that a Kubernetes workspace
-  // never looks like a Compose one -- which commands refuse, where the data lives and
-  // how to reach it all differ.
-  if (r.runtime && r.runtime !== "docker") bits.push(r.runtime === "kubernetes" ? "k8s" : r.runtime);
-  // Monitoring is NOT here. It is a fact about the workspace rather than something it
-  // wants from you, the panel carries it as a Grafana link and the action pane offers
-  // to detach it -- and on a one-line row it cost eight characters of the name.
+  if (r.state === "running" && healthClass(r) === "bad") bits.push(r.health || "unhealthy");
+  if (route && route.reachable === false) bits.push("https 502");
   return bits.join(" · ");
 }
 
@@ -542,9 +531,11 @@ function renderActionPane(d, busyLabel) {
   if (next.length) {
     pane.append(el("div", { class: "apgroup" }, "Next, probably"));
     const box = el("div", { class: "apnext" });
-    for (const [it, why] of next) {
-      box.append(el("button", { class: "apn", onclick: it.fn },
-        el("b", {}, it.label), el("span", {}, why)));
+    // The label, and nothing else. The reason each one was chosen was a sentence under
+    // it, and a sentence under a suggestion is a thing to read before you can act: the
+    // heading already says these are suggestions, and the item says what it does.
+    for (const [it] of next) {
+      box.append(el("button", { class: "apn", onclick: it.fn }, el("b", {}, it.label)));
     }
     pane.append(box);
   }
@@ -1203,40 +1194,37 @@ function renderTab() {
   closeLogs();
   body.innerHTML = "";
   if (dstate.tab === "overview") {
-    // ONE LINE EACH, not six big cells. These are the workspace's facts and four of
-    // the six never change for the life of it -- version, database, runtime,
-    // scenario -- so they were spending the top of the panel on things nobody came
-    // back to read, and pushing what the workspace has to say below the fold.
+    const kv = (k, v, cls = "") => el("div", { class: "kv" }, el("div", { class: "k" }, k), el("div", { class: "v " + cls }, v));
+    // Exactly six, three columns, two full rows, no hole -- a seventh cell leaves an
+    // empty third, which is why the conditional restart count below adds a ROW rather
+    // than sitting between two of these.
     //
-    // The third column is new and is the reason rows beat cells here: a fact often
-    // has a qualifier ("restarted 4x", "pinned", "not you") that had nowhere to go
-    // inside a cell and was either dropped or turned into a seventh cell.
-    const fr = (k, v, cls = "", note = "") => el("div", { class: "fr" },
-      el("div", { class: "fr-k" }, k),
-      el("div", { class: "fr-v " + cls }, v),
-      el("div", { class: "fr-n" }, note));
+    // Rows were tried here and reverted: they read as a form rather than as a set of
+    // readings, and the values lost the size that makes health and uptime findable
+    // without looking for them. The facts a cell had nowhere to put -- "failing its
+    // healthcheck", "restarted 4x" -- are said by the triage block above instead,
+    // which is where a reader is looking when either of them is true.
+    //
+    // WHERE IT RUNS earns a cell. It decides what every other command will do to this
+    // workspace -- which ones refuse, where the data lives, how to reach it -- and the
+    // panel stated it nowhere. `Port` gave up its place: it is already in the identity
+    // line under the title AND in the URL box below, so it was the one fact on this
+    // grid stated three times, while the runtime was stated nowhere.
     const where = d.runtime === "kubernetes" ? "Kubernetes" : "Compose";
-    const rows = el("div", { class: "factrows" });
-    // Live first: health and uptime are the two that change, and they are what the
-    // panel is opened to look at.
-    rows.append(fr("Health", d.health || d.state || "—",
-                   HEALTH_TONE[healthClass(d)] || "",
-                   healthClass(d) === "bad" ? "failing its healthcheck" : ""));
-    rows.append(fr("Uptime", d.uptime || "—", d.uptime ? "green" : "",
-                   d.restarts ? `restarted ${d.restarts}×` : ""));
-    rows.append(fr("Rocket.Chat", d.rc_version || "?", "", d.pinned ? "pinned" : ""));
-    // The flavour is a COMPOSE image choice -- the Kubernetes StatefulSet honours
-    // neither value, and printing it there labelled a workspace with an image it
-    // does not run.
-    rows.append(fr("MongoDB", d.mongo_tag || "?", "",
-                   d.runtime === "kubernetes" ? "" : (d.mongo_flavor || "")));
-    // WHERE IT RUNS decides what every other command will do to this workspace --
-    // which ones refuse, where the data lives, how to reach it -- and the panel
-    // stated it nowhere until v0.66.0.
-    rows.append(fr("Runs on", d.deployment ? `${where} · ${d.deployment}` : where));
-    rows.append(fr("Scenario", d.preset || "default", "",
-                   d.instances > 1 ? `${d.instances} instances` : ""));
-    body.append(rows);
+    const grid = el("div", { class: "kv-grid" },
+      kv("RC Version", d.rc_version), kv("MongoDB", d.mongo_tag),
+      kv("Runs on", d.deployment ? `${where} · ${d.deployment}` : where),
+      kv("Uptime", d.uptime || "—", d.uptime ? "green" : ""),
+      kv("Scenario", d.preset || "default"),
+      // healthClass() knows unhealthy/starting/healthy; the kv only understood the
+      // literal string "healthy", so a container reporting "running" rendered plain.
+      kv("Health", d.health || d.state || "—", HEALTH_TONE[healthClass(d)] || ""));
+    // A climbing restart count separates "slow to boot" from "crash-looping". No
+    // banner under it any more: that is the triage block, above the tabs.
+    if (typeof d.restarts === "number" && d.restarts > 0) {
+      grid.append(kv("RC restarts", String(d.restarts), d.restarts >= 2 ? "bad" : "warn"));
+    }
+    body.append(grid);
     // Parsed once and shared: the links card merges a note that names a place it
     // already lists, and records which notes it took, so no group below repeats one.
     const parsed = noteItemsByGroup(d);
@@ -1681,10 +1669,29 @@ function queueLog(e) {
   if (!logv.frame) logv.frame = requestAnimationFrame(flushLogs);
 }
 
+// kubectl's `--prefix`: `[pod/<pod>/<container>] the actual line`. On a microservices
+// workspace every line arrives like this from nine pods at once, and this function knew
+// only Compose's `service-1  | line` -- so the SERVICE column was empty on the runtime
+// where it matters most, the filter had nothing to offer, and 55 characters of pod name
+// sat in front of every message pushing the content out of alignment. When the line was
+// JSON the prefix was silently dropped instead, which is worse: nine pods' logs
+// interleaved with no way to tell which said what.
+const K8S_PREFIX = /^\[pod\/([^/\]]+)\/([^/\]]+)\]\s?/;
+
 function parseLogLine(line) {
-  const bar = line.indexOf("|");
-  let service = "", content = line;
-  if (bar > 0 && bar < 40) { service = line.slice(0, bar).trim().replace(/-\d+$/, ""); content = line.slice(bar + 1).trim(); }
+  let service = "", content = line, pod = "";
+  const k = K8S_PREFIX.exec(line);
+  if (k) {
+    pod = k[1];
+    // The CONTAINER, not the pod: a pod name carries a replicaset hash that changes on
+    // every rollout, and the container is the same word Compose calls a service --
+    // `rocketchat`, `ddp-streamer`, `presence`. The chart suffixes half of them with
+    // `-service`, which is noise in a 92px column where every row has it.
+    service = k[2].replace(/-service$/, "");
+    content = line.slice(k[0].length);
+  }
+  const bar = content.indexOf("|");
+  if (!k && bar > 0 && bar < 40) { service = content.slice(0, bar).trim().replace(/-\d+$/, ""); content = content.slice(bar + 1).trim(); }
   let level = "info", msg = content, ts = "";
   const b = content.indexOf("{");
   if (b >= 0) {
@@ -1699,7 +1706,7 @@ function parseLogLine(line) {
       if (o.name) msg = `[${o.name}] ${msg}`;
     } catch (_) { /* not JSON — keep raw */ }
   }
-  return { service, level, msg, ts, raw: line };
+  return { service, level, msg, ts, pod, raw: line };
 }
 function passes(e) {
   return LEVELS.indexOf(e.level) >= LEVELS.indexOf(logv.min)
@@ -1707,10 +1714,14 @@ function passes(e) {
     && (!logv.q || e.msg.toLowerCase().includes(logv.q));
 }
 function logRow(e) {
+  // The pod on the service cell's tooltip: two replicas of one service are the same
+  // word in this column, and which of the two said it is occasionally the whole
+  // question. Not in the column itself -- a replicaset hash is 20 characters of noise
+  // on every row to answer a question nobody asks most of the time.
   return el("div", { class: "logrow lv-" + e.level },
     el("span", { class: "lt" }, e.ts || ""),
     el("span", { class: "ll lv-" + e.level }, e.level.toUpperCase()),
-    el("span", { class: "ls" }, e.service || ""),
+    el("span", { class: "ls", title: e.pod || "" }, e.service || ""),
     el("span", { class: "lm" }, e.msg));
 }
 // The service filter's options, rebuilt from whatever services the buffer has seen.
