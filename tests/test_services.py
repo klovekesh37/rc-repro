@@ -2569,9 +2569,17 @@ def test_a_missing_ingress_controller_only_blocks_a_request_that_needs_one():
     assert k8s.ingress_blocker(have, wants_domain=True) == ""
 
 
-def test_doctor_says_nothing_about_ingress(monkeypatch, tmp_path):
-    """Deliberate omission, asserted so it stays deliberate. `doctor` does not know
-    whether you are about to ask for `--domain`, and most workspaces never do."""
+def test_doctor_never_warns_about_ingress(monkeypatch, tmp_path):
+    """This used to assert `doctor` did not MENTION ingress at all, on the reasoning that
+    it cannot know whether you are about to ask for `--domain` and most workspaces never
+    do. That reasoning was about not nagging, and it still holds -- but silence turned out
+    to be the wrong way to keep it: on a cluster that already has an ingress controller
+    (k3s ships Traefik) the report left a reader unable to see the one thing that
+    distinguishes their cluster from a kind one.
+
+    So it is reported as a FACT and never as a warning. Severity still belongs to whatever
+    needs it, which is `ingress_blocker` refusing a `--domain` that cannot be served.
+    """
     from rc_repro.services import doctor, k8s
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
@@ -2586,8 +2594,16 @@ def test_doctor_says_nothing_about_ingress(monkeypatch, tmp_path):
         "get namespace": (0, ""),
         "version": (0, "v9.9.9"),
     }))
-    msgs = [r["message"] for r in doctor.run_checks()["checks"]]
-    assert not any("ingress" in m.lower() for m in msgs), msgs
+    rows = doctor.run_checks()["checks"]
+    ingress = [r for r in rows if "ingress" in r["message"].lower()]
+    assert len(ingress) == 1, [r["message"] for r in ingress]
+    assert ingress[0]["status"] == "ok", "an absent ingress controller is not a fault"
+    assert ingress[0]["check"] == "kubernetes-ingress"
+    assert "port-forward" in ingress[0]["message"], \
+        "and it says why its absence does not matter"
+    # Nothing anywhere in the report escalates over it.
+    assert not any(r["status"] in ("warn", "fail") and "ingress" in r["message"].lower()
+                   for r in rows)
 
 
 def test_rc_repro_never_rewrites_the_users_kubeconfig(monkeypatch, tmp_path):
@@ -5683,3 +5699,56 @@ def test_a_create_refused_for_want_of_a_cluster_leaves_no_record(monkeypatch, tm
     assert not (tmp_path / "repros" / "ghost").exists(), \
         "a refusal wrote a record for a workspace that was never created"
     assert lc.runner.used_ports() == set(), "and it reserved that workspace's port"
+
+
+def test_doctor_reports_what_a_cluster_provides_the_same_way_on_every_distribution(
+        monkeypatch, tmp_path):
+    """The difference between kind and k3s is three capabilities -- ingress, load
+    balancer, metrics -- and nothing in the report said so. A reader on a context called
+    `default` was not even told it was k3s, and found out that `stats` works there by
+    running it.
+
+    All three are `ok` rows on purpose. A capability is a FACT; severity belongs to
+    whatever needs it, and an absent ingress controller cannot affect a workspace reached
+    by port-forward -- `ingress_blocker` is what refuses when something asks for a
+    hostname. A doctor that warns about a feature you are not using teaches people to
+    ignore its warnings.
+    """
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    def report_for(pre):
+        monkeypatch.setattr(k8s, "preflight", lambda *a, **k: pre)
+        monkeypatch.setattr(k8s, "which", lambda t: "/usr/bin/" + t)
+        rows = doctor.run_checks()["checks"]
+        return {r["check"]: r for r in rows if r["check"].startswith("kubernetes")}
+
+    tools = {n: k8s.Tool(name=n, path="/usr/bin/" + n, version=(9, 9))
+             for n in ("kubectl", "helm", "kind")}
+    k3s = report_for(k8s.Preflight(
+        tools=tools, cluster_reachable=True, context="default",
+        provider=k8s.PROVIDER_EXTERNAL, distribution="k3s", node_count=1,
+        architectures=["amd64"], default_storage_class="local-path",
+        ingress_classes=["traefik"], metrics=True,
+        loadbalancer="traefik has 172.16.0.2"))
+    assert "k3s, 1 node, amd64" in k3s["kubernetes-cluster"]["message"]
+    assert "traefik" in k3s["kubernetes-ingress"]["message"]
+    assert "172.16.0.2" in k3s["kubernetes-loadbalancer"]["message"]
+    assert "`rc-repro stats` works here" in k3s["kubernetes-metrics"]["message"]
+    assert all(k3s[c]["status"] == "ok" for c in
+               ("kubernetes-ingress", "kubernetes-loadbalancer", "kubernetes-metrics"))
+
+    kind = report_for(k8s.Preflight(
+        tools=tools, cluster_reachable=True, cluster_exists=True, context=k8s.CONTEXT,
+        provider=k8s.PROVIDER_KIND, distribution="kind", node_count=1,
+        architectures=["amd64"], default_storage_class="standard"))
+    assert "kind, 1 node, amd64" in kind["kubernetes-cluster"]["message"]
+    # The same three subjects, answered the other way and still not a warning.
+    assert "none installed" in kind["kubernetes-ingress"]["message"]
+    assert "not confirmed" in kind["kubernetes-loadbalancer"]["message"]
+    assert "refuses" in kind["kubernetes-metrics"]["message"]
+    assert all(kind[c]["status"] == "ok" for c in
+               ("kubernetes-ingress", "kubernetes-loadbalancer", "kubernetes-metrics"))
+    # Storage is reported when it is THERE too, not only when it is missing.
+    assert "standard (default)" in kind["kubernetes-storage"]["message"]

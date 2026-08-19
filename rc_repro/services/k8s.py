@@ -151,6 +151,16 @@ class Preflight:
     ingress_classes: list[str] = field(default_factory=list)
     other_clusters: list[str] = field(default_factory=list)
     namespaces: list[str] = field(default_factory=list)
+    #: What this cluster IS, and what it can do. The name is for the wording of a
+    #: message and never for a branch -- what it CAN do is each of the fields below,
+    #: because `k3s --disable traefik` is a real setup and minikube's ingress is an
+    #: addon that ships off.
+    distribution: str = ""
+    node_count: int = 0
+    architectures: list[str] = field(default_factory=list)
+    metrics: bool = False
+    #: Evidence that a LoadBalancer works here, or "" -- see loadbalancer_address().
+    loadbalancer: str = ""
     #: The context actually probed, and how that cluster came to exist. On a box
     #: with no kind this is whatever `kubectl` is already pointed at -- the
     #: bring-your-own-cluster case, where rc-repro manages namespaces and never
@@ -373,6 +383,59 @@ def storage_classes(context: str = CONTEXT) -> tuple[list[str], str]:
     return names, default
 
 
+def metrics_available(context: str = CONTEXT) -> bool:
+    """Whether `kubectl top` can answer here, i.e. metrics-server is installed.
+
+    Asked rather than assumed per distribution: kind ships none, k3s ships one, and
+    minikube has it as an addon that is off by default -- and any of the three can be
+    changed by the person running the cluster. `stats` already discovers this by trying;
+    this is the same question asked before anybody needs the answer, so `doctor` can say
+    it instead of `stats` being the way you find out.
+    """
+    return run(["kubectl", "--context", context, "top", "nodes", "--no-headers"],
+               own=is_ours(context)).returncode == 0
+
+
+def loadbalancer_address(context: str = CONTEXT) -> str:
+    """An address some LoadBalancer Service actually got, or "".
+
+    EVIDENCE, not a capability claim: "no address" means either no controller or nobody
+    asked for one, and those cannot be told apart from outside. Reported as what it is,
+    because a cluster that has given a Service a real address has demonstrably got a
+    load balancer -- which on k3s is ServiceLB and on kind is nothing at all.
+    """
+    res = run(["kubectl", "--context", context, "get", "svc", "-A", "-o",
+               "jsonpath={range .items[?(@.spec.type=='LoadBalancer')]}"
+               "{.metadata.name}={.status.loadBalancer.ingress[0].ip}"
+               "{.status.loadBalancer.ingress[0].hostname} {end}"],
+              own=is_ours(context))
+    if res.returncode != 0:
+        return ""
+    for pair in (res.stdout or "").split():
+        name, _, addr = pair.partition("=")
+        if addr:
+            return f"{name} has {addr}"
+    return ""
+
+
+def nodes_summary(context: str = CONTEXT) -> tuple[int, list[str]]:
+    """(how many nodes, which architectures). Both matter, for different reasons.
+
+    Node COUNT decides whether a node-local default StorageClass can bite: `local-path`
+    on kind and k3s alike is `WaitForFirstConsumer`, so on more than one node a MongoDB
+    pod rescheduled elsewhere cannot rebind its volume. ARCHITECTURE matters because on
+    kind and k3s the node is this machine and on a managed cluster it need not be --
+    `bitnamilegacy/mongodb`, which every Rocket.Chat below 8 pairs with, is amd64-only.
+    """
+    res = run(["kubectl", "--context", context, "get", "nodes", "-o",
+               "jsonpath={range .items[*]}{.status.nodeInfo.architecture} {end}"],
+              own=is_ours(context))
+    if res.returncode != 0:
+        return 0, []
+    arches = (res.stdout or "").split()
+    return len(arches), sorted(set(arches))
+
+
 def ingress_classes(context: str = CONTEXT) -> list[str]:
     """Ingress controllers installed in this cluster.
 
@@ -457,6 +520,10 @@ def preflight(context: str = "") -> Preflight:
     out.storage_classes, out.default_storage_class = storage_classes(out.context)
     out.ingress_classes = ingress_classes(out.context)
     out.namespaces = workspace_namespaces(out.context)
+    out.distribution = distribution(out.context)
+    out.node_count, out.architectures = nodes_summary(out.context)
+    out.metrics = metrics_available(out.context)
+    out.loadbalancer = loadbalancer_address(out.context)
     return out
 
 
