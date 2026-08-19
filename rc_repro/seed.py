@@ -103,6 +103,11 @@ REACT_EVERY = 3
 #: room held two. It is stated here rather than absorbed into a fudge factor because
 #: a plan that cannot say what a room will contain is the thing this module exists
 #: to stop being.
+#:
+#: 6.x was deliberately not measured -- it is out of support, and a floor nobody
+#: runs is a claim nobody can maintain. If the number ever differs on a future
+#: release the room reads as holding MORE than planned, which is reported and not a
+#: fault, so an unmeasured version degrades quietly rather than failing.
 ANCHOR_MESSAGES = 2
 
 # --- the room kinds -----------------------------------------------------------
