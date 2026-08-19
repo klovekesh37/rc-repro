@@ -702,6 +702,54 @@ async function openScenarios() {
 }
 
 
+// One grouped note, as a card. Three kinds of content and each gets the treatment
+// it needs rather than all three arriving as bullets:
+//
+//   rows      facts. A key/value table -- "Cluster: kind-x" was three facts welded
+//             into a sentence, and a sentence is the wrong shape for a lookup.
+//   body      what a reader needs to KNOW. Still read through the notes pattern's
+//             three shapes, so a place line is still a link row and an indented
+//             line is still a copyable box.
+//   commands  what a reader has to PASTE. Its own block with a Copy button, never
+//             prose -- these were buried mid-paragraph.
+function noteGroupCard(g) {
+  const rows = g.rows || [], body = g.body || [], cmds = g.commands || [];
+  if (!rows.length && !body.length && !cmds.length) return null;
+  const card = el("div", { class: "panelcard" });
+  if (g.title) {
+    card.append(el("div", { class: "panelcard-h" },
+      el("span", { class: "section-label flat" }, g.title)));
+  }
+  if (rows.length) {
+    const t = el("table", { class: "notetable" });
+    for (const [k, v] of rows) {
+      t.append(el("tr", {}, el("th", {}, k), el("td", {}, String(v))));
+    }
+    card.append(t);
+  }
+  if (body.length || cmds.length) {
+    const box = el("div", { class: "panelcard-b notes" });
+    // The body goes through the SAME parser the ungrouped notes use, so the three
+    // shapes hold inside a group and nothing about that pattern is re-decided here.
+    if (body.length) renderNoteItems(box, parseNotes(body));
+    for (const c of cmds) {
+      box.append(el("div", { class: "note-cmd" },
+        el("code", {}, c),
+        el("button", { class: "cp", onclick: () => copy(c) }, "Copy")));
+    }
+    card.append(box);
+  }
+  return card;
+}
+
+// The scenario's own prose, whichever form this workspace records it in.
+function scenarioNotes(d) {
+  const groups = d.note_groups || [];
+  if (!groups.length) return d.notes || [];
+  const sc = groups.find((g) => g.kind === "scenario");
+  return sc ? (sc.body || []) : [];
+}
+
 // The Scenario card: what this workspace adds beyond a plain Rocket.Chat, where
 // those things are, and what you have to do to use them — in one block instead of
 // a "Where things are" list and a "Using this scenario" list that never referred
@@ -733,7 +781,11 @@ function scenarioCard(d) {
   // dc=com / admin" before the scenario would work, which is not true of anything.
   // The discriminator is the sentence that INTRODUCES the line, and it is already in
   // the note above it: a hosts entry is the only setup step any preset has.
-  const items = parseNotes(d.notes);
+  // Grouped or not, this card's prose is the SCENARIO's prose. Ungrouped that is
+  // the whole flat list; grouped it is the one group marked as the scenario, and the
+  // rest are cards of their own below. Reading d.notes in the grouped case would put
+  // every Kubernetes fact through here a second time.
+  const items = parseNotes(scenarioNotes(d));
   const introduced = (item) => {
     const before = items[items.indexOf(item) - 1];
     const text = before && before.kind === "prose" ? (before.lines || []).join(" ") : "";
@@ -895,10 +947,22 @@ function renderTab() {
     // Exactly six, exactly like v4: three columns, two full rows, no hole. The
     // owner, the port and the scenario moved into the identity line above, which
     // is where they read as a sentence rather than as three more boxes.
+    // WHERE IT RUNS earns a cell. It decides what every other command will do to
+    // this workspace -- which ones refuse, where the data lives, how to reach it --
+    // and the panel stated it nowhere: you had to notice the `k8s` tag on the rail
+    // card, or read it out of the notes, which is a fact hunt for the single most
+    // consequential thing about a workspace. `detail()` has carried `runtime` and
+    // `deployment` since v0.61.0 and nothing rendered them.
+    // Still exactly six, three columns, two full rows, no hole -- a seventh cell
+    // leaves an empty third. `Port` gave up its place: it is already in the identity
+    // line under the title AND in the URL box below, so it was the one fact on this
+    // grid stated three times, while the runtime was stated nowhere.
+    const where = d.runtime === "kubernetes" ? "Kubernetes" : "Compose";
     const grid = el("div", { class: "kv-grid" },
       kv("RC Version", d.rc_version), kv("MongoDB", d.mongo_tag),
+      kv("Runs on", d.deployment ? `${where} · ${d.deployment}` : where),
       kv("Uptime", d.uptime || "—", d.uptime ? "green" : ""),
-      kv("Port", ":" + d.host_port), kv("Scenario", d.preset || "default"),
+      kv("Scenario", d.preset || "default"),
       // healthClass() knows unhealthy/starting/healthy; the kv only understood the
       // literal string "healthy", so a container reporting "running" rendered plain.
       kv("Health", d.health || d.state || "—", HEALTH_TONE[healthClass(d)] || ""));
@@ -916,8 +980,16 @@ function renderTab() {
         `Rocket.Chat has restarted ${d.restarts || 0}× — usually resource pressure `
         + `(free some repros, or raise Docker's CPU/RAM) or a boot error. Check the Logs tab.`));
     }
-    if ((d.links && d.links.length) || (d.notes && d.notes.length)) {
+    if ((d.links && d.links.length) || scenarioNotes(d).length) {
       body.append(scenarioCard(d));
+    }
+    // Everything else the workspace has to say, one card per group. A workspace made
+    // before groups existed has none of these and its whole story stays in the card
+    // above, unchanged.
+    for (const g of (d.note_groups || [])) {
+      if (g.kind === "scenario") continue;          // rendered by the card above
+      const card = noteGroupCard(g);
+      if (card) body.append(card);
     }
     if (d.state === "running") {
       const card = el("div", { class: "panelcard" },

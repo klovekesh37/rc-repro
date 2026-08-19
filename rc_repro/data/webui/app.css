@@ -419,7 +419,13 @@ input:focus, select:focus, textarea:focus {
 .d-head .name { font-weight: 700; font-size: 1.35rem; letter-spacing: -.02em; }
 .d-head .close { margin-left: auto; background: none; border: none; color: var(--muted); font-size: 1.3rem; cursor: pointer; line-height: 1; }
 .d-head .close:hover { color: var(--ink); }
-.tabs { display: flex; gap: 1.2rem; border-bottom: 1px solid var(--line); margin: 1rem 0; }
+/* Five uppercase tabs need 402px and a phone gives 380. The shell's
+   `overflow: hidden` used to swallow the difference, which meant BACKUPS was off
+   the edge and unreachable with nothing to say so. It scrolls in its own strip
+   now -- the rule this file already applies to any wide content. */
+.tabs { display: flex; gap: 1.2rem; border-bottom: 1px solid var(--line); margin: 1rem 0;
+  overflow-x: auto; scrollbar-width: thin; }
+.tab { flex: 0 0 auto; }
 .tab { font-size: .7rem; font-weight: 600; letter-spacing: .09em;
   text-transform: uppercase; color: var(--dim); background: none; border: none;
   padding: .5rem 0; cursor: pointer; border-bottom: 2px solid transparent; }
@@ -801,7 +807,11 @@ button.jobrow:hover { background: var(--panel2); }
 /* Step two: one column. The rail is a capped, scrollable strip above the stage --
    it is how you choose a workspace, so it cannot simply go. */
 @media (max-width: 760px) {
-  .panes, .panes.no-detail { grid-template-columns: minmax(0, 1fr); }
+  /* Normal flow, not a one-column grid. A grid still sizes its rows from the track
+     it was given, so the stage's row stayed as short as the shell allowed and the
+     cards simply PAINTED over the action pane and the status bar below them. In
+     block flow each pane is as tall as its own content and they follow each other. */
+  .panes, .panes.no-detail { display: block; }
   .rail { border-right: 0; border-bottom: 1px solid var(--line); max-height: 38vh; }
   /* The stage is `position: sticky` so it stays put while the rail scrolls beside
      it. In ONE column there is nothing beside it, and a sticky box in a grid row
@@ -810,6 +820,21 @@ button.jobrow:hover { background: var(--panel2); }
      old `.layout` rule, which stopped matching anything when the panes were
      renamed and took this with it. */
   .detail, .stage { position: static; top: auto; min-height: 0; }
+  /* And the shell stops being viewport-locked. On a desktop each pane scrolls
+     inside a 100vh frame, which is right when they sit side by side. Stacked into
+     one column that same frame gives each of the three a third of the screen and
+     its own scrollbar: the panel came out as a ~200px window showing four of six
+     cells with every notes card below the cut, reachable only by scrolling a box
+     most readers would not know was a box. THIS is what "everything collapses on
+     resize" was. In one column the PAGE scrolls and the panel is as tall as its
+     content; the rail stays capped on purpose, because it is a picker.
+
+     `body.shell` is where the lock actually is -- 100vh plus `overflow: hidden`,
+     which also pinned the status bar to the viewport, so it came out drawn across
+     the middle of the panel rather than under it. */
+  body.shell { height: auto; min-height: 100vh; overflow: visible; }
+  .stage { overflow: visible; }
+  .actpane { max-height: none; }
   .forks { grid-template-columns: 1fr; }
   .statusbar { flex-wrap: wrap; gap: .5rem 1rem; }
   .grafana-embed { height: 240px; }
@@ -994,6 +1019,20 @@ button.brand:hover { color: var(--blue); }
 .note-p { margin: 0; font-size: .84rem; line-height: 1.65; color: var(--muted);
   max-width: 74ch; }
 .note-p a { color: var(--blue); }
+/* A grouped note's facts. A table because that is what they are -- a lookup, not a
+   sentence -- and `tabular-nums` so versions and counts line up down the column. */
+.notetable { width: 100%; border-collapse: collapse; font-size: .82rem;
+  font-variant-numeric: tabular-nums; }
+.notetable tr { border-top: 1px solid var(--line); }
+.notetable tr:first-child { border-top: 0; }
+.notetable th { text-align: left; font-weight: 500; color: var(--muted);
+  padding: .42rem 1.15rem; width: 10.5rem; white-space: nowrap; }
+.notetable td { font-family: var(--mono); font-size: .78rem; color: var(--ink);
+  padding: .42rem 1.15rem .42rem 0; overflow-wrap: anywhere; }
+@media (max-width: 560px) {
+  .notetable th { width: auto; white-space: normal; }
+}
+
 /* The line you have to type. It was one <div> among five and read as prose. */
 .note-cmd { display: flex; align-items: center; gap: .6rem; padding: .45rem .55rem;
   min-width: 0;

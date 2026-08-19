@@ -291,7 +291,7 @@ def _fake_detail(name="t1234", state="running", **over):
         # panel. test_fake_detail_matches_the_real_payload below now compares the two
         # so the next drift fails here instead of in production.
         "env": [{"key": "ROOT_URL", "value": "http://localhost:3001", "override": False}],
-        "links": [], "notes": [], "restarts": 0, "monitoring": False,
+        "links": [], "notes": [], "note_groups": [], "restarts": 0, "monitoring": False,
         "tls": "", "is_default": False, "created_by": "alice", "owner": "alice",
         "made_by": "alice", "owner_history": [], "workspace": "/tmp/ws", "default": False,
         "grafana_url": "", "diag": {},
@@ -2276,4 +2276,160 @@ def test_a_long_line_in_a_note_scrolls_instead_of_being_clipped_away(
         assert m["codeScrolls"] and m["overflowX"] == "auto", \
             "the long line has to scroll inside its box"
         assert m["ws"] == "pre", "a pasted line's spacing must survive"
+        assert page.errors == [], page.errors
+
+
+def test_a_grouped_note_gets_its_own_card_with_a_fact_table_and_a_copy_button(
+        serve, page, monkeypatch):
+    """A Kubernetes workspace had ten things to say and said them as one bulleted
+    dump: the cluster, the namespace and the arrangement welded into a sentence; the
+    `kubectl port-forward` you actually have to paste sitting mid-paragraph as prose;
+    the ldap preset's phpLDAPadmin credentials one bullet among the rest.
+
+    They are three different kinds of content and each now gets the shape it needs --
+    facts as a table, prose as prose, commands as a code block with Copy -- one card
+    per group. What this asserts is that all three arrive: a `.notetable` row for a
+    fact, the group's own title, and a copyable block for a command.
+    """
+    groups = [
+        {"title": "Kubernetes",
+         "rows": [["Cluster", "kind-rc-repro-local"], ["Namespace", "rc-repro-t1234"],
+                  ["Arrangement", "microservices"]],
+         "body": [], "commands": []},
+        {"title": "Port forward",
+         "rows": [],
+         "body": ["The port-forward dies with the pod. Start it again:"],
+         "commands": ["kubectl -n rc-repro-t1234 port-forward deployment/rc 3001:3000"]},
+    ]
+    _stub_lifecycle(monkeypatch, _kube_detail(note_groups=groups,
+                                              notes=["Kubernetes:", "    Cluster  x"]))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .notetable")
+        m = page.evaluate("""() => {
+          const cards = [...document.querySelectorAll('#d-body .panelcard')];
+          const titled = t => cards.find(c => (c.querySelector('.section-label')
+                                               || {}).textContent === t);
+          const kube = titled('Kubernetes'), fwd = titled('Port forward');
+          const rows = kube ? [...kube.querySelectorAll('.notetable tr')].map(
+            r => [r.querySelector('th').textContent, r.querySelector('td').textContent])
+            : null;
+          return {rows,
+                  fwdCmd: fwd ? (fwd.querySelector('.note-cmd code') || {}).textContent : null,
+                  fwdCopy: !!(fwd && fwd.querySelector('.note-cmd .cp')),
+                  fwdProse: fwd ? fwd.textContent.includes('dies with the pod') : false,
+                  // the facts must NOT also be a bullet in the old flat dump
+                  flatDump: cards.some(c => c.textContent.includes('Cluster  x'))};
+        }""")
+        assert m["rows"] == [["Cluster", "kind-rc-repro-local"],
+                             ["Namespace", "rc-repro-t1234"],
+                             ["Arrangement", "microservices"]], m["rows"]
+        assert m["fwdCmd"] == \
+            "kubectl -n rc-repro-t1234 port-forward deployment/rc 3001:3000"
+        assert m["fwdCopy"], "a command you have to paste needs its Copy button"
+        assert m["fwdProse"], "the group's own prose has to survive next to it"
+        assert not m["flatDump"], \
+            "the flat notes are still rendered too, so every fact appears twice"
+        assert page.errors == [], page.errors
+
+
+def test_the_overview_says_which_runtime_the_workspace_runs_on(
+        serve, page, monkeypatch):
+    """Both runtimes rendered an identical Overview. A support engineer handed a link
+    could see the version, the scenario and the health of a workspace with no way to
+    tell whether it was Compose or Kubernetes -- which decides what half the actions
+    in the pane will even do.
+
+    It takes Port's cell: the port is already in the identity line under the name and
+    in the URL box below, and the grid is deliberately exactly six so it fills two
+    rows of three with no hole.
+    """
+    _stub_lifecycle(monkeypatch, _kube_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .kv-grid")
+        cells = page.evaluate("""() => [...document.querySelectorAll(
+          '#d-body .kv-grid .kv')].map(c => [
+            c.querySelector('.k').textContent, c.querySelector('.v').textContent])""")
+        keys = [k for k, _ in cells]
+        assert "Runs on" in keys, keys
+        assert dict(cells)["Runs on"] == "Kubernetes · microservices"
+        assert len(cells) == 6, "the grid is six cells so two rows of three fill"
+        assert page.errors == [], page.errors
+
+
+def test_the_panel_is_not_a_two_hundred_pixel_window_on_a_narrow_screen(
+        serve, page, monkeypatch):
+    """"Everything collapses when I resize the browser."
+
+    The shell is viewport-locked by design -- `body.shell` is 100vh with
+    `overflow: hidden` and each pane scrolls inside it, which is right when the three
+    sit side by side. Stacked into one column it gave each of them a third of the
+    screen: the workspace panel came out a ~200px window showing four of its six
+    cells, with every notes card below the cut and reachable only by scrolling a box
+    nothing marked as a box. The status bar stayed pinned to the viewport too, so it
+    was drawn ACROSS the middle of the panel.
+
+    In one column the page scrolls instead: the panes stack in normal flow, each as
+    tall as its content, and the status bar is last. The rail stays capped, because
+    it is a picker and not content.
+    """
+    groups = [{"title": f"Group {i}", "kind": "", "rows": [],
+               "body": [f"Something worth reading, number {i}."], "commands": []}
+              for i in range(8)]
+    _stub_lifecycle(monkeypatch, _kube_detail(note_groups=groups))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .panelcard")
+        page.set_viewport_size({"width": 520, "height": 900})
+        page.wait_for_timeout(300)
+        m = page.evaluate("""() => {
+          const stage = document.querySelector('.stage');
+          const cards = [...document.querySelectorAll('#d-body .panelcard')];
+          const last = cards[cards.length - 1].getBoundingClientRect();
+          const sb = document.querySelector('.statusbar').getBoundingClientRect();
+          const grid = document.querySelectorAll('#d-body .kv-grid .kv').length;
+          return {pageScrolls: document.documentElement.scrollHeight > window.innerHeight,
+                  sideways: document.body.scrollWidth > window.innerWidth + 2,
+                  // nothing hidden inside an internal scroller
+                  stageHidden: stage.scrollHeight - stage.clientHeight,
+                  lastBottom: last.bottom, sbTop: sb.top, cells: grid,
+                  cards: cards.length};
+        }""")
+        assert m["pageScrolls"], "the page has to scroll; the panel does not fit 900px"
+        assert not m["sideways"], "and it must not scroll sideways"
+        assert m["stageHidden"] <= 2, \
+            f"{m['stageHidden']}px of the panel is hidden inside the stage's own scroller"
+        assert m["cells"] == 6, f"only {m['cells']} of the six Overview cells rendered"
+        assert m["cards"] >= 9, f"only {m['cards']} cards rendered of the 8 groups + scenario"
+        assert m["lastBottom"] <= m["sbTop"] + 2, \
+            "the status bar is drawn over the panel instead of below it"
+        # Five uppercase tabs want 402px. With the shell's `overflow: hidden` gone
+        # they would push the whole page sideways, so the strip scrolls itself --
+        # which also makes BACKUPS reachable, and it was not.
+        page.set_viewport_size({"width": 380, "height": 900})
+        page.wait_for_timeout(200)
+        t = page.evaluate("""() => {
+          const strip = document.querySelector('.tabs');
+          const tabs = [...strip.querySelectorAll('.tab')];
+          const last = tabs[tabs.length - 1];
+          strip.scrollLeft = strip.scrollWidth;
+          const r = last.getBoundingClientRect(), s = strip.getBoundingClientRect();
+          return {label: last.textContent, scrolls: strip.scrollWidth > strip.clientWidth,
+                  reachable: r.right <= s.right + 2 && r.left >= s.left - 2,
+                  sideways: document.documentElement.scrollWidth
+                            > document.documentElement.clientWidth};
+        }""")
+        assert not t["sideways"], "the tab strip pushes the page sideways at 380px"
+        assert t["scrolls"], "the strip should be scrollable, not squeezed"
+        assert t["reachable"], f"{t['label']} cannot be scrolled into view"
         assert page.errors == [], page.errors

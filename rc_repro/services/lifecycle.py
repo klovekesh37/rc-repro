@@ -1341,6 +1341,55 @@ def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: fl
     return {"booted_s": elapsed, "running_version": running}
 
 
+# --- a workspace's notes, as groups ------------------------------------------
+#
+# A note used to be a string, and the whole set a flat list. That was readable in a
+# terminal and became a dump in a browser: eleven bullets in a row, half of them
+# repeating metadata the panel already states above them, with the commands you
+# actually have to paste buried in the middle as prose.
+#
+# So the GROUPS are the source and the flat list is DERIVED from them. One
+# definition, two renderings: the CLI keeps printing strings and cannot drift from
+# what the browser shows, older workspaces whose records hold only the flat list
+# still render the old way, and nothing needs a heuristic to work out where one
+# thought ends and the next begins -- which is what the browser was doing, and it
+# got it wrong twice.
+#
+# Three kinds of content, because that is what is actually in there:
+#   rows      -- facts. Key and value, rendered as a table, never as a sentence.
+#   body      -- the thing a reader needs to KNOW. Prose, and only prose.
+#   commands  -- the thing a reader has to PASTE. Its own block, with a copy button.
+
+
+def note_group(title: str, *, rows: list | None = None, body: list | None = None,
+               commands: list | None = None, kind: str = "") -> dict:
+    return {"title": title, "kind": kind,
+            "rows": [list(r) for r in (rows or [])],
+            "body": list(body or []), "commands": list(commands or [])}
+
+
+def flatten_notes(groups: list[dict]) -> list[str]:
+    """The groups as the flat string list every existing consumer expects.
+
+    Indentation is the contract the flat form already had and the CLI and the browser
+    both parse: a four-space line is something to paste. `key: value` rows become
+    that same shape so a terminal reader sees a list rather than a table it has no
+    way to draw.
+    """
+    out: list[str] = []
+    for group in groups:
+        rows = group.get("rows") or []
+        if rows:
+            width = max(len(str(k)) for k, _ in rows)
+            out.append(f"{group['title']}:")
+            out.extend(f"    {str(k).ljust(width)}  {v}" for k, v in rows)
+        elif group.get("title"):
+            out.append(f"{group['title']}:")
+        out.extend(group.get("body") or [])
+        out.extend(f"    {c}" for c in (group.get("commands") or []))
+    return out
+
+
 # --- seed (inline, used by create --seed) -------------------------------------
 
 def check_seed(meta: runner.Metadata, auth, plan, result: dict,
@@ -1433,6 +1482,11 @@ def _summary(meta: runner.Metadata) -> dict:
         "mongo_flavor": meta.mongo_flavor, "preset": meta.preset, "root_url": meta.root_url,
         "host_port": meta.host_port, "login": {"user": config.ADMIN_USERNAME, "password": config.ADMIN_PASSWORD},
         "pinned": meta.pinned, "notes": list(meta.extra.get("notes", []) if isinstance(meta.extra, dict) else []),
+        # The grouped form, when the workspace has one. A workspace made before
+        # groups existed carries only the flat list, and the panel falls back to
+        # rendering that -- so this is additive and no record needs migrating.
+        "note_groups": list(meta.extra.get("note_groups", [])
+                            if isinstance(meta.extra, dict) else []),
         # Which runtime, and how Rocket.Chat is arranged inside it. `list_repros`
         # has carried the runtime all along and the DETAIL payload had neither, so
         # the panel rendered every workspace as though it were Compose -- and
@@ -2394,56 +2448,86 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     # otherwise the first person to run the guide's `kubectl -n <ns> get pods` finds
     # no operator and reasonably concludes it was never installed.
     if out.get("mongo_managed_by") == "operator":
-        mongo_note = (
-            f"MongoDB {resolved.mongo_tag} via the official operator, with SCRAM "
-            f"auth — {out.get('mongo_image', '')}")
-        shared = [
-            f"the operator itself is SHARED: one install in {k8s.OPERATOR_NAMESPACE} "
-            f"watching every namespace, not one per workspace as the official guide "
-            f"shows. Its CRDs are cluster-scoped, so a per-workspace install would "
-            f"collide at the second workspace. Nothing of it lives in {ns} except "
-            f"the database, its Secrets and its ServiceAccount:",
-            f"    kubectl -n {k8s.OPERATOR_NAMESPACE} get pods    # the operator",
-            f"    kubectl -n {ns} get mongodbcommunity              # this workspace's DB",
-        ]
+        mongo_group = note_group("MongoDB", rows=[
+            ("Version", resolved.mongo_tag),
+            ("Image", out.get("mongo_image", "")),
+            ("Managed by", "the official operator"),
+            ("Authentication", "SCRAM"),
+        ])
+        shared = [note_group("The MongoDB operator is shared", body=[
+            f"One install in {k8s.OPERATOR_NAMESPACE} watches every namespace, "
+            f"rather than one per workspace as the official guide shows. Its CRDs "
+            f"are cluster-scoped, so a second per-workspace install would collide "
+            f"on them. Nothing of it lives in {ns} except the database, its Secrets "
+            f"and its ServiceAccount."],
+            commands=[
+                f"kubectl -n {k8s.OPERATOR_NAMESPACE} get pods",
+                f"kubectl -n {ns} get mongodbcommunity",
+            ])]
     else:
-        mongo_note = (
-            f"MongoDB {resolved.mongo_tag} as a plain StatefulSet — "
-            f"{out.get('mongo_image', '')}, NO authentication. This path is "
-            f"rc-repro's own: the official guide documents only the operator, which "
-            f"needs MongoDB "
+        mongo_group = note_group("MongoDB", rows=[
+            ("Version", resolved.mongo_tag),
+            ("Image", out.get("mongo_image", "")),
+            ("Managed by", "a plain StatefulSet"),
+            ("Authentication", "none"),
+        ], body=[
+            f"This path is rc-repro's own: the official guide documents only the "
+            f"operator, which needs MongoDB "
             f"{'.'.join(str(n) for n in k8s.OPERATOR_MIN_MONGO)}+. Add "
-            f"--mongo-operator for the documented path with auth.")
+            f"`--mongo-operator` for the documented path, with authentication."])
         shared = []
-    meta.extra["notes"] = [
-        f"{'microservices' if microservices else 'monolith'} on "
-        f"{out['context']} — about {pods} pods, namespace {ns}",
-        mongo_note,
+    # GROUPS, not a flat list -- see `note_group` for why. The facts that used to be
+    # sentences ("microservices on kind-x — about 9 pods, namespace rc-repro-y") are
+    # rows now: that one was three facts welded into prose, and it is what the
+    # browser kept gluing to the note after it.
+    groups = [
+        note_group("Kubernetes", rows=[
+            ("Cluster", out["context"]),
+            ("Namespace", ns),
+            ("Arrangement", "microservices" if microservices else "monolith"),
+            ("Pods", f"about {pods}"),
+        ]),
+        mongo_group,
         *shared,
-        reach,
-        "the port-forward dies with its pod; bring it back with:",
-        f"    kubectl -n {ns} port-forward {addr}"
-        f"deployment/{out['release']}-rocketchat {host_port}:3000",
-        "rc-repro keeps its own kubeconfig; a bare kubectl will not see this:",
-        f"    export KUBECONFIG={kubeconfig}",
-        f"    kubectl -n {ns} get pods",
-        f"    kubectl -n {ns} logs -l app.kubernetes.io/name=rocketchat -f",
-        f"    helm -n {ns} get values {out['release']}",
-        "monitoring is shared the same way: `rc-repro monitor --name "
-        f"{repro_name}` installs one Prometheus + Grafana in "
-        f"{k8s.OPERATOR_NAMESPACE} for the whole cluster, and `--off` leaves it up "
-        "while any other workspace still wants it.",
+        note_group("Access", body=[reach]),
+        note_group("Port forward", body=[
+            "The port-forward is tied to the Rocket.Chat pod and dies with it. If "
+            "the pod is replaced, start it again:"],
+            commands=[f"kubectl -n {ns} port-forward {addr}"
+                      f"deployment/{out['release']}-rocketchat {host_port}:3000"]),
+        note_group("kubectl and helm", body=[
+            "rc-repro keeps its own kubeconfig so creating a cluster cannot move the "
+            "context you were using. A bare `kubectl` will not see this workspace "
+            "until it is pointed here:"],
+            commands=[
+                f"export KUBECONFIG={kubeconfig}",
+                f"kubectl -n {ns} get pods",
+                f"kubectl -n {ns} logs -l app.kubernetes.io/name=rocketchat -f",
+                f"helm -n {ns} get values {out['release']}",
+            ]),
+        note_group("Monitoring", body=[
+            f"Prometheus and Grafana are shared by the cluster, not installed per "
+            f"workspace: this puts one stack in {k8s.OPERATOR_NAMESPACE}, and `--off` "
+            f"leaves it up while any other workspace still wants it."],
+            commands=[f"rc-repro monitor --name {repro_name}"]),
         # This used to say "logs, stats and backup have no Kubernetes path yet". Two
         # of the three were right and backup was not: it has run on this runtime
         # since it learned to exec through `kubectl` instead of compose, and an audit
         # found the note still telling users otherwise. A workspace's own notes are
         # where someone checks what they can do with it, so a stale one costs them a
         # capability they already have.
-        "`logs`, `stats`, `env`, `upgrade`, `backup`, `restore`, `seed`, `monitor`, "
-        "`api`, `pat` and `token` all work here. `stats` needs metrics-server in the "
-        "cluster and says so if it is missing; `env --set` still refuses and hands "
-        "over the `helm upgrade` that changes a value.",
+        note_group("What works here", body=[
+            "`logs`, `stats`, `env`, `upgrade`, `backup`, `restore`, `seed`, "
+            "`monitor`, `api`, `pat` and `token` all work on this runtime. `stats` "
+            "needs metrics-server in the cluster and says so if it is missing; "
+            "`env --set` refuses and hands over the `helm upgrade` that changes a "
+            "value."]),
     ]
+    meta.extra["note_groups"] = groups
+    # Derived, never written twice: the CLI and every workspace record made before
+    # groups existed read this, and a second hand-maintained copy is how the two
+    # would come to disagree.
+    meta.extra["notes"] = flatten_notes(groups)
     # A preset's own notes, which the Compose path already surfaces via
     # `meta.extra["notes"] = pre.notes`. This path builds its own list, so without
     # this the preset's UI URL and credentials existed and were never printed --
@@ -2456,7 +2540,23 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         meta.extra["post_ready"] = preset_for_notes.post_ready
     scenario_notes = list(getattr(preset_for_notes, "notes", None) or [])
     if scenario_notes:
-        meta.extra["notes"] = scenario_notes + list(meta.extra["notes"])
+        # The preset's own notes go in FRONT and keep their own shape. They are prose
+        # a human wrote per preset -- place lines, indented commands, wrapped
+        # paragraphs -- so they stay a `body` and are still read through the three
+        # shapes the notes pattern already defines. The group only gives them a title
+        # and a card of their own, which is what they were missing: an ldap
+        # workspace's phpLDAPadmin credentials were a bullet among ten.
+        # kind="scenario", not a title the panel has to recognise by its prefix. The
+        # panel feeds this group BACK into the scenario card instead of making it a
+        # card of its own: that card already absorbs a place note into the link row
+        # naming the same url, and already tells a hosts-file setup step apart from a
+        # credential that merely looks like one. A plain group card would lose both
+        # and put the phpLDAPadmin url on screen twice.
+        groups = [note_group(f"Scenario · {preset_for_notes.name}",
+                             kind="scenario", body=scenario_notes)] + list(
+            meta.extra.get("note_groups") or [])
+        meta.extra["note_groups"] = groups
+        meta.extra["notes"] = flatten_notes(groups)
     # No compose document, so `write` is given an empty one rather than a fake:
     # a file that looks like a compose project but is not would be worse than none.
     ws = runner.workspace(repro_name)

@@ -4380,8 +4380,9 @@ def test_the_notes_say_the_operator_is_shared_when_it_is_used():
     import inspect
 
     src = inspect.getsource(lc._create_kubernetes)
-    assert "SHARED" in src and "official guide" in src
-    assert "monitoring is shared the same way" in src
+    assert "The MongoDB operator is shared" in src and "official guide" in src
+    # Monitoring deviates the same way and for the same reason.
+    assert "shared by the cluster, not installed per" in src
 
 
 def test_the_oplog_user_can_actually_read_the_oplog(monkeypatch):
@@ -5297,3 +5298,47 @@ def test_no_copy_anywhere_is_not_current(tmp_path, monkeypatch):
     monkeypatch.chdir(empty)
     st = skill.state()
     assert st["current"] is False, "nothing installed is not the same as up to date"
+
+
+def test_the_flat_notes_are_derived_from_the_groups_not_maintained_beside_them():
+    """A workspace's notes now exist in two renderings -- grouped cards in the GUI,
+    a flat list of lines in the terminal and in every record written before groups
+    existed. Two hand-written copies is how the two come to disagree, so the groups
+    are the source and the flat list is computed from them.
+
+    What the flattening has to preserve is the notes pattern the panel already
+    parses: an INDENTED line is a copyable box, a line naming a place is a link row,
+    anything else is prose. So a group's rows come out as an aligned indented block
+    (a table where it is read as text), its commands come out indented (a code box),
+    and its prose comes out flush (prose).
+    """
+    g = lc.note_group("Kubernetes", rows=[("Cluster", "kind-x"), ("Namespace", "rc-y")])
+    assert g == {"title": "Kubernetes", "kind": "", "body": [], "commands": [],
+                 "rows": [["Cluster", "kind-x"], ["Namespace", "rc-y"]]}
+
+    lines = lc.flatten_notes([
+        g,
+        lc.note_group("Port forward", body=["It dies with the pod. Start it again:"],
+                      commands=["kubectl -n rc-y port-forward deployment/rc 3001:3000"]),
+    ])
+    assert lines == [
+        "Kubernetes:",
+        "    Cluster    kind-x",      # padded to the widest key, so the column lines up
+        "    Namespace  rc-y",
+        "Port forward:",
+        "It dies with the pod. Start it again:",
+        "    kubectl -n rc-y port-forward deployment/rc 3001:3000",
+    ], lines
+    # The two shapes that matter to the parser, stated as such: indentation is what
+    # makes a line copyable, and prose must not be indented or it becomes a command.
+    assert lines[1].startswith("    ") and lines[-1].startswith("    ")
+    assert not lines[4].startswith(" ")
+
+
+def test_an_empty_group_contributes_no_stray_heading():
+    """A group is built unconditionally and filled conditionally -- the operator note
+    only exists on one MongoDB path -- so an empty one must vanish rather than leave a
+    bare `Monitoring:` above nothing."""
+    assert lc.flatten_notes([lc.note_group("Monitoring")]) == ["Monitoring:"]
+    assert lc.flatten_notes([]) == []
+    assert lc.flatten_notes([lc.note_group("", body=["a bare line"])]) == ["a bare line"]
