@@ -2025,6 +2025,13 @@ def detail(name: str) -> dict:
         # already distinguishes starting/running/stopped. A per-pod answer is in the
         # containers tab, where it belongs.
         d["health"] = ""
+        # ROCKET.CHAT'S OWN restart count, which this branch never set -- so the panel's
+        # restart cell and the triage rule that reads it were both dead on Kubernetes,
+        # on a runtime where a crash-looping workspace is the common failure. Its own
+        # pod, by the label `pod_rows` marks, because nine pods here have a count each
+        # and "RC restarts: 3" must not be a sidecar's.
+        d["restarts"] = max((int(r.get("restarts") or 0)
+                             for r in d["containers"] if r.get("app")), default=0)
         # LINKS ARE NOT COMPOSE-SHAPED, and leaving them out of this branch cost the
         # panel every address a scenario publishes. A preset's UI answers on the SAME
         # host port under both runtimes -- Compose binds it, Kubernetes port-forwards

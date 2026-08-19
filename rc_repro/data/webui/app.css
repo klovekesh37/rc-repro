@@ -1122,7 +1122,7 @@ body { overflow-x: clip; }
 
 /* ---- scenarios ---- */
 .scen-b { padding: .85rem 1rem; }
-.scen-d { margin: 0; font-size: .86rem; line-height: 1.6; color: var(--muted); max-width: 68ch; }
+.scen-d { margin: 0; font-size: .86rem; line-height: 1.6; color: var(--muted); }
 /* Notes are pre-wrapped for an 80-column terminal. Re-flowing them into a narrow
    column produces "…reaches Keycloak at the same / URL Rocket.Chat's backend
    uses", which reads as broken text rather than as instructions. */
@@ -1178,8 +1178,11 @@ button.brand:hover { color: var(--blue); }
   border: 1px solid var(--line); border-radius: var(--r-md); padding: 1rem 1.1rem; }
 .notes code.inline { font-family: var(--mono); font-size: .82em; padding: .1em .35em;
   background: var(--panel2); border: 1px solid var(--line); border-radius: var(--r-xs); }
-.note-p { margin: 0; font-size: .84rem; line-height: 1.65; color: var(--muted);
-  max-width: 74ch; }
+/* NO `ch` cap. A 74ch measure is the right idea for a page of running text and the
+   wrong one inside a card: it made a paragraph 647px wide in an 832px card at 1440, and
+   the same 647px in a 1344px card at 1920 -- half the box, with the code block under it
+   running the full width. The card is the measure; the panel column is what bounds it. */
+.note-p { margin: 0; font-size: .84rem; line-height: 1.65; color: var(--muted); }
 .note-p a { color: var(--blue); }
 /* A grouped note's facts. A table because that is what they are -- a lookup, not a
    sentence -- and `tabular-nums` so versions and counts line up down the column. */
@@ -1249,7 +1252,7 @@ button.brand:hover { color: var(--blue); }
 /* Indented to the url column, so the second line reads as part of the row rather
    than as a new one that happens to sit under it. */
 .linkrow .l-sub { flex: 0 0 100%; padding-left: 9.5rem; font-size: .78rem;
-  line-height: 1.6; color: var(--muted); max-width: 76ch; }
+  line-height: 1.6; color: var(--muted); }
 .linkrow .l-sub a { color: var(--blue); }
 .linkrow .l-sub code.inline { font-family: var(--mono); font-size: .82em; padding: .1em .35em;
   background: var(--panel2); border: 1px solid var(--line); border-radius: var(--r-xs); }
@@ -1279,7 +1282,7 @@ button.brand:hover { color: var(--blue); }
 .note-cmd code { font-size: .8rem; }
 /* The scenario card: a document, not a form. */
 .scen-b { padding: 1rem 1.15rem 1.15rem; }
-.scen-d { font-size: .88rem; line-height: 1.7; color: var(--ink); opacity: .8; max-width: 72ch; }
+.scen-d { font-size: .88rem; line-height: 1.7; color: var(--ink); opacity: .8; }
 .scen-f { padding: .8rem 1.15rem; font-size: .74rem; }
 .hcard, .capcard { border-radius: var(--r-lg); }
 .hcard-h { padding: .8rem 1.1rem; }

@@ -1048,6 +1048,23 @@ function triageOf(d) {
          [logs]);
   }
 
+  // A pod OTHER than Rocket.Chat's that keeps restarting. The rule above counts
+  // Rocket.Chat's own restarts and nothing counted the rest, so on microservices a
+  // ddp-streamer or presence pod could crash-loop all day with the panel calling the
+  // workspace healthy -- and it is the same fault, one layer along. `app` is the
+  // server's answer to "which pod is Rocket.Chat", from the label it selects on.
+  const flapping = (d.containers || []).filter((c) => !c.app && (c.restarts || 0) >= 2);
+  if (flapping.length) {
+    const one = flapping.length === 1;
+    push(one ? `${flapping[0].service} keeps restarting`
+             : `${flapping.length} pods keep restarting`,
+         (one ? `It has restarted ${flapping[0].restarts}×`
+              : flapping.slice(0, 3).map((c) => `${c.service} — ${c.restarts}×`).join(" · "))
+         + ". Rocket.Chat depends on these, so it will be failing in ways its own logs "
+         + "only half explain.",
+         [pods]);
+  }
+
   // Pods that cannot start, named. `blocked` is decided server-side by the module
   // that owns the list of reasons a pod never recovers from (services/k8s.py); the
   // browser reads the flag rather than keeping a second copy of the policy, which is

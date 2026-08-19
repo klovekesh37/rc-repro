@@ -1975,6 +1975,13 @@ def pod_rows(name: str, *, context: str) -> list[dict]:
         rows.append({"service": str(meta.get("name") or ""),
                      "state": phase.lower(), "status": status,
                      "health": "healthy" if main and ready == len(main) else "",
+                     # WHICH POD IS ROCKET.CHAT ITSELF, decided by the label the
+                     # APP_SELECTOR above already names -- not by a substring of the
+                     # pod name, which is a naming rule the browser would then hold a
+                     # second copy of. The panel needs it to report Rocket.Chat's own
+                     # restart count on a runtime where nine pods have one each.
+                     "app": (meta.get("labels") or {}).get(
+                         "app.kubernetes.io/name") == "rocketchat",
                      # Decided HERE, next to the list that defines it, because the
                      # browser needs the answer and must not keep a second copy of
                      # the policy: `ContainerCreating` and `PodInitializing` are

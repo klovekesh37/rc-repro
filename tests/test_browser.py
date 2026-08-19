@@ -2961,3 +2961,114 @@ def test_a_kubernetes_log_line_is_split_by_pod_like_a_compose_one(serve, page, m
         }""")
         assert cell == ["ddp-streamer", "rocketchat-ddp-streamer-768f896d7-2r7w7", "hello"], cell
         assert page.errors == [], page.errors
+
+
+def test_a_note_paragraph_is_as_wide_as_the_card_it_is_in(serve, page, monkeypatch):
+    """The prose in a note card was capped at 74ch. A measure like that is the right
+    idea for a page of running text and the wrong one inside a card: it made the
+    paragraph 647px wide in an 832px card at 1440, and the SAME 647px in a 1344px card
+    at 1920 -- half the box -- while the code block directly under it ran the full
+    width. Text stopping at half the box with a border drawn round the whole of it
+    reads as a broken layout, not as a measure.
+    """
+    groups = [{"title": "1 · Point kubectl and helm at this cluster", "rows": [],
+               "body": ["rc-repro keeps its own kubeconfig so creating a cluster cannot "
+                        "move the context you were using. A bare `kubectl` will not see "
+                        "this workspace until it is pointed here, and every command "
+                        "below assumes it:"],
+               "commands": ["export KUBECONFIG=/home/you/.rc-repro/clients/kubernetes/config"]}]
+    _stub_lifecycle(monkeypatch, _kube_detail(note_groups=groups))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .note-cmd")
+        for width in (1440, 1920):
+            page.set_viewport_size({"width": width, "height": 1000})
+            page.wait_for_timeout(200)
+            m = page.evaluate("""() => {
+              const card = [...document.querySelectorAll('#d-body .panelcard')].find(
+                (c) => c.textContent.includes('own kubeconfig'));
+              const w = (sel) => Math.round(
+                card.querySelector(sel).getBoundingClientRect().width);
+              return {para: w('.note-p'), cmd: w('.note-cmd'),
+                      card: Math.round(card.clientWidth)};
+            }""")
+            # The paragraph and the thing under it share one edge. Comparing them to each
+            # other rather than to a number is what makes this hold at every width.
+            assert abs(m["para"] - m["cmd"]) <= 2, (
+                f"at {width}px the paragraph is {m['para']}px and the code block "
+                f"{m['cmd']}px in a {m['card']}px card")
+        assert page.errors == [], page.errors
+
+
+def test_a_sidecar_that_keeps_restarting_is_a_fault_on_kubernetes(serve, page, monkeypatch):
+    """The restart rule read `d.restarts`, and the Kubernetes branch of detail() never
+    set it -- so both the restart cell and the triage rule were dead on the runtime where
+    a crash-looping workspace is the common failure. Found on a live microservices
+    workspace whose `ddp-streamer` pod had restarted three times while the panel called
+    it healthy.
+
+    Two halves. `restarts` is now Rocket.Chat's OWN pod, by the label the server selects
+    on -- nine pods here have a count each and "RC restarts: 3" must not be a sidecar's.
+    And a sidecar that keeps restarting gets its own entry, because Rocket.Chat depends
+    on it and the fault is the same one a layer along.
+    """
+    d = _kube_detail(restarts=0, containers=[
+        {"service": "rocketchat-rocketchat-579c867b87-mwq4w", "state": "running",
+         "status": "1/1 ready", "health": "healthy", "app": True, "restarts": 0},
+        {"service": "rocketchat-ddp-streamer-768f896d7-rpcw9", "state": "running",
+         "status": "1/1 ready · 3 restarts", "health": "healthy", "app": False,
+         "restarts": 3},
+        # One restart is what a slow first boot looks like, on either runtime.
+        {"service": "rocketchat-presence-7ffb7dc6f7-m25vt", "state": "running",
+         "status": "1/1 ready · 1 restart", "health": "healthy", "app": False,
+         "restarts": 1}])
+    _stub_lifecycle(monkeypatch, d)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#detail .triage .tri")
+        m = page.evaluate("""() => [...document.querySelectorAll('#detail .triage .tri')].map(
+          (t) => [t.querySelector('.tri-t b').textContent,
+                  t.querySelector('.tri-t span').textContent])""")
+        assert len(m) == 1, m
+        assert m[0][0] == "rocketchat-ddp-streamer-768f896d7-rpcw9 keeps restarting", m
+        assert "restarted 3×" in m[0][1], m[0][1]
+        assert "presence" not in m[0][1], "one restart is a slow boot, not a fault"
+        page.click("#detail .triage .tri-a button")
+        page.wait_for_selector("#d-body .dtable")
+        assert page.errors == [], page.errors
+
+
+def test_the_restart_count_on_kubernetes_is_rocket_chats_own_pod(monkeypatch, tmp_path):
+    """`app` is decided in services/k8s.py from the label APP_SELECTOR already names,
+    never from a substring of the pod name -- the browser would then hold a second copy
+    of a naming rule, and on microservices every pod's name starts with the release.
+    """
+    import json as _json
+
+    from rc_repro import runner
+    from rc_repro.services import k8s as k8ssvc
+    from rc_repro.services import lifecycle as lcsvc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    (tmp_path / "repros" / "kub").mkdir(parents=True)
+    (tmp_path / "repros" / "kub" / "repro.json").write_text(_json.dumps({
+        "name": "kub", "project": "p", "rc_version": "8.5.1", "rc_image": "i",
+        "mongo_tag": "8.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3131", "host_port": 3131, "version_source": "x",
+        "extra": {"runtime": "kubernetes", "namespace": "rc-repro-kub",
+                  "release": "rocketchat"}}))
+    monkeypatch.setattr(runner, "docker_available", lambda **_k: False)
+    monkeypatch.setattr(lcsvc, "kubernetes_state", lambda name, meta: "running")
+    monkeypatch.setattr(k8ssvc, "pod_rows", lambda name, **kw: [
+        {"service": "rocketchat-ddp-streamer-x", "state": "running", "status": "",
+         "health": "", "app": False, "restarts": 3, "started": ""},
+        {"service": "rocketchat-rocketchat-y", "state": "running", "status": "",
+         "health": "healthy", "app": True, "restarts": 1, "started": ""}])
+    # Rocket.Chat's own, not the worst in the namespace.
+    assert lcsvc.detail("kub")["restarts"] == 1
