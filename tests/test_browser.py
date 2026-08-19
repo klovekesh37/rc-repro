@@ -2179,3 +2179,101 @@ def test_the_three_panes_survive_a_narrow_window(serve, page, monkeypatch, tmp_p
             assert m["stage"] >= 320, f"the stage is {m['stage']}px at {width}px"
             assert not m["overlap"], f"the rail and the stage overlap at {width}px"
         assert page.errors == [], page.errors
+
+
+def test_a_note_that_ends_in_a_name_is_not_glued_to_the_next_one(serve, page, monkeypatch):
+    """The notes pattern has three shapes, and this is the third one's rule: prose
+    lines are joined into a paragraph only when the previous line was WRAPPED — they
+    were written for an 80-column terminal, not as separate points.
+
+    "Ends in any lowercase word" was too broad, and the Kubernetes notes proved it:
+    "monolith on kind-rc-repro-local — about 5 pods, namespace rc-repro-x" is a
+    complete point that happens to end in an identifier, and it was being glued to
+    the MongoDB note after it — two unrelated facts in one bullet, in the notes a
+    reader consults to find out what their workspace actually is.
+
+    Both sides are pinned here, because narrowing the rule could easily have broken
+    the wrapping it exists for -- `oidc`'s real notes must still join, which is the
+    test directly after this one.
+    """
+    kube_notes = [
+        "monolith on kind-rc-repro-local — about 5 pods, namespace rc-repro-x",
+        "MongoDB 8.0 as a plain StatefulSet — mongo:8.0, NO authentication.",
+        "reachable on this box at http://localhost:3000",
+    ]
+    _stub_lifecycle(monkeypatch, _fake_detail(state="stopped", notes=kube_notes))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        paras = page.eval_on_selector_all(
+            "#d-body .note-p", "es => es.map(e => e.textContent.trim())")
+        assert len(paras) == 3, paras
+        assert paras[0].endswith("rc-repro-x"), paras[0]
+        assert "StatefulSet" not in paras[0], "two notes were glued into one bullet"
+        assert page.errors == [], page.errors
+
+
+def test_a_genuinely_wrapped_note_still_joins_the_line_after_it(serve, page, monkeypatch):
+    """The other side of the same rule, and the reason narrowing it was risky:
+    `oidc`'s real notes trail off in "…can reach Keycloak at the", which is what
+    wrapping actually looks like, and those two lines are one point."""
+    from rc_repro import presets as presets_mod
+
+    oidc = list(presets_mod.load("oidc").notes or [])
+    assert oidc[0].rstrip().endswith("the"), \
+        "the fixture for this assertion is oidc's real wrapped line"
+    _stub_lifecycle(monkeypatch, _fake_detail(state="stopped", preset="oidc", notes=oidc))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        joined = page.eval_on_selector_all(
+            "#d-body .note-p", "es => es.map(e => e.textContent)")
+        assert any("host entry" in t and "/etc/hosts" in t for t in joined), \
+            f"the wrapped oidc line stopped joining: {joined}"
+        assert page.errors == [], page.errors
+
+
+def test_a_long_line_in_a_note_scrolls_instead_of_being_clipped_away(
+        serve, page, monkeypatch):
+    """A Kubernetes workspace's notes carry `export KUBECONFIG=<absolute path>`, and
+    it did not fit: `.note-cmd` came out 1147px inside an 824px panel, and
+    `.panelcard`'s `overflow-x: hidden` silently CLIPPED the rest — so the reader was
+    told to paste a path whose end they could not see.
+
+    `white-space: pre` has to stay (a pasted line's spacing is load-bearing and
+    another test asserts it), so the fix is `min-width: 0` on the flex/grid items:
+    without it they refuse to shrink below their content and the `overflow-x: auto`
+    that was already there never engages.
+    """
+    long_path = "/tmp/pytest-of-someone/a-very-long-isolated-home-0/clients/kubernetes/config"
+    notes = ["rc-repro keeps its own kubeconfig; a bare kubectl will not see this:",
+             f"    export KUBECONFIG={long_path}"]
+    _stub_lifecycle(monkeypatch, _fake_detail(state="stopped", notes=notes))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .note-cmd")
+        m = page.evaluate("""() => {
+          const card = document.querySelector('#d-body .panelcard');
+          const box = document.querySelector('#d-body .note-cmd');
+          const code = box.querySelector('code');
+          return {cardOver: card.scrollWidth > card.clientWidth + 2,
+                  boxOver: box.scrollWidth > box.clientWidth + 2,
+                  codeScrolls: code.scrollWidth > code.clientWidth,
+                  overflowX: getComputedStyle(code).overflowX,
+                  ws: getComputedStyle(code).whiteSpace};
+        }""")
+        assert not m["cardOver"], "the card still overflows, so the panel clips it"
+        assert not m["boxOver"], "the code box still pushes past its own bounds"
+        assert m["codeScrolls"] and m["overflowX"] == "auto", \
+            "the long line has to scroll inside its box"
+        assert m["ws"] == "pre", "a pasted line's spacing must survive"
+        assert page.errors == [], page.errors

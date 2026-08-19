@@ -996,9 +996,22 @@ button.brand:hover { color: var(--blue); }
 .note-p a { color: var(--blue); }
 /* The line you have to type. It was one <div> among five and read as prose. */
 .note-cmd { display: flex; align-items: center; gap: .6rem; padding: .45rem .55rem;
+  min-width: 0;
   background: var(--panel2); border: 1px solid var(--line); border-radius: var(--r-sm); }
-.note-cmd code { flex: 1; font-family: var(--mono); font-size: .78rem; color: var(--ink);
-  overflow-x: auto; white-space: pre; }
+.note-cmd code { flex: 1; min-width: 0; font-family: var(--mono); font-size: .78rem;
+  color: var(--ink); overflow-x: auto; white-space: pre; }
+/* `min-width: 0` on BOTH -- the box and the code inside it -- is the whole fix, and
+   without it the `overflow-x` here never engaged. A flex or grid item defaults to
+   `min-width: auto`, which refuses to shrink below its content's intrinsic width, so
+   a long line pushed its own container wide; `.note-cmd` is a grid item of
+   `.panelcard-b.notes`, so it needed the same thing its `<code>` child did.
+   Measured on a Kubernetes workspace, whose notes carry
+   `export KUBECONFIG=<absolute path>`: `.note-cmd` came out 1147px inside an 824px
+   panel, and `.panelcard`'s `overflow-x: hidden` silently CLIPPED the difference --
+   so the reader was told to paste a path whose end they could not see. `white-space:
+   pre` has to stay (a pasted line's spacing is load-bearing and a test asserts it),
+   which is exactly why the box has to scroll rather than the text wrap. Same bug as
+   `.rail-two .input`, two hundred lines up. */
 .cp { font-size: .68rem; font-family: var(--sans); color: var(--muted); background: none;
   border: 1px solid var(--line2); border-radius: var(--r-xs); padding: .18rem .45rem; cursor: pointer;
   flex: 0 0 auto; }

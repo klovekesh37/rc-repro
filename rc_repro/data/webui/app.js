@@ -1982,6 +1982,13 @@ function renderCreateResult(r) {
 // notes as plain text -- a preset that says "pass --reg-token" or "`loadtest
 // --live`" is naming something you type, and leaving the backticks on screen is
 // showing the reader the markup instead of the meaning.
+//: Words a finished sentence does not end on. A note ending in one of these was
+//: wrapped for an 80-column terminal and continues on the next line; a note ending
+//: in anything else -- a name, a number, a url, punctuation -- is a complete point.
+const WRAPPED_TAIL = new RegExp("\\b(?:a|an|the|and|or|but|of|to|in|on|at|by|for|from|"
+  + "with|is|are|was|were|be|been|being|that|which|who|as|its|their|your|our|this|"
+  + "these|those|into|than|then|so|if|when|while|it|not|no|any|each|per|via)$");
+
 const TOKEN_RE = /`([^`]+)`|\bhttps?:\/\/[^\s)]+/;
 
 function linkify(line) {
@@ -2062,13 +2069,23 @@ function parseNotes(notes) {
       continue;
     }
     // A column-0 line continues the one above ONLY if that one broke mid-sentence,
-    // and the reliable signal is what it ENDS with. Ending punctuation is not
-    // enough on its own: livechat has two separate points that each end in a url,
-    // and one that starts with a lowercase username. A line that trails off in a
-    // plain lowercase word ("…can reach Keycloak at the") was wrapped; one ending
-    // in a url, a path, a number or punctuation was finished.
+    // and the reliable signal is what it ENDS with. Ending punctuation is not enough
+    // on its own: livechat has two separate points that each end in a url, and one
+    // that starts with a lowercase username.
+    //
+    // "Ends in any lowercase word" was too broad, and the Kubernetes notes are what
+    // proved it: "monolith on kind-rc-repro-local — about 5 pods, namespace
+    // rc-repro-knotes" is a COMPLETE point that happens to end in an identifier, and
+    // it was being glued to the MongoDB note that followed it — two facts in one
+    // bullet, in the notes a reader consults to find out what their workspace is.
+    //
+    // So the test is narrower: a line was wrapped only if it trails off in a short
+    // FUNCTION word, which is a thing no finished sentence ends with. `oidc`'s
+    // "…can reach Keycloak at the" still joins the line after it; a namespace name
+    // no longer does. Indented continuations (the 2-space ones `email` and `saml`
+    // use) never needed this test and still do not — they are handled above.
     const tail = prev.trim();
-    const wrapped = para && /[a-z][a-z'’]*$/.test(tail) && !/\/\S*$/.test(tail);
+    const wrapped = para && WRAPPED_TAIL.test(tail) && !/\/\S*$/.test(tail);
     if (!para || !(indented || wrapped)) {
       para = { kind: "prose", lines: [] };
       items.push(para);
