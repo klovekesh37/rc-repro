@@ -2649,6 +2649,75 @@ def ensure_operator(*, context: str, emit: Emit = null_emit) -> None:
         raise CreateFailedError("could not install the MongoDB operator: " + why(res))
 
 
+def mongodb_resources(context: str) -> list[str]:
+    """Namespaces that still hold a `MongoDBCommunity`, i.e. still need the operator.
+
+    Empty when the CRD is not installed at all, which is the answer, not an error --
+    `--ignore-not-found` keeps a cluster that never had the operator from looking like
+    a failure.
+    """
+    res = run(["kubectl", "--context", context, "get", "mongodbcommunity", "-A",
+               "--ignore-not-found", "-o",
+               "jsonpath={range .items[*]}{.metadata.namespace}{\"\\n\"}{end}"],
+              timeout=APPLY_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        return []
+    return sorted({ns for ns in (res.stdout or "").split() if ns})
+
+
+def operator_installed(context: str) -> bool:
+    """Whether the shared MongoDB operator release is in this cluster."""
+    res = run(["helm", "list", "--kube-context", context, "-n", OPERATOR_NAMESPACE,
+               "-q"], timeout=APPLY_TIMEOUT, own=is_ours(context))
+    return OPERATOR_RELEASE in (res.stdout or "").split()
+
+
+def remove_operator(*, context: str, emit: Emit = null_emit) -> bool:
+    """Uninstall the shared MongoDB operator once nothing is using it any more.
+
+    `down --volumes` means delete everything, so leaving an operator running afterwards
+    is the wrong answer -- but three things about it are shared, and the ORDER is what
+    makes removing it safe rather than destructive.
+
+    **The custom resources go first, and they already have.** This is called after the
+    workspace's namespace is deleted, which takes its `MongoDBCommunity` with it while
+    the operator is still alive to clear the finalizer. Removing the operator first
+    deadlocks on a resource nothing is left to finalise, and the namespace then sits in
+    Terminating forever -- the identical failure `remove_monitoring` records for a
+    GrafanaFolder, observed there on the first real uninstall.
+
+    **The reference count is a real check, not bureaucracy.** With a second workspace
+    still holding a `MongoDBCommunity`, removing the operator leaves its finalizer with
+    nothing to clear it, so a later `down --volumes` on THAT workspace hangs. In the
+    normal one-workspace case the check passes immediately and the operator goes.
+
+    **The CRD stays.** `helm uninstall` does not remove it anyway, and deleting it would
+    delete every `MongoDBCommunity` in the cluster -- every other workspace's database,
+    instantly. It is inert without the operator and the next `--mongo-operator` reuses
+    it. Same for the namespace: `rc-repro-system` is shared with the monitoring stack.
+    """
+    if not operator_installed(context):
+        return False
+    still = mongodb_resources(context)
+    if still:
+        info(emit, "leaving the MongoDB operator up — still used by "
+                   + ", ".join(n.removeprefix(NAMESPACE_PREFIX) for n in still),
+             phase="teardown")
+        return False
+    info(emit, f"uninstalling the MongoDB operator from {OPERATOR_NAMESPACE} — "
+               "nothing is using it now", phase="teardown")
+    res = run(["helm", "uninstall", OPERATOR_RELEASE, "--kube-context", context,
+               "-n", OPERATOR_NAMESPACE, "--wait", "--timeout", "5m"],
+              timeout=INSTALL_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        # Not an error worth failing a teardown for: the workspace is already gone and
+        # the next `--mongo-operator` runs `upgrade --install`, which repairs it.
+        warn(emit, "the MongoDB operator could not be uninstalled and is still "
+                   f"running in {OPERATOR_NAMESPACE}: " + why(res), phase="teardown")
+        return False
+    return True
+
+
 def wait_for_mongodb(*, namespace: str, context: str, emit: Emit = null_emit,
                      sleep=time.sleep) -> None:
     """Wait for the operator to report the MongoDBCommunity Running.

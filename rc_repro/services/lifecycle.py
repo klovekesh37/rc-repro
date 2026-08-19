@@ -2315,6 +2315,12 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
             found = k8s.delete_namespace(target, context=context, volumes=volumes,
                                          emit=emit)
             if volumes:
+                # AFTER the namespace, never before: deleting it took this workspace's
+                # MongoDBCommunity with it while the operator was still there to clear
+                # the finalizer. `--volumes` means delete everything, so an operator
+                # left running afterwards is the wrong answer -- and `remove_operator`
+                # refuses while any other workspace still needs it.
+                k8s.remove_operator(context=context, emit=emit)
                 shutil.rmtree(runner.workspace(target), ignore_errors=True)
                 _clear_default_if(target)
             # Docker's nouns are wrong here. "containers, data volume, and

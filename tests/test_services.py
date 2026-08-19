@@ -5752,3 +5752,81 @@ def test_doctor_reports_what_a_cluster_provides_the_same_way_on_every_distributi
                ("kubernetes-ingress", "kubernetes-loadbalancer", "kubernetes-metrics"))
     # Storage is reported when it is THERE too, not only when it is missing.
     assert "standard (default)" in kind["kubernetes-storage"]["message"]
+
+
+def test_the_mongodb_operator_goes_with_the_last_workspace_but_not_before(monkeypatch):
+    """`--volumes` means delete everything, and an operator left running afterwards is
+    the wrong answer -- but three things about it are shared, and the ORDER is what makes
+    removing it safe rather than destructive.
+
+    The reference count is not bureaucracy: with a second workspace still holding a
+    `MongoDBCommunity`, removing the operator leaves its finalizer with nothing to clear
+    it, so a later `down --volumes` on THAT workspace hangs in Terminating forever. It is
+    the identical failure `remove_monitoring` recorded for a GrafanaFolder.
+    """
+    import subprocess as sp
+
+    from rc_repro.services import k8s
+
+    calls = []
+
+    def fake(mongodbs, installed=True, rc=0):
+        def run(argv, timeout=None, own=False):
+            calls.append(" ".join(argv))
+            j = " ".join(argv)
+            if "helm list" in j:
+                return sp.CompletedProcess(argv, 0,
+                                           k8s.OPERATOR_RELEASE if installed else "", "")
+            if "get mongodbcommunity" in j:
+                return sp.CompletedProcess(argv, 0, "\n".join(mongodbs), "")
+            return sp.CompletedProcess(argv, rc, "", "boom" if rc else "")
+        return run
+
+    # Nothing left that needs it: the operator goes.
+    calls.clear()
+    monkeypatch.setattr(k8s, "run", fake([]))
+    assert k8s.remove_operator(context="default") is True
+    assert any("helm uninstall " + k8s.OPERATOR_RELEASE in c for c in calls), calls
+    # The CRD is never touched: deleting it would delete every MongoDBCommunity in the
+    # cluster, i.e. every other workspace's database.
+    assert not any("delete crd" in c for c in calls), calls
+    # Nor the namespace, which is shared with the monitoring stack.
+    assert not any("delete namespace" in c for c in calls), calls
+
+    # Another workspace still has one: left alone, and it says whose.
+    calls.clear()
+    events = []
+    monkeypatch.setattr(k8s, "run", fake(["rc-repro-other"]))
+    assert k8s.remove_operator(context="default", emit=events.append) is False
+    assert not any("helm uninstall" in c for c in calls), calls
+    assert any("still used by other" in e.message for e in events), \
+        [e.message for e in events]
+
+    # A cluster that never had it is not an error and says nothing.
+    calls.clear()
+    monkeypatch.setattr(k8s, "run", fake([], installed=False))
+    assert k8s.remove_operator(context="default") is False
+    assert not any("helm uninstall" in c for c in calls), calls
+
+
+def test_removing_the_operator_never_fails_a_teardown(monkeypatch):
+    """The workspace is already gone by the time this runs, and the next
+    `--mongo-operator` is an `upgrade --install` that repairs it. A teardown that reports
+    failure for wreckage it cannot help would leave a user believing their workspace is
+    still there."""
+    import subprocess as sp
+
+    from rc_repro.services import k8s
+
+    def run(argv, timeout=None, own=False):
+        j = " ".join(argv)
+        if "helm list" in j:
+            return sp.CompletedProcess(argv, 0, k8s.OPERATOR_RELEASE, "")
+        if "get mongodbcommunity" in j:
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "uninstall exploded")
+
+    monkeypatch.setattr(k8s, "run", run)
+    events = []
+    assert k8s.remove_operator(context="default", emit=events.append) is False
+    assert any("could not be uninstalled" in e.message for e in events)
