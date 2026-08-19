@@ -307,6 +307,7 @@ def up(
     set_: list[str] = typer.Option(None, "--set", help="preset parameter KEY=VALUE (repeatable), e.g. --set users=5"),
     seed: bool = typer.Option(False, "--seed", help="populate with sample users/channels/messages after boot"),
     seed_profile: str = typer.Option("small", "--seed-profile", help="seed size: small | standard | large"),
+    verify_seed: bool = typer.Option(False, "--verify-seed", help="with --seed: fail if the readback disagrees with the plan"),
     pin: bool = typer.Option(False, "--pin", help="mark persistent + set as default"),
     wait: bool = typer.Option(False, "--wait", help="block until RC is serving"),
     offline: bool = typer.Option(False, "--offline", help="skip the live version lookup"),
@@ -354,7 +355,8 @@ def up(
         _render_create_result(result)
     seeded = None
     if seed:
-        seeded = _run_seed(runner.read_meta(result["name"]), seed_profile, stats=stats)
+        seeded = _run_seed(runner.read_meta(result["name"]), seed_profile,
+                           stats=stats, verify=verify_seed)
     if json_out:
         data = dict(result)
         if seeded is not None:
@@ -364,7 +366,8 @@ def up(
 
 
 def _run_seed(meta: runner.Metadata, profile: str,
-              users=None, channels=None, messages=None, stats: bool = False) -> dict:
+              users=None, channels=None, messages=None, stats: bool = False,
+              verify: bool = False) -> dict:
     """Seed, print the result, and RETURN the summary.
 
     The return value is new and is why: `up --seed --json` promises exactly one
@@ -397,7 +400,41 @@ def _run_seed(meta: runner.Metadata, profile: str,
     total = time.monotonic() - t0
     if not quiet:
         _print_seed_result(s, total, resources, meta)
+    verdict = lcsvc.check_seed(meta, auth, plan, s)
+    if not quiet:
+        _print_seed_verification(verdict)
+    # `--verify-seed` turns the report into a gate. Off by default on purpose: a
+    # check that fails a healthy workspace is one people learn to bypass, and the
+    # readback is worth having as information whether or not it refuses.
+    if verify and verdict.get("faults"):
+        _fail(errors.CreateFailedError(
+            f"seed verification failed: {len(verdict['faults'])} mismatch(es) between "
+            "the plan and the workspace (drop --verify-seed to seed anyway; the "
+            "readback is recorded in repro.json either way)"))
     return {**s, "profile": profile, "elapsed_s": round(total, 2)}
+
+
+def _print_seed_verification(verdict: dict) -> None:
+    """The readback, in one line when it agrees and a list when it does not."""
+    if not verdict or verdict.get("ok") is None:
+        return
+    faults = verdict.get("faults") or []
+    unreadable = verdict.get("unreadable") or []
+    extra = verdict.get("extra") or []
+    if not faults and not unreadable and not extra:
+        ui.ok(f"✓ readback: {verdict['checked']} rooms match the plan")
+        return
+    for f in faults:
+        ui.warn(f"  ⚠ {f['room'] or 'users'}: wanted {f['want']}, found {f['got']}"
+                + (f" ({f['detail']})" if f.get("detail") else ""))
+    if extra:
+        ui.note(f"  · {len(extra)} room(s) hold more than this run planned — they had "
+                "content already (a re-seed, a preset, a restore). Not a fault: "
+                "seeding only ever adds.")
+    for u in unreadable:
+        # Reported apart from the faults, and never as one: a single unreadable
+        # room is a gap in the CHECK, not a defect in the workspace.
+        ui.hint(f"  · {u['what']} could not be read back ({u['why']})")
 
 
 def _run_scale(meta: runner.Metadata, spec_str: str) -> None:
@@ -475,7 +512,15 @@ def _print_seed_result(s: dict, total: float, resources, meta: runner.Metadata) 
                    f"p99 {fmt_ms(lat['p99'])}  {s.get('latency_hist', '')}")
     row("users", s["users"], d.get("users", 0.0))
     row("channels", s["channels"], d.get("channels", 0.0))
-    row("messages", s["messages"], d.get("messages", 0.0), display=f"~{s['messages']}", extra=lat_str)
+    # No tilde. It was there because the count was an estimate -- thread replies
+    # were counted optimistically and nothing read the room back. Both are fixed,
+    # so the number is now exactly what is in the workspace.
+    row("messages", s["messages"], d.get("messages", 0.0), extra=lat_str)
+    if s.get("threads"):
+        row("threads", s["threads"], 0.0)
+    if s.get("rooms_total"):
+        row("rooms", s["rooms_total"], d.get("channels", 0.0),
+            extra=" · ".join(f"{k} {v}" for k, v in sorted((s.get("rooms") or {}).items())))
     row("DMs", s["dms"], d.get("dms", 0.0))
     _print_resources(resources or {}, meta.name)
 
@@ -1406,6 +1451,9 @@ def seed_cmd(
         help="bulk Mongo prefill for scale repros, e.g. users=50000,messages=800000@team-chat"),
     clear_scale: bool = typer.Option(
         False, "--clear-scale", help="remove data a prior --scale added, then exit"),
+    verify: bool = typer.Option(
+        False, "--verify-seed",
+        help="fail if the readback disagrees with the plan (the readback runs and is recorded either way)"),
 ) -> None:
     """Populate a repro with sample users, channels, DMs and messages.
 
@@ -1422,7 +1470,7 @@ def seed_cmd(
     if scale:
         _run_scale(m, scale)
         return
-    _run_seed(m, profile, users, channels, messages, stats=stats)
+    _run_seed(m, profile, users, channels, messages, stats=stats, verify=verify)
 
 
 @app.command(name="config-import")

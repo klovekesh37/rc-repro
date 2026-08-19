@@ -907,7 +907,13 @@ def test_seed_returns_durations_and_latency(monkeypatch):
     # drive the seed body with a mock poster; no server needed.
     from unittest.mock import MagicMock
     from rc_repro import seed, rcapi
-    resp = MagicMock(ok=True); resp.json.return_value = {"message": {"_id": "m"}}
+    # The mock has to answer a room CREATE as well as a message post: messages go
+    # by `rid` now, because a discussion's name is a server-generated slug and
+    # `#name` cannot reach one.
+    resp = MagicMock(ok=True)
+    resp.json.return_value = {"message": {"_id": "m"}, "channel": {"_id": "r1"},
+                              "group": {"_id": "r1"}, "room": {"_id": "r1"},
+                              "team": {"_id": "t1", "roomId": "r1"}}
     post = MagicMock(return_value=resp)
     plan = seed.plan_from("small", users=2, channels=1, messages=3)
     monkeypatch.setattr(rcapi, "login", lambda *a, **k: (_ for _ in ()).throw(Exception("no server")))
@@ -1530,9 +1536,12 @@ def test_status_breakdown_non_zero_only():
 
 def test_seed_profile_and_overrides():
     p = seed.plan_from("standard")
-    assert (p.users, p.channels, p.messages, p.rich) == (20, 8, 20, True)
+    assert (p.users, p.channels, p.messages, p.rich) == (20, 5, 20, True)
     p2 = seed.plan_from("standard", users=3, messages=1)
-    assert p2.users == 3 and p2.messages == 1 and p2.channels == 8  # override + inherit
+    assert p2.users == 3 and p2.messages == 1 and p2.channels == 5  # override + inherit
+    # An override reshapes the MANIFEST, not just the counts: three users means
+    # every room's membership is drawn from three names.
+    assert all(set(r.members) <= {"alice", "bob", "carol"} for r in p2.rooms)
 
 
 def test_seed_usernames_avoid_userN_collision():
@@ -1592,7 +1601,7 @@ def test_seed_does_not_count_failed_dms():
     def post(path, _headers, _payload):
         return _Resp(not path.endswith("im.create"))
 
-    plan = seed.Plan(users=3, channels=1, messages=1, dms=3, rich=False)
+    plan = seed.plan_from("small", users=3, channels=1, messages=1)
     out = seed._seed_body("http://x", {"h": "1"}, plan, post, lambda _m: None)
     # was 3: post() returns None only on a TRANSPORT error, so a 400 still counted
     # and the number reached the benchmark report as workload never created.
@@ -3009,3 +3018,210 @@ def test_every_port_a_preset_configures_rocket_chat_to_use_is_reachable():
             assert port in svc_ports[host], (
                 f"{name}: Rocket.Chat is pointed at {host}:{port} but the {host} "
                 f"Service exposes {sorted(svc_ports[host])}")
+
+
+# --- the seed manifest --------------------------------------------------------
+#
+# A plan used to be four numbers and everything else was `random`. It is a MANIFEST
+# now -- every room named, every membership decided, every message counted before
+# the first HTTP call -- and these hold that line, because the readback below is
+# only meaningful if the plan is something a workspace can be compared against.
+
+def test_the_seed_manifest_is_the_same_every_time():
+    """Two runs of one profile must produce the same workspace. Without it, a
+    customer's ticket and the reproduction of it cannot be compared, and nothing can
+    be read back and checked -- a plan of counts has nothing to check against."""
+    a, b = seed.plan_from("standard"), seed.plan_from("standard")
+    assert a.rooms == b.rooms
+    assert [r.members for r in a.rooms] == [r.members for r in b.rooms]
+    assert a.total_messages == b.total_messages
+
+
+def test_every_profile_contains_every_kind_of_room():
+    """Support tickets are rarely about a public channel. They are about a
+    discussion inside a private team channel, or a thread nobody else can see -- so
+    `small` carries one of each rather than being a scaled-down `standard`."""
+    for profile in ("small", "standard", "large"):
+        kinds = set(seed.plan_from(profile).by_kind())
+        for kind in (seed.CHANNEL, seed.PRIVATE, seed.TEAM, seed.TEAM_CHANNEL,
+                     seed.TEAM_CHANNEL_PRIVATE, seed.DISCUSSION, seed.DM,
+                     seed.GENERAL):
+            assert kind in kinds, f"{profile} has no {kind}"
+    # And both team visibilities appear as soon as there are two teams.
+    assert seed.TEAM_PRIVATE in seed.plan_from("standard").by_kind()
+
+
+def test_a_discussion_hangs_off_a_room_that_exists_first():
+    """Creation order is part of the manifest: a team before its channels, a parent
+    before its discussions. Nothing sorts this list later, because sorting it would
+    break seeding."""
+    plan = seed.plan_from("standard")
+    seen: set[str] = set()
+    for room in plan.rooms:
+        if room.parent:
+            assert room.parent in seen, f"{room.name} is created before {room.parent}"
+        seen.add(room.name)
+
+
+def test_dm_pairs_do_not_repeat_while_there_are_pairs_left():
+    """`random.sample` drew with replacement across DMs, so the same pair could come
+    up twice -- and the second `im.create` returns the SAME room, so a plan asking
+    for five DM rooms could quietly produce four."""
+    for n in (5, 6, 20):
+        names = [seed.username(i) for i in range(n)]
+        # The published bound: `gap == n / 2` on an even count folds back onto
+        # pairs an earlier gap already produced, so it is (n-1)//2 bands, not n//2.
+        pairs = [frozenset(seed.dm_pair(names, i)) for i in range(n * ((n - 1) // 2))]
+        assert len(set(pairs)) == len(pairs), f"a pair repeated with {n} users"
+        assert all(len(p) == 2 for p in pairs), "a pair must never be a user with itself"
+    # And every profile stays inside it.
+    for profile in ("small", "standard", "large"):
+        plan = seed.plan_from(profile)
+        dms = [r for r in plan.rooms if r.kind == seed.DM]
+        assert len({frozenset(r.members) for r in dms}) == len(dms), profile
+
+
+def test_a_planned_thread_is_counted_as_a_message_in_its_room():
+    """A threaded reply IS a message in the room -- `channels.messages` returns it
+    with a `tmid` -- so a plan that omits it cannot match what the server reports,
+    and every room would verify as short by the number of its threads."""
+    plan = seed.plan_from("small")
+    room = next(r for r in plan.rooms if r.kind == seed.CHANNEL)
+    assert room.threads == tuple(range(0, room.messages, seed.THREAD_EVERY))
+    assert room.total_messages == room.messages + len(room.threads)
+
+
+def test_two_teams_do_not_fight_over_one_channel_name():
+    """A channel name is unique workspace-wide, so two teams both wanting `planning`
+    would collide and the second team would come out empty."""
+    plan = seed.plan_from("large")
+    names = [r.name for r in plan.rooms]
+    assert len(names) == len(set(names))
+    team_channels = [r.name for r in plan.rooms if r.kind.startswith("team-channel")]
+    assert all("-" in n for n in team_channels)
+
+
+def test_a_thread_reply_is_posted_the_only_way_that_creates_a_thread():
+    """The defect this exists for: `chat.postMessage` with a `tmid` answers 400, so
+    every reply this module attempted was silently lost and no thread was ever
+    created -- while the `rich` profiles advertised threads and reactions and
+    delivered reactions.
+
+    Asserted on the CALL SHAPE, because that is what was wrong: the server said no
+    and the seeder counted it as a message it had failed to post, so nothing
+    downstream noticed for as long as the feature existed.
+    """
+    calls: list[tuple[str, dict]] = []
+
+    class _Resp:
+        ok, status_code = True, 200
+
+        @staticmethod
+        def json():
+            return {"message": {"_id": "m1"}, "channel": {"_id": "r1"},
+                    "group": {"_id": "r1"}, "room": {"_id": "r1"},
+                    "team": {"_id": "t1", "roomId": "r1"}}
+
+    def post(path, _headers, payload):
+        calls.append((path, payload))
+        return _Resp()
+
+    plan = seed.plan_from("small", users=2, channels=1, messages=5)
+    seed._seed_body("http://x", {"h": "1"}, plan, post, lambda _m: None)
+    threaded = [p for path, p in calls
+                if path.endswith("chat.sendMessage") and (p.get("message") or {}).get("tmid")]
+    assert threaded, "no threaded reply was posted at all"
+    assert all("rid" in p["message"] for p in threaded), "a thread reply needs its room"
+    assert not [p for path, p in calls if path.endswith("chat.postMessage")], \
+        "chat.postMessage cannot create a thread and is not used for messages any more"
+
+
+# --- the seed readback --------------------------------------------------------
+
+def _facts(plan, **over):
+    """Readback facts for a plan where everything is exactly as asked."""
+    rooms = []
+    for spec in plan.rooms:
+        rooms.append(seed.RoomFacts(spec=spec, found=True, rid=f"r-{spec.name}",
+                                    messages=spec.total_messages, replies=spec.replies,
+                                    threads=len(spec.threads)))
+    out = {"rooms": rooms, "planned_users": [seed.username(i) for i in range(plan.users)],
+           "users_unreadable": ""}
+    out["users_found"] = list(out["planned_users"])
+    out.update(over)
+    return out
+
+
+def test_a_clean_seed_verifies_clean():
+    plan = seed.plan_from("small")
+    verdict = seed.verify(plan, _facts(plan))
+    assert verdict["ok"] is True
+    assert verdict["faults"] == [] and verdict["extra"] == []
+    assert verdict["checked"] == len(plan.rooms)
+
+
+def test_more_content_than_planned_is_not_a_fault():
+    """Seeding only ever ADDS, so a room holding more than this run planned cannot
+    be evidence that this run lost anything: it had content already, which is what a
+    second `rc-repro seed`, a preset that posts on boot, or a restored backup all
+    look like.
+
+    Gating on exact equality is precisely what made an earlier version of this idea
+    refuse a workspace that was working, and a check that fails when nothing is
+    wrong is one people learn to bypass.
+    """
+    plan = seed.plan_from("small")
+    facts = _facts(plan)
+    facts["rooms"][0].messages += 40
+    verdict = seed.verify(plan, facts)
+    assert verdict["ok"] is True, verdict["faults"]
+    assert len(verdict["extra"]) == 1
+    assert verdict["extra"][0]["room"] == plan.rooms[0].name
+
+
+def test_fewer_messages_than_planned_is_a_fault():
+    plan = seed.plan_from("small")
+    facts = _facts(plan)
+    facts["rooms"][0].messages -= 1
+    verdict = seed.verify(plan, facts)
+    assert verdict["ok"] is False
+    assert verdict["faults"][0]["kind"] == "messages"
+    assert verdict["faults"][0]["got"] == plan.rooms[0].total_messages - 1
+
+
+def test_a_room_that_could_not_be_read_is_a_gap_in_the_check_not_a_fault():
+    """One 500 on a listing must not fail an otherwise perfect seed. The version of
+    this that required `not unavailable` for a pass did exactly that."""
+    plan = seed.plan_from("small")
+    facts = _facts(plan)
+    facts["rooms"][1].unreadable = "HTTP 500"
+    verdict = seed.verify(plan, facts)
+    assert verdict["ok"] is True
+    assert verdict["unreadable"] == [{"what": plan.rooms[1].name, "why": "HTTP 500"}]
+
+
+def test_a_room_that_is_absent_is_a_fault_even_though_the_lookup_failed():
+    """Rocket.Chat answers a lookup for a deleted room with HTTP 400 and
+    `error-room-not-found`. That is an ANSWER, not a failure to ask -- and filing it
+    under "could not read" made a workspace with a missing room verify clean. Found
+    live, by deleting one and watching the check pass.
+    """
+    plan = seed.plan_from("small")
+    facts = _facts(plan)
+    facts["rooms"][0].found = False
+    facts["rooms"][0].unreadable = ""       # what ABSENT leaves behind
+    verdict = seed.verify(plan, facts)
+    assert verdict["ok"] is False
+    assert verdict["faults"][0]["kind"] == "missing"
+
+
+def test_a_team_channel_that_is_not_in_its_team_is_a_fault():
+    """A channel can exist and not be in the team, which looks identical from
+    `channels.info` -- and is the whole difference between a team workspace and a
+    workspace with similarly-named channels."""
+    plan = seed.plan_from("small")
+    facts = _facts(plan)
+    room = next(f for f in facts["rooms"] if f.spec.kind == seed.TEAM_CHANNEL)
+    room.in_team = False
+    verdict = seed.verify(plan, facts)
+    assert any(f["kind"] == "team" for f in verdict["faults"])

@@ -1250,6 +1250,62 @@ def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: fl
 
 # --- seed (inline, used by create --seed) -------------------------------------
 
+def check_seed(meta: runner.Metadata, auth, plan, result: dict,
+               emit: Emit = null_emit) -> dict:
+    """Read the seeded workspace back, compare it with the manifest, and record it.
+
+    Both front-ends call this, because both had the same hole: the seed summary was
+    what the seeder ASKED for, and nothing anywhere checked it. `messages: ~62` --
+    the tilde was the tool admitting it did not know.
+
+    REPORTS, it does not refuse. A mismatch is written into the result and warned
+    about; whether that ends the command is the caller's decision and the default is
+    that it does not. The version of this idea that shipped elsewhere gated on exact
+    equality over a seeder that was losing every thread reply, so `up --seed` failed
+    on a healthy workspace -- and a check that fails when nothing is wrong is one
+    people learn to bypass.
+
+    The verification is persisted into `repro.json` either way. A seeded workspace
+    that says what it contains, and whether that was confirmed, is the difference
+    between a reproduction and a pile of plausible content.
+    """
+    try:
+        facts = seeder.readback(meta.root_url, auth, plan)
+        verdict = seeder.verify(plan, facts)
+    except Exception as exc:  # noqa: BLE001 - a check must never break the seed
+        warn(emit, f"could not read the seed back: {exc}", phase="seed")
+        return {"ok": None, "faults": [], "unreadable": [], "checked": 0, "rooms": []}
+    result["verification"] = {k: verdict[k] for k in
+                              ("ok", "faults", "extra", "unreadable", "checked")}
+    result["readback"] = verdict["rooms"]
+    if verdict["faults"]:
+        warn(emit, f"seed readback found {len(verdict['faults'])} mismatch(es): "
+                   + "; ".join(f"{f['room'] or 'users'} wanted {f['want']}, found {f['got']}"
+                               for f in verdict["faults"][:3]), phase="seed")
+    elif verdict["extra"]:
+        info(emit, f"readback: {len(verdict['extra'])} room(s) hold more than this run "
+                   "planned — they had content already (a re-seed, a preset, a restore)",
+             phase="seed")
+    elif verdict["unreadable"]:
+        warn(emit, f"{len(verdict['unreadable'])} room(s) could not be read back — "
+                   "not counted as a fault", phase="seed")
+    else:
+        info(emit, f"readback: {verdict['checked']} rooms match the plan", phase="seed")
+    try:
+        runner.update_meta(meta.name, lambda m: m.extra.update({"seed": {
+            "profile": plan.profile,
+            "planned": result.get("planned", {}),
+            "actual": {k: result.get(k) for k in
+                       ("users", "rooms", "rooms_total", "messages", "threads", "dms")},
+            "verification": result["verification"],
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }}))
+    except Exception:  # noqa: BLE001 - a record is not worth failing a good seed
+        pass
+    return verdict
+
+
+
 def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit) -> dict:
     from rc_repro import perf
     try:
@@ -1270,6 +1326,7 @@ def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit
     s["total_s"] = time.monotonic() - t0
     if resources is not None:
         s["resources_keys"] = sorted(resources)
+    check_seed(meta, auth, plan, s, emit)
     return s
 
 

@@ -1999,3 +1999,48 @@ def test_the_one_preset_with_a_real_setup_step_keeps_it(serve, page, monkeypatch
         assert "127.0.0.1  keycloak" in setup, setup
         assert "Needs sudo" in setup
         assert page.errors == [], page.errors
+
+
+def test_the_seed_job_shows_what_it_made_and_whether_it_was_confirmed(
+        serve, page, monkeypatch, tmp_path):
+    """A seed job had no result renderer at all: the browser saw progress lines and
+    then nothing, while the CLI printed a table. The readback verdict is the part
+    worth showing -- it is the difference between "the seeder says it made 283
+    messages" and "283 messages are in there"."""
+    from rc_repro.services import lifecycle as lcsvc
+
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    # The panel's live chart polls /stats for a RUNNING workspace, and this one has
+    # no compose project on disk -- so the poll would shell out in a directory that
+    # does not exist. The chart is not what this test is about.
+    monkeypatch.setattr(lcsvc.runner, "container_ids", lambda *a, **k: [])
+    # The seed route reads the workspace record, which is a real file rather than
+    # something `_stub_lifecycle` intercepts.
+    import json as _json
+    (tmp_path / "repros" / "t1234").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repros" / "t1234" / "repro.json").write_text(_json.dumps({
+        "name": "t1234", "project": "p", "rc_version": "7.4.1", "rc_image": "i",
+        "mongo_tag": "7.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3001", "host_port": 3001,
+        "version_source": "x", "extra": {}}))
+    monkeypatch.setattr(lcsvc, "run_seed_inline", lambda *a, **k: {
+        "users": 20, "messages": 283, "threads": 48, "rooms_total": 22, "dms": 5,
+        "rooms": {"channel": 5, "team": 1, "discussion": 3, "dm": 5},
+        "verification": {"ok": True, "faults": [], "extra": [], "unreadable": [],
+                         "checked": 22}})
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        page.click("button:has-text('Add sample data')")
+        page.wait_for_selector("#seed-dialog[open]")
+        page.click("#seed-submit")
+        page.wait_for_selector("#job-log", timeout=20000)
+        page.wait_for_timeout(2500)
+        body = page.text_content("#job-log")
+        assert "match the plan" in body, body[-400:]
+        assert "283 messages" in body and "48 in threads" in body
+        assert "channel 5" in body and "discussion 3" in body
+        assert page.errors == [], page.errors

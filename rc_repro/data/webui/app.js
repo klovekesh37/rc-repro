@@ -1722,7 +1722,11 @@ async function submitSeed() {
       streamJob(job.job_id, `Scale prefill: ${SEED_TARGET}`);
     } else {
       job = await api(`/api/repros/${SEED_TARGET}/seed`, { method: "POST", body: JSON.stringify({ profile: f.profile.value }) });
-      streamJob(job.job_id, `Seeding ${SEED_TARGET} (${f.profile.value})`);
+      // The renderer goes here as well as in JOB_RESULT_RENDERER: the table only
+      // covers reopening a job from Activity, and the run you just started is the
+      // one you are watching.
+      streamJob(job.job_id, `Seeding ${SEED_TARGET} (${f.profile.value})`,
+                renderSeedResult);
     }
   } catch (e) { toast(e.message); }
 }
@@ -2438,9 +2442,55 @@ async function openDoctor() {
 // list one: a 20-minute benchmark whose dialog got closed finished server-side
 // with its result unreachable. The manager already retains them (MAX_JOBS), so
 // this only needed somewhere to look.
+// A seed job had NO result renderer, so the browser saw the progress lines and
+// then nothing -- while the CLI printed a table. That mattered less when the result
+// was four counts; it carries the room breakdown and the readback verdict now, and
+// the verdict is the whole reason to look: it is the difference between "the seeder
+// says it made 283 messages" and "283 messages are in there".
+function renderSeedResult(r) {
+  const pre = $("#job-log");
+  const box = el("div", { class: "result" });
+  const kv = (k, v, cls = "") => el("div", { class: cls }, el("b", {}, k + ": "), v);
+  box.append(el("div", { html: "<hr>" }));
+  box.append(kv("Seeded", `${r.users || 0} users · ${r.messages || 0} messages · `
+    + `${r.threads || 0} in threads · ${r.rooms_total || 0} rooms`));
+  const kinds = Object.entries(r.rooms || {}).sort();
+  if (kinds.length) box.append(kv("Rooms", kinds.map(([k, n]) => `${k} ${n}`).join(" · ")));
+  const v = r.verification;
+  if (v) {
+    const faults = v.faults || [], extra = v.extra || [], unread = v.unreadable || [];
+    if (!faults.length && !unread.length && !extra.length) {
+      // Green because it is confirmed, not merely finished.
+      box.append(kv("Readback", `${v.checked} rooms match the plan`, "green"));
+    } else {
+      if (faults.length) {
+        box.append(kv("Readback", `${faults.length} mismatch(es)`, "bad"));
+        for (const f of faults.slice(0, 6)) {
+          box.append(el("div", { class: "hint" },
+            `· ${f.room || "users"}: wanted ${f.want}, found ${f.got}`));
+        }
+      }
+      // Amber, not red, and stated as what it is: seeding only ever adds, so more
+      // than planned means the room had content already.
+      if (extra.length) {
+        box.append(el("div", { class: "hint" },
+          `· ${extra.length} room(s) hold more than this run planned — they had `
+          + `content already (a re-seed, a preset, a restore). Not a fault.`));
+      }
+      for (const u of unread.slice(0, 4)) {
+        box.append(el("div", { class: "hint" },
+          `· ${u.what} could not be read back (${u.why}) — a gap in the check, not a fault`));
+      }
+    }
+  }
+  pre.append(box);
+  pre.scrollTop = pre.scrollHeight;
+}
+
 const JOB_RESULT_RENDERER = {
   create: renderCreateResult, up: renderCreateResult,
   monitor: renderCreateResult, "monitor-off": renderCreateResult,
+  seed: renderSeedResult,
   loadtest: renderPerfResult, capacity: renderCapResult, benchmark: renderBenchResult,
 };
 const jobTitle = (j) => (j.label ? `${j.kind}: ${j.label}` : j.kind);
