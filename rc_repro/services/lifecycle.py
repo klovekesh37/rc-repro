@@ -204,7 +204,7 @@ def capacity() -> dict:
             "room": max(0, avail_mb - reserve) // WORKSPACE_MB}
 
 
-def _kube_overhead_mb(req: "CreateReq") -> int:
+def _kube_overhead_mb(req: "CreateReq", provisioning: bool = True) -> int:
     """What Kubernetes adds to a workspace's memory bill, in MB.
 
     Zero for Compose, which is every workspace today. The control plane is charged
@@ -218,15 +218,13 @@ def _kube_overhead_mb(req: "CreateReq") -> int:
         return 0
     # The chart's own baseline, on both deployments -- see KUBE_CHART_MB.
     need = KUBE_CHART_MB
-    try:
-        from rc_repro.services import k8s
-        # Specifically OUR cluster, not "a reachable cluster". rc-repro creates its
-        # own, so somebody else's cluster being up does not mean the control plane
-        # is already paid for. Charging on `cluster_reachable` billed zero on a box
-        # whose only cluster belonged to someone else.
-        if not k8s.preflight().cluster_exists:
-            need += CLUSTER_MB
-    except Exception:  # noqa: BLE001 - an unprobeable cluster is charged for
+    # Charged when a control plane is about to be BUILT, which is the only case where
+    # its memory is new. An earlier version charged unless rc-repro's own kind cluster
+    # existed, on the reasoning that "somebody else's cluster being up does not mean
+    # the control plane is already paid for" -- true while rc-repro always created its
+    # own, and wrong as soon as it can use one that is already running, where the 600
+    # MB is spent whatever this create does.
+    if provisioning:
         need += CLUSTER_MB
     # An empty deployment means "that runtime's default", which for Kubernetes is
     # microservices -- the expensive one. Reading empty as free would under-charge
@@ -248,7 +246,30 @@ ENGINE_FLOOR_CPUS = 4
 ENGINE_FLOOR_MEMORY_GIB = 6.0
 
 
-def _check_engine_floor(req: "CreateReq", emit: Emit = null_emit) -> None:
+def _will_provision(req: "CreateReq") -> bool:
+    """Whether this create is going to CREATE a cluster, as opposed to use one.
+
+    The two capacity questions below both turn on it, and both used to ask something
+    narrower that gave the wrong answer the moment rc-repro could use a cluster it did
+    not make: `cluster_exists` is specifically OUR kind cluster, so a box whose k3s was
+    about to be adopted was billed 600 MB for a control plane already running -- and
+    `check_capacity` refusing a create the host can hold is how people learn to type
+    --force by reflex.
+
+    False on any doubt. An unprobeable cluster is not evidence that one will be built.
+    """
+    from rc_repro.services import topology
+    if topology.normalize(getattr(req, "runtime", "")) != topology.KUBERNETES:
+        return False
+    try:
+        from rc_repro.services import k8s
+        return k8s.plan_cluster().create
+    except Exception:  # noqa: BLE001 - no cluster and no kind: the create will refuse
+        return False
+
+
+def _check_engine_floor(req: "CreateReq", emit: Emit = null_emit,
+                        provisioning: bool = True) -> None:
     """Refuse a Kubernetes create the container engine is too small for.
 
     Compose is left alone: it runs two containers and works on a 2 GB VM, so a floor
@@ -262,6 +283,12 @@ def _check_engine_floor(req: "CreateReq", emit: Emit = null_emit) -> None:
     """
     from rc_repro.services import topology
     if topology.normalize(getattr(req, "runtime", "")) != topology.KUBERNETES:
+        return
+    # The floor's whole premise is that the container VM has to hold a control plane.
+    # When the cluster is not one rc-repro is about to build in Docker -- an adopted
+    # k3s, minikube, anything -- the premise is void and `docker info` is describing a
+    # machine the workspace will not run on.
+    if not provisioning:
         return
     cap = runner.docker_capacity()
     if cap is None:
@@ -351,7 +378,10 @@ def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_em
     # 4 GB VM passes every check below and then cannot run a Kubernetes workspace at
     # all -- the failure arriving later as pods that never schedule, which names
     # nothing a reader can act on.
-    _check_engine_floor(req, emit)
+    # Probed once and passed to both, because both ask the same question and the probe
+    # talks to a cluster.
+    provisioning = _will_provision(req)
+    _check_engine_floor(req, emit, provisioning)
     mem = runner.host_memory()
     if mem is None:                     # not Linux: skip rather than guess
         return
@@ -363,7 +393,7 @@ def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_em
     # brings a control plane if there is not one yet, and microservices runs six
     # more processes than a monolith -- charging it as Compose would let through
     # exactly the create this function exists to refuse.
-    need += _kube_overhead_mb(req)
+    need += _kube_overhead_mb(req, provisioning)
 
     reserve = host_reserve_mb(total_mb)
     headroom = available_mb - reserve
@@ -2356,6 +2386,20 @@ def prunable() -> list[str]:
 
 
 
+def _orphan_context() -> str:
+    """Which cluster to look for orphaned namespaces in.
+
+    `k8s.CONTEXT` was hardcoded here, which meant that on a box using a cluster
+    rc-repro did not create -- the whole point of the k3s path -- `prune --orphans`
+    looked for strays in a kind cluster that may not even exist, and reported none.
+    """
+    from rc_repro.services import k8s
+    try:
+        return k8s.plan_cluster().context
+    except Exception:  # noqa: BLE001 - no cluster at all: nothing to sweep
+        return k8s.CONTEXT
+
+
 def orphan_namespaces(context: str = "") -> list[str]:
     """Namespaces labelled ours that NO local record can explain.
 
@@ -2372,7 +2416,7 @@ def orphan_namespaces(context: str = "") -> list[str]:
     --orphans` is the opt-in.
     """
     from rc_repro.services import k8s
-    ctx = context or k8s.CONTEXT
+    ctx = context or _orphan_context()
     try:
         found = k8s.workspace_namespaces(ctx)
     except Exception:  # noqa: BLE001 - no cluster is not an error here
@@ -2442,10 +2486,11 @@ def prune(*, confirm: bool = False, orphans: bool = False,
     swept = []
     if stray:
         from rc_repro.services import k8s
+        ctx = _orphan_context()
         for ns in stray:
-            res = k8s.run(["kubectl", "--context", k8s.CONTEXT, "delete", "namespace",
+            res = k8s.run(["kubectl", "--context", ctx, "delete", "namespace",
                            ns, "--wait=false"], timeout=k8s.APPLY_TIMEOUT,
-                          own=k8s.is_ours(k8s.CONTEXT))
+                          own=k8s.is_ours(ctx))
             if res.returncode == 0:
                 swept.append(ns)
                 info(emit, f"removed orphaned namespace {ns}", phase="done")
@@ -2596,6 +2641,11 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     # afterwards, so an interrupted create leaves something to clean up with. This
     # makes the runtimes agree. The namespace name is deterministic, so it can be
     # recorded before it exists; everything learned later is merged in below.
+    # THE CLUSTER IS CHOSEN FIRST, before a single byte is written. `plan_cluster` only
+    # probes, and it is what refuses when there is no cluster and no `kind` -- so that
+    # refusal now costs nothing, where before it left an `incomplete` record that `list`
+    # showed as a workspace and whose port `used_ports()` went on reserving.
+    plan = k8s.plan_cluster()
     provisional = runner.Metadata(
         name=repro_name, project=k8s.namespace_for(repro_name),
         rc_version=resolved.rc_version, rc_image=resolved.rc_image,
@@ -2606,7 +2656,10 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     topology.stamp(provisional.extra, topology.KUBERNETES)
     provisional.extra[config.EXTRA_DEPLOYMENT] = req.deployment or topology.MICROSERVICES
     provisional.extra["namespace"] = k8s.namespace_for(repro_name)
-    provisional.extra["context"] = k8s.CONTEXT
+    # The chosen context, not a guess at it. This was `k8s.CONTEXT` unconditionally,
+    # which was right only while rc-repro's own cluster was the only one it could use.
+    provisional.extra["context"] = plan.context
+    provisional.extra["distribution"] = plan.distribution
     provisional.extra["incomplete"] = True
     if req.actor:
         provisional.extra["created_by"] = req.actor
@@ -2631,6 +2684,7 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         # two renderings. `_refuse_unsupported_on_kubernetes` has already proved
         # this resolves, so a failure here would be a bug rather than bad input.
         preset=preset_for_notes,
+        plan=plan,
         emit=emit)
 
     meta = runner.Metadata(
@@ -2642,6 +2696,10 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     topology.stamp(meta.extra, topology.KUBERNETES)
     meta.extra[config.EXTRA_DEPLOYMENT] = req.deployment or topology.MICROSERVICES
     meta.extra.update({k: v for k, v in out.items() if k != "microservices"})
+    # WHAT kind of cluster this workspace lives in. A label, never a branch -- it is
+    # what lets `doctor`, the notes and a support case say "k3s" instead of leaving a
+    # reader to infer it from a context name.
+    meta.extra["distribution"] = plan.distribution
     if req.replicas > 1:
         meta.extra["instances"] = req.replicas
     if req.actor:

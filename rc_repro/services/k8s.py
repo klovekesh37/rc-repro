@@ -539,6 +539,110 @@ def cluster_context() -> str:
     return found or CONTEXT
 
 
+#: What `distribution` a cluster is, for the one thing a name may decide: the wording
+#: of a message. Never a branch -- `k3s --disable traefik` is a real setup, minikube
+#: ships ingress as an addon that is off, and kind gains one when rc-repro installs it,
+#: so what a cluster CAN do is probed (see Preflight) and what it IS is only labelled.
+#:
+#: Signals in order of reliability, each verified against a live cluster: `providerID`
+#: (`kind://docker/…`, `k3s://docker-01`), then the kubelet's version suffix (`+k3s`,
+#: `+rke2`), then node labels. A managed cluster's `providerID` names its cloud, which
+#: is the most reliable "this is not a disposable cluster" signal there is.
+_PROVIDER_ID_PREFIX = (("kind://", "kind"), ("k3s://", "k3s"), ("aws://", "eks"),
+                       ("gce://", "gke"), ("azure://", "aks"))
+_KUBELET_SUFFIX = (("+k3s", "k3s"), ("+rke2", "rke2"))
+
+
+def distribution(context: str) -> str:
+    """What kind of Kubernetes this is, as a label. "unknown" is a fine answer.
+
+    Asks the first node, because every signal lives there and one node is enough to
+    identify a distribution. Never raises: an unreachable cluster is "unknown", and a
+    label nobody branches on is not worth a failure.
+    """
+    res = run(["kubectl", "--context", context, "get", "nodes", "-o",
+               "jsonpath={.items[0].spec.providerID} {.items[0].status.nodeInfo."
+               "kubeletVersion} {.items[0].metadata.labels."
+               "node\\.kubernetes\\.io/instance-type} {.items[0].metadata.name}"],
+              own=is_ours(context))
+    if res.returncode != 0:
+        return "unknown"
+    parts = (res.stdout or "").split()
+    blob = " ".join(parts)
+    for prefix, name in _PROVIDER_ID_PREFIX:
+        if prefix in blob:
+            return name
+    for suffix, name in _KUBELET_SUFFIX:
+        if suffix in blob:
+            return name
+    if "minikube" in blob:
+        return "minikube"
+    if "docker-desktop" in blob:
+        return "docker-desktop"
+    return "unknown"
+
+
+@dataclass
+class ClusterPlan:
+    """Which cluster this create will use, decided before anything is written.
+
+    The whole Kubernetes/k3s difference is ONE STEP: provisioning. With `kind` here,
+    rc-repro creates its own cluster exactly as it always has; without it, that step
+    is skipped and the cluster `kubectl` already points at is used instead. Every step
+    afterwards is the same code, because every function below takes `context=`.
+
+    `create` is the only thing any caller needs to know beyond the context: it decides
+    what a failed create may roll back (never a cluster we did not make), and whether
+    `check_capacity` should charge for a control plane that does not exist yet.
+    """
+    context: str
+    distribution: str = ""
+    create: bool = False          # this call will bring the cluster into existence
+
+
+def plan_cluster() -> ClusterPlan:
+    """Choose the cluster, probing only -- nothing here writes to the machine.
+
+    Separate from `ensure_cluster` on purpose, and the reason is a measured defect: the
+    write-ahead `repro.json` is written before `create_workspace` runs, so a create that
+    refuses for want of a cluster left an `incomplete` record that `list` showed as a
+    workspace and whose port `used_ports()` reserved. A pure probe can run BEFORE that
+    write, so the refusal costs nothing.
+
+    Order, and it is short because it is not a precedence contest:
+
+      1. a cluster rc-repro created, if it still answers  -- ask the cluster, not `kind`
+      2. `kind` present                                   -- create ours, as today
+      3. whatever `kubectl` points at, if it answers       -- k3s, minikube, anything
+      4. refuse
+
+    Step 1 asks the owned kubeconfig rather than `kind get clusters` deliberately: that
+    probe needs the kind BINARY, so uninstalling kind while its cluster still ran made
+    the cluster invisible -- containers holding memory that nothing in rc-repro could
+    see or remove, and resolution quietly falling through to a different cluster.
+    """
+    ours = cluster_context()
+    if which("kind") and CLUSTER_NAME in clusters()[0] and reachable(ours):
+        return ClusterPlan(context=ours, distribution="kind", create=False)
+    # No kind binary, but our kubeconfig may still name a cluster that is up.
+    if not which("kind") and ours and reachable(ours):
+        return ClusterPlan(context=ours, distribution=distribution(ours), create=False)
+    if which("kind"):
+        # Not created yet. The context is kind's own naming convention, which is
+        # predictable enough to record before the cluster exists -- `ensure_cluster`
+        # reads the real one back from the kubeconfig afterwards.
+        return ClusterPlan(context=CONTEXT, distribution="kind", create=True)
+    active = active_context()
+    if active and reachable(active):
+        return ClusterPlan(context=active, distribution=distribution(active),
+                           create=False)
+    raise PreflightError(
+        "kind is not installed, so rc-repro cannot create a cluster, and `kubectl` is "
+        + ("not pointed at one either" if not active else
+           f"pointed at {active!r}, which is not answering")
+        + ". Install kind, or point kubectl at a cluster you already have.")
+
+
 def ensure_cluster(emit: Emit = null_emit) -> str:
     """Create rc-repro's cluster if it is not there, and return its context.
 
@@ -1500,7 +1604,7 @@ def record_rendered(name: str, *, values: dict, manifests: dict) -> list[str]:
 def create_workspace(*, name: str, resolved, host_port: int, microservices: bool,
                      replicas: int = 1, owner: str = "", root_url: str = "",
                      bind_host: str = "", use_operator: bool = False,
-                     reg_token: str = "", preset=None,
+                     reg_token: str = "", preset=None, plan: ClusterPlan | None = None,
                      emit: Emit = null_emit) -> dict:
     """Build a Kubernetes workspace, and return what repro.json needs.
 
@@ -1514,8 +1618,19 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
     initiated BEFORE the chart goes in, because Rocket.Chat needs change streams
     and would otherwise sit at not-ready with nothing in its logs naming MongoDB.
     """
-    had_cluster = CLUSTER_NAME in clusters()[0]
-    context = ensure_cluster(emit=emit)
+    # The plan was made before the caller wrote its record, so the refusal for "no
+    # cluster and no kind" has already happened by here. Provisioning is the ONE step
+    # that differs between a kind box and a k3s box; everything below is the same code.
+    plan = plan or plan_cluster()
+    context = ensure_cluster(emit=emit) if plan.create else plan.context
+    if not plan.create:
+        info(emit, f"using your {plan.distribution} cluster {context!r} — rc-repro "
+                   "creates a namespace in it and never removes the cluster",
+             phase="provision", pct=5)
+    # Only a cluster THIS call created may be rolled back. `plan.create` carries that;
+    # it is not inferred from the cluster's name, which is what made a hand-made
+    # `rc-repro-local` look like ours.
+    had_cluster = not plan.create
     ensure_repo(emit=emit)
     chart_version = resolve_chart_version(resolved.rc_version, emit=emit)
     info(emit, f"chart {chart_version} for Rocket.Chat {resolved.rc_version}",

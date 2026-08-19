@@ -2673,55 +2673,74 @@ def test_a_kubernetes_workspace_is_not_charged_as_a_compose_one(monkeypatch, tmp
     assert lc._kube_overhead_mb(mono) == lc.CLUSTER_MB + lc.KUBE_CHART_MB
 
 
-def test_the_control_plane_is_charged_once_not_per_workspace(monkeypatch, tmp_path):
-    """It is shared. Billing it to the second and third workspace would refuse
-    creates the host could hold -- and a capacity check that is wrong in the safe
-    direction still stops people using the tool, which is how they learn to pass
-    --force by reflex."""
-    from rc_repro.services import k8s, topology
+def test_the_control_plane_is_charged_only_when_one_is_about_to_be_built(monkeypatch, tmp_path):
+    """It is shared, so billing it to the second and third workspace would refuse creates
+    the host could hold -- and a capacity check that is wrong in the safe direction still
+    stops people using the tool, which is how they learn to pass --force by reflex.
+
+    The charge now turns on whether this create will BUILD a control plane, which is the
+    only case where its memory is new.
+    """
+    from rc_repro.services import topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     req = lc.CreateReq(version="8.6.1", runtime="k8s", deployment=topology.MONOLITH)
 
-    monkeypatch.setattr(k8s, "preflight",
-                        lambda *a, **k: k8s.Preflight(cluster_exists=False))
-    assert lc._kube_overhead_mb(req) == lc.CLUSTER_MB + lc.KUBE_CHART_MB, "first one pays"
-
-    monkeypatch.setattr(k8s, "preflight",
-                        lambda *a, **k: k8s.Preflight(cluster_exists=True))
-    assert lc._kube_overhead_mb(req) == lc.KUBE_CHART_MB, \
+    assert lc._kube_overhead_mb(req, provisioning=True) == lc.CLUSTER_MB + lc.KUBE_CHART_MB, \
+        "the create that builds the cluster pays for it"
+    assert lc._kube_overhead_mb(req, provisioning=False) == lc.KUBE_CHART_MB, \
         "the rest share the cluster but still pay for their own chart"
 
 
-def test_somebody_elses_reachable_cluster_does_not_pay_for_ours(monkeypatch, tmp_path):
-    """The charge is on OUR cluster existing, not on "a cluster is reachable".
+def test_a_cluster_that_is_already_running_is_not_charged_for(monkeypatch, tmp_path):
+    """INVERTED, deliberately, and the old reasoning is worth recording.
 
-    Keyed on `cluster_reachable` it billed zero on this box -- whose only cluster
-    belongs to someone else -- because rc-repro would still have to create its own
-    alongside it, and the 573 MiB would be spent after the check said there was room.
+    This charge used to be keyed on whether rc-repro's OWN kind cluster existed, on the
+    argument that "somebody else's cluster being up does not mean the control plane is
+    already paid for" -- true while rc-repro always created its own alongside, and wrong
+    the moment it can use one that is already running, where the 600 MB is spent whatever
+    this create does. Charging it anyway refuses creates the box can hold, on a box whose
+    only cluster is the one about to be adopted.
     """
     from rc_repro.services import k8s, topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    req = lc.CreateReq(version="8.6.1", runtime="k8s", deployment=topology.MONOLITH)
-    monkeypatch.setattr(k8s, "preflight", lambda *a, **k: k8s.Preflight(
-        cluster_exists=False, cluster_reachable=True,      # theirs is up
-        context="kind-somebody-else", provider=k8s.PROVIDER_EXTERNAL))
-    assert lc._kube_overhead_mb(req) == lc.CLUSTER_MB + lc.KUBE_CHART_MB, \
-        "another cluster being up does not pay for the one we still have to create"
+    req = lc.CreateReq(version="8.6.1", runtime="kubernetes", deployment=topology.MONOLITH)
+    # A k3s cluster that is up: nothing to build, so nothing to charge.
+    monkeypatch.setattr(k8s, "plan_cluster", lambda: k8s.ClusterPlan(
+        context="default", distribution="k3s", create=False))
+    assert lc._will_provision(req) is False
+    assert lc._kube_overhead_mb(req, lc._will_provision(req)) == lc.KUBE_CHART_MB
+
+    # And with kind and no cluster yet, the control plane is real and is charged.
+    monkeypatch.setattr(k8s, "plan_cluster", lambda: k8s.ClusterPlan(
+        context=k8s.CONTEXT, distribution="kind", create=True))
+    assert lc._will_provision(req) is True
+    assert lc._kube_overhead_mb(req, lc._will_provision(req)) == \
+        lc.CLUSTER_MB + lc.KUBE_CHART_MB
 
 
-def test_an_unprobeable_cluster_is_charged_for_rather_than_assumed_free(monkeypatch, tmp_path):
-    """If the cluster cannot be probed, the safe assumption is that it is not there.
-    Assuming it exists would let the create through and spend the memory anyway."""
-    from rc_repro.services import k8s
+def test_no_cluster_and_no_kind_charges_nothing_because_the_create_refuses(monkeypatch, tmp_path):
+    """The old rule was "an unprobeable cluster is charged for", on the reasoning that
+    assuming it exists would let the create through and spend the memory anyway.
+
+    There is nothing to be safe about any more: the only thing `plan_cluster` raises for
+    is having no cluster AND no way to make one, and that create is refused before a byte
+    is written. Charging for a control plane that will never be built would refuse for
+    memory a create was never going to spend.
+    """
+    from rc_repro.services import k8s, topology
+    from rc_repro.errors import PreflightError
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    def boom(*_a, **_k):
-        raise OSError("kubectl exploded")
-    monkeypatch.setattr(k8s, "preflight", boom)
-    req = lc.CreateReq(version="8.6.1", runtime="k8s")
-    assert lc._kube_overhead_mb(req) >= lc.CLUSTER_MB
+    def refuse():
+        raise PreflightError("kind is not installed, ...")
+    monkeypatch.setattr(k8s, "plan_cluster", refuse)
+    # MONOLITH explicitly: an empty deployment means "that runtime's default", which for
+    # Kubernetes is microservices and carries its own 800 MB.
+    req = lc.CreateReq(version="8.6.1", runtime="k8s", deployment=topology.MONOLITH)
+    assert lc._will_provision(req) is False
+    assert lc._kube_overhead_mb(req, lc._will_provision(req)) == lc.KUBE_CHART_MB
 
 
 def test_the_kubernetes_overhead_actually_reaches_the_refusal(monkeypatch, tmp_path):
@@ -2733,8 +2752,11 @@ def test_the_kubernetes_overhead_actually_reaches_the_refusal(monkeypatch, tmp_p
     from rc_repro.services import k8s
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    monkeypatch.setattr(k8s, "preflight",
-                        lambda *a, **k: k8s.Preflight(cluster_exists=False))
+    # A kind box with no cluster yet, so the control plane is part of the bill. STATED
+    # rather than probed: `check_capacity` now asks which cluster it would use, and a
+    # unit test must not depend on whether one happens to be running on the machine.
+    monkeypatch.setattr(k8s, "plan_cluster", lambda: k8s.ClusterPlan(
+        context=k8s.CONTEXT, distribution="kind", create=True))
     # A host with room for exactly one Compose workspace and no more.
     need_k8s = (lc.WORKSPACE_MB + lc.CLUSTER_MB + lc.KUBE_CHART_MB
                 + lc.MICROSERVICES_MB)
@@ -5269,6 +5291,9 @@ def test_a_kubernetes_create_is_refused_when_the_ENGINE_is_too_small(monkeypatch
     Podman, and the capacity check only ever asked the host. A laptop with 32 GB and
     a 4 GB VM passed everything and then could not run a Kubernetes workspace -- the
     failure arriving minutes later as pods stuck Pending, which names nothing."""
+    from rc_repro.services import k8s
+    monkeypatch.setattr(k8s, "plan_cluster", lambda: k8s.ClusterPlan(
+        context=k8s.CONTEXT, distribution="kind", create=True))
     monkeypatch.setattr(lc.runner, "docker_capacity", lambda: (2.0, 3 * 1024 ** 3))
     with pytest.raises(errors.PreflightError) as caught:
         lc.check_capacity(lc.CreateReq(version="8.5.1", runtime="kubernetes"))
@@ -5291,6 +5316,9 @@ def test_an_unreadable_engine_is_not_evidence_of_a_small_one(monkeypatch):
 
 def test_force_downgrades_the_engine_floor_to_a_warning(monkeypatch):
     events = []
+    from rc_repro.services import k8s
+    monkeypatch.setattr(k8s, "plan_cluster", lambda: k8s.ClusterPlan(
+        context=k8s.CONTEXT, distribution="kind", create=True))
     monkeypatch.setattr(lc.runner, "docker_capacity", lambda: (1.0, 1 * 1024 ** 3))
     monkeypatch.setattr(lc.runner, "host_memory", lambda: (16000, 12000, 0))
     lc.check_capacity(lc.CreateReq(version="8.5.1", runtime="kubernetes", force=True),
@@ -5526,3 +5554,132 @@ def test_the_terminal_prints_the_same_sections_the_panel_draws(capsys):
             assert any(k in ln and str(v) in ln for ln in out.split("\n")), k
         for c in group["commands"]:
             assert c in out
+
+
+def _kube_probe_stubs(monkeypatch, *, kind: bool, our_cluster: bool, active: str,
+                      reachable: bool = True):
+    """The four facts `plan_cluster` reads, stated instead of probed."""
+    from rc_repro.services import k8s
+    monkeypatch.setattr(k8s, "which", lambda t: "/usr/bin/kind" if (t == "kind" and kind) else "")
+    monkeypatch.setattr(k8s, "clusters",
+                        lambda: ([k8s.CLUSTER_NAME] if our_cluster else [], ""))
+    monkeypatch.setattr(k8s, "cluster_context",
+                        lambda: k8s.CONTEXT if our_cluster else "")
+    monkeypatch.setattr(k8s, "active_context", lambda: active)
+    monkeypatch.setattr(k8s, "reachable", lambda ctx=None: reachable)
+    monkeypatch.setattr(k8s, "distribution", lambda ctx: "k3s")
+
+
+def test_the_only_difference_between_kind_and_k3s_is_whether_a_cluster_is_built(monkeypatch):
+    """`up --runtime kubernetes` could only ever use a cluster rc-repro built itself:
+    `create_workspace` opened with `ensure_cluster()`, which refuses when `kind` is
+    absent. So on a box running k3s -- an ordinary way to have Kubernetes -- `doctor`
+    said "Using your cluster 'default'" and `up` refused to use it, two commands in one
+    tool contradicting each other.
+
+    Provisioning is the ONE step that differs. Everything after it already took
+    `context=`, which is why adopting a cluster is a resolver and not a runtime.
+    """
+    from rc_repro.errors import PreflightError
+    from rc_repro.services import k8s
+
+    # kind, with its cluster already up: ours, and nothing to build. Today's behaviour.
+    _kube_probe_stubs(monkeypatch, kind=True, our_cluster=True, active="default")
+    plan = k8s.plan_cluster()
+    assert (plan.context, plan.distribution, plan.create) == (k8s.CONTEXT, "kind", False)
+
+    # kind, no cluster yet: build ours. Today's behaviour, and the k3s box is IGNORED --
+    # "no change to kind" is the stronger promise, so an existing cluster elsewhere never
+    # takes the choice away from a box that can make its own.
+    _kube_probe_stubs(monkeypatch, kind=True, our_cluster=False, active="default")
+    plan = k8s.plan_cluster()
+    assert (plan.context, plan.distribution, plan.create) == (k8s.CONTEXT, "kind", True)
+
+    # No kind: skip provisioning and use what kubectl points at.
+    _kube_probe_stubs(monkeypatch, kind=False, our_cluster=False, active="default")
+    plan = k8s.plan_cluster()
+    assert (plan.context, plan.distribution, plan.create) == ("default", "k3s", False)
+
+    # No kind and nothing reachable: refuse, and the message is now true.
+    _kube_probe_stubs(monkeypatch, kind=False, our_cluster=False, active="")
+    try:
+        k8s.plan_cluster()
+    except PreflightError as exc:
+        assert "not pointed at one either" in str(exc), str(exc)
+    else:
+        raise AssertionError("a box with no cluster and no kind must be refused")
+
+
+def test_a_cluster_rc_repro_made_is_found_by_asking_it_not_by_asking_kind(monkeypatch):
+    """`cluster_exists` was `CLUSTER_NAME in clusters()`, and that probe needs the kind
+    BINARY. So uninstalling kind while its cluster was still running made the cluster
+    invisible -- node containers holding memory that nothing in rc-repro could see or
+    remove, and resolution quietly falling through to a different cluster.
+    """
+    from rc_repro.services import k8s
+
+    # kind gone, but our kubeconfig still names a cluster that answers.
+    _kube_probe_stubs(monkeypatch, kind=False, our_cluster=True, active="default")
+    plan = k8s.plan_cluster()
+    assert plan.context == k8s.CONTEXT, "our own cluster is still the one to use"
+    assert plan.create is False
+
+
+def test_the_distribution_is_read_from_the_node_not_guessed_from_a_name(monkeypatch):
+    """A label for messages, never a branch: `k3s --disable traefik` is a real setup, so
+    what a cluster CAN do is probed and what it IS is only named. Signals are the ones
+    verified against live clusters.
+    """
+    import subprocess as sp
+
+    from rc_repro.services import k8s
+
+    def answer(text):
+        return lambda argv, timeout=None, own=False: sp.CompletedProcess(argv, 0, text, "")
+
+    monkeypatch.setattr(k8s, "run", answer("k3s://docker-01 v1.36.3+k3s1 k3s docker-01"))
+    assert k8s.distribution("default") == "k3s"
+    monkeypatch.setattr(k8s, "run", answer(
+        "kind://docker/rc-repro-local/rc-repro-local-control-plane v1.36.1  x"))
+    assert k8s.distribution("kind-rc-repro-local") == "kind"
+    monkeypatch.setattr(k8s, "run", answer("aws:///eu-west-1a/i-0abc v1.31.0-eks-1234 m5"))
+    assert k8s.distribution("arn:aws:eks:x") == "eks", \
+        "a cloud providerID is the most reliable 'not a disposable cluster' signal"
+    monkeypatch.setattr(k8s, "run", answer(" v1.29.0  somenode"))
+    assert k8s.distribution("x") == "unknown", "unknown is a fine answer"
+    monkeypatch.setattr(k8s, "run",
+                        lambda argv, timeout=None, own=False: sp.CompletedProcess(argv, 1, "", "no"))
+    assert k8s.distribution("x") == "unknown", "an unreachable cluster is not a failure here"
+
+
+def test_a_create_refused_for_want_of_a_cluster_leaves_no_record(monkeypatch, tmp_path):
+    """Measured on a box with k3s and no kind: the refusal left an `incomplete`
+    repro.json, `list` showed it as a workspace, and `used_ports()` went on reserving its
+    port -- so a create that could never have succeeded held :3142 until somebody ran
+    `down --volumes`.
+
+    The write-ahead record is not the problem and must not be weakened: it exists because
+    an interrupted create once left a workspace running and unrecorded. The order was.
+    Choosing the cluster only probes, so it belongs above the write.
+    """
+    from rc_repro.errors import PreflightError
+
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "check_capacity", lambda *a, **k: None)
+    # Only functions that predate this change, so the test drives the OLD code too: no
+    # kind and nothing for kubectl to point at is the box that gets refused.
+    monkeypatch.setattr(k8s, "which", lambda _t: "")
+    monkeypatch.setattr(k8s, "cluster_context", lambda: "")
+    monkeypatch.setattr(k8s, "active_context", lambda: "")
+    req = lc.CreateReq(version="8.5.1", runtime="kubernetes", name="ghost", offline=True)
+    try:
+        lc._create_kubernetes(req)
+    except PreflightError:
+        pass
+    else:
+        raise AssertionError("it must refuse")
+    assert not (tmp_path / "repros" / "ghost").exists(), \
+        "a refusal wrote a record for a workspace that was never created"
+    assert lc.runner.used_ports() == set(), "and it reserved that workspace's port"
