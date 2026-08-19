@@ -266,3 +266,82 @@ def test_ui_json_mode_moves_every_helper_to_stderr(capsys):
             assert word in out.err
     finally:
         ui.json_mode(False)
+
+
+# --- capabilities: the build describing itself ----------------------------------
+
+def test_capabilities_reports_exactly_the_commands_that_really_speak_json():
+    """The invariant that makes the document trustworthy, and the bug it exists for.
+
+    A caller reads this to avoid hardcoding a flag list; if it can advertise a
+    command that does not answer in JSON, it has moved the same guess one level up
+    and made it authoritative. The version borrowed from elsewhere advertised
+    `rc-repro.loadtest.v1` and `rc-repro.capacity.v1` for two commands that printed
+    a bare payload, so an agent reaching for `.data` got nothing.
+
+    Derived from the registered app on BOTH sides -- the truth is the `--json`
+    parameter on the callback, and this asserts the document agrees with it.
+    """
+    import inspect
+
+    doc = jsonout.capabilities(cli.app)
+    advertised = {c["name"] for c in doc["commands"] if c["json"]}
+
+    real = set()
+    def scan(cmd, prefix=""):
+        cb = getattr(cmd, "callback", None)
+        if cb is None:
+            return
+        name = (cmd.name or cb.__name__.replace("_", "-")).removesuffix("-cmd")
+        for param in inspect.signature(cb).parameters.values():
+            for decl in (getattr(param.default, "param_decls", None) or ()):
+                if decl == "--json":
+                    real.add((prefix + name).strip())
+
+    for cmd in cli.app.registered_commands:
+        scan(cmd)
+    for group in getattr(cli.app, "registered_groups", []):
+        for cmd in getattr(group.typer_instance, "registered_commands", []):
+            scan(cmd, prefix=f"{group.name} ")
+
+    assert advertised == real, (
+        f"capabilities advertises {sorted(advertised - real)} that do not take "
+        f"--json, and omits {sorted(real - advertised)} that do")
+    assert advertised, "no command speaks JSON, which cannot be right"
+
+
+def test_capabilities_lists_a_grouped_subcommand():
+    """`skill install` lives under a group, and the obvious implementation walks
+    only `registered_commands` -- so grouped subcommands vanish from the document
+    that claims to list everything. Silently, and only once a group exists."""
+    names = {c["name"] for c in jsonout.capabilities(cli.app)["commands"]}
+    assert "skill install" in names and "skill status" in names
+
+
+def test_capabilities_does_not_advertise_an_error_code_nothing_can_raise():
+    """`errors.GATE_CODES` names seven authority gates and this build raises none of
+    them -- `AuthorityGateError` is defined and never used. Publishing them would
+    teach a caller to write a branch that never runs, which is the same class of
+    wrongness as advertising a flag that does not exist."""
+    codes = set(jsonout.capabilities(cli.app)["error_codes"])
+    assert "VALIDATION_FAILED" in codes and "NOT_READY" in codes
+    assert not (codes & set(errors.GATE_CODES)), sorted(codes & set(errors.GATE_CODES))
+
+
+def test_capabilities_says_which_commands_stream_by_looking_at_them():
+    """`up` and `ready` build an EventWriter; `down` does not. A hardcoded list of
+    verb names had all three, which is wrong today and would rot anyway."""
+    streams = {c["name"]: c.get("streams") for c in jsonout.capabilities(cli.app)["commands"]
+               if c["json"]}
+    assert streams["up"] is True and streams["ready"] is True
+    assert streams["down"] is False, "down is synchronous; claiming a stream is a lie"
+
+
+def test_capabilities_needs_no_engine_and_no_home(tmp_path, monkeypatch):
+    """It is asked BEFORE anybody knows whether the environment works."""
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "nothing-here"))
+    monkeypatch.setattr(cli.runner, "docker_available",
+                        lambda **_k: pytest.fail("capabilities asked docker"))
+    res = runner_.invoke(cli.app, ["capabilities"])
+    assert res.exit_code == 0
+    assert json.loads(res.stdout.strip())["data"]["rc_repro_version"]

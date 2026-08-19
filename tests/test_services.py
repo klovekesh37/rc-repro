@@ -5148,3 +5148,109 @@ def test_pod_rows_answers_empty_rather_than_raising_when_the_cluster_is_asleep()
     with mock.patch.object(k8s, "run", return_value=type(
             "R", (), {"returncode": 1, "stdout": "", "stderr": "connection refused"})()):
         assert k8s.pod_rows("k", context="c") == []
+
+
+# --- the agent skill ------------------------------------------------------------
+
+def test_the_repo_copies_of_the_skill_match_the_packaged_one():
+    """Three copies of one file, and the two under `.claude/` and `.agents/` exist so
+    a fresh clone teaches an agent to drive this tool. Three copies is also how they
+    drift, so this is the thing that stops them.
+
+    It is a real check rather than a formality: the packaged copy is what
+    `rc-repro skill install` writes on a machine that has no checkout, so a repo
+    copy that says something different is instructions half the callers never see.
+    """
+    from pathlib import Path
+
+    from rc_repro.services import skill
+
+    root = Path(skill.packaged()).resolve().parents[3]
+    want = skill.packaged().read_text(encoding="utf-8")
+    for rel in (".claude/skills/rc-repro/SKILL.md", ".agents/skills/rc-repro/SKILL.md"):
+        copy = root / rel
+        assert copy.exists(), f"{rel} is missing — `cp {skill.packaged()} {rel}`"
+        assert copy.read_text(encoding="utf-8") == want, (
+            f"{rel} has drifted from the packaged skill — copy it again")
+
+
+def test_the_skill_knows_stale_from_edited_locally(tmp_path, monkeypatch):
+    """Two ways an installed file can differ, needing opposite answers: the package
+    moved on (reinstall it) or a human edited it (that is theirs). The sidecar's
+    recorded sha is what separates them -- without it, an edit and a new release look
+    identical and one of the two gets clobbered."""
+    from rc_repro.services import skill
+
+    monkeypatch.setenv("RC_REPRO_SKILL_HOME", str(tmp_path))
+    assert skill.host_state("claude").status == "absent"
+
+    skill.install("claude")
+    assert skill.host_state("claude").status == "current"
+    assert skill.install("claude")["hosts"][0]["action"] == "unchanged"
+
+    path = skill.target("claude")
+    path.write_text("a human changed this\n", encoding="utf-8")
+    assert skill.host_state("claude").status == "modified"
+    with pytest.raises(errors.ConflictError):
+        skill.install("claude")
+    assert path.read_text(encoding="utf-8") == "a human changed this\n", \
+        "a refusal that had already overwritten the file would be worse than none"
+    skill.install("claude", force=True)
+    assert skill.host_state("claude").status == "current"
+
+    # A copy this build wrote, from an older build: stale, and overwritten freely.
+    path.write_text("what 0.1.0 shipped\n", encoding="utf-8")
+    (path.parent / skill.SIDECAR).write_text(json.dumps(
+        {"rc_repro_version": "0.1.0", "sha256": skill.sha256("what 0.1.0 shipped\n")}),
+        encoding="utf-8")
+    assert skill.host_state("claude").status == "stale"
+    assert skill.install("claude")["hosts"][0]["action"] == "updated"
+
+
+def test_the_skill_never_writes_into_the_rc_repro_state_directory(tmp_path, monkeypatch):
+    """It is read by an agent that knows nothing about RC_REPRO_HOME, so it goes
+    where that agent looks -- and a test that got this wrong would write into the
+    developer's real ~/.claude."""
+    from rc_repro.services import skill
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("RC_REPRO_SKILL_HOME", str(tmp_path / "home"))
+    skill.install("all")
+    assert (tmp_path / "home" / ".claude" / "skills" / "rc-repro" / "SKILL.md").exists()
+    assert not (tmp_path / "state").exists()
+
+
+# --- the engine floor -----------------------------------------------------------
+
+def test_a_kubernetes_create_is_refused_when_the_ENGINE_is_too_small(monkeypatch):
+    """The host and the container engine are different machines on macOS and on
+    Podman, and the capacity check only ever asked the host. A laptop with 32 GB and
+    a 4 GB VM passed everything and then could not run a Kubernetes workspace -- the
+    failure arriving minutes later as pods stuck Pending, which names nothing."""
+    monkeypatch.setattr(lc.runner, "docker_capacity", lambda: (2.0, 3 * 1024 ** 3))
+    with pytest.raises(errors.PreflightError) as caught:
+        lc.check_capacity(lc.CreateReq(version="8.5.1", runtime="kubernetes"))
+    said = str(caught.value)
+    assert "2 CPUs" in said and "3.0 GiB" in said
+    assert "podman machine set" in said, "a refusal has to say how to fix it"
+
+    # Compose runs two containers and works on that VM: a floor there would refuse
+    # creates that succeed today.
+    monkeypatch.setattr(lc.runner, "host_memory", lambda: (16000, 12000, 0))
+    lc.check_capacity(lc.CreateReq(version="8.5.1"))
+
+
+def test_an_unreadable_engine_is_not_evidence_of_a_small_one(monkeypatch):
+    """A refusal on no evidence is how people learn to pass --force by reflex."""
+    monkeypatch.setattr(lc.runner, "docker_capacity", lambda: None)
+    monkeypatch.setattr(lc.runner, "host_memory", lambda: (16000, 12000, 0))
+    lc.check_capacity(lc.CreateReq(version="8.5.1", runtime="kubernetes"))
+
+
+def test_force_downgrades_the_engine_floor_to_a_warning(monkeypatch):
+    events = []
+    monkeypatch.setattr(lc.runner, "docker_capacity", lambda: (1.0, 1 * 1024 ** 3))
+    monkeypatch.setattr(lc.runner, "host_memory", lambda: (16000, 12000, 0))
+    lc.check_capacity(lc.CreateReq(version="8.5.1", runtime="kubernetes", force=True),
+                      emit=events.append)
+    assert any("below the Kubernetes floor" in e.message for e in events)

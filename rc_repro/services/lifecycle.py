@@ -239,6 +239,56 @@ def _kube_overhead_mb(req: "CreateReq") -> int:
     return need
 
 
+#: What the container ENGINE must have before a Kubernetes workspace is worth
+#: starting: a control plane, the MongoDB operator or a StatefulSet, and on
+#: microservices six more Rocket.Chat processes. Taken from PR #3, whose measured
+#: floor these are; the value of them is not the numbers but WHERE they are read
+#: from -- `docker info`, i.e. the VM, not `/proc/meminfo`.
+ENGINE_FLOOR_CPUS = 4
+ENGINE_FLOOR_MEMORY_GIB = 6.0
+
+
+def _check_engine_floor(req: "CreateReq", emit: Emit = null_emit) -> None:
+    """Refuse a Kubernetes create the container engine is too small for.
+
+    Compose is left alone: it runs two containers and works on a 2 GB VM, so a floor
+    there would refuse creates that succeed today.
+
+    Silent when the engine cannot be asked. An unreadable `docker info` is not
+    evidence of a small VM, and a refusal on no evidence is the failure mode this
+    whole family of checks has to avoid -- `up` already refuses for real capacity,
+    and a second refusal nobody can explain is how people learn to pass --force by
+    reflex.
+    """
+    from rc_repro.services import topology
+    if topology.normalize(getattr(req, "runtime", "")) != topology.KUBERNETES:
+        return
+    cap = runner.docker_capacity()
+    if cap is None:
+        return
+    cpus, mem_bytes = cap
+    gib = mem_bytes / (1024 ** 3)
+    short = []
+    if cpus and cpus < ENGINE_FLOOR_CPUS:
+        short.append(f"{cpus:.0f} CPUs (needs {ENGINE_FLOOR_CPUS})")
+    if gib and gib < ENGINE_FLOOR_MEMORY_GIB:
+        short.append(f"{gib:.1f} GiB of memory (needs {ENGINE_FLOOR_MEMORY_GIB})")
+    if not short:
+        return
+    if getattr(req, "force", False):
+        warn(emit, "the container engine is below the Kubernetes floor — "
+                   + " and ".join(short) + ". Continuing because --force was given.",
+             phase="preflight")
+        return
+    raise PreflightError(
+        "the container engine has " + " and ".join(short) + ". A Kubernetes "
+        "workspace needs a control plane, MongoDB and the chart, and below this it "
+        "does not fail cleanly -- pods stay Pending with nothing naming memory. "
+        "Raise the VM (Docker Desktop: Settings -> Resources; Podman: "
+        "`podman machine set --cpus 4 --memory 6144`), or use --runtime docker. "
+        "--force overrides this.")
+
+
 def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_emit) -> None:
     """Refuse to create a workspace the host cannot hold.
 
@@ -259,6 +309,13 @@ def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_em
     reads until after the machine is down. Overridable with --force, and the
     message says what to stop instead.
     """
+    # The ENGINE's floor first, and it is a different question from the host's
+    # headroom. On Linux the engine is the host and the two agree; on macOS and on
+    # Podman the container VM has its own allocation, so a laptop with 32 GB and a
+    # 4 GB VM passes every check below and then cannot run a Kubernetes workspace at
+    # all -- the failure arriving later as pods that never schedule, which names
+    # nothing a reader can act on.
+    _check_engine_floor(req, emit)
     mem = runner.host_memory()
     if mem is None:                     # not Linux: skip rather than guess
         return

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rc-repro"
-version = "0.63.1"
+version = "0.64.0"
 description = "Launch version-matched Rocket.Chat reproduction environments"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,7 +30,7 @@ rc-repro = "rc_repro.cli:app"
 packages = ["rc_repro", "rc_repro.presets", "rc_repro.perf", "rc_repro.services", "rc_repro.web"]
 
 [tool.setuptools.package-data]
-rc_repro = ["data/*.yaml", "data/presets/*.yaml", "data/monitoring/*.json", "data/loadtest/*.js", "data/webui/*"]
+rc_repro = ["data/*.yaml", "data/presets/*.yaml", "data/monitoring/*.json", "data/loadtest/*.js", "data/webui/*", "data/skill/*.md"]
 
 [tool.ruff]
 line-length = 110

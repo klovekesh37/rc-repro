@@ -248,3 +248,140 @@ class EventWriter:
         if getattr(ev, "terminal", False):
             return
         emit(self.event(ev))
+
+
+# --- capabilities ---------------------------------------------------------------
+#
+# What this build can do, described by the build itself. It exists so an agent (or a
+# CI step, or a colleague's script) can ask rather than assume: which commands are
+# here, which speak JSON, which stream, what the codes mean. The alternative is a
+# caller that hardcodes a flag list and breaks the first time one moves -- and a
+# hardcoded list on OUR side would drift from the real flags just as fast, which is
+# why every field below is derived from the registered app rather than written out.
+#
+# No `--json` flag of its own, deliberately: this command IS JSON. A flag that is
+# accepted and then ignored is worse than no flag.
+
+
+def _error_codes() -> list[str]:
+    """Every stable error code this build can actually emit.
+
+    Walked from the exception hierarchy rather than listed by hand, so a new
+    ReproError subclass cannot be forgotten.
+
+    `errors.GATE_CODES` is deliberately NOT merged in. Those name authority gates --
+    onboarding, an unapproved cluster, public exposure -- and this build raises none
+    of them: `AuthorityGateError` is defined and never used. Advertising a code
+    nothing can produce is the exact failure this document exists to prevent, and it
+    would teach a caller to write a branch that never runs. If a gate ever gets
+    raised, it joins the hierarchy walk on its own.
+    """
+    seen: set[str] = set()
+
+    def walk(cls: type) -> None:
+        code = getattr(cls, "code", None)
+        if code:
+            seen.add(code)
+        for sub in cls.__subclasses__():
+            walk(sub)
+
+    walk(errors.ReproError)
+    return sorted(seen)
+
+
+def _commands(app: Any) -> list[dict]:
+    """The CLI surface, introspected from the registered commands.
+
+    Groups are walked as well as top-level commands. rc-repro has no groups today,
+    and the version of this borrowed from elsewhere read only
+    `app.registered_commands` -- so the moment one is added, its subcommands would be
+    missing from the document that claims to list everything, silently.
+    """
+    import inspect
+
+    out: list[dict] = []
+
+    def describe(cmd: Any, prefix: str = "") -> None:
+        callback = getattr(cmd, "callback", None)
+        if callback is None:
+            return
+        name = cmd.name or callback.__name__.replace("_", "-")
+        name = name.removesuffix("-cmd")
+        flags: list[str] = []
+        speaks_json = False
+        for param in inspect.signature(callback).parameters.values():
+            decls = getattr(param.default, "param_decls", None) or ()
+            flags.extend(d for d in decls if d.startswith("--"))
+            if param.name in ("json_out", "json_output"):
+                speaks_json = True
+        entry: dict[str, Any] = {"name": (prefix + name).strip(),
+                                 "flags": sorted(set(flags)), "json": speaks_json}
+        if speaks_json:
+            entry["schema"] = f"rc-repro.{entry['name']}.v1"
+            # DERIVED, not a hardcoded list of verb names: a command streams if its
+            # body builds an EventWriter. A list would be right on the day it was
+            # written and wrong the first time a command gained progress.
+            try:
+                entry["streams"] = "EventWriter" in inspect.getsource(callback)
+            except OSError:                      # no source (frozen, exec'd)
+                entry["streams"] = False
+        out.append(entry)
+
+    for cmd in getattr(app, "registered_commands", []):
+        describe(cmd)
+    for group in getattr(app, "registered_groups", []):
+        sub = getattr(group, "typer_instance", None)
+        if sub is None:
+            continue
+        for cmd in getattr(sub, "registered_commands", []):
+            describe(cmd, prefix=f"{group.name} ")
+    return sorted(out, key=lambda e: e["name"])
+
+
+def capabilities(app: Any) -> dict:
+    """What this build can do, for a version-matched caller.
+
+    Answers OFFLINE and with no container engine: a caller asks this *before* it
+    knows whether the environment works, so anything needing docker belongs in
+    `doctor` instead.
+    """
+    from rc_repro import config, presets
+    from rc_repro.services import topology
+
+    try:
+        catalog = sorted(p.name for p in presets.list_presets())
+    except Exception:  # noqa: BLE001 - discovery must not fail on a bad user preset
+        catalog = []
+    try:
+        from rc_repro import seed as seeder
+        profiles = sorted(seeder.PROFILES)
+    except Exception:  # noqa: BLE001
+        profiles = []
+    return {
+        "contract_versions": [CONTRACT],
+        "rc_repro_version": __version__,
+        "commands": _commands(app),
+        "phases": list(PHASES),
+        "error_codes": _error_codes(),
+        "exit_codes": {str(k): v for k, v in sorted(errors.EXIT_CODES.items())},
+        "presets": catalog,
+        "seed_profiles": profiles,
+        # The three axes, from the one table that defines them -- the same source
+        # /api/settings serves the browser, so the CLI and the GUI cannot disagree
+        # about what exists.
+        "runtimes": [{"name": rt, "deployments": list(deps),
+                      "default_deployment": deps[0],
+                      "creatable": rt in topology.REGISTERED}
+                     for rt, deps in topology.DEPLOYMENTS.items()],
+        "default_runtime": topology.DOCKER,
+        "default_bind_host": config.DEFAULT_BIND_HOST,
+        "skill": _skill_state(),
+    }
+
+
+def _skill_state() -> dict:
+    try:
+        from rc_repro.services import skill
+        return skill.state()
+    except Exception:  # noqa: BLE001 - discovery must not fail on an odd home
+        return {}

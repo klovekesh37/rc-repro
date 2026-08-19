@@ -2763,6 +2763,69 @@ def chown_cmd(
 
 
 @app.command()
+def capabilities() -> None:
+    """What this build can do, as JSON, for an agent or a script.
+
+    No `--json` flag, deliberately: this command IS JSON. A flag that is accepted
+    and then ignored is worse than no flag.
+
+    Every field is derived from the registered app rather than written out, because
+    a hardcoded list is right on the day it is written and wrong the first time a
+    flag moves -- which is exactly the drift a caller reads this to avoid. Answers
+    offline and with no container engine: it is asked BEFORE anybody knows whether
+    the environment works, and the question "does this box work" is `doctor`.
+    """
+    jsonout.activate()
+    jsonout.reply("capabilities", jsonout.capabilities(app))
+
+
+skill_app = typer.Typer(help="Install the agent skill that teaches a caller to drive rc-repro.")
+app.add_typer(skill_app, name="skill")
+
+
+@skill_app.command("install")
+def skill_install(
+    host: str = typer.Option("all", "--host", help="claude | agents | all"),
+    force: bool = typer.Option(False, "--force", help="overwrite a locally-edited copy"),
+    json_out: bool = typer.Option(False, "--json", help="print the result as one JSON envelope"),
+) -> None:
+    """Copy the packaged skill where an agent will find it."""
+    from rc_repro.services import skill as skillsvc
+    if json_out:
+        jsonout.activate()
+    try:
+        res = skillsvc.install(host, force=force)
+    except errors.ReproError as exc:
+        _fail(exc)
+    if json_out:
+        jsonout.reply("skill-install", res)
+        return
+    for row in res["hosts"]:
+        (ui.ok if row["action"] != "unchanged" else ui.hint)(
+            f"  {row['action']:<9} {row['path']}")
+    ui.hint(f"  version {res['version']}")
+
+
+@skill_app.command("status")
+def skill_status(
+    json_out: bool = typer.Option(False, "--json", help="print the result as one JSON envelope"),
+) -> None:
+    """Whether the installed skill matches this build."""
+    from rc_repro.services import skill as skillsvc
+    if json_out:
+        jsonout.activate()
+    st = skillsvc.state()
+    if json_out:
+        jsonout.reply("skill-status", st)
+        return
+    for host, row in sorted(st["hosts"].items()):
+        mark = {"current": ui.ok, "absent": ui.hint}.get(row["status"], ui.warn)
+        mark(f"  {host:<8} {row['status']:<9} {row['path']}")
+    if not st["current"]:
+        ui.hint("  `rc-repro skill install` writes the copy this build ships.")
+
+
+@app.command()
 def doctor(
     json_out: bool = typer.Option(False, "--json", help="print the report as one JSON envelope; exits 3 on any failing check"),
 ) -> None:
