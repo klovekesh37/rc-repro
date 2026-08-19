@@ -302,15 +302,59 @@ function render() {
 
   if (!ALL_REPROS.length) grid.append(el("p", { class: "empty" }, "No workspaces yet. Start with “+ New workspace”."));
   else if (!list.length) grid.append(el("p", { class: "empty" }, "Nothing matches this filter."));
-  for (const r of list) grid.append(card(r));
+
+  // GROUPED BY WHAT IT WANTS FROM YOU. A flat list is fine with two workspaces and
+  // is the wrong shape for a shared box running eight to twelve: "which one is
+  // unhappy" was a question you answered by reading every row, and the unhappy one
+  // could be anywhere in an alphabetical list.
+  //
+  // With docker unreachable every state is "?" -- there is nothing to distinguish, so
+  // grouping would sort them into one bucket with a heading that says nothing.
+  for (const [title, tone, rows] of unknown ? [["", "", list]] : railGroups(list)) {
+    if (!rows.length) continue;
+    // The heading is suppressed when there is only one group: with everything in one
+    // state the rail-head pill above already says which, and a heading over the whole
+    // list is a label for the thing it is inside.
+    if (title && !unknown) {
+      grid.append(el("div", { class: "rgrp" },
+        el("span", { class: "rdot " + tone }),
+        el("span", { class: "rgrp-t" }, title),
+        el("span", { class: "rgrp-n" }, String(rows.length))));
+    }
+    for (const r of rows) grid.append(card(r));
+  }
 }
 
+// Three buckets, in the order you need them. "Wants you" is not "not running": a
+// stopped workspace is doing exactly what it was told, and a restart-looping one is
+// not, so they cannot share a group without the group meaning nothing.
+const RAIL_ORDER = [["Wants you", "warn"], ["Running", "ok"], ["Not running", "off"]];
+function wantsYou(r) {
+  // States nothing is going to fix on its own.
+  if (["restarting", "dead", "paused"].includes(r.state)) return true;
+  // Running, answering, and failing the healthcheck it sets for itself.
+  if (r.state === "running" && healthClass(r) === "bad") return true;
+  // Its https name resolves and answers 502, which looks like a broken workspace
+  // rather than a broken route -- so the rail has to be the thing that says so.
+  const route = ((EDGE && EDGE.routes) || []).find((x) => x.name === r.name);
+  return !!(route && route.reachable === false);
+}
+function railGroups(list) {
+  const buckets = [[], [], []];
+  for (const r of list) {
+    buckets[wantsYou(r) ? 0 : r.state === "running" ? 1 : 2].push(r);
+  }
+  const live = buckets.filter((b) => b.length).length;
+  return RAIL_ORDER.map(([title, tone], i) =>
+    [live > 1 ? title : "", tone, buckets[i]]);
+}
+
+// One line. Three of them was right for a rail nobody had more than four rows in;
+// twelve rows of three lines is 620px of picker, and everything that made the third
+// line -- the port, the owner, the scenario -- is in the panel's identity line the
+// moment you click. What survives is what you SCAN for: the name, the version, and
+// the one thing that tells you whether this row is the problem.
 function card(r) {
-  // A row, not a card. The old one was 130px tall and carried six buttons; six
-  // workspaces meant 36 buttons on screen and 4.5 of them visible. This is 52px,
-  // has no buttons at all, and shows the whole name -- which is the thing anyone
-  // is actually scanning for. Everything you can DO lives in the stage, next to
-  // the workspace it acts on.
   const busy = pendingOn(r.name);
   const state = busy ? "working" : stateClass(r.state || "?");
   const row = el("button", {
@@ -320,24 +364,55 @@ function card(r) {
     title: r.name,
     onclick: () => selectRepro(r.name),
   });
-  const r1 = el("span", { class: "r1" }, el("span", { class: "nm" }, r.name));
-  if (r.default) r1.append(el("span", { class: "star", title: "used by CLI commands with no --name" }, "★"));
-  r1.append(el("span", { class: "ver" }, r.rc_version || "?"));
-  const bits = [r.preset, ":" + r.host_port, r.created_by].filter(Boolean);
-  // Runtime is shown only when it is NOT the default. Compose is the overwhelming
-  // majority, so labelling every row "docker" would be noise on the common case and
-  // make the rare one harder to spot rather than easier. What matters is that a
-  // Kubernetes workspace never looks like a Compose one: which commands refuse,
-  // where the data lives and how to reach it all differ, and the list was the one
-  // place the two were indistinguishable.
-  if (r.runtime && r.runtime !== "docker") bits.push(r.runtime === "kubernetes" ? "k8s" : r.runtime);
-  if (r.monitoring) bits.push("monitored");
-  row.append(r1, el("span", { class: "meta" }, bits.join(" · ")));
-  row.append(el("span", { class: "r3" },
-    el("span", { class: "wstate " + (busy ? "working" : stateClass(r.state)) },
-      busy ? (BUSY_VERB[busy] || busy) : (r.state === "?" ? "state unknown" : r.state)),
-    el("span", { class: "wage" }, r.uptime || "")));
+  const nm = el("span", { class: "nm" }, r.name);
+  row.append(nm);
+  if (r.default) row.append(el("span", { class: "star", title: "used by CLI commands with no --name" }, "★"));
+  row.append(el("span", { class: "ver" }, r.rc_version || "?"));
+  row.append(el("span", { class: "meta " + (busy ? "working" : wantsYou(r) ? "warn" : "") },
+                railTag(r, busy)));
   return row;
+}
+
+// What this row's group does not already say. In "wants you" that is the reason,
+// which is the whole point of the row being there; in "running" it is how long and
+// what kind; in "not running" it is that nothing was thrown away.
+// "2 hours" -> "2h". The panel spells it out; the rail has one line and the name is
+// what it is for, so the tag gives up its characters first. Docker's own phrasing is
+// what both runtimes produce (services/lifecycle._since), so this reads one
+// vocabulary -- and anything it does not recognise passes through unchanged rather
+// than being mangled.
+function shortAge(s) {
+  const m = /^(\d+)\s*(second|minute|hour|day|week|month|year)/.exec(String(s || ""));
+  return m ? m[1] + (m[2] === "month" ? "mo" : m[2][0]) : String(s || "");
+}
+
+function railTag(r, busy) {
+  if (busy) return BUSY_VERB[busy] || busy;
+  if (r.state === "?") return "state unknown";
+  const bits = [];
+  if (wantsYou(r)) {
+    const route = ((EDGE && EDGE.routes) || []).find((x) => x.name === r.name);
+    if (r.state !== "running") bits.push(r.state);
+    else if (healthClass(r) === "bad") bits.push(r.health || "unhealthy");
+    if (route && route.reachable === false) bits.push("https 502");
+    return bits.join(" · ");
+  }
+  // "data kept" only for `down`. A stopped workspace obviously still has its data --
+  // the tag already says stopped -- and every character here is one the NAME does not
+  // get, which is what the rail is for.
+  if (r.state !== "running") return r.state === "down" ? "down · data kept" : r.state;
+  if (r.uptime) bits.push(shortAge(r.uptime));
+  if (r.preset && r.preset !== "default") bits.push(r.preset);
+  // Runtime only when it is NOT the default: Compose is the overwhelming majority, so
+  // labelling every row "docker" would be noise on the common case and make the rare
+  // one harder to spot rather than easier. What matters is that a Kubernetes workspace
+  // never looks like a Compose one -- which commands refuse, where the data lives and
+  // how to reach it all differ.
+  if (r.runtime && r.runtime !== "docker") bits.push(r.runtime === "kubernetes" ? "k8s" : r.runtime);
+  // Monitoring is NOT here. It is a fact about the workspace rather than something it
+  // wants from you, the panel carries it as a Grafana link and the action pane offers
+  // to detach it -- and on a one-line row it cost eight characters of the name.
+  return bits.join(" · ");
 }
 
 const PENDING = new Map();

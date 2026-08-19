@@ -2587,3 +2587,119 @@ def test_a_pod_that_cannot_start_is_named_in_the_panel(serve, page, monkeypatch)
         page.click("#detail .triage .tri-a button")
         page.wait_for_selector("#d-body .dtable")
         assert page.errors == [], page.errors
+
+
+def _stub_list(monkeypatch, rows):
+    """Several workspaces in the rail, with the panel answering for whichever is asked."""
+    from rc_repro.services import lifecycle as lc
+    by_name = {r["name"]: r for r in rows}
+    monkeypatch.setattr(lc, "list_repros", lambda: [dict(r) for r in rows])
+    monkeypatch.setattr(lc, "detail", lambda name: dict(by_name[name]))
+    monkeypatch.setattr(lc, "resolve_name", lambda name: name)
+    return rows
+
+
+def test_the_rail_groups_by_what_each_workspace_wants_from_you(serve, page, monkeypatch):
+    """A flat alphabetical list is fine with two workspaces and is the wrong shape for
+    the shared box this tool is run on, which carries eight to twelve. "Which one is
+    unhappy" was a question you answered by reading every row, and the unhappy one
+    could be anywhere in the list.
+
+    "Wants you" is deliberately not "not running": a stopped workspace is doing exactly
+    what it was told and a restart-looping one is not, so putting them together would
+    make the group mean nothing.
+    """
+    _stub_list(monkeypatch, [
+        _fake_detail(name="aa-loop", state="restarting", restarts=4),
+        _fake_detail(name="bb-sick", state="running", health="unhealthy"),
+        _fake_detail(name="cc-fine", state="running"),
+        _fake_detail(name="dd-stopped", state="stopped", uptime="", health=""),
+        _fake_detail(name="ee-down", state="down", uptime="", health=""),
+    ])
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros .rgrp")
+        m = page.evaluate("""() => {
+          const out = [];
+          let g = null;
+          for (const c of document.querySelector('#repros').children) {
+            if (c.classList.contains('rgrp')) {
+              g = {title: c.querySelector('.rgrp-t').textContent,
+                   count: c.querySelector('.rgrp-n').textContent, rows: []};
+              out.push(g);
+            } else if (g) g.rows.push(c.querySelector('.nm').textContent);
+          }
+          return out;
+        }""")
+        assert [g["title"] for g in m] == ["Wants you", "Running", "Not running"], m
+        assert [g["count"] for g in m] == ["2", "1", "2"], m
+        assert m[0]["rows"] == ["aa-loop", "bb-sick"], m[0]
+        assert m[1]["rows"] == ["cc-fine"], m[1]
+        assert m[2]["rows"] == ["dd-stopped", "ee-down"], m[2]
+        assert page.errors == [], page.errors
+
+
+def test_one_state_gets_no_group_headings(serve, page, monkeypatch):
+    """A heading over a list that is entirely one state is a label for the thing it is
+    inside, and the rail head's pill already says "3 running". The rule is conditional,
+    so both halves of it are asserted: three running workspaces get no headings, and the
+    moment one of them is in another state all three headings appear.
+    """
+    _stub_list(monkeypatch, [_fake_detail(name=f"ws-{i}") for i in range(3)])
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros .wrow")
+        assert page.locator("#repros .rgrp").count() == 0
+        assert page.locator("#repros .wrow").count() == 3
+        # The rule itself, both ways round, without waiting out a four-second poll.
+        titles = page.evaluate("""() => [
+          railGroups([{state: 'running'}, {state: 'running'}]).map(g => g[0]),
+          railGroups([{state: 'running'}, {state: 'stopped'}]).map(g => g[0]),
+        ]""")
+        assert titles[0] == ["", "", ""], titles[0]
+        assert titles[1] == ["Wants you", "Running", "Not running"], titles[1]
+        assert page.errors == [], page.errors
+
+
+def test_a_long_workspace_name_does_not_push_the_rail_sideways(serve, page, monkeypatch):
+    """`.rows` was left on the implicit `auto` grid track, which is at least as wide as
+    its widest item's MIN-content -- and a one-line row whose name cannot wrap has a
+    min-content of the whole name. One long name made every row 484px wide inside a
+    287px rail, so the rail scrolled sideways and the state tags and group counts were
+    clipped off the right edge.
+
+    The name is what the rail is for, so it keeps its characters and the TAG gives up
+    first; past that the name ellipsises and the full one stays in the row's title.
+    """
+    long_name = "a-really-long-workspace-name-for-ticket-4821"
+    _stub_list(monkeypatch, [
+        _fake_detail(name=long_name, preset="ldap"),
+        _fake_detail(name="dana-upgrade", uptime="4 minutes", monitoring=True),
+    ])
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros .wrow")
+        m = page.evaluate("""() => {
+          const rows = document.querySelector('#repros');
+          const inside = [...rows.querySelectorAll('.wrow')].every(
+            (r) => r.scrollWidth <= r.clientWidth + 1);
+          const dana = [...rows.querySelectorAll('.wrow')].find(
+            (r) => r.querySelector('.nm').textContent.startsWith('dana'));
+          return {sideways: rows.scrollWidth > rows.clientWidth + 1, inside,
+                  // one line, not three: the row is no taller than its text
+                  height: Math.round(dana.getBoundingClientRect().height),
+                  // and the tag is the half that gave up
+                  name: dana.querySelector('.nm').textContent,
+                  tag: dana.querySelector('.meta').textContent,
+                  title: rows.querySelector('.wrow').title};
+        }""")
+        assert not m["sideways"], "the rail scrolls sideways"
+        assert m["inside"], "a row is wider than the rail"
+        assert m["height"] <= 34, f"a row is {m['height']}px; one line is about 28"
+        assert m["name"] == "dana-upgrade", "the name gave up its characters, not the tag"
+        assert m["tag"] == "4m · base", m["tag"]
+        assert m["title"] == long_name, "the full name has to stay reachable"
+        assert page.errors == [], page.errors
