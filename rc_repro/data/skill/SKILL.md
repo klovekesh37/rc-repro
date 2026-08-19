@@ -45,7 +45,7 @@ question is about documented behaviour rather than observed behaviour.
 Every `--json` reply is one envelope:
 
 ```json
-{"schema":"rc-repro.info.v1","contract":1,"rc_repro_version":"0.63.1",
+{"schema":"rc-repro.info.v1","contract":1,"rc_repro_version":"0.64.0",
  "generated_at":"...","ok":true,"data":{...},"warnings":[],"error":null}
 ```
 
@@ -171,6 +171,14 @@ rc-repro-owned namespace remains.
 
 ## If this skill is stale
 
-`capabilities.skill.current` is false when the installed copy does not match the
-build. Reinstall with `rc-repro skill install`, and prefer `capabilities` over this
-file wherever the two disagree — it is generated from the build, and this is prose.
+`capabilities.skill.current` is false when a copy that exists does not match the
+build. `capabilities.skill.hosts` names each one and its scope:
+
+- `project` — the checkout's own `.claude/skills/rc-repro/SKILL.md`. This is the one
+  in play when you are working inside the repository, and it travels with the branch.
+- `user` — `~/.claude/skills/` and `~/.agents/skills/`, for a machine with no
+  checkout. `rc-repro skill install` writes these; it refuses to overwrite a copy
+  you have edited unless you pass `--force`.
+
+Prefer `capabilities` over this file wherever the two disagree. That one is
+generated from the build; this is prose, and prose goes stale.

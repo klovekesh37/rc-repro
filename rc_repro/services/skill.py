@@ -112,17 +112,55 @@ def host_state(host: str) -> HostState:
     return HostState(host=host, status="stale", path=str(path), version=version)
 
 
+def project_copy(start: Path | None = None) -> Path | None:
+    """The CHECKOUT's own copy, if the caller is working inside one.
+
+    An agent reads `.claude/skills/` relative to the project before it reads the
+    one in a home directory, so in a checkout that is the file actually in play --
+    and reporting only the home copy meant `capabilities` said `current: false` to
+    a developer who was, at that moment, reading a perfectly current skill. It then
+    told them to run `skill install`, which writes a DIFFERENT copy somewhere the
+    agent was not reading. Found by driving the skill and watching it say that.
+
+    Walked upward from the working directory, the same way the tooling finds it.
+    """
+    here = (start or Path.cwd()).resolve()
+    for directory in (here, *here.parents):
+        candidate = directory / ".claude" / HOSTS["claude"].split("/", 1)[1] / SKILL_DIR / SKILL_FILE
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def state() -> dict:
-    """Every host, for `capabilities`. Never raises: discovery must not fail."""
+    """Every copy that exists, for `capabilities`. Never raises: discovery must not
+    fail on an odd home or an unreadable directory.
+
+    `current` is true when every copy that EXISTS matches this build, and at least
+    one does. Absent is not current -- there is nothing to have read -- and a stale
+    copy anywhere is worth reporting even if another one is fine, because nobody
+    knows which of them the caller loaded.
+    """
     out: dict = {"version": __version__, "hosts": {}}
     for host in sorted(HOSTS):
         try:
             st = host_state(host)
             out["hosts"][host] = {"status": st.status, "path": st.path,
-                                  "version": st.version}
+                                  "version": st.version, "scope": "user"}
         except Exception:  # noqa: BLE001
-            out["hosts"][host] = {"status": "unknown", "path": "", "version": ""}
-    out["current"] = all(h.get("status") == "current" for h in out["hosts"].values())
+            out["hosts"][host] = {"status": "unknown", "path": "", "version": "",
+                                  "scope": "user"}
+    try:
+        local = project_copy()
+    except Exception:  # noqa: BLE001
+        local = None
+    if local is not None:
+        same = _read(local) == _read(packaged())
+        out["hosts"]["project"] = {"status": "current" if same else "stale",
+                                   "path": str(local), "version": __version__ if same else "",
+                                   "scope": "project"}
+    present = [h for h in out["hosts"].values() if h["status"] != "absent"]
+    out["current"] = bool(present) and all(h["status"] == "current" for h in present)
     return out
 
 

@@ -345,3 +345,71 @@ def test_capabilities_needs_no_engine_and_no_home(tmp_path, monkeypatch):
     res = runner_.invoke(cli.app, ["capabilities"])
     assert res.exit_code == 0
     assert json.loads(res.stdout.strip())["data"]["rc_repro_version"]
+
+
+# --- the invariant that closes the contract -------------------------------------
+
+#: How to drive each `--json` command so it terminates without a workspace, and
+#: whether that run should succeed. The TABLE is checked against the app below, so a
+#: command that gains `--json` and is not listed here fails this file rather than
+#: shipping unexercised -- which is the whole point: the contract is "every --json
+#: reply is exactly one envelope, last", and a command nobody drove is a command
+#: nobody knows that about.
+JSON_COMMANDS: dict[str, tuple[list[str], bool]] = {
+    "list": (["list", "--json"], True),
+    "doctor": (["doctor", "--json"], True),
+    "skill status": (["skill", "status", "--json"], True),
+    "skill install": (["skill", "install", "--json"], True),
+    "info": (["info", "--name", "nope", "--json"], False),
+    "ready": (["ready", "--name", "nope", "--json"], False),
+    "down": (["down", "--name", "nope", "--json"], False),
+    "up": (["up", "--version", "8.5.1", "--set", "nonsense", "--json"], False),
+    "loadtest": (["loadtest", "--name", "nope", "--json"], False),
+    "capacity": (["capacity", "--name", "nope", "--json"], False),
+}
+
+
+def test_the_table_below_covers_every_command_that_takes_json():
+    """Derived from the app, not from a list somebody remembers to update."""
+    advertised = {c["name"] for c in jsonout.capabilities(cli.app)["commands"] if c["json"]}
+    assert advertised == set(JSON_COMMANDS), (
+        f"not exercised: {sorted(advertised - set(JSON_COMMANDS))}; "
+        f"listed but gone: {sorted(set(JSON_COMMANDS) - advertised)}")
+
+
+@pytest.mark.parametrize("name", sorted(JSON_COMMANDS))
+def test_every_json_command_answers_with_exactly_one_envelope(
+        name, tmp_path, monkeypatch):
+    """The single promise the whole contract rests on.
+
+    A caller reads to end of stream and parses the LAST line. That only works if
+    there is exactly one envelope and it is last -- so this drives every `--json`
+    command to completion and checks the stream itself, on the success paths and,
+    more importantly, on the failure paths, where a contract usually breaks: the
+    error happens somewhere nobody remembered to wrap, and the caller gets an empty
+    stdout with a non-zero exit.
+    """
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("RC_REPRO_SKILL_HOME", str(tmp_path / "skills"))
+    argv, want_ok = JSON_COMMANDS[name]
+    res = runner_.invoke(cli.app, argv)
+
+    lines = [ln for ln in res.stdout.splitlines() if ln.strip()]
+    assert lines, f"{name} wrote nothing to stdout (exit {res.exit_code})"
+    objs = []
+    for ln in lines:
+        objs.append(json.loads(ln))          # every line is JSON, or this raises
+    envelopes = [o for o in objs if o.get("schema", "").startswith("rc-repro.")
+                 and "ok" in o]
+    assert len(envelopes) == 1, f"{name} wrote {len(envelopes)} envelopes"
+    assert objs[-1] is envelopes[0], f"{name}'s envelope is not the last line"
+
+    env = envelopes[0]
+    assert env["contract"] == jsonout.CONTRACT
+    assert env["ok"] is want_ok, f"{name}: ok={env['ok']} (exit {res.exit_code})"
+    if want_ok:
+        assert env["error"] is None and res.exit_code == 0
+    else:
+        # A failure names a code from the published set, and exits non-zero.
+        assert env["error"]["code"] in jsonout.capabilities(cli.app)["error_codes"]
+        assert res.exit_code != 0

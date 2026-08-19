@@ -5254,3 +5254,46 @@ def test_force_downgrades_the_engine_floor_to_a_warning(monkeypatch):
     lc.check_capacity(lc.CreateReq(version="8.5.1", runtime="kubernetes", force=True),
                       emit=events.append)
     assert any("below the Kubernetes floor" in e.message for e in events)
+
+
+def test_the_skill_reports_the_copy_an_agent_actually_reads(tmp_path, monkeypatch):
+    """An agent reads `.claude/skills/` relative to the PROJECT before it reads a
+    home directory, so in a checkout that is the file in play. Reporting only the
+    home copy told a developer `current: false` while they were reading a perfectly
+    current skill -- and then pointed them at `skill install`, which writes a
+    different copy somewhere the agent was not reading.
+
+    Found by driving the skill and watching `capabilities` say exactly that.
+    """
+    from rc_repro.services import skill
+
+    monkeypatch.setenv("RC_REPRO_SKILL_HOME", str(tmp_path / "home"))
+    project = tmp_path / "checkout"
+    (project / ".claude" / "skills" / "rc-repro").mkdir(parents=True)
+    local = project / ".claude" / "skills" / "rc-repro" / "SKILL.md"
+    local.write_text(skill.packaged().read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.chdir(project)
+
+    st = skill.state()
+    assert st["hosts"]["project"]["status"] == "current"
+    assert st["hosts"]["project"]["scope"] == "project"
+    # Nothing is installed in the home, and that does NOT make the state stale:
+    # absent copies are not copies somebody read.
+    assert st["hosts"]["claude"]["status"] == "absent"
+    assert st["current"] is True
+
+    # A checkout carrying an out-of-date copy is worth reporting even though the
+    # home copy might be fine, because nobody knows which one the caller loaded.
+    local.write_text("what an older branch shipped\n", encoding="utf-8")
+    assert skill.state()["current"] is False
+
+
+def test_no_copy_anywhere_is_not_current(tmp_path, monkeypatch):
+    from rc_repro.services import skill
+
+    monkeypatch.setenv("RC_REPRO_SKILL_HOME", str(tmp_path / "home"))
+    empty = tmp_path / "elsewhere"
+    empty.mkdir()
+    monkeypatch.chdir(empty)
+    st = skill.state()
+    assert st["current"] is False, "nothing installed is not the same as up to date"

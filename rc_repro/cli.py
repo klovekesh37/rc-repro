@@ -2069,6 +2069,14 @@ def loadtest(
     REST rate limiter is disabled for the run and restored after. Exits non-zero
     if a --slo rule is not met — usable as a CI gate.
     """
+    # FIRST, before `_require_docker` and before any `_err`. This was missing, and
+    # the shape of the bug is the reason the contract is tested rather than reasoned
+    # about: the success path called `jsonout.reply` directly, so stdout was a valid
+    # envelope whenever the run worked -- and every failure before it went out as
+    # prose on stderr with an EMPTY stdout. A JSON caller got a clean document right
+    # up until something went wrong.
+    if json_out:
+        jsonout.activate()
     _require_docker()
     from rc_repro import monitoring
     from rc_repro.perf import (baseline, constrain as constrain_mod, k6, mongoprof,
@@ -2436,11 +2444,11 @@ def capacity(
     """
     _require_docker()
     from rc_repro import monitoring
+    if json_out:
+        jsonout.activate()          # before any `_err`; see `loadtest`
     from rc_repro.perf import constrain as constrain_mod, k6, rcmetrics, slo as slo_mod
     if scenario not in k6.SCENARIOS or scenario in ("custom", "webhook"):
         _err("capacity supports the built-in scenarios (journey/messages/read/mixed/login/badbot)")
-    if json_out:
-        jsonout.activate()
     try:
         rules = slo_mod.parse(slo)
     except ValueError as exc:
