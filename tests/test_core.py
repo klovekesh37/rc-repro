@@ -3144,7 +3144,7 @@ def _facts(plan, **over):
     for spec in plan.rooms:
         rooms.append(seed.RoomFacts(spec=spec, found=True, rid=f"r-{spec.name}",
                                     messages=spec.total_messages, replies=spec.replies,
-                                    threads=len(spec.threads)))
+                                    reacted=spec.reacted, threads=len(spec.threads)))
     out = {"rooms": rooms, "planned_users": [seed.username(i) for i in range(plan.users)],
            "users_unreadable": ""}
     out["users_found"] = list(out["planned_users"])
@@ -3225,3 +3225,78 @@ def test_a_team_channel_that_is_not_in_its_team_is_a_fault():
     room.in_team = False
     verdict = seed.verify(plan, facts)
     assert any(f["kind"] == "team" for f in verdict["faults"])
+
+
+def test_reactions_are_planned_rather_than_decided_while_posting():
+    """They were the one part of a `rich` profile that worked, which made them the
+    part with no evidence: `i % 3 == 0` lived in the posting loop, so nothing could
+    say how many there should be and nothing checked how many there were."""
+    rich = seed.plan_from("standard")
+    room = next(r for r in rich.rooms if r.kind == seed.CHANNEL)
+    assert room.reactions == tuple(range(0, room.messages, seed.REACT_EVERY))
+    assert room.reacted == len(room.reactions)
+    # `small` asks for none, and plans none.
+    assert all(r.reactions == () for r in seed.plan_from("small").rooms)
+
+
+def test_the_seeder_reacts_exactly_where_the_manifest_says(monkeypatch):
+    calls: list[tuple[str, dict]] = []
+
+    class _Resp:
+        ok, status_code = True, 200
+
+        @staticmethod
+        def json():
+            return {"message": {"_id": "m1"}, "channel": {"_id": "r1"},
+                    "group": {"_id": "r1"}, "room": {"_id": "r1"},
+                    "team": {"_id": "t1", "roomId": "r1"}}
+
+    def post(path, _headers, payload):
+        calls.append((path, payload))
+        return _Resp()
+
+    # `general` is LOOKED UP rather than created (every workspace ships it), and the
+    # lookup is a GET rather than the injected `post` -- so without this the one room
+    # every user is in gets no rid and no messages, and the totals are quietly short.
+    monkeypatch.setattr(seed.requests, "get", lambda *a, **k: _Resp())
+    plan = seed.plan_from("standard", users=2, channels=1, messages=6)
+    seed._seed_body("http://x", {"h": "1"}, plan, post, lambda _m: None)
+    reacts = [p for path, p in calls if path.endswith("chat.react")]
+    assert reacts, "a rich profile that reacts nowhere"
+    assert all("messageId" in p and "emoji" in p for p in reacts)
+    # One per planned index per room, and not one per message.
+    assert len(reacts) == sum(r.reacted for r in plan.rooms)
+
+
+def test_fewer_reactions_than_planned_is_a_fault():
+    plan = seed.plan_from("standard")
+    facts = _facts(plan)
+    facts["rooms"][0].reacted -= 1
+    verdict = seed.verify(plan, facts)
+    assert verdict["ok"] is False
+    assert verdict["faults"][0]["kind"] == "reactions"
+
+
+def test_a_discussion_that_lost_its_anchor_is_a_fault():
+    """The `pmid` variant was dead code for a while: discussions were created before
+    their parents had posted anything, so the branch could never fire and every
+    discussion came out attached to the room instead. Nothing noticed.
+
+    It is caught by the message count rather than by a check of its own, and that is
+    deliberate: a discussion opened from a message arrives holding ANCHOR_MESSAGES it
+    did not post, so a `pmid` that stops being sent makes the room come back exactly
+    that much short -- which is a fault, named by room.
+    """
+    plan = seed.plan_from("standard")
+    anchored = next(r for r in plan.rooms
+                    if r.kind == seed.DISCUSSION and r.from_message >= 0)
+    plain = next(r for r in plan.rooms
+                 if r.kind == seed.DISCUSSION and r.from_message < 0)
+    assert anchored.total_messages - plain.total_messages == seed.ANCHOR_MESSAGES
+
+    facts = _facts(plan)
+    lost = next(f for f in facts["rooms"] if f.spec is anchored)
+    lost.messages -= seed.ANCHOR_MESSAGES          # what an un-anchored one looks like
+    verdict = seed.verify(plan, facts)
+    assert verdict["ok"] is False
+    assert verdict["faults"][0]["room"] == anchored.name

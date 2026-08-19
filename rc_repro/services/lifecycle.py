@@ -1251,7 +1251,7 @@ def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: fl
 # --- seed (inline, used by create --seed) -------------------------------------
 
 def check_seed(meta: runner.Metadata, auth, plan, result: dict,
-               emit: Emit = null_emit) -> dict:
+               emit: Emit = null_emit, tokens: dict | None = None) -> dict:
     """Read the seeded workspace back, compare it with the manifest, and record it.
 
     Both front-ends call this, because both had the same hole: the seed summary was
@@ -1270,7 +1270,7 @@ def check_seed(meta: runner.Metadata, auth, plan, result: dict,
     between a reproduction and a pile of plausible content.
     """
     try:
-        facts = seeder.readback(meta.root_url, auth, plan)
+        facts = seeder.readback(meta.root_url, auth, plan, tokens=tokens)
         verdict = seeder.verify(plan, facts)
     except Exception as exc:  # noqa: BLE001 - a check must never break the seed
         warn(emit, f"could not read the seed back: {exc}", phase="seed")
@@ -1319,14 +1319,16 @@ def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit
     info(emit, f"seeding (profile {profile})", phase="seed")
     mon = perf.ResourceMonitor(meta.name).start() if stats else None
     t0 = time.monotonic()
+    tokens: dict = {}
     try:
-        s = seeder.seed(meta.root_url, auth, plan, log=lambda m: info(emit, m.strip(), phase="seed"))
+        s = seeder.seed(meta.root_url, auth, plan, tokens_out=tokens,
+                        log=lambda m: info(emit, m.strip(), phase="seed"))
     finally:
         resources = mon.stop() if mon else None
     s["total_s"] = time.monotonic() - t0
     if resources is not None:
         s["resources_keys"] = sorted(resources)
-    check_seed(meta, auth, plan, s, emit)
+    check_seed(meta, auth, plan, s, emit, tokens=tokens)
     return s
 
 

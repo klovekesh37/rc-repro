@@ -91,6 +91,20 @@ _EMOJI = [":+1:", ":tada:", ":eyes:", ":rocket:"]
 #: readback can tell "the thread was not created" from "the dice said no".
 THREAD_EVERY = 5
 
+#: And one in every N gets a reaction, on the profiles that ask for them.
+REACT_EVERY = 3
+
+#: What a discussion created FROM a message starts with, before anyone posts into
+#: it: Rocket.Chat copies the parent message in as the discussion's anchor -- it
+#: comes back with an empty `msg` and no `t`, so a message listing counts it as
+#: content -- and the `reply` we send alongside becomes the first real line.
+#:
+#: MEASURED, on live 7.4.1 and 8.5.1, not assumed: the first guess was one, and the
+#: room held two. It is stated here rather than absorbed into a fudge factor because
+#: a plan that cannot say what a room will contain is the thing this module exists
+#: to stop being.
+ANCHOR_MESSAGES = 2
+
 # --- the room kinds -----------------------------------------------------------
 #: Every shape of room Rocket.Chat has, because every one of them is something a
 #: customer files a ticket about. The kind decides which endpoint creates it and
@@ -127,6 +141,11 @@ class RoomSpec:
     #: Indexes of this room's messages that get one threaded reply each. A tuple
     #: rather than a count, so the readback knows WHICH message to look under.
     threads: tuple[int, ...] = ()
+    #: Indexes of this room's messages that get a reaction. Planned rather than
+    #: decided while posting, for the same reason as `threads`: a count nobody can
+    #: predict is a count nobody can check, and reactions were the one part of a
+    #: `rich` profile that did work -- so they were also the part with no evidence.
+    reactions: tuple[int, ...] = ()
     #: A team's name for a team channel; the parent room's name for a discussion.
     parent: str = ""
     #: For a discussion: the index of the parent message it hangs off, or -1 for a
@@ -143,14 +162,25 @@ class RoomSpec:
         return len(self.threads)
 
     @property
+    def reacted(self) -> int:
+        return len(self.reactions)
+
+    @property
     def total_messages(self) -> int:
-        """Messages that will exist in the room: the base ones plus the replies.
+        """Messages that will exist in the room: the base ones, the replies, and the
+        opening line of a discussion that was created from a message.
 
         A threaded reply IS a message in the room -- `channels.messages` returns it
         with a `tmid` -- so a count that omits it does not match what the server
         reports, which is exactly the mismatch a verifier would report as a fault.
+
+        A discussion opened from a message is the same trap one level down: it
+        arrives holding `ANCHOR_MESSAGES` before anyone posts into it, and leaving
+        those out made every message-anchored discussion report more than planned on
+        a perfectly good seed.
         """
-        return self.messages + self.replies
+        return (self.messages + self.replies
+                + (ANCHOR_MESSAGES if self.from_message >= 0 else 0))
 
 
 @dataclass(frozen=True)
@@ -286,7 +316,12 @@ def dm_pair(names: list[str], i: int) -> tuple[str, str]:
     with 20 DMs would, and it should get repeats rather than a wrong promise.
     """
     n = len(names)
-    gap = 1 + i // n
+    # The gap wraps within 1..n-1 so it can never be a multiple of n, because a gap
+    # of 0 pairs a user WITH THEMSELVES -- `im.create` accepts that and makes a
+    # self-DM, which is a real Rocket.Chat object and not what a plan asking for a
+    # conversation between two people meant. It appeared the moment `--users 2` was
+    # passed with the default five DMs.
+    gap = 1 + (i // n) % (n - 1)
     a = i % n
     return names[a], names[(a + gap) % n]
 
@@ -304,7 +339,9 @@ def _build(shape: Shape, names: list[str]) -> tuple[RoomSpec, ...]:
     def add(kind: str, name: str, size: int, messages: int, **kw) -> RoomSpec:
         nonlocal idx
         spec = RoomSpec(kind=kind, name=name, members=_members(names, idx, size),
-                        messages=messages, threads=_threads(messages), **kw)
+                        messages=messages, threads=_threads(messages),
+                        reactions=_threads(messages, REACT_EVERY) if shape.reactions else (),
+                        **kw)
         rooms.append(spec)
         idx += 1
         return spec
@@ -327,8 +364,9 @@ def _build(shape: Shape, names: list[str]) -> tuple[RoomSpec, ...]:
                 team_channel_name(t, c), 3, max(3, shape.messages // 2), parent=tname)
     # Everyone is already in `general`, so it is the one room where the whole user
     # list authors.
-    rooms.append(RoomSpec(GENERAL, "general", tuple(names), shape.messages,
-                          _threads(shape.messages)))
+    rooms.append(RoomSpec(
+        GENERAL, "general", tuple(names), shape.messages, _threads(shape.messages),
+        reactions=_threads(shape.messages, REACT_EVERY) if shape.reactions else ()))
 
     parents = [r for r in rooms if r.kind in _DISCUSSABLE]
     for d in range(shape.discussions):
@@ -342,12 +380,19 @@ def _build(shape: Shape, names: list[str]) -> tuple[RoomSpec, ...]:
             max(2, shape.messages // 4),
             parent=parent.name, from_message=0 if d % 2 == 0 else -1)
 
-    for i in range(shape.dms):
-        if len(names) < 2:
+    # Capped at the number of DISTINCT pairs: `im.create` for a pair that already has
+    # a room returns that same room, so asking for five DMs from two users produced
+    # five records pointing at one or two rooms -- and the verification then reported
+    # rooms as short that were simply the same room counted twice.
+    n = len(names)
+    for i in range(min(shape.dms, n * (n - 1) // 2)):
+        if n < 2:
             break
         a, b = dm_pair(names, i)
         msgs = max(2, shape.messages // 5)
-        rooms.append(RoomSpec(DM, f"{a}~{b}", (a, b), msgs, _threads(msgs)))
+        rooms.append(RoomSpec(
+            DM, f"{a}~{b}", (a, b), msgs, _threads(msgs),
+            reactions=_threads(msgs, REACT_EVERY) if shape.reactions else ()))
     return tuple(rooms)
 
 
@@ -371,8 +416,15 @@ def plan_from(profile: str, users=None, channels=None, messages=None) -> Plan:
                 rooms=_build(shape, names))
 
 
-def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
-    """Seed the repro. `log(msg)` is called with progress lines."""
+def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None,
+         tokens_out: dict | None = None) -> dict:
+    """Seed the repro. `log(msg)` is called with progress lines.
+
+    `tokens_out`, when given, is filled with the per-user sessions this created, for
+    a readback that has to look at a DM. An out-parameter rather than a key in the
+    result: the result is written into `repro.json` and rendered in a browser, and a
+    session token has no business in either.
+    """
     base = root_url.rstrip("/")
     session = requests.Session()
     admin_hdr = {**admin.headers(), "Content-Type": "application/json"}
@@ -416,7 +468,7 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None) -> dict:
         log("  ⚠ could not disable the API rate limiter — seed rates may be throttled")
 
     try:
-        return _seed_body(root_url, admin_hdr, plan, post, log)
+        return _seed_body(root_url, admin_hdr, plan, post, log, tokens_out)
     finally:
         if not limiter_was_off:
             _set(rate_limiter, True)
@@ -457,7 +509,8 @@ class _Made:
     message_ids: list[str] = field(default_factory=list)
 
 
-def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
+def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log,
+               tokens_out: dict | None = None) -> dict:
     """Create everything the plan names; split out so seed() can guarantee setting
     restoration in a finally. Times each phase and collects per-message latency for
     the seed timing breakdown."""
@@ -485,6 +538,8 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
         except Exception:  # noqa: BLE001 - fall back to admin authorship
             pass
     durs["users"] = time.monotonic() - _t
+    if tokens_out is not None:
+        tokens_out.update(tokens)
     log(f"users: {len(names)} ({len(tokens)} usable as authors)")
 
     def hdr_for(members: tuple[str, ...], turn: int) -> dict:
@@ -534,6 +589,13 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
         rec = _Made(spec=spec)
         made[spec.name] = rec
         members = list(spec.members)
+        if spec.kind == DISCUSSION:
+            # NOT here. Half of them are meant to hang off a MESSAGE in the parent,
+            # and at this point no message has been posted anywhere -- so the `pmid`
+            # branch could never fire and every discussion came out attached to the
+            # room instead. The whole variant was dead code, silently. They are
+            # created in their own pass below, after the parents have said something.
+            continue
         if spec.kind == GENERAL:
             # Not created -- every workspace ships it. Looked up, because messages
             # go by rid and a name would not reach a renamed default room.
@@ -568,24 +630,6 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
                 if not rec.rid:
                     rec.failed = "teams.create"
             continue
-        if spec.kind == DISCUSSION:
-            parent = made.get(spec.parent)
-            if not parent or not parent.rid:
-                rec.failed = "no parent room"
-                continue
-            payload = {"prid": parent.rid, "t_name": spec.name,
-                       "users": list(members)}
-            if spec.from_message >= 0 and len(parent.message_ids) > spec.from_message:
-                # Opened FROM a message, which is how a support engineer usually
-                # makes one and which leaves a different system message behind.
-                payload["pmid"] = parent.message_ids[spec.from_message]
-                payload["reply"] = _REPLIES[spec.from_message % len(_REPLIES)]
-            r = timed("channels", "/api/v1/rooms.createDiscussion", admin_hdr, payload)
-            if r is None or not r.ok:
-                rec.failed = "rooms.createDiscussion"
-                continue
-            rec.rid = _room_id(_json(r))
-            continue
         # A plain channel or group, standalone or inside a team. `extraData.teamId`
         # puts it in the team in ONE call -- `teams.createRoom` does not exist on
         # 8.5.1 (404), and create-then-`teams.addRooms` is two round trips for the
@@ -608,10 +652,10 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
     #    chat.sendMessage against an rid. A discussion's `name` is a generated slug
     #    rather than its title, so addressing rooms by `#name` -- as this used to --
     #    cannot reach one at all.
-    for ordinal, rec in enumerate(made.values()):
+    def fill(ordinal: int, rec: _Made) -> None:
         spec = rec.spec
         if not rec.rid:
-            continue
+            return
         bucket = "dms" if spec.kind == DM else "messages"
         for i in range(spec.messages):
             # Stride 7 against a pool of 16 is coprime, so a room walks the whole
@@ -644,11 +688,39 @@ def _seed_body(root_url, admin_hdr: dict, plan: Plan, post, log) -> dict:
                                         "msg": _REPLIES[i % len(_REPLIES)]}})
                 if tr is not None and tr.ok:
                     rec.replies += 1
-            if plan.reactions and mid and i % 3 == 0:
+            if mid and i in spec.reactions:
                 rr = timed(bucket, "/api/v1/chat.react", hdr_for(spec.members, i),
                            {"messageId": mid, "emoji": _EMOJI[i % len(_EMOJI)]})
                 if rr is not None and rr.ok:
                     rec.reactions += 1
+
+    ordinals = {name: n for n, name in enumerate(made)}
+    for name, rec in made.items():
+        if rec.spec.kind != DISCUSSION:
+            fill(ordinals[name], rec)
+
+    # 4. Discussions LAST, so the half that hang off a message have one to hang off.
+    for name, rec in made.items():
+        spec = rec.spec
+        if spec.kind != DISCUSSION:
+            continue
+        parent = made.get(spec.parent)
+        if not parent or not parent.rid:
+            rec.failed = "no parent room"
+            continue
+        payload: dict = {"prid": parent.rid, "t_name": spec.name,
+                         "users": list(spec.members)}
+        if 0 <= spec.from_message < len(parent.message_ids):
+            # Opened FROM a message, which is how a support engineer usually makes
+            # one, and which leaves a different system message in the parent.
+            payload["pmid"] = parent.message_ids[spec.from_message]
+            payload["reply"] = _REPLIES[spec.from_message % len(_REPLIES)]
+        r = timed("channels", "/api/v1/rooms.createDiscussion", admin_hdr, payload)
+        if r is None or not r.ok:
+            rec.failed = "rooms.createDiscussion"
+            continue
+        rec.rid = _room_id(_json(r))
+        fill(ordinals[name], rec)
 
     return _result(plan, made, names, durs, msg, log)
 
@@ -745,24 +817,34 @@ class RoomFacts:
     rid: str = ""
     messages: int = 0        # content messages, replies included
     replies: int = 0         # of those, the ones inside a thread
+    reacted: int = 0         # of those, the ones carrying at least one reaction
     threads: int = 0         # parent messages that have a thread
     in_team: bool = True     # for a team channel: is it actually IN the team
     unreadable: str = ""     # why this room could not be checked at all
 
 
 def readback(root_url, admin: rcapi.Auth, plan: Plan,
-             login=rcapi.login) -> dict:
+             login=rcapi.login, tokens: dict | None = None) -> dict:
     """Re-read the seeded workspace and report what is actually there.
 
     Reads as the ADMIN wherever the admin can see the room, and as a participant
     where it cannot: a direct message belongs to its two users and is invisible to
     everyone else, so a readback that only used the admin token would report every
-    DM missing. `login` is injectable so a test does not need a server.
+    DM missing.
+
+    `tokens` are the sessions the SEEDER already minted, and passing them is not an
+    optimisation. Seeding turns email-2FA off for its own logins and turns it back
+    on afterwards -- so by the time this runs, signing in as a user needs a code
+    from a mailbox that does not exist, and every DM comes back "cannot sign in".
+    On a workspace with 2FA off the fallback login works and this can be called on
+    its own. `login` is injectable so a test does not need a server.
     """
     base = root_url.rstrip("/")
     session = requests.Session()
     hdr = {**admin.headers(), "Content-Type": "application/json"}
-    cache: dict[str, dict] = {}
+    cache: dict[str, dict] = {
+        name: {**auth.headers(), "Content-Type": "application/json"}
+        for name, auth in (tokens or {}).items()}
 
     def get(path: str, headers: dict, **params):
         """(body, why). `why` is "" on success and `ABSENT` when the room is gone.
@@ -794,12 +876,21 @@ def readback(root_url, admin: rcapi.Auth, plan: Plan,
                 cache[name] = {}
         return cache[name] or None
 
-    def count_messages(rid: str, path: str, headers: dict) -> tuple[int, int, str]:
+    def count_messages(rid: str, path: str, headers: dict) -> tuple[int, int, int, str]:
+        """(content messages, replies, reacted, why).
+
+        All three come out of ONE listing: a reacted message carries a `reactions`
+        object and a reply carries a `tmid`, so asking per message would be N calls
+        for facts the room already handed over.
+        """
         body, why = get(path, headers, roomId=rid, count=0)
         if body is None:
-            return 0, 0, why
+            return 0, 0, 0, why
         msgs = [m for m in (body.get("messages") or []) if _is_content(m)]
-        return len(msgs), sum(1 for m in msgs if m.get("tmid")), ""
+        return (len(msgs),
+                sum(1 for m in msgs if m.get("tmid")),
+                sum(1 for m in msgs if m.get("reactions")),
+                "")
 
     facts: list[RoomFacts] = []
     rids: dict[str, str] = {}
@@ -820,7 +911,7 @@ def readback(root_url, admin: rcapi.Auth, plan: Plan,
                     f.found, f.rid = True, room.get("_id", "")
                     break
             if f.rid:
-                f.messages, f.replies, f.unreadable = count_messages(
+                f.messages, f.replies, f.reacted, f.unreadable = count_messages(
                     f.rid, "/api/v1/im.messages", headers)
             continue
         if spec.kind == DISCUSSION:
@@ -848,7 +939,8 @@ def readback(root_url, admin: rcapi.Auth, plan: Plan,
             if f.rid:
                 path = ("/api/v1/groups.messages" if spec.private
                         else "/api/v1/channels.messages")
-                f.messages, f.replies, f.unreadable = count_messages(f.rid, path, hdr)
+                f.messages, f.replies, f.reacted, f.unreadable = count_messages(
+                    f.rid, path, hdr)
             continue
         info_path = "/api/v1/groups.info" if spec.private else "/api/v1/channels.info"
         body, why = get(info_path, hdr, roomName=spec.name)
@@ -863,7 +955,8 @@ def readback(root_url, admin: rcapi.Auth, plan: Plan,
             continue
         rids[spec.name] = f.rid
         msg_path = "/api/v1/groups.messages" if spec.private else "/api/v1/channels.messages"
-        f.messages, f.replies, f.unreadable = count_messages(f.rid, msg_path, hdr)
+        f.messages, f.replies, f.reacted, f.unreadable = count_messages(
+            f.rid, msg_path, hdr)
         tl, why = get("/api/v1/chat.getThreadsList", hdr, rid=f.rid, count=100)
         if tl is not None:
             f.threads = int(tl.get("total") or 0)
@@ -945,8 +1038,16 @@ def verify(plan: Plan, facts: dict) -> dict:
             continue
         counted("messages", spec.name, spec.total_messages, f.messages)
         counted("threads", spec.name, spec.replies, f.replies)
+        counted("reactions", spec.name, spec.reacted, f.reacted)
         if not f.in_team:
             fault("team", spec.name, f"in {spec.parent}", "not in the team")
+        # A discussion's ANCHOR is checked by that message count, not separately: one
+        # opened from a message arrives holding ANCHOR_MESSAGES it did not post, so a
+        # `pmid` that silently stopped being sent makes the room come back two short
+        # -- a fault, named by room. That is not a happy accident; it is why the
+        # anchor is in the plan instead of being subtracted out. The variant was dead
+        # code for a while (discussions were created before their parents had said
+        # anything) and nothing noticed, which is what this now prevents.
     return {
         "ok": not faults,
         "faults": faults,
@@ -956,6 +1057,7 @@ def verify(plan: Plan, facts: dict) -> dict:
         "rooms": [{"kind": f.spec.kind, "name": f.spec.name, "found": f.found,
                    "messages": f.messages, "want_messages": f.spec.total_messages,
                    "replies": f.replies, "want_replies": f.spec.replies,
+                   "reacted": f.reacted, "want_reacted": f.spec.reacted,
                    "threads": f.threads, "in_team": f.in_team,
                    "unreadable": f.unreadable}
                   for f in facts["rooms"]],

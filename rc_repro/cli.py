@@ -392,15 +392,16 @@ def _run_seed(meta: runner.Metadata, profile: str,
         )
     mon = perf.ResourceMonitor(meta.name).start() if stats else None
     t0 = time.monotonic()
+    tokens: dict = {}
     try:
-        s = seeder.seed(meta.root_url, auth, plan,
+        s = seeder.seed(meta.root_url, auth, plan, tokens_out=tokens,
                         log=(lambda m: None) if quiet else (lambda m: typer.echo(f"  {m}")))
     finally:
         resources = mon.stop() if mon else None   # stop the sampler thread even if seed raises
     total = time.monotonic() - t0
     if not quiet:
         _print_seed_result(s, total, resources, meta)
-    verdict = lcsvc.check_seed(meta, auth, plan, s)
+    verdict = lcsvc.check_seed(meta, auth, plan, s, tokens=tokens)
     if not quiet:
         _print_seed_verification(verdict)
     # `--verify-seed` turns the report into a gate. Off by default on purpose: a
@@ -518,6 +519,8 @@ def _print_seed_result(s: dict, total: float, resources, meta: runner.Metadata) 
     row("messages", s["messages"], d.get("messages", 0.0), extra=lat_str)
     if s.get("threads"):
         row("threads", s["threads"], 0.0)
+    if s.get("reactions"):
+        row("reactions", s["reactions"], 0.0)
     if s.get("rooms_total"):
         row("rooms", s["rooms_total"], d.get("channels", 0.0),
             extra=" · ".join(f"{k} {v}" for k, v in sorted((s.get("rooms") or {}).items())))
