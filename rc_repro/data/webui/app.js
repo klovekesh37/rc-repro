@@ -467,6 +467,22 @@ async function runAction(name, label, fn) {
 // The grouping is not decoration, it is the teaching: "put data in it" explains
 // what Seed does to somebody who never read the CLI's help. That only works if
 // they can SEE it, which is why this is a pane and not a menu.
+// The suggestion ladder, stated in order. Only ever the FIRST TWO that qualify, and
+// every reason is a fact about THIS workspace rather than a guess about intent --
+// guessing "next" wrongly is worse than not guessing, which is why nothing here reads
+// a name, an age or a preset.
+//
+// Nothing is suggested for a workspace that is not running: what its state admits is
+// "start it", which the panel's own action row and the triage block above both offer.
+const NEXT_LADDER = [
+  ["seed", (d) => !d.seed,
+   "It has no sample data yet — no users, rooms or messages beyond the admin account."],
+  ["call", () => true,
+   "Send a REST request to this workspace and read the response here."],
+  ["backup", (d) => !!d.seed,
+   "It has data now, and a backup can be restored into a new workspace."],
+];
+
 function renderActionPane(d, busyLabel) {
   const pane = $("#actpane");
   pane.innerHTML = "";
@@ -477,54 +493,70 @@ function renderActionPane(d, busyLabel) {
     return;
   }
   const running = d.state === "running";
-  // A fourth element: false means "this runtime refuses it". The load test and the
-  // capacity search are Compose-only and the server says so with a 400 -- rendering
-  // them on a Kubernetes workspace could only produce a red toast, which is the same
-  // reason the logs and env tabs are kept off a readonly panel. Not "unimplemented":
-  // both would be measuring the `kubectl port-forward` rather than Rocket.Chat.
+  // `on: false` means "this runtime refuses it". The load test and the capacity search
+  // are Compose-only and the server says so with a 400 -- rendering them on a
+  // Kubernetes workspace could only produce a red toast, which is the same reason the
+  // logs and env tabs are kept off a readonly panel. Not "unimplemented": both would
+  // be measuring the `kubectl port-forward` rather than Rocket.Chat.
   // See services/perf.require_compose_for_perf.
   const kube = d.runtime === "kubernetes";
-  const groups = [
-    ["Put data in it", [
-      ["Add sample data", () => openSeed(d.name), running],
-      ["Import settings", () => openImport(d.name), running],
-    ]],
-    ["Measure it", [
-      ["Run a load test", () => openPerf(d.name, d.monitoring), running, !kube],
-      ["Find capacity", () => openCap(d.name), running, !kube],
-      // Named for the thing rather than for one of its parts: it attaches
-      // Prometheus, Grafana, Loki and the exporters, and "stream to Grafana"
-      // described the last hop of it.
-      [d.monitoring ? "Detach monitoring" : "Attach monitoring",
-       () => doMonitor(d.name, !!d.monitoring), running],
-    ]],
-    ["Connect to it", [
-      ["PAT and Token", () => doPat(d.name), running],
-      ["Send an API call", () => openCall(d.name), running],
-    ]],
-    ["Keep or move it", [
-      ["Back up now", () => doBackup(d.name), running],
-      ["Upgrade version", () => openUpgrade(d.name, d.rc_version), running],
-      // Greyed on Compose, GONE on Kubernetes: TLS is a runtime property there, so a
-      // Compose workspace can gain HTTPS later and this becomes available -- while
-      // `up --https` is refused outright on Kubernetes, so it never can.
-      ["Check the certificate", () => doTlsStatus(d.name), running && !!d.public_url,
-       !kube],
-      ["Use for CLI commands", () => doDefault(d.name), !d.is_default],
-    ]],
-  ];
-  for (const [title, rawItems] of groups) {
-    // Dropped entirely, not disabled: a greyed button invites "why can't I?" about
-    // a thing that will never be available on this runtime, which is the same
-    // reasoning the create dialog gives for HIDING the privileged fields.
-    const items = rawItems.filter(([, , , supported]) => supported !== false);
-    const usable = items.filter(([, , ok]) => ok !== false || running);
-    if (!usable.length) continue;
-    pane.append(el("div", { class: "apgroup" }, title));
+  // ONE FLAT LIST, in the order the four headings used to impose. Four titled groups
+  // over eleven items is a taxonomy, and a taxonomy is what you need when you do not
+  // know what you are looking for -- but the question people arrive with is "what do I
+  // do with this workspace now", and a heading called "Keep or move it" does not answer
+  // it. The two that DO are lifted out above, with the reason they were chosen.
+  const items = [
+    { id: "seed", label: "Add sample data", fn: () => openSeed(d.name), ok: running },
+    { id: "import", label: "Import settings", fn: () => openImport(d.name), ok: running },
+    { id: "call", label: "Send an API call", fn: () => openCall(d.name), ok: running },
+    { id: "pat", label: "PAT and Token", fn: () => doPat(d.name), ok: running },
+    { id: "backup", label: "Back up now", fn: () => doBackup(d.name), ok: running },
+    { id: "upgrade", label: "Upgrade version",
+      fn: () => openUpgrade(d.name, d.rc_version), ok: running },
+    // Named for the thing rather than for one of its parts: it attaches Prometheus,
+    // Grafana, Loki and the exporters, and "stream to Grafana" described the last hop.
+    { id: "monitor", label: d.monitoring ? "Detach monitoring" : "Attach monitoring",
+      fn: () => doMonitor(d.name, !!d.monitoring), ok: running },
+    { id: "loadtest", label: "Run a load test",
+      fn: () => openPerf(d.name, d.monitoring), ok: running, on: !kube },
+    { id: "capacity", label: "Find capacity", fn: () => openCap(d.name), ok: running,
+      on: !kube },
+    // Greyed on Compose, GONE on Kubernetes: TLS is a runtime property there, so a
+    // Compose workspace can gain HTTPS later and this becomes available -- while
+    // `up --https` is refused outright on Kubernetes, so it never can.
+    { id: "tls", label: "Check the certificate", fn: () => doTlsStatus(d.name),
+      ok: running && !!d.public_url, on: !kube },
+    { id: "default", label: "Use for CLI commands", fn: () => doDefault(d.name),
+      ok: !d.is_default },
+  ].filter((it) => it.on !== false);
+
+  const byId = new Map(items.map((it) => [it.id, it]));
+  const next = [];
+  if (running && !busyLabel) {
+    for (const [id, when, why] of NEXT_LADDER) {
+      if (next.length === 2) break;
+      const it = byId.get(id);
+      if (it && it.ok && when(d)) next.push([it, why]);
+    }
+  }
+  if (next.length) {
+    pane.append(el("div", { class: "apgroup" }, "Next, probably"));
+    const box = el("div", { class: "apnext" });
+    for (const [it, why] of next) {
+      box.append(el("button", { class: "apn", onclick: it.fn },
+        el("b", {}, it.label), el("span", {}, why)));
+    }
+    pane.append(box);
+  }
+
+  const rest = items.filter((it) => !next.some(([n]) => n === it.id || n.id === it.id));
+  if (rest.length) {
+    pane.append(el("div", { class: "apgroup" },
+      next.length ? "Everything else" : "What you can do with it"));
     const listEl = el("div", { class: "aplist" });
-    for (const [label, fn, ok] of items) {
-      const b = el("button", { onclick: fn }, label);
-      if (!ok || busyLabel) b.disabled = true;
+    for (const it of rest) {
+      const b = el("button", { onclick: it.fn }, it.label);
+      if (!it.ok || busyLabel) b.disabled = true;
       listEl.append(b);
     }
     pane.append(listEl);

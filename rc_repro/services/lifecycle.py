@@ -1687,6 +1687,15 @@ def _summary(meta: runner.Metadata) -> dict:
         "runtime": topology.of_meta(meta),
         "deployment": topology.axes_of_meta(meta).get("deployment", ""),
     }
+    # Whether this workspace HAS sample data, and whether the readback agreed. The
+    # panel needs it to know whether "add sample data" is the obvious next thing or a
+    # repeat: seeding only ever adds, so offering it first on a workspace that is
+    # already full is a wrong guess, and a wrong guess about what to do next is worse
+    # than not guessing. Always present, never conditional -- a key that appears only
+    # sometimes is how the panel's payload drifts from what the tests render.
+    _seed = (meta.extra.get("seed") if isinstance(meta.extra, dict) else None) or {}
+    d["seed"] = {"profile": _seed.get("profile", ""), "at": _seed.get("at", ""),
+                 "ok": bool((_seed.get("verification") or {}).get("ok"))} if _seed else None
     n = meta.extra.get("instances") if isinstance(meta.extra, dict) else None
     if n:
         d["instances"] = int(n)

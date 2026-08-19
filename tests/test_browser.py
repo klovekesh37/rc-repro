@@ -298,6 +298,9 @@ def _fake_detail(name="t1234", state="running", **over):
         # The three axes the panel now reads: which runtime it is, how it is
         # arranged, and what address it publishes on.
         "runtime": "docker", "deployment": "monolith", "bind_host": "127.0.0.1",
+        # None until something seeds it. The action pane's first suggestion turns on
+        # this, so the fake has to carry the key whichever way it is set.
+        "seed": None,
         "pinned": False,
         # Kubernetes-only, "" on Compose: the fixture is the UNION of what both
         # branches of detail() return, so one fixture covers either runtime.
@@ -2702,4 +2705,111 @@ def test_a_long_workspace_name_does_not_push_the_rail_sideways(serve, page, monk
         assert m["name"] == "dana-upgrade", "the name gave up its characters, not the tag"
         assert m["tag"] == "4m · base", m["tag"]
         assert m["title"] == long_name, "the full name has to stay reachable"
+        assert page.errors == [], page.errors
+
+
+def _pane(page):
+    return page.evaluate("""() => ({
+      next: [...document.querySelectorAll('#actpane .apn')].map(
+        (b) => [b.querySelector('b').textContent, b.querySelector('span').textContent]),
+      rest: [...document.querySelectorAll('#actpane .aplist button')].map(
+        (b) => [b.textContent, b.disabled]),
+      groups: [...document.querySelectorAll('#actpane .apgroup')].map((g) => g.textContent),
+      note: (document.querySelector('#actpane .apnote') || {}).textContent || "",
+    })""")
+
+
+def test_the_action_pane_leads_with_what_this_state_admits(serve, page, monkeypatch):
+    """Eleven equally-weighted items under four headings is a taxonomy, and a taxonomy
+    is what you need when you do not know what you are looking for. The question people
+    arrive at this pane with is "what do I do with this workspace now", and a heading
+    called "Keep or move it" does not answer it -- nor could a 30px row with a label
+    carry the reason anything was worth doing.
+
+    Two at most, each with a fact about THIS workspace as its reason, and nothing
+    appears twice: a promoted item leaves the list below.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#actpane .apn")
+        m = _pane(page)
+        assert [n[0] for n in m["next"]] == ["Add sample data", "Send an API call"], m["next"]
+        assert "no sample data yet" in m["next"][0][1], m["next"][0]
+        assert m["groups"][:2] == ["Next, probably", "Everything else"], m["groups"]
+        labels = [r[0] for r in m["rest"]]
+        assert "Add sample data" not in labels and "Send an API call" not in labels, labels
+        # and the suggestion is the same action, not a second way of describing it
+        page.click("#actpane .apn")
+        page.wait_for_selector("#seed-dialog[open]")
+        assert page.errors == [], page.errors
+
+
+def test_a_seeded_workspace_is_not_told_to_seed_itself(serve, page, monkeypatch):
+    """Seeding only ever ADDS, so "add sample data" on a workspace that is already full
+    is a wrong guess -- and a wrong guess about what to do next is worse than not
+    guessing. The ladder moves on to the next thing its state admits.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail(
+        seed={"profile": "standard", "at": "2026-08-19T09:00:00+00:00", "ok": True}))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#actpane .apn")
+        m = _pane(page)
+        assert [n[0] for n in m["next"]] == ["Send an API call", "Back up now"], m["next"]
+        assert "restored into a new workspace" in m["next"][1][1], m["next"][1]
+        assert "Add sample data" in [r[0] for r in m["rest"]]
+        assert page.errors == [], page.errors
+
+
+def test_nothing_is_suggested_for_a_workspace_that_is_not_running(serve, page, monkeypatch):
+    """What a down workspace's state admits is "start it", which the panel's own action
+    row and the triage block above it both offer. Suggesting "add sample data" against a
+    workspace that cannot answer would be an invitation to a red toast.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail(state="down", uptime="", health=""))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#actpane .aplist")
+        m = _pane(page)
+        assert m["next"] == [], m["next"]
+        # The heading says what the list is when nothing has been picked out of it.
+        assert m["groups"][:1] == ["What you can do with it"], m["groups"]
+        assert "need the workspace running" in m["note"]
+        # Everything that needs it running is offered but refused in place, rather than
+        # being hidden -- it will be available again the moment it is up.
+        rest = dict(m["rest"])
+        assert rest["Add sample data"] is True, "it would only answer with a red toast"
+        assert rest["Use for CLI commands"] is False, "that one does not need it running"
+        assert page.errors == [], page.errors
+
+
+def test_the_pane_never_offers_what_this_runtime_refuses(serve, page, monkeypatch):
+    """Dropped entirely, not disabled. A greyed button invites "why can't I?" about a
+    thing that will never be available on this runtime -- both would be measuring the
+    `kubectl port-forward` rather than Rocket.Chat -- and the pane says so once, in
+    prose, instead of eleven times in grey.
+    """
+    _stub_lifecycle(monkeypatch, _kube_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#actpane .aplist")
+        m = _pane(page)
+        labels = [r[0] for r in m["rest"]] + [n[0] for n in m["next"]]
+        assert "Run a load test" not in labels, labels
+        assert "Find capacity" not in labels, labels
+        assert "Check the certificate" not in labels, labels
+        assert "Compose-only" in page.text_content("#actpane")
         assert page.errors == [], page.errors

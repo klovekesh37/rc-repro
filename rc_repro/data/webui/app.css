@@ -404,18 +404,34 @@ input:focus, select:focus, textarea:focus {
 .stage { overflow: auto; min-height: 0; }
 
 /* ---- the action pane ---- */
-/* Persistent, not a dropdown: the grouping is the teaching. "Put data in it"
-   explains what Seed does to somebody who never read the CLI's help -- but only
-   if they can SEE it. Equal 30px rows and single-line labels are most of what
-   makes a list look composed; the destructive action is pinned to the bottom
-   rather than trailing the last group, because it is not the eleventh item on a
-   menu. */
+/* Persistent, not a dropdown, and it LEADS with the one or two things this
+   workspace's state actually admits, each with the reason it was chosen. Four titled
+   groups over eleven equally-weighted items is a taxonomy, and a taxonomy is what you
+   need when you do not know what you are looking for -- the question people arrive
+   with is "what do I do with this one now", and a heading called "Keep or move it"
+   does not answer it. Equal 30px rows and single-line labels are most of what makes
+   the rest look composed; the destructive action is pinned to the bottom rather than
+   trailing the last item, because it is not the eleventh thing on a menu. */
 .actpane { background: var(--panel); border-left: 1px solid var(--line);
   overflow: auto; display: flex; flex-direction: column; padding-bottom: 1.1rem; }
 .apgroup { display: flex; align-items: center; gap: .6rem; padding: 1.05rem .95rem .35rem;
   font-size: .62rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase;
   color: var(--dim); }
 .apgroup::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+/* The suggestions. A card each, because each carries a REASON -- a 30px row with a
+   label has nowhere to put one, which is why the old pane could not explain any of its
+   eleven items. Blue: the rule at the top of this file gives blue to "you can click
+   it", and these are the two things it is suggesting you click. */
+.apnext { display: grid; gap: .4rem; padding: 0 .8rem; }
+.apn { display: grid; gap: .15rem; text-align: left; padding: .55rem .7rem .6rem;
+  border: 1px solid var(--line2); border-radius: var(--r-sm); background: var(--bg);
+  font: inherit; color: var(--ink); cursor: pointer; }
+.apn:first-child { border-color: var(--accent); background: var(--accent-soft); }
+.apn:hover { border-color: var(--accent); }
+.apn b { font-size: .8rem; }
+.apn:first-child b { color: var(--blue); }
+.apn span { font-size: .7rem; line-height: 1.45; color: var(--muted); }
+
 .aplist { display: grid; }
 .aplist button { display: flex; align-items: center; height: 30px; padding: 0 .95rem;
   font: inherit; font-size: .8rem; color: var(--ink); background: none; border: 0;
