@@ -184,8 +184,7 @@ async function loadRepros() {
     } catch (_) { /* signed out; api() has already redirected */ }
     // The top bar too: "+ New repro" and "Prune down" are member+, so a readonly
     // session should not be offered them at all.
-    for (const [sel, ok] of [["#btn-new", canWrite()], ["#btn-prune", canWrite()],
-                             ["#btn-bench", canWrite()]]) {
+    for (const [sel, ok] of [["#btn-new", canWrite()], ["#btn-prune", canWrite()]]) {
       const b = $(sel); if (b) b.hidden = !ok;
     }
     // Only worth offering once somebody else's workspaces can appear.
@@ -2292,16 +2291,6 @@ function renderCapResult(r) {
   pre.append(box, t); pre.scrollTop = pre.scrollHeight;
 }
 
-// ---- benchmark dialog -------------------------------------------------------
-function openBench() { $("#bench-dialog").showModal(); }
-async function submitBench() {
-  const f = $("#bench-form");
-  if (!f.versions.value.trim()) { toast("enter at least two versions"); return; }
-  $("#bench-dialog").close();
-  try { const { job_id } = await api("/api/benchmark", { method: "POST", body: JSON.stringify({ versions: f.versions.value.trim(), seed_profile: f.seed_profile.value }) });
-    streamJob(job_id, "Benchmark", renderBenchResult); }
-  catch (e) { toast(e.message); }
-}
 function renderBenchResult(r) {
   const pre = $("#job-log");
   const t = el("table", { class: "dtable" }, el("tr", {}, el("th", {}, "version"), el("th", {}, "boot"), el("th", {}, "seed"), el("th", {}, "msg/s"), el("th", {}, "p95"), el("th", {}, "RC mem"), el("th", {}, "flag")));
@@ -2764,9 +2753,11 @@ function renderRuntimeAxes() {
     },
       el("span", { class: "fork-n" }, el("span", { class: "fork-dot" }),
          RUNTIME_LABEL[spec.name] || spec.name),
-      el("div", { class: "fork-cost" },
-         `~${fmtGb(cost.workspace_mb || 0)} · ${cost.shape || ""}`
-         + (cost.cluster_mb ? ` · +${fmtGb(cost.cluster_mb)} once` : "")),
+      // What it BUILDS, not what it might weigh. The memory figure was an
+      // estimate dressed as a fact -- it depends on the preset, the arrangement
+      // and what else is running -- and the free-space line in this same header
+      // answers "will it fit" from the box itself, which is the question.
+      el("div", { class: "fork-cost" }, cost.shape || ""),
       el("div", { class: "fork-can" }, RUNTIME_PITCH[spec.name] || ""));
     forks.append(card);
   }
@@ -3356,7 +3347,6 @@ $("#import-preview").addEventListener("click", (e) => { e.preventDefault(); prev
 $("#import-apply").addEventListener("click", applyImport);
 $("#perf-cancel").addEventListener("click", () => $("#perf-dialog").close());
 $("#perf-submit").addEventListener("click", submitPerf);
-$("#btn-bench").addEventListener("click", openBench);
 $("#btn-jobs").addEventListener("click", () => openJobs("running"));
 $("#pat-close").addEventListener("click", () => $("#pat-dialog").close());
 $("#pat-copy").addEventListener("click", () => copy(PAT_HEADERS));
@@ -3380,8 +3370,6 @@ $("#doctor-recheck").addEventListener("click", openDoctor);
 $("#doctor-close").addEventListener("click", () => $("#doctor-dialog").close());
 $("#cap-cancel").addEventListener("click", () => $("#cap-dialog").close());
 $("#cap-submit").addEventListener("click", submitCap);
-$("#bench-cancel").addEventListener("click", () => $("#bench-dialog").close());
-$("#bench-submit").addEventListener("click", (e) => { e.preventDefault(); submitBench(); });
 
 const POLL_MS = 4000;
 let pollTimer = null;

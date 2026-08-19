@@ -1572,8 +1572,7 @@ def test_the_create_dialog_offers_a_runtime_and_follows_it(serve, page, monkeypa
         assert any("multi-instance" in d for d in arrangements()), arrangements()
         assert not any("microservices" in d for d in arrangements()), arrangements()
         assert page.locator("#mongo-operator").count() == 0
-        # A card carries what a select could not: the cost, and the shape.
-        assert "GB" in fork("Docker Compose").inner_text()
+        # A card carries what a select could not: what this runtime BUILDS.
         assert "containers" in fork("Docker Compose").inner_text()
         assert "pods" in fork("Kubernetes").inner_text()
 
@@ -2077,16 +2076,16 @@ def test_the_seed_job_shows_what_it_made_and_whether_it_was_confirmed(
         assert page.errors == [], page.errors
 
 
-def test_the_create_dialog_quotes_a_cost_the_preflight_will_not_contradict(
+def test_the_create_dialog_says_what_it_builds_and_what_the_box_has_left(
         serve, page, monkeypatch):
-    """A card carries what a `<select>` could not: what this runtime costs and what
-    it builds. Those numbers come from the SERVER, computed from the same constants
-    `check_capacity` spends -- a card quoting 1.1 GB while the preflight reserves
-    something else is a card contradicted by the refusal it exists to prevent.
+    """A card carries what a `<select>` could not: what this runtime BUILDS.
 
-    And the free-space line sits in the same header, because `up` already refuses
-    without headroom: the cost belongs at the moment of choosing, not in the failure
-    afterwards.
+    It used to quote a memory estimate as well, and that came out: the figure
+    depends on the preset, the arrangement and whatever else is running, so it was a
+    guess dressed as a fact -- while the line beside it answers "will it fit" from
+    the box itself, which is the question and is measured. `up` already REFUSES
+    without headroom, so that belongs at the moment of choosing rather than in the
+    failure afterwards.
     """
     _stub_lifecycle(monkeypatch)
     usersvc.add("alice", PASSWORD, role="admin")
@@ -2101,13 +2100,13 @@ def test_the_create_dialog_quotes_a_cost_the_preflight_will_not_contradict(
         assert "room for about" in page.locator("#create-room").inner_text()
 
         compose = page.locator("#runtime-forks button").first.inner_text()
-        assert "1.1 GB" in compose, compose
-        assert "2 containers" in compose, compose
         kube = page.locator("#runtime-forks button").nth(1).inner_text()
+        assert "2 containers" in compose, compose
         # Microservices is not a monolith with a label, and the card says so.
-        assert "2.4 GB" in kube and "9 pods" in kube, kube
-        # The cluster is paid once per machine, not once per workspace.
-        assert "once" in kube, kube
+        assert "9 pods" in kube, kube
+        # And no invented weight on either.
+        for card in (compose, kube):
+            assert "GB" not in card and "MB" not in card, card
         assert page.errors == [], page.errors
 
 
@@ -2131,4 +2130,52 @@ def test_the_arrangement_says_what_it_builds(serve, page, monkeypatch):
         assert "HTTPS" not in note, "the refusal is stated once, in Advanced"
         page.locator("#deployment-seg button:has-text('monolith')").click()
         assert "One Rocket.Chat process" in page.locator("#runtime-hint").inner_text()
+        assert page.errors == [], page.errors
+
+
+def test_the_three_panes_survive_a_narrow_window(serve, page, monkeypatch, tmp_path):
+    """532px of the layout was fixed -- a 288px rail and a 244px action pane -- and
+    nothing was responsive: the @media rules still named `.layout`, the class the
+    workbench redesign replaced with `.panes`, so they had matched nothing since.
+
+    Measured before the fix, at 900px tall with a workspace open: 236px of stage at
+    768, 108px at 640, and at 480 the page scrolled sideways with 42px of stage.
+
+    The stage is also `position: sticky`, which in ONE column rides up over the row
+    above -- the rail ended up underneath the panel and its rows could not be
+    clicked at all. That reset lived in the dead rule and went with it.
+    """
+    import json as _json
+
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    (tmp_path / "repros" / "t1234").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repros" / "t1234" / "repro.json").write_text(_json.dumps({
+        "name": "t1234", "project": "p", "rc_version": "7.4.1", "rc_image": "i",
+        "mongo_tag": "7.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3001", "host_port": 3001,
+        "version_source": "x", "extra": {}}))
+
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        for width in (1440, 1024, 768, 640, 480, 380):
+            page.set_viewport_size({"width": width, "height": 900})
+            page.wait_for_timeout(150)
+            m = page.evaluate("""() => {
+              const r = document.querySelector('.rail').getBoundingClientRect();
+              const d = document.querySelector('#detail').getBoundingClientRect();
+              return {over: document.documentElement.scrollWidth
+                             > document.documentElement.clientWidth,
+                      stage: Math.round(d.width),
+                      overlap: Math.round(Math.min(r.bottom, d.bottom)
+                                          - Math.max(r.top, d.top))
+                               > 2 && Math.round(Math.min(r.right, d.right)
+                                          - Math.max(r.left, d.left)) > 2};
+            }""")
+            assert not m["over"], f"the page scrolls sideways at {width}px"
+            assert m["stage"] >= 320, f"the stage is {m['stage']}px at {width}px"
+            assert not m["overlap"], f"the rail and the stage overlap at {width}px"
         assert page.errors == [], page.errors

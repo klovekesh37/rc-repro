@@ -17,7 +17,6 @@
       <button id="btn-home" class="toplink">Home</button>
       <button id="btn-jobs" class="toplink">Activity</button>
       <button id="btn-scenarios" class="toplink">Scenarios</button>
-      <button id="btn-bench" class="toplink">Benchmark</button>
       <button id="btn-refresh" class="toplink">Refresh</button>
       <button id="theme-toggle" class="chip iconbtn" title="Switch between the light and dark theme"></button>
       <!-- The account menu. Clicking the name used to open the sessions DIALOG,
@@ -351,20 +350,6 @@
   </dialog>
 
   <!-- Benchmark dialog -->
-  <dialog id="bench-dialog">
-    <form id="bench-form" method="dialog">
-      <h2>Benchmark versions</h2>
-      <p class="hint">Boots each version in a throwaway sandbox, runs the identical seed workload, and compares. Sequential — can take a while.</p>
-      <label>Versions (comma-separated) <input name="versions" placeholder="8.4.1,8.5.1"></label>
-      <label>Seed profile
-        <select name="seed_profile"><option>small</option><option selected>standard</option><option>large</option></select>
-      </label>
-      <menu>
-        <button type="button" id="bench-cancel" class="btn">Cancel</button>
-        <button class="btn primary" id="bench-submit">Run benchmark</button>
-      </menu>
-    </form>
-  </dialog>
 
   <!-- API token. Its own dialog rather than reusing the job log, which a
        detached background job may still be writing into. -->

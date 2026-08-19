@@ -771,19 +771,54 @@ button.jobrow:hover { background: var(--panel2); }
 .toast.ok { background: var(--green); color: #06210d; }
 .toast.info { background: var(--blue); color: #04162e; }
 
-/* Responsive: the layout's first track had a hard 360px floor, so with a repro
-   selected the page scrolled horizontally below ~465px and the detail column was
-   squeezed to nothing between there and ~800px. There were no @media rules at all. */
+/* ---- responsive ----
+   The three panes are a 288px rail, the stage, and a 244px action pane: 532px of
+   fixed chrome. There was nothing responsive about them at all -- the @media rules
+   here still named `.layout`, the class the workbench redesign replaced with
+   `.panes`, so they had matched nothing since. Measured, at 900px height:
+
+     width   stage   result
+      768    236px   unusable
+      640    108px   unusable
+      480     42px   AND the page scrolled sideways (532 > 480)
+
+   Two steps, each removing one fixed track rather than hiding a control. Nothing
+   becomes unreachable at any width: the actions move under the panel, and the rail
+   moves above it. A control you cannot reach on a laptop is worse than one you have
+   to scroll to. */
 @media (max-width: 1100px) { .kv-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 900px) {
-  .layout { grid-template-columns: 1fr; }
-  .detail { position: static; max-height: none; }
+
+/* Step one: the action pane stops being a column and becomes a strip under the
+   stage, full width. It keeps its own scroll and its danger zone stays at the end. */
+@media (max-width: 1080px) {
+  .panes { grid-template-columns: 288px minmax(0, 1fr); }
+  .actpane { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line);
+    max-height: 40vh; }
+  .aplist { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+    gap: .25rem; }
+}
+
+/* Step two: one column. The rail is a capped, scrollable strip above the stage --
+   it is how you choose a workspace, so it cannot simply go. */
+@media (max-width: 760px) {
+  .panes, .panes.no-detail { grid-template-columns: minmax(0, 1fr); }
+  .rail { border-right: 0; border-bottom: 1px solid var(--line); max-height: 38vh; }
+  /* The stage is `position: sticky` so it stays put while the rail scrolls beside
+     it. In ONE column there is nothing beside it, and a sticky box in a grid row
+     rides up over the row above -- the rail ended up underneath the panel, and
+     the workspace rows could not even be clicked. The reset for this lived in the
+     old `.layout` rule, which stopped matching anything when the panes were
+     renamed and took this with it. */
+  .detail, .stage { position: static; top: auto; min-height: 0; }
+  .forks { grid-template-columns: 1fr; }
   .statusbar { flex-wrap: wrap; gap: .5rem 1rem; }
   .grafana-embed { height: 240px; }
 }
 @media (max-width: 560px) {
   .bar, .toolbar-controls { flex-wrap: wrap; }
   .topbar-actions { flex-wrap: wrap; }
+  .kv-grid { grid-template-columns: 1fr; }
+  dialog { width: calc(100vw - 1.5rem); }
 }
 body { overflow-x: hidden; }
 
