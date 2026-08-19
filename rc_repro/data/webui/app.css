@@ -432,17 +432,42 @@ input:focus, select:focus, textarea:focus {
 .tab:hover { color: var(--ink); }
 .tab.active { color: var(--blue); border-bottom-color: var(--blue); }
 .d-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: 1.1rem; }
-/* Three columns, and exactly six facts fill them — the seventh used to be the
-   owner, which now reads as part of the identity line above. Cells carry their
-   own right/bottom rule and the third in each row drops the right one, so a rare
-   seventh fact adds a row instead of a hole. */
-.kv-grid { display: grid; grid-template-columns: repeat(3, 1fr);
-  background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-md);
-  overflow: hidden; margin-bottom: 1.3rem; }
-.kv { padding: .85rem 1.05rem .95rem; border-right: 1px solid var(--line);
+/* THE TRIAGE BLOCK -- what is wrong and what to do about it, above the tabs.
+   Amber on purpose: the rule at the top of this file gives red to "about to destroy
+   something", and a crash-looping workspace wants you rather than threatening you.
+   Spending red here would leave nothing louder for the Down button. */
+.triage { display: grid; gap: .5rem; margin: .9rem 0 0; }
+.tri { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .1rem .7rem;
+  align-items: start; padding: .85rem 1rem .9rem;
+  background: rgba(180,83,9,.07); border: 1px solid rgba(180,83,9,.4);
+  border-radius: var(--r-md); }
+[data-theme="dark"] .tri { background: rgba(240,180,41,.08); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .tri { background: rgba(240,180,41,.08); }
+}
+.tri-i { color: var(--amber); font-size: .78rem; line-height: 1.5; }
+.tri-t { font-size: .84rem; line-height: 1.6; }
+.tri-t b { display: block; font-size: .9rem; }
+.tri-t span { color: var(--muted); }
+.tri-a { grid-column: 2; display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .6rem; }
+
+/* THE FACTS, one line each. Six cells spent the top of the panel on four things
+   that never change; a row is enough for a fact, and the third column holds the
+   qualifier a cell had nowhere to put ("restarted 4x", "pinned"). */
+.factrows { background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r-md); overflow: hidden; margin-bottom: 1.3rem; }
+.fr { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr) auto;
+  align-items: baseline; gap: .8rem; padding: .5rem 1.05rem;
   border-bottom: 1px solid var(--line); }
-.kv:nth-child(3n) { border-right: 0; }
-.kv:nth-last-child(-n+3) { border-bottom: 0; }
+.fr:last-child { border-bottom: 0; }
+.fr-k { font-size: .64rem; font-weight: 600; color: var(--dim);
+  text-transform: uppercase; letter-spacing: .1em; }
+.fr-v { font-family: var(--mono); font-size: .92rem; font-weight: 600;
+  letter-spacing: -.02em; overflow-wrap: anywhere; }
+.fr-v.green { color: var(--green); }
+.fr-v.bad { color: var(--red); }
+.fr-v.warn { color: var(--amber); }
+.fr-n { font-size: .74rem; color: var(--muted); text-align: right; }
 
 /* The identity line: the pairing this product exists to get right, then what
    kind of workspace it is and whose. */
@@ -452,13 +477,6 @@ input:focus, select:focus, textarea:focus {
 .d-sub b { font-size: .92rem; font-weight: 700; color: var(--ink); letter-spacing: -.02em; }
 .d-sub i { font-style: normal; color: var(--line2); }
 .d-sub .bad { color: var(--red); }
-.kv .k { font-size: .64rem; font-weight: 600; color: var(--dim);
-  text-transform: uppercase; letter-spacing: .1em; }
-.kv .v { font-family: var(--mono); font-size: 1.15rem; font-weight: 600;
-  letter-spacing: -.02em; margin-top: .28rem; }
-.kv .v.green { color: var(--green); }
-.kv .v.bad { color: var(--red); }
-.kv .v.warn { color: var(--amber); }
 .section-label { font-size: .64rem; font-weight: 600; color: var(--dim);
   text-transform: uppercase; letter-spacing: .1em; margin: 1.4rem 0 .55rem; }
 .chart-box { border: 1px solid var(--line); border-radius: var(--r-md); padding: .8rem; background: var(--bg); }
@@ -792,8 +810,6 @@ button.jobrow:hover { background: var(--panel2); }
    becomes unreachable at any width: the actions move under the panel, and the rail
    moves above it. A control you cannot reach on a laptop is worse than one you have
    to scroll to. */
-@media (max-width: 1100px) { .kv-grid { grid-template-columns: repeat(2, 1fr); } }
-
 /* Step one: the action pane stops being a column and becomes a strip under the
    stage, full width. It keeps its own scroll and its danger zone stays at the end. */
 @media (max-width: 1080px) {
@@ -842,7 +858,9 @@ button.jobrow:hover { background: var(--panel2); }
 @media (max-width: 560px) {
   .bar, .toolbar-controls { flex-wrap: wrap; }
   .topbar-actions { flex-wrap: wrap; }
-  .kv-grid { grid-template-columns: 1fr; }
+  /* The label column gives up its fixed width before the value wraps. */
+  .fr { grid-template-columns: minmax(0, 1fr) auto; }
+  .fr-k { grid-column: 1 / -1; }
   dialog { width: calc(100vw - 1.5rem); }
 }
 body { overflow-x: hidden; }

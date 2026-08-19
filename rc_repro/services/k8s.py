@@ -1975,6 +1975,13 @@ def pod_rows(name: str, *, context: str) -> list[dict]:
         rows.append({"service": str(meta.get("name") or ""),
                      "state": phase.lower(), "status": status,
                      "health": "healthy" if main and ready == len(main) else "",
+                     # Decided HERE, next to the list that defines it, because the
+                     # browser needs the answer and must not keep a second copy of
+                     # the policy: `ContainerCreating` and `PodInitializing` are
+                     # waiting reasons too, and a panel that treated every reason as
+                     # a failure would report a booting workspace as broken. The
+                     # create path spends the same list -- see terminal_pod_failure.
+                     "blocked": reason in TERMINAL_POD_REASONS,
                      "restarts": restarts,
                      "started": str(st.get("startTime") or "")})
     # Named order, so the tab does not reshuffle itself between two panel opens.

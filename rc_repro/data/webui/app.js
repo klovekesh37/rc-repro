@@ -881,6 +881,125 @@ function closeDetail() {
 }
 function switchTab(t) { dstate.tab = t; renderDetail(); }
 
+// ---- triage: what is wrong, and what to do about it -------------------------
+//
+// The panel is opened when something LOOKS wrong, and it used to open with six
+// facts that never change. The one thing on it that said anything was wrong -- the
+// restart banner -- was under them, which on a 900px window is under the fold. This
+// goes first, and it answers the two questions in the order they get asked: what is
+// wrong, and what do I do about it.
+//
+// Every entry is a rule over what the payload already carries, never a guess about
+// intent. Guessing "next" wrongly is worse than not guessing, so nothing here is
+// inferred from a workspace's name, its age or its preset.
+//
+// The quiet state is ABSENCE. A healthy workspace gets no block at all rather than a
+// green one saying so -- a box that is always on screen stops being read, and the six
+// facts below it already say everything is fine.
+function triageOf(d) {
+  const out = [];
+  const push = (title, why, actions) => out.push({ title, why, actions: actions.filter(Boolean) });
+  // Logs are member+ on the server (they carry an LDAP bind password), so offering
+  // the button to a readonly reader would offer them a 403.
+  const logs = canWrite() && ["Open the logs", () => switchTab("logs"), true];
+  const pods = ["See the pods", () => switchTab("containers")];
+
+  // The STATE comes first and comes alone. The health of a workspace that is not
+  // running is not a second problem, it is the same problem said twice.
+  if (d.state === "?") {
+    push("Docker is not answering",
+         "Nothing here can report its state, start or stop until it is back.",
+         [["Check this box", openDoctor, true]]);
+    return out;
+  }
+  if (d.state === "down") {
+    push("This workspace is not running",
+         `Its record and its data volume are still here, and :${d.host_port} stays `
+         + "reserved for it. Bringing it up reuses both.",
+         [canWrite() && ["Bring it up", () => doBringUp(d.name), true]]);
+    return out;
+  }
+  if (d.state === "stopped") {
+    push("This workspace is stopped",
+         d.runtime === "kubernetes"
+           ? "Its release is scaled to zero. The data and the namespace are intact."
+           : "Its containers exist and are not running. The data volume is intact.",
+         [canWrite() && ["Start it", () => doState(d.name, "start"), true]]);
+    return out;
+  }
+
+  // Restarting, or a restart count that is climbing. Two restarts is the line
+  // because one is what a slow first boot looks like.
+  const n = d.restarts || 0;
+  if (d.state === "restarting" || n >= 2) {
+    // The free-memory sentence only when the number is actually known -- the home
+    // stage fetches it, and inventing one would be worse than leaving it out.
+    const free = HOME.cap && HOME.cap.known
+      ? ` This box has ${fmtGb(Math.max(0, (HOME.cap.available_mb || 0)
+                                          - (HOME.cap.reserve_mb || 0)))} free.` : "";
+    push(n ? `Rocket.Chat has restarted ${n}×` : "Rocket.Chat is restarting",
+         "That is usually memory pressure — the kernel kills it and Docker starts it "
+         + "again — or an error during boot, which the logs name." + free,
+         [logs, ["Check this box", openDoctor]]);
+  } else if (healthClass(d) === "bad") {
+    // Running, answering, and reporting itself unhealthy: its healthcheck is what
+    // knows why, and the logs are where it says so.
+    push("It is failing its healthcheck",
+         "The container is up but Rocket.Chat is not answering the check it sets "
+         + "for itself, so anything talking to it will see errors.",
+         [logs]);
+  }
+
+  // Pods that cannot start, named. `blocked` is decided server-side by the module
+  // that owns the list of reasons a pod never recovers from (services/k8s.py); the
+  // browser reads the flag rather than keeping a second copy of the policy, which is
+  // how the create dialog's refusal list came to be wrong.
+  const stuck = (d.containers || []).filter((c) => c.blocked);
+  if (stuck.length) {
+    push(stuck.length === 1 ? "One pod cannot start"
+                            : `${stuck.length} pods cannot start`,
+         stuck.slice(0, 3).map((c) => `${c.service} — ${c.status}`).join(" · ")
+         + ". Kubernetes will keep retrying and will not get further on its own.",
+         [pods]);
+  }
+
+  // The https name resolves and answers 502, which looks like a broken workspace
+  // rather than a broken route -- so it has to be said next to the workspace.
+  const route = ((EDGE && EDGE.routes) || []).find((r) => r.name === d.name);
+  if (route && route.reachable === false) {
+    push("The edge cannot reach this workspace",
+         `${d.public_url || "Its https name"} answers 502. The route exists; the `
+         + "edge is not on this workspace's network.",
+         [["Look at the edge", openEdge, true]]);
+  }
+  return out;
+}
+
+function triageBlock(d) {
+  const items = triageOf(d);
+  if (!items.length) return null;
+  // Amber, not red. The rule in app.css is that red means "about to destroy
+  // something" -- a crash-looping workspace wants you, it does not threaten you, and
+  // spending red here leaves nothing louder for the Down button.
+  const box = el("div", { class: "triage" });
+  for (const t of items) {
+    const card = el("div", { class: "tri" });
+    card.append(el("span", { class: "tri-i" }, "▲"));
+    card.append(el("div", { class: "tri-t" },
+      el("b", {}, t.title), el("span", {}, t.why)));
+    if (t.actions.length) {
+      const row = el("div", { class: "tri-a" });
+      for (const [label, fn, primary] of t.actions) {
+        row.append(el("button", { class: "btn small" + (primary ? " solid" : ""),
+                                  onclick: fn }, label));
+      }
+      card.append(row);
+    }
+    box.append(card);
+  }
+  return box;
+}
+
 function renderDetail() {
   const d = dstate.detail; if (!d) return;
   if (dstate.statsTimer) { clearInterval(dstate.statsTimer); dstate.statsTimer = null; }
@@ -945,7 +1064,13 @@ function renderDetail() {
     actions.append(dBtn("Restart", () => doState(d.name, "restart")));
   }
   renderActionPane(d, busyLabel);
-  panel.append(head, sub, tabs, actions, el("div", { class: "d-body", id: "d-body" }));
+  // Above the TABS, not inside Overview: what is wrong with the workspace is not a
+  // property of the tab you happen to be on, and it was invisible from Logs --
+  // which is precisely where you go when something is wrong.
+  panel.append(head, sub);
+  const tri = triageBlock(d);
+  if (tri) panel.append(tri);
+  panel.append(tabs, actions, el("div", { class: "d-body", id: "d-body" }));
   renderTab();
 }
 
@@ -960,43 +1085,40 @@ function renderTab() {
   closeLogs();
   body.innerHTML = "";
   if (dstate.tab === "overview") {
-    const kv = (k, v, cls = "") => el("div", { class: "kv" }, el("div", { class: "k" }, k), el("div", { class: "v " + cls }, v));
-    // Exactly six, exactly like v4: three columns, two full rows, no hole. The
-    // owner, the port and the scenario moved into the identity line above, which
-    // is where they read as a sentence rather than as three more boxes.
-    // WHERE IT RUNS earns a cell. It decides what every other command will do to
-    // this workspace -- which ones refuse, where the data lives, how to reach it --
-    // and the panel stated it nowhere: you had to notice the `k8s` tag on the rail
-    // card, or read it out of the notes, which is a fact hunt for the single most
-    // consequential thing about a workspace. `detail()` has carried `runtime` and
-    // `deployment` since v0.61.0 and nothing rendered them.
-    // Still exactly six, three columns, two full rows, no hole -- a seventh cell
-    // leaves an empty third. `Port` gave up its place: it is already in the identity
-    // line under the title AND in the URL box below, so it was the one fact on this
-    // grid stated three times, while the runtime was stated nowhere.
+    // ONE LINE EACH, not six big cells. These are the workspace's facts and four of
+    // the six never change for the life of it -- version, database, runtime,
+    // scenario -- so they were spending the top of the panel on things nobody came
+    // back to read, and pushing what the workspace has to say below the fold.
+    //
+    // The third column is new and is the reason rows beat cells here: a fact often
+    // has a qualifier ("restarted 4x", "pinned", "not you") that had nowhere to go
+    // inside a cell and was either dropped or turned into a seventh cell.
+    const fr = (k, v, cls = "", note = "") => el("div", { class: "fr" },
+      el("div", { class: "fr-k" }, k),
+      el("div", { class: "fr-v " + cls }, v),
+      el("div", { class: "fr-n" }, note));
     const where = d.runtime === "kubernetes" ? "Kubernetes" : "Compose";
-    const grid = el("div", { class: "kv-grid" },
-      kv("RC Version", d.rc_version), kv("MongoDB", d.mongo_tag),
-      kv("Runs on", d.deployment ? `${where} · ${d.deployment}` : where),
-      kv("Uptime", d.uptime || "—", d.uptime ? "green" : ""),
-      kv("Scenario", d.preset || "default"),
-      // healthClass() knows unhealthy/starting/healthy; the kv only understood the
-      // literal string "healthy", so a container reporting "running" rendered plain.
-      kv("Health", d.health || d.state || "—", HEALTH_TONE[healthClass(d)] || ""));
-
-    // Where its https name is actually served from. Without this the panel shows
-    // a workspace with no TLS port and no Traefik, which now looks like HTTPS is
-    // simply missing rather than handled one layer up.
-    // A climbing restart count separates "slow to boot" from "crash-looping".
-    if (typeof d.restarts === "number" && d.restarts > 0) {
-      grid.append(kv("RC restarts", String(d.restarts), d.restarts >= 2 ? "bad" : "warn"));
-    }
-    body.append(grid);
-    if (d.state === "restarting" || (d.restarts || 0) >= 2) {
-      body.append(el("p", { class: "banner bad" },
-        `Rocket.Chat has restarted ${d.restarts || 0}× — usually resource pressure `
-        + `(free some repros, or raise Docker's CPU/RAM) or a boot error. Check the Logs tab.`));
-    }
+    const rows = el("div", { class: "factrows" });
+    // Live first: health and uptime are the two that change, and they are what the
+    // panel is opened to look at.
+    rows.append(fr("Health", d.health || d.state || "—",
+                   HEALTH_TONE[healthClass(d)] || "",
+                   healthClass(d) === "bad" ? "failing its healthcheck" : ""));
+    rows.append(fr("Uptime", d.uptime || "—", d.uptime ? "green" : "",
+                   d.restarts ? `restarted ${d.restarts}×` : ""));
+    rows.append(fr("Rocket.Chat", d.rc_version || "?", "", d.pinned ? "pinned" : ""));
+    // The flavour is a COMPOSE image choice -- the Kubernetes StatefulSet honours
+    // neither value, and printing it there labelled a workspace with an image it
+    // does not run.
+    rows.append(fr("MongoDB", d.mongo_tag || "?", "",
+                   d.runtime === "kubernetes" ? "" : (d.mongo_flavor || "")));
+    // WHERE IT RUNS decides what every other command will do to this workspace --
+    // which ones refuse, where the data lives, how to reach it -- and the panel
+    // stated it nowhere until v0.66.0.
+    rows.append(fr("Runs on", d.deployment ? `${where} · ${d.deployment}` : where));
+    rows.append(fr("Scenario", d.preset || "default", "",
+                   d.instances > 1 ? `${d.instances} instances` : ""));
+    body.append(rows);
     // Parsed once and shared: the links card merges a note that names a place it
     // already lists, and records which notes it took, so no group below repeats one.
     const parsed = noteItemsByGroup(d);

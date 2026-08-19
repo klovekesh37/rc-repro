@@ -2343,9 +2343,10 @@ def test_the_overview_says_which_runtime_the_workspace_runs_on(
     tell whether it was Compose or Kubernetes -- which decides what half the actions
     in the pane will even do.
 
-    It takes Port's cell: the port is already in the identity line under the name and
-    in the URL box below, and the grid is deliberately exactly six so it fills two
-    rows of three with no hole.
+    It takes Port's place: the port is already in the identity line under the name
+    and in the URL box below. The facts are one line each -- six cells spent the top
+    of the panel on four things that never change -- and the third column carries the
+    qualifier a cell had nowhere to put.
     """
     _stub_lifecycle(monkeypatch, _kube_detail())
     usersvc.add("alice", PASSWORD, role="admin")
@@ -2353,14 +2354,17 @@ def test_the_overview_says_which_runtime_the_workspace_runs_on(
         _sign_in(page, s.url)
         page.wait_for_selector("#repros")
         page.click("text=t1234")
-        page.wait_for_selector("#d-body .kv-grid")
+        page.wait_for_selector("#d-body .factrows")
         cells = page.evaluate("""() => [...document.querySelectorAll(
-          '#d-body .kv-grid .kv')].map(c => [
-            c.querySelector('.k').textContent, c.querySelector('.v').textContent])""")
+          '#d-body .factrows .fr')].map(c => [
+            c.querySelector('.fr-k').textContent, c.querySelector('.fr-v').textContent])""")
         keys = [k for k, _ in cells]
         assert "Runs on" in keys, keys
         assert dict(cells)["Runs on"] == "Kubernetes · microservices"
-        assert len(cells) == 6, "the grid is six cells so two rows of three fill"
+        # Health and uptime lead: they are the two that change, and they are what the
+        # panel is opened to look at.
+        assert keys[:2] == ["Health", "Uptime"], keys
+        assert len(cells) == 6, keys
         assert page.errors == [], page.errors
 
 
@@ -2397,7 +2401,7 @@ def test_the_panel_is_not_a_two_hundred_pixel_window_on_a_narrow_screen(
           const cards = [...document.querySelectorAll('#d-body .panelcard')];
           const last = cards[cards.length - 1].getBoundingClientRect();
           const sb = document.querySelector('.statusbar').getBoundingClientRect();
-          const grid = document.querySelectorAll('#d-body .kv-grid .kv').length;
+          const grid = document.querySelectorAll('#d-body .factrows .fr').length;
           return {pageScrolls: document.documentElement.scrollHeight > window.innerHeight,
                   sideways: document.body.scrollWidth > window.innerWidth + 2,
                   // nothing hidden inside an internal scroller
@@ -2409,7 +2413,7 @@ def test_the_panel_is_not_a_two_hundred_pixel_window_on_a_narrow_screen(
         assert not m["sideways"], "and it must not scroll sideways"
         assert m["stageHidden"] <= 2, \
             f"{m['stageHidden']}px of the panel is hidden inside the stage's own scroller"
-        assert m["cells"] == 6, f"only {m['cells']} of the six Overview cells rendered"
+        assert m["cells"] == 6, f"only {m['cells']} of the six Overview facts rendered"
         assert m["cards"] >= 9, f"only {m['cards']} cards rendered of the 8 groups + scenario"
         assert m["lastBottom"] <= m["sbTop"] + 2, \
             "the status bar is drawn over the panel instead of below it"
@@ -2475,4 +2479,111 @@ def test_a_place_a_group_names_is_the_link_row_and_not_a_second_row(
         assert m["grafanaRows"] == 1, "Grafana is on screen twice"
         assert m["creds"], "the merge dropped the credential the note carried"
         assert m["rest"], "the rest of the group's prose was dropped with it"
+        assert page.errors == [], page.errors
+
+
+def test_a_healthy_workspace_gets_no_triage_block_at_all(serve, page, monkeypatch):
+    """The quiet state is ABSENCE, not a green box saying everything is fine. A panel
+    that always carries a status block trains people to stop reading it, and the facts
+    below it already say the workspace is healthy.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .factrows")
+        assert page.locator("#detail .triage").count() == 0
+        assert page.errors == [], page.errors
+
+
+def test_the_panel_leads_with_what_is_wrong_and_what_to_do(serve, page, monkeypatch):
+    """The panel is opened when something looks wrong, and it opened with six facts
+    that never change. The one thing on it that said anything was wrong -- the restart
+    banner -- was under them, i.e. under the fold on a 900px window, and it named no
+    action: it said "check the Logs tab" and left you to find the tab.
+
+    It leads with it now, above the TABS rather than inside Overview, because what is
+    wrong with a workspace is not a property of the tab you happen to be on -- it was
+    invisible from Logs, which is exactly where you go when something is wrong.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail(restarts=4, health="unhealthy"))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#detail .triage .tri")
+        m = page.evaluate("""() => {
+          const tri = document.querySelector('#detail .triage');
+          const tabs = document.querySelector('#detail .tabs');
+          return {
+            title: tri.querySelector('.tri-t b').textContent,
+            why: tri.querySelector('.tri-t span').textContent,
+            acts: [...tri.querySelectorAll('.tri-a button')].map(b => b.textContent),
+            // 4 == DOCUMENT_POSITION_FOLLOWING: the block precedes the tab strip
+            beforeTabs: !!(tri.compareDocumentPosition(tabs) & 4),
+            // and one problem, not two: a restart loop and its failing healthcheck
+            // are the same fault reported twice
+            count: document.querySelectorAll('#detail .triage .tri').length,
+          };
+        }""")
+        assert m["title"] == "Rocket.Chat has restarted 4×", m["title"]
+        assert "memory pressure" in m["why"]
+        assert m["acts"][:1] == ["Open the logs"], m["acts"]
+        assert m["beforeTabs"], "the triage block is below the tab strip"
+        assert m["count"] == 1, "a restart loop and its healthcheck are one problem"
+        # And the action IS the tab, not a sentence telling you to go and find it.
+        page.click("#detail .triage .tri-a button")
+        page.wait_for_selector("button.tab.active:has-text('Logs')")
+        assert page.errors == [], page.errors
+
+
+def test_a_down_workspace_is_told_what_it_still_holds(serve, page, monkeypatch):
+    """"down" is not a fault, and the panel said nothing about it at all: the reader
+    had to infer from a greyed action pane that the port and the data volume are still
+    reserved and that bringing it up reuses both.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail(state="down", health="", uptime=""))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#detail .triage .tri")
+        why = page.text_content("#detail .triage .tri-t span")
+        assert ":3001" in why and "data volume" in why, why
+        assert page.text_content("#detail .triage .tri-a button") == "Bring it up"
+        assert page.errors == [], page.errors
+
+
+def test_a_pod_that_cannot_start_is_named_in_the_panel(serve, page, monkeypatch):
+    """An ImagePullBackOff was reachable only by opening the Containers tab and
+    reading a table. It is the answer to "why is this workspace not up", so it is on
+    the panel -- named, with its reason.
+
+    `blocked` is decided in services/k8s.py, beside the list of reasons a pod never
+    recovers from: `ContainerCreating` is a waiting reason too, and a browser holding
+    its own copy of that policy would report a booting workspace as broken.
+    """
+    d = _kube_detail(containers=[
+        {"service": "rocketchat-0", "state": "pending", "status": "ImagePullBackOff",
+         "health": "", "blocked": True, "restarts": 0, "started": ""},
+        {"service": "mongodb-0", "state": "pending", "status": "ContainerCreating",
+         "health": "", "blocked": False, "restarts": 0, "started": ""}])
+    _stub_lifecycle(monkeypatch, d)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#detail .triage .tri")
+        title = page.text_content("#detail .triage .tri-t b")
+        why = page.text_content("#detail .triage .tri-t span")
+        assert title == "One pod cannot start", title
+        assert "rocketchat-0 — ImagePullBackOff" in why, why
+        assert "mongodb-0" not in why, "a pod that is merely starting is not a fault"
+        page.click("#detail .triage .tri-a button")
+        page.wait_for_selector("#d-body .dtable")
         assert page.errors == [], page.errors
