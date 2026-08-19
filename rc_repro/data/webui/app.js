@@ -2632,15 +2632,21 @@ async function openCreate(preset) {
     }
     if (Array.isArray(s.runtimes) && s.runtimes.length) {
       RUNTIMES = s.runtimes;
-      const rsel = $("#runtime-select");
-      const want = rsel.value || s.default_runtime;
-      rsel.innerHTML = "";
-      for (const r of RUNTIMES) {
-        rsel.append(el("option", { value: r.name }, RUNTIME_LABEL[r.name] || r.name));
-      }
-      rsel.value = RUNTIMES.some((r) => r.name === want) ? want : RUNTIMES[0].name;
+      const cur = $("#runtime-value");
+      const want = cur.value || s.default_runtime;
+      cur.value = RUNTIMES.some((r) => r.name === want) ? want : RUNTIMES[0].name;
     }
   } catch (_) { ACME_EMAIL_REMEMBERED = false; MAY_SET_PRIVILEGED = false; }
+  // What the box has left, next to the choice that spends it. `up` already REFUSES
+  // without headroom, so the cost belongs at the moment of choosing rather than in
+  // the failure afterwards -- and this is the same number the refusal uses.
+  $("#create-room").textContent = "";
+  api("/api/machine").then((cap) => {
+    if (!cap || !cap.known) return;
+    const free = Math.max(0, (cap.available_mb || 0) - (cap.reserve_mb || 0));
+    $("#create-room").textContent =
+      `${fmtGb(free)} free · room for about ${cap.room} more`;
+  }).catch(() => {});
   renderRuntimeAxes();
   syncHttpsFields();
   const sel = $("#preset-select");
@@ -2710,10 +2716,16 @@ const DEPLOYMENT_LABEL = {
 // What CHANGES when you pick one, said where the choice is made. Not decoration:
 // the runtime decides which other commands will work on this workspace for the
 // rest of its life, and that is not recoverable from the word "Kubernetes".
-const RUNTIME_HINT = {
-  docker: "",
-  kubernetes: "Its own kind cluster, one namespace per workspace. HTTPS is not "
-    + "available here yet; everything else works.",
+// What the ARRANGEMENT builds, since that is the choice directly above it. What
+// the runtime cannot do is said once, by the absence line in Advanced, which is
+// generated from the server's refusal registry -- so this no longer repeats "HTTPS
+// is not available here", which was the same fact in two places and only one of
+// them would have been updated when it changes.
+const DEPLOYMENT_NOTE = {
+  monolith: "One Rocket.Chat process.",
+  "multi-instance": "Several Rocket.Chat containers behind a load balancer.",
+  microservices: "Rocket.Chat plus presence, ddp-streamer, account, authorization "
+    + "and stream-hub, each its own deployment.",
 };
 
 // TWO functions, not one, and the split is load-bearing. Changing the RUNTIME
@@ -2722,37 +2734,147 @@ const RUNTIME_HINT = {
 // events made every arrangement choice snap straight back to the runtime's
 // default -- picking `monolith` on Kubernetes recorded `microservices`, and the
 // dialog looked right the whole time. Found by clicking it, not by a test.
-function renderRuntimeAxes() {
-  const rt = $("#runtime-select").value;
-  const spec = RUNTIMES.find((r) => r.name === rt);
-  const dsel = $("#deployment-select");
-  dsel.innerHTML = "";
-  for (const d of (spec ? spec.deployments : [])) {
-    dsel.append(el("option", { value: d }, DEPLOYMENT_LABEL[d] || d));
-  }
-  // The RUNTIME'S default, rather than carrying the previous runtime's over. Both
-  // offer `monolith`, so preserving looked considerate and produced a real
-  // divergence: `--runtime k8s` on the CLI defaults to microservices, and the
-  // dialog would have handed you monolith because that is what Compose had
-  // selected a moment earlier. The value sitting there was never a choice.
-  dsel.value = spec ? spec.default_deployment : "";
-  $("#runtime-hint").textContent = RUNTIME_HINT[rt] || "";
+// What a card says, beyond its name. Everything measurable comes from the server
+// (`/api/settings` -> runtimes[].cost, built from the same constants check_capacity
+// spends), so a card cannot quote a figure the preflight will contradict. Only the
+// one-line "what this is for" is written here, because it is a judgement rather
+// than a measurement.
+const RUNTIME_PITCH = {
+  docker: "Every command works, including HTTPS and load tests.",
+  kubernetes: "Helm, real pods, microservices. SCRAM auth available.",
+};
 
-  const kube = rt === "kubernetes";
-  $("#mongo-operator-row").hidden = !kube;
-  // HTTPS is refused by the service layer on Kubernetes -- there is no ingress yet.
-  // Hidden rather than disabled: a greyed-out control invites "why can't I?", and
-  // the hint above already says so in a sentence.
-  const https = $("#create-https-block");
-  if (https) https.hidden = kube;
+function fmtGb(mb) {
+  return mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${mb} MB`;
+}
+
+// The runtime fork. Rendered rather than written into the markup because the list
+// of runtimes comes from the server -- the same table the CLI resolves against, so
+// the dialog cannot offer a combination the service layer refuses.
+function renderRuntimeAxes() {
+  const rt = $("#runtime-value").value || (RUNTIMES[0] && RUNTIMES[0].name) || "docker";
+  const forks = $("#runtime-forks");
+  forks.innerHTML = "";
+  for (const spec of RUNTIMES) {
+    const chosen = spec.name === rt;
+    const cost = (spec.cost || {})[spec.default_deployment] || {};
+    const card = el("button", {
+      type: "button", class: "fork", "aria-pressed": String(chosen),
+      onclick: () => pickRuntime(spec.name),
+    },
+      el("span", { class: "fork-n" }, el("span", { class: "fork-dot" }),
+         RUNTIME_LABEL[spec.name] || spec.name),
+      el("div", { class: "fork-cost" },
+         `~${fmtGb(cost.workspace_mb || 0)} · ${cost.shape || ""}`
+         + (cost.cluster_mb ? ` · +${fmtGb(cost.cluster_mb)} once` : "")),
+      el("div", { class: "fork-can" }, RUNTIME_PITCH[spec.name] || ""));
+    forks.append(card);
+  }
+  const spec = RUNTIMES.find((r) => r.name === rt);
+
+  // Arrangement: a segmented control INSIDE this section, because it is dependent
+  // on the runtime rather than a peer of it. Two peer dropdowns claimed to be
+  // independent and the code then had to fight that -- it produced two live bugs,
+  // the arrangement snapping back to the runtime default being one of them.
+  const seg = $("#deployment-seg");
+  seg.innerHTML = "";
+  const deployments = spec ? spec.deployments : [];
+  // A value outside this runtime's list can never stand. Choosing the runtime's
+  // default when the runtime CHANGES is `pickRuntime`'s job, not this function's --
+  // see the comment there for why "keep it if it is still legal" is wrong.
+  if (!deployments.includes($("#deployment-value").value)) {
+    $("#deployment-value").value = spec ? spec.default_deployment : "";
+  }
+  for (const d of deployments) {
+    seg.append(el("button", {
+      type: "button", "aria-pressed": String($("#deployment-value").value === d),
+      onclick: () => pickDeployment(d),
+    }, d));
+  }
+  $("#runtime-hint").textContent =
+    DEPLOYMENT_NOTE[$("#deployment-value").value] || "";
+
+  // The one control a runtime ADDS rather than removes, and it belongs here in
+  // "where it runs" rather than in Advanced: it decides whether this workspace's
+  // MongoDB requires a password.
+  const extra = $("#runtime-extra");
+  extra.innerHTML = "";
+  if (rt === "kubernetes") {
+    extra.append(el("label", {},
+      el("input", { type: "checkbox", name: "mongo_operator", id: "mongo-operator" }),
+      " MongoDB via the official operator (adds SCRAM authentication)"));
+  }
+  syncAdvancedForRuntime(spec);
   syncDeploymentFields();
+}
+
+function pickRuntime(name) {
+  if ($("#runtime-value").value === name) return;
+  $("#runtime-value").value = name;
+  // The new runtime's DEFAULT, unconditionally -- not "keep the old one if it is
+  // still legal". Both runtimes offer `monolith`, so keeping it looked considerate
+  // and produced a real divergence: `--runtime k8s` on the CLI defaults to
+  // microservices, and the dialog would hand you monolith because that is what
+  // Compose had selected a moment earlier. The value sitting there was never a
+  // choice about Kubernetes.
+  const spec = RUNTIMES.find((r) => r.name === name);
+  $("#deployment-value").value = spec ? spec.default_deployment : "";
+  renderRuntimeAxes();
+}
+
+function pickDeployment(name) {
+  $("#deployment-value").value = name;
+  renderRuntimeAxes();
+}
+
+// Advanced follows the runtime too, and it is a DIFFERENT SET rather than a
+// cosmetic difference: the fields below do not work on Kubernetes, and each was
+// once accepted and silently dropped. The list comes from the server's own refusal
+// registry, so the form cannot claim something is unavailable that has since been
+// built -- `--reg-token` and every preset were on that list until they were.
+const ADV_GONE_LABEL = {
+  https: "HTTPS", domain: "a public domain",
+  fresh: "rebuild and DELETE data",
+};
+
+function syncAdvancedForRuntime(spec) {
+  const gone = new Set(((spec && spec.unsupported) || []).map((u) => u.field));
+
+  // HTTPS is a block of its own, so it goes entirely.
+  const https = $("#create-https-block");
+  if (https) https.hidden = gone.has("https") || gone.has("domain");
+
+  // `fresh` is ONE OPTION of the existing-name select, not the whole control:
+  // `reuse` and `force` work on both runtimes, and hiding the row would take a
+  // working choice away to remove a broken one. The option is removed and put back
+  // rather than disabled, for the same reason the privileged fields are hidden.
+  const existing = $("#create-form").existing;
+  if (existing) {
+    const has = [...existing.options].some((o) => o.value === "fresh");
+    if (gone.has("fresh") && has) {
+      if (existing.value === "fresh") existing.value = "reuse";
+      [...existing.options].find((o) => o.value === "fresh").remove();
+    } else if (!gone.has("fresh") && !has) {
+      existing.append(el("option", { value: "fresh" },
+        "Rebuild it and DELETE its data — users, channels, messages, uploads"));
+    }
+  }
+
+  const note = $("#adv-gone");
+  if (!note) return;
+  const named = [...gone].map((f) => ADV_GONE_LABEL[f] || f);
+  note.hidden = !named.length;
+  note.textContent = named.length
+    ? "Not on this runtime: " + named.join(" · ")
+      + ". Each is refused with its reason rather than accepted and dropped."
+    : "";
 }
 
 function syncDeploymentFields() {
   // --replicas means something on both runtimes, but nothing at all on a monolith.
   // Offering a field that is silently ignored is how `--seed` and `--https` were
   // quietly dropped on this runtime.
-  $("#replicas-row").hidden = $("#deployment-select").value === "monolith";
+  $("#replicas-row").hidden = $("#deployment-value").value === "monolith";
 }
 
 function renderPresetParams() {
@@ -3182,8 +3304,8 @@ $("#scope-filter").addEventListener("change", (e) => {
   view.scope = e.target.value; localStorage.setItem("rc_scope", view.scope); render();
 });
 $("#preset-select").addEventListener("change", renderPresetParams);
-$("#runtime-select").addEventListener("change", renderRuntimeAxes);
-$("#deployment-select").addEventListener("change", syncDeploymentFields);
+// The fork and the segmented control carry their own handlers, so there is nothing
+// to bind here: a <select>'s change event was the only reason those lines existed.
 $("#https-mode").addEventListener("change", syncHttpsFields);
 // The profile only means anything when seeding is on, so don't show it otherwise.
 function syncCreateSeed() {

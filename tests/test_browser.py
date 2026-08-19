@@ -1552,47 +1552,78 @@ def test_the_create_dialog_offers_a_runtime_and_follows_it(serve, page, monkeypa
         page.click("#btn-new")
         page.wait_for_selector("#create-dialog[open]")
 
-        # Compose is the default and its arrangement list is Compose's.
-        assert page.locator("#runtime-select").input_value() == "docker"
-        deployments = page.locator("#deployment-select option").all_inner_texts()
-        assert any("monolith" in d for d in deployments), deployments
-        assert any("multi-instance" in d for d in deployments), deployments
-        assert not any("microservices" in d for d in deployments), deployments
-        assert page.locator("#mongo-operator-row").is_hidden()
+        # The runtime is a pair of CARDS now, not a select: it decides what the
+        # other twenty-odd fields mean, and the two facts that decide it -- what it
+        # costs and what it cannot do -- have nowhere to live inside an <option>.
+        # The assertions below are the same ones; only the widget moved.
+        def fork(name):
+            return page.locator(f"#runtime-forks button:has-text('{name}')")
 
-        page.select_option("#runtime-select", "kubernetes")
-        deployments = page.locator("#deployment-select option").all_inner_texts()
-        assert any("microservices" in d for d in deployments), deployments
+        def arrangement():
+            return page.locator("#deployment-seg button[aria-pressed='true']").inner_text()
+
+        def arrangements():
+            return page.locator("#deployment-seg button").all_inner_texts()
+
+        # Compose is the default and its arrangement list is Compose's.
+        assert page.locator("#runtime-value").input_value() == "docker"
+        assert fork("Docker Compose").get_attribute("aria-pressed") == "true"
+        assert any("monolith" in d for d in arrangements()), arrangements()
+        assert any("multi-instance" in d for d in arrangements()), arrangements()
+        assert not any("microservices" in d for d in arrangements()), arrangements()
+        assert page.locator("#mongo-operator").count() == 0
+        # A card carries what a select could not: the cost, and the shape.
+        assert "GB" in fork("Docker Compose").inner_text()
+        assert "containers" in fork("Docker Compose").inner_text()
+        assert "pods" in fork("Kubernetes").inner_text()
+
+        fork("Kubernetes").click()
+        assert any("microservices" in d for d in arrangements()), arrangements()
         # The RUNTIME'S default, not the one Compose had selected: `--runtime k8s`
         # on the CLI defaults to microservices, and the two must not disagree.
-        assert page.locator("#deployment-select").input_value() == "microservices"
-        assert not any("multi-instance" in d for d in deployments), deployments
+        assert arrangement() == "microservices"
+        assert not any("multi-instance" in d for d in arrangements()), arrangements()
         # Kubernetes-only control appears; HTTPS, which the service layer refuses
         # on this runtime, goes away.
-        assert page.locator("#mongo-operator-row").is_visible()
+        assert page.locator("#mongo-operator").count() == 1
         # `hidden` rather than is_visible: the HTTPS block lives inside the
         # Advanced disclosure, so is_visible() would be answering about the
         # twisty, not about the runtime.
         assert page.eval_on_selector("#create-https-block", "e => e.hidden") is True
-        assert "Kubernetes" in page.locator("#runtime-hint").inner_text() or \
-            page.locator("#runtime-hint").inner_text() != ""
+        # And the form says what it took away, from the server's own registry --
+        # not a list written in JS, which would still be refusing --reg-token.
+        assert page.eval_on_selector("#adv-gone", "e => e.hidden") is False
+        # textContent, not inner_text: this line lives inside the same closed
+        # <details> as the HTTPS block, and inner_text answers "" for anything a
+        # closed twisty is hiding -- which would pass whatever the text said.
+        assert "HTTPS" in page.eval_on_selector("#adv-gone", "e => e.textContent")
+        # `fresh` is one OPTION of the existing-name select, not the whole control:
+        # reuse and force work on both runtimes.
+        opts = page.eval_on_selector_all(
+            "select[name=existing] option", "es => es.map(e => e.textContent)")
+        assert not any("DELETE" in o for o in opts), opts
+        assert any("Reuse" in o for o in opts), opts
 
         # An arrangement the user PICKS must stick. Wiring the runtime handler to
-        # this select too made every choice snap back to the runtime default:
+        # this control too made every choice snap back to the runtime default:
         # picking monolith on Kubernetes created a microservices workspace, and the
         # dialog looked correct throughout. Found by clicking, not by a test.
-        page.select_option("#deployment-select", "monolith")
-        assert page.locator("#deployment-select").input_value() == "monolith"
+        page.locator("#deployment-seg button:has-text('monolith')").click()
+        assert arrangement() == "monolith"
         assert page.locator("#replicas-row").is_hidden(), \
             "replicas mean nothing on a monolith"
-        page.select_option("#deployment-select", "microservices")
-        assert page.locator("#deployment-select").input_value() == "microservices"
+        page.locator("#deployment-seg button:has-text('microservices')").click()
+        assert arrangement() == "microservices"
 
         # Back to Compose and HTTPS returns -- the hiding is a consequence of the
-        # choice, not a one-way door.
-        page.select_option("#runtime-select", "docker")
+        # choice, not a one-way door. So does the option that deletes data.
+        fork("Docker Compose").click()
         assert page.eval_on_selector("#create-https-block", "e => e.hidden") is False
-        assert page.locator("#mongo-operator-row").is_hidden()
+        assert page.locator("#mongo-operator").count() == 0
+        assert page.eval_on_selector("#adv-gone", "e => e.hidden") is True
+        opts = page.eval_on_selector_all(
+            "select[name=existing] option", "es => es.map(e => e.textContent)")
+        assert any("DELETE" in o for o in opts), opts
 
 
 def test_creating_a_kubernetes_workspace_sends_the_axes(serve, page, monkeypatch):
@@ -1612,8 +1643,8 @@ def test_creating_a_kubernetes_workspace_sends_the_axes(serve, page, monkeypatch
         page.click("#btn-new")
         page.wait_for_selector("#create-dialog[open]")
         page.fill("input[name=version]", "8.5.1")
-        page.select_option("#runtime-select", "kubernetes")
-        page.select_option("#deployment-select", "microservices")
+        page.locator("#runtime-forks button:has-text('Kubernetes')").click()
+        page.locator("#deployment-seg button:has-text('microservices')").click()
         page.check("input[name=mongo_operator]")
         page.click("#create-submit")
         for _ in range(40):
@@ -2043,4 +2074,61 @@ def test_the_seed_job_shows_what_it_made_and_whether_it_was_confirmed(
         assert "match the plan" in body, body[-400:]
         assert "283 messages" in body and "48 in threads" in body
         assert "channel 5" in body and "discussion 3" in body
+        assert page.errors == [], page.errors
+
+
+def test_the_create_dialog_quotes_a_cost_the_preflight_will_not_contradict(
+        serve, page, monkeypatch):
+    """A card carries what a `<select>` could not: what this runtime costs and what
+    it builds. Those numbers come from the SERVER, computed from the same constants
+    `check_capacity` spends -- a card quoting 1.1 GB while the preflight reserves
+    something else is a card contradicted by the refusal it exists to prevent.
+
+    And the free-space line sits in the same header, because `up` already refuses
+    without headroom: the cost belongs at the moment of choosing, not in the failure
+    afterwards.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#btn-new")
+        page.click("#btn-new")
+        page.wait_for_selector("#create-dialog[open]")
+        page.wait_for_function(
+            "() => document.querySelector('#create-room').textContent.includes('free')",
+            timeout=15000)
+        assert "room for about" in page.locator("#create-room").inner_text()
+
+        compose = page.locator("#runtime-forks button").first.inner_text()
+        assert "1.1 GB" in compose, compose
+        assert "2 containers" in compose, compose
+        kube = page.locator("#runtime-forks button").nth(1).inner_text()
+        # Microservices is not a monolith with a label, and the card says so.
+        assert "2.4 GB" in kube and "9 pods" in kube, kube
+        # The cluster is paid once per machine, not once per workspace.
+        assert "once" in kube, kube
+        assert page.errors == [], page.errors
+
+
+def test_the_arrangement_says_what_it_builds(serve, page, monkeypatch):
+    """The note under the segmented control describes the ARRANGEMENT, which is the
+    choice directly above it. It used to describe the runtime and repeat "HTTPS is
+    not available here" -- the same fact the absence line in Advanced now states
+    from the server's registry, and only one of the two would have been updated when
+    that changes."""
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#btn-new")
+        page.click("#btn-new")
+        page.wait_for_selector("#create-dialog[open]")
+        assert "One Rocket.Chat process" in page.locator("#runtime-hint").inner_text()
+        page.locator("#runtime-forks button:has-text('Kubernetes')").click()
+        note = page.locator("#runtime-hint").inner_text()
+        assert "ddp-streamer" in note, note
+        assert "HTTPS" not in note, "the refusal is stated once, in Advanced"
+        page.locator("#deployment-seg button:has-text('monolith')").click()
+        assert "One Rocket.Chat process" in page.locator("#runtime-hint").inner_text()
         assert page.errors == [], page.errors

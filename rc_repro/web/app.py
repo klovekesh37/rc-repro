@@ -1262,7 +1262,17 @@ def create_app(allow_hosts: list[str] | None = None, *,
                 # field the API rejects, which is exactly what happened there.
                 "runtimes": [
                     {"name": rt, "deployments": list(deps),
-                     "default_deployment": deps[0]}
+                     "default_deployment": deps[0],
+                     # What it costs and what it builds, from the same constants
+                     # `check_capacity` spends -- a card quoting one number while
+                     # the preflight reserves another is a card the refusal
+                     # contradicts. Per deployment, because microservices is not
+                     # a monolith with a label.
+                     "cost": {dep: lc.runtime_cost(rt, dep) for dep in deps},
+                     # And what this runtime cannot honour, from the registry the
+                     # create path enforces. The list has shrunk twice; a copy
+                     # written into the form would still be refusing `--reg-token`.
+                     "unsupported": lc.unsupported_fields(rt)}
                     for rt, deps in topology.DEPLOYMENTS.items()
                 ],
                 "default_runtime": topology.DOCKER,

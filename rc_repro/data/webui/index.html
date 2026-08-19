@@ -101,17 +101,46 @@
            wants something from you, and it is a notice -- it changes no field and
            no URL. -->
       <p id="create-bind-hint" class="banner warn" hidden></p>
-      <label>Rocket.Chat version <input name="version" placeholder="8.5.1" required></label>
-      <p id="version-hint" class="hint"></p>
-      <div class="row2">
-        <label>Runs on <select name="runtime" id="runtime-select"></select></label>
-        <label>Arrangement <select name="deployment" id="deployment-select"></select></label>
-      </div>
-      <p id="runtime-hint" class="hint"></p>
-      <label>Preset <select name="preset" id="preset-select"></select></label>
-      <p id="preset-desc" class="hint"></p>
-      <div id="preset-params"></div>
-      <label>Host port (blank = auto) <input name="port" type="number" min="1024" max="65535" placeholder="auto"></label>
+
+      <!-- THREE NUMBERED SECTIONS. The numbers are not decoration: choosing a
+           runtime re-shapes the form, and numbering says WHICH part changed rather
+           than leaving fields to appear and vanish somewhere in a long scroll.
+           Sections 1 and 3 are identical across runtimes; only 2 and Advanced
+           differ, which is the honest picture. -->
+      <section class="sec">
+        <div class="sec-h"><span class="sec-n">1</span>
+          <span class="sec-t">Which Rocket.Chat</span></div>
+        <label>Version <input name="version" placeholder="8.5.1" required></label>
+        <p id="version-hint" class="hint"></p>
+      </section>
+
+      <section class="sec">
+        <div class="sec-h"><span class="sec-n">2</span>
+          <span class="sec-t">Where it runs</span>
+          <span class="sec-sub" id="create-room"></span></div>
+        <!-- Two CARDS rather than a select. The runtime decides what the other
+             twenty-odd fields mean, and the two facts that decide it -- what it
+             costs and what it cannot do -- have nowhere to live inside an
+             <option>. The hidden input keeps the submit path unchanged. -->
+        <div class="forks" id="runtime-forks" role="group" aria-label="Runtime"></div>
+        <input type="hidden" name="runtime" id="runtime-value">
+        <!-- Arrangement is DEPENDENT on the runtime, so it is a segmented control
+             inside this section, changing when its parent changes. Two peer
+             dropdowns said they were independent and the code then had to fight
+             that -- it produced two live bugs. -->
+        <div class="seg" id="deployment-seg" role="group" aria-label="Arrangement"></div>
+        <input type="hidden" name="deployment" id="deployment-value">
+        <p id="runtime-hint" class="hint seg-note"></p>
+        <div class="checks" id="runtime-extra"></div>
+      </section>
+
+      <section class="sec">
+        <div class="sec-h"><span class="sec-n">3</span>
+          <span class="sec-t">What to reproduce</span></div>
+        <label>Preset <select name="preset" id="preset-select"></select></label>
+        <p id="preset-desc" class="hint"></p>
+        <div id="preset-params"></div>
+        <label>Host port (blank = auto) <input name="port" type="number" min="1024" max="65535" placeholder="auto"></label>
       <div class="checks">
         <label><input type="checkbox" name="monitor"> Monitoring (Prometheus + Grafana)</label>
         <label><input type="checkbox" name="seed"> Seed sample data (users, channels, messages)</label>
@@ -128,12 +157,15 @@
              has it. Buried under Advanced it was below "Root URL override", which
              is a long way to hide the switch that decides whether this
              workspace's MongoDB requires a password. -->
-        <label id="mongo-operator-row" hidden><input type="checkbox" name="mongo_operator">
-          MongoDB via the official operator (adds SCRAM authentication)</label>
       </div>
+      </section>
 
       <details class="adv">
         <summary>Advanced options</summary>
+        <!-- Filled by syncAdvancedForRuntime from the server's own refusal registry,
+             so this can never claim a field is unavailable that has since been
+             built. It said `--reg-token` and every preset until they were. -->
+        <p id="adv-gone" class="adv-gone" hidden></p>
         <label>Name (blank = derived) <input name="name" placeholder="e.g. rc8-5-1-ldap"></label>
         <label>If that name already exists
           <select name="existing">

@@ -616,6 +616,52 @@ form textarea { font-family: var(--mono); font-size: .8rem; resize: vertical; }
 .adv summary:hover { color: var(--ink); }
 .adv summary:hover { color: var(--ink); }
 form menu { display: flex; justify-content: flex-end; gap: .5rem; padding: 0; margin: 1.1rem 0 0; }
+/* ---- the create dialog's three sections ----
+   Moved from .docs/design/prototype/create.html as-is: every value is a token this
+   system already has, and the prototype introduced no colour, radius or shadow of
+   its own. The NUMBER is not decoration -- choosing a runtime re-shapes the form,
+   and the number says which part changed rather than leaving fields to appear and
+   vanish in a scroll. */
+.sec { border-top: 1px solid var(--line); padding-top: .9rem; margin-top: 1rem; }
+.sec:first-of-type { border-top: 0; padding-top: 0; margin-top: 0; }
+.sec-h { display: flex; align-items: baseline; gap: .5rem; margin-bottom: .7rem; }
+.sec-n { font: 600 .7rem/1.5 var(--mono); color: var(--dim);
+  min-width: 1.15rem; height: 1.15rem; text-align: center;
+  border: 1px solid var(--line2); border-radius: var(--r-pill); }
+.sec-t { font-weight: 600; font-size: .9rem; color: var(--ink); }
+.sec-sub { font-size: .78rem; color: var(--muted); margin-left: auto; }
+
+/* The runtime fork. Two cards rather than a select, because the two facts that
+   decide it -- what it costs and what it cannot do -- have nowhere to live inside
+   an <option>. Blue is "you can click it", which is what these are. */
+.forks { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
+.fork { text-align: left; padding: .7rem .8rem; border: 1px solid var(--line2);
+  border-radius: var(--r-md); background: var(--panel); cursor: pointer;
+  transition: border-color var(--t) var(--ease), background var(--t) var(--ease); }
+.fork:hover { border-color: var(--accent); }
+.fork[aria-pressed="true"] { border-color: var(--accent);
+  background: var(--accent-soft); box-shadow: 0 0 0 3px var(--accent-ring); }
+.fork-n { display: flex; align-items: center; gap: .4rem;
+  font-weight: 600; font-size: .88rem; color: var(--ink); }
+.fork-dot { width: .5rem; height: .5rem; border-radius: var(--r-pill);
+  border: 1px solid var(--line2); }
+.fork[aria-pressed="true"] .fork-dot { background: var(--accent); border-color: var(--accent); }
+.fork-cost { font: .72rem/1.4 var(--mono); color: var(--muted); margin: .3rem 0 .35rem; }
+.fork-can { font-size: .74rem; color: var(--muted); }
+
+/* Arrangement is DEPENDENT on the runtime, so it is a segmented control inside the
+   same section rather than a second peer dropdown beside it. */
+.seg { display: inline-flex; border: 1px solid var(--line2);
+  border-radius: var(--r-sm); overflow: hidden; margin-top: .85rem; }
+.seg button { border: 0; background: var(--panel); color: var(--muted);
+  padding: .38rem .8rem; font: inherit; font-size: .82rem; cursor: pointer;
+  border-right: 1px solid var(--line2); }
+.seg button:last-child { border-right: 0; }
+.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--ink);
+  font-weight: 600; }
+.seg-note { font-size: .76rem; color: var(--muted); margin: .45rem 0 0; }
+.adv-gone { margin: 0 0 .7rem; font-size: .76rem; color: var(--muted);
+  padding-left: .6rem; border-left: 2px solid var(--line2); }
 .hint { color: var(--muted); font-size: .82rem; margin: .1rem 0 .4rem; }
 /* A server message quoted verbatim, where the newlines in it carry meaning: the
    metrics-server install is two commands, the helm upgrade is one long one. Without

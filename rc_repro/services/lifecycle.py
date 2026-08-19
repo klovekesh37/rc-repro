@@ -289,6 +289,42 @@ def _check_engine_floor(req: "CreateReq", emit: Emit = null_emit) -> None:
         "--force overrides this.")
 
 
+def unsupported_fields(runtime: str) -> list[dict]:
+    """What a runtime cannot honour, from the registry the create path enforces.
+
+    Published so the create dialog can say it BEFORE somebody fills a field in --
+    and, more to the point, so it cannot say it wrongly. The list has shrunk twice
+    while the GUI's own copy of it would not have: `--reg-token` and every preset
+    were on it until they were built. Two places deciding the same thing is how a
+    form ends up refusing something that works, which is worse than not mentioning
+    it at all.
+    """
+    from rc_repro.services import topology
+    if topology.normalize(runtime) != topology.KUBERNETES:
+        return []
+    return [{"field": name, "why": why} for name, why in _KUBERNETES_UNSUPPORTED]
+
+
+def runtime_cost(runtime: str, deployment: str = "") -> dict:
+    """Roughly what one workspace costs, from the numbers `check_capacity` spends.
+
+    The same constants, not a second set written for the screen: a card that quotes
+    1.1 GB while the preflight reserves something else is a card that will be
+    contradicted by the refusal it was meant to prevent. `cluster_mb` is charged
+    separately because it is paid once per machine, not once per workspace.
+    """
+    from rc_repro.services import topology
+    if topology.normalize(runtime) != topology.KUBERNETES:
+        return {"workspace_mb": WORKSPACE_MB, "cluster_mb": 0, "shape": "2 containers"}
+    deployment = deployment or topology.DEPLOYMENTS[topology.KUBERNETES][0]
+    micro = deployment == topology.MICROSERVICES
+    return {
+        "workspace_mb": WORKSPACE_MB + KUBE_CHART_MB + (MICROSERVICES_MB if micro else 0),
+        "cluster_mb": CLUSTER_MB,
+        "shape": "9 pods" if micro else "5 pods",
+    }
+
+
 def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_emit) -> None:
     """Refuse to create a workspace the host cannot hold.
 

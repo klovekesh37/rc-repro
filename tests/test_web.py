@@ -2582,3 +2582,25 @@ def test_a_down_engine_is_502_on_the_two_routes_that_check_it(monkeypatch):
         assert r.json()["kind"] == "DockerError"
     # /state already answered 502 for this on main — the point is that all three agree.
     assert errors.DockerError.http_status == 502
+def test_settings_publishes_what_each_runtime_costs_and_refuses(monkeypatch, tmp_path):
+    """Both are facts the create dialog would otherwise have to hardcode, and both
+    have moved: the refusal list has shrunk twice -- `--reg-token` and every preset
+    were on it until they were built -- and a card quoting a cost the preflight does
+    not use is a card the refusal contradicts.
+    """
+    from rc_repro.services import lifecycle as lcsvc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    body = client().get("/api/settings", headers=H).json()
+    kube = next(r for r in body["runtimes"] if r["name"] == "kubernetes")
+    docker = next(r for r in body["runtimes"] if r["name"] == "docker")
+
+    assert docker["unsupported"] == [], "Compose refuses none of them"
+    assert {u["field"] for u in kube["unsupported"]} == {"https", "domain", "fresh"}
+    assert all(u["why"] for u in kube["unsupported"]), "a refusal without a reason"
+
+    # The same constants check_capacity spends, per deployment.
+    assert docker["cost"]["monolith"]["workspace_mb"] == lcsvc.WORKSPACE_MB
+    micro = kube["cost"]["microservices"]
+    assert micro["workspace_mb"] > kube["cost"]["monolith"]["workspace_mb"], \
+        "microservices is not a monolith with a label"
+    assert micro["cluster_mb"] == lcsvc.CLUSTER_MB, "charged once per machine"
