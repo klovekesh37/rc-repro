@@ -110,27 +110,15 @@ pair is refused with `VALIDATION_FAILED` before anything is created.
 
 ### Which cluster it runs in
 
-One decision, made for you, and it is the only thing k3s and kind change:
+If `kind` is installed, rc-repro creates and manages its own cluster (`rc-repro-local`;
+`prune` deletes it once no rc-repro namespace is left). If it is not, rc-repro uses the
+cluster `kubectl` already points at and never removes it. With both present, kind wins.
+Provisioning is the only step that differs.
 
-- **`kind` installed** — rc-repro creates and manages its own cluster,
-  `rc-repro-local`, on first use. `prune` deletes it once no rc-repro namespace is
-  left. Costs ~600 MB for the control plane, once per machine.
-- **`kind` not installed** — rc-repro uses the cluster `kubectl` already points at
-  (k3s, minikube, Docker Desktop, remote). It creates namespaces there and **never**
-  removes the cluster; `prune` cannot delete it.
-
-With both a `kind` binary and a running k3s on the box, **kind wins** — the binary
-being present is the test. Everything after provisioning is identical code on either.
-
-Which to pick, when the choice is yours: **k3s** already provides ingress, a load
-balancer, storage and metrics-server, so `stats` works and no control plane is added;
-**kind** is rc-repro's own, so `prune` can reset the whole cluster and nothing you
-care about is at risk.
-
-`rc-repro doctor --json` is the authority on which one applies and on what the
-cluster provides: `storage`, `ingress`, `loadbalancer` and `metrics` are reported as
-facts per cluster. A stock k3s has all four; a stock kind has storage only, so
-`stats` refuses there. Do not assume a capability from the distribution name.
+`rc-repro doctor --json` is the authority on which applies and on what the cluster
+provides -- `storage`, `ingress`, `loadbalancer`, `metrics`. Do not infer a capability
+from a distribution name: a stock k3s has all four, a stock kind has storage only, so
+`stats` refuses on one and not the other.
 
 ### What Kubernetes refuses, and why
 
