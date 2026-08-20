@@ -2451,12 +2451,41 @@ def orphan_namespaces(context: str = "") -> list[str]:
     return sorted(ns for ns in found
                   if ns not in known and ns != k8s.OPERATOR_NAMESPACE)
 
+def _reclaim_cluster(emit: Emit = null_emit) -> bool:
+    """Give back rc-repro's own cluster once nothing of ours is left in it.
+
+    Only ever OUR cluster: `delete_cluster` takes no parameter, needs the `kind` binary,
+    and refuses while any workspace namespace remains -- so a cluster somebody else
+    supplied (a k3s, a minikube, anything adopted) cannot be reached from here at all.
+    That is the teardown asymmetry the runtime split is built on: what rc-repro created
+    it may destroy, and what you supplied it only ever borrows a namespace in.
+
+    Best-effort: a cluster that will not go is not a failed prune. The workspaces are
+    already gone, which is what was asked for.
+    """
+    from rc_repro.services import k8s
+    try:
+        return k8s.delete_cluster(emit=emit)
+    except ReproError as exc:
+        warn(emit, f"the cluster was left alone: {exc}", phase="done")
+        return False
+    except Exception:  # noqa: BLE001 - never let cleanup fail a successful prune
+        return False
+
+
 def prune(*, confirm: bool = False, orphans: bool = False,
           emit: Emit = null_emit) -> dict:
     targets = prunable()
     stray = orphan_namespaces() if orphans else []
     if not targets and not stray:
-        return {"targets": [], "removed": [], "orphans": []}
+        # Still worth asking about the CLUSTER. With every workspace gone, rc-repro's
+        # own kind cluster is a 514 MiB control plane holding nothing -- and both the
+        # README and the agent skill said `prune` reclaims it, which nothing did:
+        # `delete_cluster` had exactly one caller, a failed create's rollback. So the
+        # documented promise was never kept, and the memory the tool tells you to worry
+        # about was the memory it left behind.
+        return {"targets": [], "removed": [], "orphans": [],
+                "cluster": _reclaim_cluster(emit)}
     if not confirm:
         raise ValidationError(f"prune deletes {len(targets)} down repro(s) incl. data - pass confirm=true")
     auditsvc.record("prune", ",".join(targets))
@@ -2523,7 +2552,8 @@ def prune(*, confirm: bool = False, orphans: bool = False,
             else:
                 warn(emit, f"could not remove orphaned namespace {ns}: "
                            f"{(res.stderr or '').strip()[:120]}", phase="done")
-    return {"targets": targets, "removed": removed, "orphans": swept}
+    return {"targets": targets, "removed": removed, "orphans": swept,
+            "cluster": _reclaim_cluster(emit)}
 
 
 #: What `up` accepts on Compose and cannot honour on Kubernetes, with the reason.

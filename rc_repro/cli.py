@@ -738,8 +738,26 @@ def prune(
         stray = lcsvc.orphan_namespaces() if orphans else []
     except errors.ReproError as exc:
         _fail(exc)
+    # The CLUSTER is reclaimable separately from any workspace: with everything gone,
+    # rc-repro's own kind control plane is 514 MiB holding nothing, and both the README
+    # and the agent skill said `prune` gives it back -- which nothing did.
+    reclaim = _cluster_reclaimable()
     if not targets and not stray:
-        typer.echo("Nothing to prune.")
+        if not reclaim:
+            typer.echo("Nothing to prune.")
+            return
+        if not yes:
+            typer.echo("Nothing to prune, but rc-repro's own Kubernetes cluster is "
+                       "empty and can be given back (about 0.5 GB).")
+            typer.confirm("Delete the cluster?", abort=True)
+        try:
+            res = lcsvc.prune(confirm=True, orphans=orphans, emit=_cli_emit)
+        except errors.ReproError as exc:
+            _fail(exc)
+        if res.get("cluster"):
+            ui.ok("✓ the cluster is gone — the next Kubernetes workspace creates a new one.")
+        else:
+            typer.echo("Nothing to prune.")
         return
     if not yes:
         typer.echo("These down repros will be deleted — containers, data volumes, and records:")
@@ -766,6 +784,18 @@ def prune(
         ui.ok(f"✓ pruned {len(res['removed'])}: {', '.join(res['removed'])}")
     else:
         typer.echo("Nothing to prune.")
+    if res.get("cluster"):
+        ui.ok("✓ the cluster is gone too — the next Kubernetes workspace creates a new one.")
+
+
+def _cluster_reclaimable() -> bool:
+    """Whether `prune` has a cluster to give back. Never raises: a cleanup verb must not
+    fail because a probe did."""
+    try:
+        from rc_repro.services import k8s
+        return k8s.cluster_reclaimable()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _say_reattach(target: str) -> None:

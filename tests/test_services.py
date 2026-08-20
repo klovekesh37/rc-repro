@@ -4322,6 +4322,9 @@ def test_detaching_monitoring_leaves_it_up_for_the_workspaces_still_using_it(
                         lambda ctx: ["rc-repro-a", "rc-repro-b"])
     monkeypatch.setattr(k8s, "monitoring_wanted",
                         lambda ns, *, context: ns == "rc-repro-b")
+    # The stack IS installed here: "who else wants it" is only a question once
+    # something exists to keep, and `remove_monitoring` now returns early otherwise.
+    monkeypatch.setattr(k8s, "release_installed", lambda *a, **k: True)
     calls = []
 
     def fake_run(argv, **kw):
@@ -5907,6 +5910,8 @@ def test_the_workspace_being_destroyed_does_not_vote_to_keep_the_stack(monkeypat
 
     def run(argv, timeout=None, own=False):
         j = " ".join(argv)
+        if "helm list" in j:
+            return sp.CompletedProcess(argv, 0, k8s.MONITORING_RELEASE, "")
         if "get namespace" in j and "-l" in j:
             return sp.CompletedProcess(argv, 0, "namespace/rc-repro-going\n", "")
         if "get namespace rc-repro-going" in j or "jsonpath" in j and "monitoring" in j:
@@ -5922,3 +5927,85 @@ def test_the_workspace_being_destroyed_does_not_vote_to_keep_the_stack(monkeypat
     events.clear()
     assert k8s.remove_monitoring(context="default", excluding="rc-repro-going",
                                  emit=events.append) is True
+
+
+def test_detaching_monitoring_that_was_never_attached_says_nothing_alarming(monkeypatch):
+    """Measured live: `monitor --off` on a workspace whose attach had failed ran the
+    uninstall anyway, helm answered "Release not loaded: monitoring: release: not found",
+    and the fallback announced that "the monitoring stack needed its finalizers cleared by
+    hand" -- a frightening sentence about wreckage that did not exist.
+
+    Nothing installed is nothing to report, which is also what `remove_operator` already
+    did; the two are symmetric now.
+    """
+    import subprocess as sp
+
+    from rc_repro.services import k8s
+
+    calls = []
+
+    def run(argv, timeout=None, own=False):
+        calls.append(" ".join(argv))
+        # `helm list -q` answers with no releases: nothing is installed here.
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", run)
+    events = []
+    assert k8s.remove_monitoring(context="default", emit=events.append) is False
+    assert not any("uninstall" in c for c in calls), calls
+    assert not any("finalizer" in e.message for e in events), [e.message for e in events]
+
+
+def test_prune_gives_back_the_cluster_it_created(monkeypatch, tmp_path):
+    """Measured live: with every workspace gone, `prune` said "Nothing to prune" and left
+    rc-repro's own kind control plane running -- 514 MiB holding nothing. Both the README
+    and the agent skill said `prune` reclaims it; `delete_cluster` had exactly one caller,
+    a failed create's rollback, so the documented promise was never kept and the memory
+    the tool tells you to worry about was the memory it left behind.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "prunable", lambda: [])
+    monkeypatch.setattr(lc, "orphan_namespaces", lambda *a, **k: [])
+    deleted = []
+    monkeypatch.setattr(k8s, "delete_cluster",
+                        lambda **kw: deleted.append(kw) is None or True)
+
+    res = lc.prune(confirm=True)
+    assert res["cluster"] is True, "the cluster was left running with nothing in it"
+    assert deleted, "delete_cluster was never called"
+
+    # And after a prune that DID remove workspaces, the same offer applies.
+    deleted.clear()
+    monkeypatch.setattr(lc, "prunable", lambda: [])
+    res = lc.prune(confirm=True, orphans=False)
+    assert res["cluster"] is True
+
+
+def test_reclaiming_the_cluster_can_only_ever_reach_our_own(monkeypatch, tmp_path):
+    """The teardown asymmetry the runtime split is built on: what rc-repro created it may
+    destroy, what you supplied it only borrows a namespace in. `delete_cluster` takes no
+    parameter, needs the `kind` binary, and refuses while a workspace namespace remains --
+    so an adopted k3s cannot be reached from a prune at all. And a refusal is not a failed
+    prune: the workspaces are already gone, which is what was asked for.
+    """
+    from rc_repro.errors import ConflictError
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "prunable", lambda: [])
+    monkeypatch.setattr(lc, "orphan_namespaces", lambda *a, **k: [])
+
+    # No kind binary: there is nothing of ours to give back.
+    monkeypatch.setattr(k8s, "which", lambda _t: "")
+    assert k8s.cluster_reclaimable() is False
+
+    # A cluster that still holds a workspace refuses, and the prune still succeeds.
+    def refuse(**_kw):
+        raise ConflictError("cluster rc-repro-local still holds 1 workspace namespace(s)")
+    monkeypatch.setattr(k8s, "delete_cluster", refuse)
+    events = []
+    res = lc.prune(confirm=True, emit=events.append)
+    assert res["cluster"] is False
+    assert any("left alone" in e.message for e in events), [e.message for e in events]

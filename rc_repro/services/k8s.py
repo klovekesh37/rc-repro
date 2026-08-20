@@ -782,6 +782,20 @@ def ensure_cluster(emit: Emit = null_emit) -> str:
     return context
 
 
+def cluster_reclaimable() -> bool:
+    """Whether rc-repro's own cluster exists and holds nothing of ours.
+
+    Mirrors `delete_cluster`'s own guard so a caller can ASK before offering to reclaim,
+    rather than finding out by being refused. A cluster that exists but does not answer
+    counts: `kind delete` talks to Docker, not to the API server, and a control plane
+    nobody can reach is the clearest case of memory doing nothing.
+    """
+    if not which("kind") or CLUSTER_NAME not in clusters()[0]:
+        return False
+    ctx = cluster_context()
+    return not reachable(ctx) or not workspace_namespaces(ctx)
+
+
 def delete_cluster(*, force: bool = False, emit: Emit = null_emit) -> bool:
     """Delete rc-repro's own cluster. Returns False if there was nothing to delete.
 
@@ -2673,11 +2687,17 @@ def mongodb_resources(context: str) -> list[str]:
     return sorted({ns for ns in (res.stdout or "").split() if ns})
 
 
+def release_installed(release: str, namespace: str, context: str) -> bool:
+    """Whether a helm release is in this cluster. Used before uninstalling one, so
+    "there was nothing there" is reported as nothing rather than as a failure."""
+    res = run(["helm", "list", "--kube-context", context, "-n", namespace, "-q"],
+              timeout=APPLY_TIMEOUT, own=is_ours(context))
+    return release in (res.stdout or "").split()
+
+
 def operator_installed(context: str) -> bool:
     """Whether the shared MongoDB operator release is in this cluster."""
-    res = run(["helm", "list", "--kube-context", context, "-n", OPERATOR_NAMESPACE,
-               "-q"], timeout=APPLY_TIMEOUT, own=is_ours(context))
-    return OPERATOR_RELEASE in (res.stdout or "").split()
+    return release_installed(OPERATOR_RELEASE, OPERATOR_NAMESPACE, context)
 
 
 def remove_operator(*, context: str, excluding: str = "",
@@ -2898,6 +2918,14 @@ def remove_monitoring(*, context: str, excluding: str = "",
     so a teardown asking "does anyone else want this?" would be told yes by the
     workspace it is in the middle of deleting.
     """
+    # Nothing installed is nothing to report. Without this, `monitor --off` on a
+    # workspace that never had monitoring ran the uninstall anyway, helm answered
+    # "Release not loaded: monitoring: release: not found", and the fallback path
+    # announced that "the monitoring stack needed its finalizers cleared by hand" --
+    # a frightening sentence about wreckage that did not exist. Measured on a live
+    # detach after an attach that had failed.
+    if not release_installed(MONITORING_RELEASE, MONITORING_NAMESPACE, context):
+        return False
     others = [n for n in workspace_namespaces(context)
               if n != excluding and monitoring_wanted(n, context=context)]
     if others:
