@@ -960,3 +960,96 @@ def test_create_repro_derives_the_same_name_it_locks():
         inner = (lcsvc.sanitize(req.name) if req.name
                  else lcsvc.derive_name(req.version, req.preset))
         assert outer == inner and outer
+
+
+def test_backup_uses_kubectl_for_a_kubernetes_workspace_and_compose_for_a_compose_one(
+        monkeypatch, tmp_path):
+    """backup.py's LOGIC is runtime-agnostic -- the bundle format, the manifest, the
+    safety checks are the same on both -- so only the five places that actually
+    touch a container differ, and each asks `_kube` which runtime it is on.
+
+    The alternative was a second copy of a 699-line module, which is how the admin
+    environment ended up drifting between compose.py and the Kubernetes values.
+    """
+    from rc_repro.services import backup as bk
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = bk.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="u", host_port=3000,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+    bk.runner.write("k", "", m)
+
+    monkeypatch.setattr(bk.runner, "compose_exec_capture",
+                        lambda *a, **kw: pytest.fail("it reached for docker compose"))
+    seen = []
+    monkeypatch.setattr(k8s, "exec_capture",
+                        lambda n, argv, **kw: (seen.append(argv), (0, "ok"))[1])
+    assert bk._exec_capture("k", ["true"]) == (0, "ok")
+    assert seen == [["true"]], seen
+
+    # A Compose workspace must still go the other way -- this is a fork, not a swap.
+    c = bk.runner.Metadata(name="c", project="rcrepro-c", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="u", host_port=3001,
+                           version_source="t")
+    bk.runner.write("c", "", c)
+    monkeypatch.setattr(bk.runner, "compose_exec_capture", lambda *a, **kw: (0, "compose"))
+    monkeypatch.setattr(k8s, "exec_capture",
+                        lambda *a, **kw: pytest.fail("it reached for kubectl"))
+    assert bk._exec_capture("c", ["true"]) == (0, "compose")
+
+
+def test_quiescing_a_kubernetes_workspace_leaves_mongodb_running():
+    """A dump needs the database UP and only its writers quiesced.
+
+    `stop_workspace` would take MongoDB with it, which would make the dump
+    impossible rather than consistent -- the same distinction runner already draws
+    between `stop()` and `stop_services()`. So the Kubernetes path scales the
+    Rocket.Chat deployments by label and nothing else.
+    """
+    import inspect
+
+    from rc_repro.services import k8s
+
+    src = inspect.getsource(k8s.scale_rocketchat)
+    assert "app.kubernetes.io/name=rocketchat" in src, \
+        "it must select Rocket.Chat by label, not scale everything"
+    assert "statefulset" not in src.lower(), "MongoDB must keep running"
+
+    # The CALL, not the prose: the comment in _Quiesced names `stop_workspace` to
+    # explain why it is the wrong one, so a substring check passes on the comment
+    # and proves nothing about the code.
+    from rc_repro.services import backup as bk
+    quiesce = inspect.getsource(bk._Quiesced)
+    assert "k8s.scale_rocketchat(" in quiesce, quiesce
+    assert "k8s.stop_workspace(" not in quiesce, "MongoDB must keep running for a dump"
+
+
+def test_restoring_into_a_kubernetes_workspace_does_not_require_docker(
+        monkeypatch, tmp_path):
+    """`require_docker` at the top of `restore` refused a Kubernetes target on a box
+    with no Docker at all -- a check for the wrong runtime, in the one place the
+    target is already known."""
+    from rc_repro.services import backup as bk
+    from rc_repro.services import k8s, lifecycle, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = bk.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="u", host_port=3000,
+                           version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+    bk.runner.write("k", "", m)
+
+    monkeypatch.setattr(lifecycle, "require_docker",
+                        lambda: pytest.fail("it demanded Docker for a k8s workspace"))
+    # Fails later on the missing bundle, which is the point: it got PAST the check.
+    try:
+        bk.restore(tmp_path / "nope.rcbak", name="k")
+    except Exception as exc:            # noqa: BLE001
+        assert "Docker" not in str(exc), exc

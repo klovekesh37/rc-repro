@@ -61,6 +61,13 @@ def build(params: dict) -> Preset:
     if verification:
         env["OVERWRITE_SETTING_Accounts_EmailVerification"] = "true"
 
+    kube = _common._k8s_manifests(
+        name="mailpit", image="docker.io/axllent/mailpit:v1.20",
+        ports=[(_MAILPIT_WEB_PORT, 8025), (1025, 1025)],
+        env={"MP_SMTP_AUTH_ACCEPT_ANY": "1", "MP_SMTP_AUTH_ALLOW_INSECURE": "1"},
+        # Only the web UI is published to the host; SMTP is reached in-cluster by
+        # Rocket.Chat, exactly as it is over the compose network.
+        ui={"mailpit": (_MAILPIT_WEB_PORT, 8025)})
     return Preset(
         name="email",
         description=(
@@ -79,6 +86,7 @@ def build(params: dict) -> Preset:
         },
         extra={config.EXTRA_MAILPIT_URL: mailpit_url},
         ports=list(config.PRESET_PORTS["email"]),
+        kubernetes_manifests=[kube],
         notes=[
             f"Mailpit (EVERY email RC sends, for ALL users, lands here): {mailpit_url}",
             "  — one shared inbox; tell users apart by the To: column.",

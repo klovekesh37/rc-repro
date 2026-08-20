@@ -80,7 +80,21 @@ def workspace(name: str) -> Path:
 
 
 def exists(name: str) -> bool:
-    return (workspace(name) / "docker-compose.yml").exists()
+    """Whether a workspace is here, whatever runtime it runs on.
+
+    This used to be `(workspace/docker-compose.yml).exists()` -- a repro WAS a
+    compose file, which was true of every workspace this tool had ever made. A
+    Kubernetes workspace has no compose file, so it would have been invisible to
+    `list`, `info`, `down` and the name-collision check, and `up` would have
+    silently created a second one over the top of it.
+
+    Either marker counts, which is strictly more permissive than before: no
+    workspace that used to be found can stop being found. repro.json is written
+    after the compose file and both go through `atomic_write`, so a half-written
+    workspace cannot look complete.
+    """
+    ws = workspace(name)
+    return (ws / "docker-compose.yml").exists() or (ws / "repro.json").exists()
 
 
 def _restrict(root: Path) -> None:

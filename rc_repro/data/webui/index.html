@@ -97,6 +97,11 @@
       <h2>New workspace</h2>
       <label>Rocket.Chat version <input name="version" placeholder="8.5.1" required></label>
       <p id="version-hint" class="hint"></p>
+      <div class="row2">
+        <label>Runs on <select name="runtime" id="runtime-select"></select></label>
+        <label>Arrangement <select name="deployment" id="deployment-select"></select></label>
+      </div>
+      <p id="runtime-hint" class="hint"></p>
       <label>Preset <select name="preset" id="preset-select"></select></label>
       <p id="preset-desc" class="hint"></p>
       <div id="preset-params"></div>
@@ -112,6 +117,13 @@
           </select>
         </label>
         <label><input type="checkbox" name="wait" checked> Wait until ready</label>
+        <!-- Kubernetes only, and hidden entirely on Compose -- so it costs the
+             common case nothing and sits where it can be found in the case that
+             has it. Buried under Advanced it was below "Root URL override", which
+             is a long way to hide the switch that decides whether this
+             workspace's MongoDB requires a password. -->
+        <label id="mongo-operator-row" hidden><input type="checkbox" name="mongo_operator">
+          MongoDB via the official operator (adds SCRAM authentication)</label>
       </div>
 
       <details class="adv">
@@ -132,6 +144,8 @@
         <label>RC image override (--rc-image) <input name="rc_image" placeholder="registry/…/rocket.chat"></label>
         <label>Bind host (--bind) <input name="bind" placeholder="127.0.0.1"></label>
         <label>Root URL override (--root-url) <input name="root_url" placeholder="http://localhost:PORT"></label>
+        <label id="replicas-row" hidden>Instances (--replicas)
+          <input name="replicas" type="number" min="1" max="9" placeholder="1"></label>
         <div class="checks">
           <label><input type="checkbox" name="pin"> Pin (persistent + set as default)</label>
           <label><input type="checkbox" name="offline"> Offline (skip live version lookup)</label>

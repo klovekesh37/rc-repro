@@ -1483,3 +1483,132 @@ def test_a_placeholder_url_in_a_link_row_is_left_alone(serve_public, public_page
         shown = public_page.locator(".linkrow").first.locator(".l-u").inner_text().strip()
         assert shown == "<repro-url>/livechat", shown
         assert public_page.errors == [], public_page.errors
+
+
+def test_the_workspace_row_says_kubernetes_and_stays_quiet_about_docker(
+        serve, page, monkeypatch):
+    """A Kubernetes workspace must never look like a Compose one in the list.
+
+    Which commands refuse, where the data lives and how to reach it all differ, and
+    the row was the one place the two were indistinguishable. Shown only when it is
+    NOT the default: Compose is the overwhelming majority, so labelling every row
+    "docker" would be noise on the common case and make the rare one HARDER to spot.
+    """
+    from rc_repro.services import lifecycle as lc
+
+    rows = [dict(_fake_detail(name="kube-one"), runtime="kubernetes"),
+            dict(_fake_detail(name="compose-one"), runtime="docker")]
+    monkeypatch.setattr(lc, "list_repros", lambda: [dict(r) for r in rows])
+    monkeypatch.setattr(lc, "detail", lambda name: dict(rows[0]))
+    monkeypatch.setattr(lc, "resolve_name", lambda name: name)
+    usersvc.add("alice", PASSWORD, role="admin")
+
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.wait_for_function(
+            "() => document.querySelector('#repros').textContent.includes('kube-one')")
+        kube = page.locator(".wrow", has_text="kube-one").locator(".meta").inner_text()
+        compose = page.locator(".wrow", has_text="compose-one").locator(".meta").inner_text()
+
+    assert "k8s" in kube, kube
+    assert "docker" not in compose and "k8s" not in compose, compose
+
+
+def test_the_create_dialog_offers_a_runtime_and_follows_it(serve, page, monkeypatch):
+    """You could not create a Kubernetes workspace from the GUI at all -- the axes
+    existed on CreateReq and in the CLI, and the dialog had no control for either.
+
+    The options come from /api/settings, never a list written in JS: the same
+    reasoning as the privileged fields, where two places deciding the same thing
+    made the dialog offer a field the API rejected.
+
+    And picking Kubernetes has to CHANGE the form, not just the value sent:
+    multi-instance does not exist there, microservices does not exist on Compose,
+    the MongoDB operator is Kubernetes-only, and HTTPS is refused by the service
+    layer -- so offering it would produce a create that fails on submit.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#btn-new")
+        page.click("#btn-new")
+        page.wait_for_selector("#create-dialog[open]")
+
+        # Compose is the default and its arrangement list is Compose's.
+        assert page.locator("#runtime-select").input_value() == "docker"
+        deployments = page.locator("#deployment-select option").all_inner_texts()
+        assert any("monolith" in d for d in deployments), deployments
+        assert any("multi-instance" in d for d in deployments), deployments
+        assert not any("microservices" in d for d in deployments), deployments
+        assert page.locator("#mongo-operator-row").is_hidden()
+
+        page.select_option("#runtime-select", "kubernetes")
+        deployments = page.locator("#deployment-select option").all_inner_texts()
+        assert any("microservices" in d for d in deployments), deployments
+        # The RUNTIME'S default, not the one Compose had selected: `--runtime k8s`
+        # on the CLI defaults to microservices, and the two must not disagree.
+        assert page.locator("#deployment-select").input_value() == "microservices"
+        assert not any("multi-instance" in d for d in deployments), deployments
+        # Kubernetes-only control appears; HTTPS, which the service layer refuses
+        # on this runtime, goes away.
+        assert page.locator("#mongo-operator-row").is_visible()
+        # `hidden` rather than is_visible: the HTTPS block lives inside the
+        # Advanced disclosure, so is_visible() would be answering about the
+        # twisty, not about the runtime.
+        assert page.eval_on_selector("#create-https-block", "e => e.hidden") is True
+        assert "Kubernetes" in page.locator("#runtime-hint").inner_text() or \
+            page.locator("#runtime-hint").inner_text() != ""
+
+        # An arrangement the user PICKS must stick. Wiring the runtime handler to
+        # this select too made every choice snap back to the runtime default:
+        # picking monolith on Kubernetes created a microservices workspace, and the
+        # dialog looked correct throughout. Found by clicking, not by a test.
+        page.select_option("#deployment-select", "monolith")
+        assert page.locator("#deployment-select").input_value() == "monolith"
+        assert page.locator("#replicas-row").is_hidden(), \
+            "replicas mean nothing on a monolith"
+        page.select_option("#deployment-select", "microservices")
+        assert page.locator("#deployment-select").input_value() == "microservices"
+
+        # Back to Compose and HTTPS returns -- the hiding is a consequence of the
+        # choice, not a one-way door.
+        page.select_option("#runtime-select", "docker")
+        assert page.eval_on_selector("#create-https-block", "e => e.hidden") is False
+        assert page.locator("#mongo-operator-row").is_hidden()
+
+
+def test_creating_a_kubernetes_workspace_sends_the_axes(serve, page, monkeypatch):
+    """The payload is what matters: a dialog that renders the control and posts
+    nothing extra would look right and build a Compose workspace."""
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#btn-new")
+        sent = []
+        page.route("**/api/repros", lambda route: (
+            sent.append(route.request.post_data),
+            route.fulfill(status=200, content_type="application/json",
+                          body='{"job_id": "j1"}')))
+        page.click("#btn-new")
+        page.wait_for_selector("#create-dialog[open]")
+        page.fill("input[name=version]", "8.5.1")
+        page.select_option("#runtime-select", "kubernetes")
+        page.select_option("#deployment-select", "microservices")
+        page.check("input[name=mongo_operator]")
+        page.click("#create-submit")
+        for _ in range(40):
+            if sent:
+                break
+            page.wait_for_timeout(100)
+
+    assert sent, "the create was never POSTed"
+    import json as _json
+    body = _json.loads(sent[0])
+    assert body["runtime"] == "kubernetes", body
+    assert body["deployment"] == "microservices", body
+    assert body["mongo_operator"] is True, body

@@ -2540,3 +2540,259 @@ def test_every_rocketchat_instance_keeps_its_healthcheck():
         assert svcs[s].get("healthcheck"), f"{s} lost its healthcheck"
     assert "rocketchat-1" in str(svcs["rocketchat-2"].get("depends_on")), \
         "the cold-start serialisation depends on rocketchat-1 being healthy"
+def test_a_compose_only_command_refuses_cleanly_rather_than_traceback(monkeypatch, tmp_path):
+    """Found by running the command, not by the suite.
+
+    Adding the topology guard to `stats` made it the FIRST raiser of a ReproError
+    in a command that had no `except errors.ReproError` handler — every other
+    handler was wired when the taxonomy landed, but `stats` had never needed one.
+    The guard therefore escaped as a rich traceback and exit 1: a stack dump where
+    the user should see one red line, and the one exit code the README defines as
+    "a bug in rc-repro" for a condition that is entirely expected.
+
+    This is the shape the whole taxonomy exists to prevent, so it is pinned at the
+    process boundary where a script would see it.
+    """
+    from typer.testing import CliRunner
+
+    from rc_repro import cli, runner as runner_mod
+    from rc_repro.services import topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = runner_mod.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
+                            mongo_tag="8.0", mongo_flavor="official", preset="default",
+                            root_url="u", host_port=3010, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    runner_mod.write("k", "services: {}\n", m)
+    monkeypatch.setattr(runner_mod, "docker_available", lambda **_k: True)
+
+    res = CliRunner().invoke(cli.app, ["stats", "--name", "k", "--for", "1"])
+    assert res.exit_code == 2, f"a compose-only refusal exited {res.exit_code}, expected 2"
+    assert res.exception is None or isinstance(res.exception, SystemExit), (
+        "the error escaped as an exception instead of being rendered")
+    assert "kubectl top" in res.output, "the alternative is stated to the user"
+    assert "Traceback" not in res.output
+
+
+def test_both_spellings_of_multi_instance_build_the_same_compose_file():
+    """The migration gate. `multi-instance` moved out of `--preset` and into
+    `--deployment`, and the old spelling stays as a permanent alias -- so the two
+    must be the SAME stack, not merely similar ones.
+
+    Byte-identical, not "still works": a one-line difference would mean the alias
+    quietly builds a different topology than the command it claims to replace,
+    which is exactly the failure nobody would notice until a ticket reproduced
+    differently under the new flag.
+    """
+    from rc_repro import compose, presets, versions
+    from rc_repro.services import topology as T
+
+    def built(**kwargs) -> str:
+        axes = T.resolve_axes(**kwargs)
+        pre = presets.load(axes.preset, axes.params)
+        resolved = versions.resolve("8.5.1", offline=True)
+        spec = compose.Spec.from_resolved(
+            resolved, project_name="rcrepro-x", root_url="http://localhost:3000",
+            host_port=3000, reg_token=None, preset=pre, bind_host="127.0.0.1")
+        return compose.to_yaml(compose.build(spec))
+
+    old = built(preset="multi-instance", params={"instances": "3"})
+    new = built(deployment="multi-instance", replicas=3)
+    assert old == new, "the alias builds a different stack than the flag it replaces"
+
+    # The preset's own default count survives the move too.
+    assert built(preset="multi-instance") == built(deployment="multi-instance")
+
+    # A plain monolith is untouched by any of this -- the overwhelming majority of
+    # command lines in use say neither flag.
+    assert built(preset="default") == built()
+
+    # And the count actually reaches the document, so the assertion above is not
+    # comparing two identically-wrong files.
+    import yaml as _yaml
+    services = _yaml.safe_load(new)["services"]
+    rc = [s for s in services if s.startswith("rocketchat")]
+    assert len(rc) == 3, f"expected 3 Rocket.Chat services, got {rc}"
+    assert len([s for s in _yaml.safe_load(built(deployment="multi-instance"))["services"]
+                if s.startswith("rocketchat")]) == 2
+
+
+def test_preset_and_topology_agree_on_what_the_runtimes_are_called():
+    """One vocabulary for the same two things.
+
+    `services/topology.py` is the registry every other layer reads -- repro.json,
+    the CLI, the GUI and the HTTP API all say "docker"/"kubernetes". PR #3's preset
+    layer said "compose"/"kubernetes" for the same pair. A second set of words for
+    one concept is how `mongo_flavor` ended up being reported for a runtime that
+    does not honour it, so the preset layer speaks the same words.
+
+    `presets` is the LOWER layer and must not import `services`, so the constant is
+    spelled out there and this test is what an import would have guaranteed.
+    """
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    assert presets._RUNTIME_DEFAULT == topology.DOCKER
+    ldap = presets._scenario_definitions()["ldap"]
+    assert set(ldap.adapters) <= topology.REGISTERED, sorted(ldap.adapters)
+    assert topology.DOCKER in ldap.adapters and topology.KUBERNETES in ldap.adapters
+
+
+def test_one_ldap_intent_renders_for_both_runtimes():
+    """The whole point of the Scenario contract, and the reason it was worth taking.
+
+    One deployment-neutral intent, one small adapter per runtime. The Rocket.Chat
+    settings are SHARED -- `OVERWRITE_SETTING_LDAP_*` is identical either way --
+    and only the backing service differs: a compose service on one side, native
+    manifests on the other. That is what makes a preset a single thing rather than
+    two implementations that drift.
+    """
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    params = {"users": "7", "domain": "example.org"}
+    compose = presets.resolve("ldap", topology.DOCKER, params)
+    kube = presets.resolve("ldap", topology.KUBERNETES, params)
+
+    assert compose.scenario == kube.scenario == "ldap"
+    assert compose.scenario_params == kube.scenario_params
+    # The settings Rocket.Chat needs are the same on both; that is the shared half.
+    for key in ("OVERWRITE_SETTING_LDAP_BaseDN", "OVERWRITE_SETTING_LDAP_Host"):
+        assert compose.env[key] == kube.env[key], key
+    # The backing service is where they differ, and only there.
+    assert compose.services and not compose.kubernetes_manifests
+    assert kube.kubernetes_manifests and not kube.services
+
+
+def test_deployments_are_not_presets_on_this_branch():
+    """PR #3 modelled `microservices` as a PRESET that implies Kubernetes, so the
+    runtime was inferred from the scenario name. This branch models it as a
+    DEPLOYMENT under an explicit `--runtime`, which is why `resolve_selection`,
+    `DEPLOYMENT_PRESETS` and the alias map were left behind rather than taken.
+
+    Keeping both would have given two answers to "what runs where" -- and the one
+    that infers would have quietly won, because it needs no flag.
+    """
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    assert not hasattr(presets, "resolve_selection")
+    assert not hasattr(presets, "DEPLOYMENT_PRESETS")
+    # Deployments live in exactly one place.
+    assert topology.MICROSERVICES in topology.DEPLOYMENTS[topology.KUBERNETES]
+    assert topology.MULTI_INSTANCE in topology.DEPLOYMENTS[topology.DOCKER]
+    assert "microservices" not in presets.scenario_names()
+
+
+def test_a_scenario_ui_is_published_on_the_same_port_on_both_runtimes():
+    """A ticket's instructions must not depend on where the workspace runs.
+
+    Compose publishes phpLDAPadmin by mapping a host port; Kubernetes cannot, so the
+    Service carries a label naming the port and the lifecycle forwards it. Both read
+    the SAME number out of `config.PRESET_PORTS`, which is why "open
+    http://localhost:8082" is true either way.
+
+    NodePort was the obvious alternative and does not work: its range is 30000-32767
+    so the port would differ from Compose's, kind's nodes are unreachable from the
+    host on macOS and Windows, and `extraPortMappings` is fixed at cluster-create
+    time -- which for a cluster shared by every workspace means recreating it to add
+    a preset.
+    """
+    import yaml
+
+    from rc_repro import config, presets
+    from rc_repro.services import k8s, topology
+
+    want = config.PRESET_PORTS["ldap"][0]
+
+    compose = presets.resolve("ldap", topology.DOCKER, {})
+    published = compose.services["phpldapadmin"]["ports"]
+    assert published == [f"{want}:80"], published
+    assert compose.ports == [want], compose.ports
+
+    kube = presets.resolve("ldap", topology.KUBERNETES, {})
+    docs = [d for d in yaml.safe_load_all(kube.kubernetes_manifests[0]) if d]
+    svc = [d for d in docs
+           if d["kind"] == "Service" and d["metadata"]["name"] == "phpldapadmin"][0]
+    assert svc["metadata"]["labels"][k8s.UI_PORT_LABEL] == str(want)
+    assert svc["spec"]["ports"][0]["port"] == 80
+
+    # The label the lifecycle looks for and the label the adapter writes are the
+    # same constant, not two strings that happen to match today.
+    from rc_repro.presets import ldap as ldap_mod
+    assert ldap_mod.UI_PORT_LABEL == k8s.UI_PORT_LABEL
+
+
+def test_the_ldap_directory_can_be_looked_at_on_both_runtimes():
+    """"Is the user there, and what attributes does it have" is the first question
+    of nearly every LDAP ticket, and answering it used to mean `docker exec ...
+    ldapsearch`. Both renderings ship the browser now, and both keep the directory
+    itself -- a UI that reaches nothing is not worth the megabytes."""
+    import yaml
+
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    compose = presets.resolve("ldap", topology.DOCKER, {})
+    assert set(compose.services) == {"openldap", "phpldapadmin"}, sorted(compose.services)
+    assert compose.services["phpldapadmin"]["depends_on"] == ["openldap"]
+
+    kube = presets.resolve("ldap", topology.KUBERNETES, {})
+    kinds = [(d["kind"], d["metadata"]["name"])
+             for d in yaml.safe_load_all(kube.kubernetes_manifests[0]) if d]
+    assert ("Deployment", "phpldapadmin") in kinds, kinds
+    assert ("Deployment", "openldap") in kinds, kinds
+    assert ("ConfigMap", "openldap-bootstrap") in kinds, kinds
+
+
+def test_keycloak_carries_both_renderings_on_one_preset():
+    """Deliberately NOT a Scenario with two adapters like `ldap`.
+
+    Keycloak's intent survives the crossing untouched: the realm JSON is
+    byte-identical, the settings Rocket.Chat needs are identical, and the post_ready
+    actions are REST calls that do not care where the IdP runs. Only the container's
+    packaging differs -- so one Preset carries both renderings and each runtime reads
+    the half it understands. Two adapters would have been two copies of the same
+    realm to keep in step.
+    """
+    import yaml
+
+    from rc_repro import config, presets
+    from rc_repro.presets import _keycloak
+
+    for name in ("saml", "oidc"):
+        p = presets.load(name, {"users": "3"})
+        assert "keycloak" in p.services, name
+        docs = [d for d in yaml.safe_load_all(p.kubernetes_manifests[0]) if d]
+        kinds = {d["kind"]: d for d in docs}
+        assert set(kinds) == {"ConfigMap", "Deployment", "Service"}, sorted(kinds)
+
+        # The realm the two renderings ship must be the SAME bytes, or a ticket
+        # reproduced on one runtime is not the ticket reproduced on the other.
+        compose_realm = dict(p.files)[f"{name}/keycloak-realm.json"]
+        assert kinds["ConfigMap"]["data"]["rcrepro-realm.json"] == compose_realm
+
+        # `keycloak` on both, because RC's backend and the browser must resolve the
+        # same hostname -- OIDC uses one URL for the authorize redirect AND the
+        # token exchange.
+        assert kinds["Service"]["metadata"]["name"] == "keycloak"
+        want = config.PRESET_PORTS[name][0]
+        assert kinds["Service"]["spec"]["ports"][0]["port"] == want
+        assert kinds["Service"]["metadata"]["labels"][_keycloak.UI_PORT_LABEL] == str(want)
+
+
+def test_the_realm_lands_as_a_file_not_a_directory():
+    """A ConfigMap mounted at a file path WITHOUT subPath becomes a directory of
+    that name, and Keycloak's `--import-realm` would find no realm to import. The
+    LDAP adapter got this right; this asserts the Keycloak one does too, because
+    the failure is silent -- the container starts happily with an empty realm."""
+    import yaml
+
+    from rc_repro import presets
+
+    docs = [d for d in yaml.safe_load_all(
+        presets.load("oidc", {}).kubernetes_manifests[0]) if d]
+    dep = [d for d in docs if d["kind"] == "Deployment"][0]
+    mount = dep["spec"]["template"]["spec"]["containers"][0]["volumeMounts"][0]
+    assert mount["subPath"] == "rcrepro-realm.json", mount
+    assert mount["mountPath"].endswith("/import/rcrepro-realm.json"), mount

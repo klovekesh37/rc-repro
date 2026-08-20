@@ -7,18 +7,26 @@ never call typer / sys.exit / typer.confirm.
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import shutil
+import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from dataclasses import asdict
+from pathlib import Path
+
 from rc_repro import compose, config, presets, rcapi, runner, versions
 from rc_repro import seed as seeder
 from rc_repro.errors import (ConflictError, DockerError, NotFoundError,
-                             NotReadyError, PreflightError, ValidationError)
+                             NotReadyError, PreflightError, ReproError,
+                             ValidationError)
 from rc_repro.services import audit as auditsvc
 from rc_repro.services import edge as edgesvc
-from rc_repro.services import diagnose, postready
+from rc_repro.services import diagnose, postready, topology
 from rc_repro.services.events import Emit, info, null_emit, warn
 
 _NAME_RE = re.compile(r"[^a-z0-9-]+")
@@ -116,6 +124,45 @@ PRESET_MB = {"saml": 450, "oidc": 450, "s3_minio": 120, "ldap": 80,
              "livechat": 60, "multi-instance": 400, "email": 40}
 #: Prometheus + Grafana + Loki + the OTel collector + two exporters.
 MONITORING_MB = 280
+
+# Kubernetes costs on top of a workspace, and both are load-bearing for the same
+# reason WORKSPACE_MB is: the formula that refuses a create has to know what it is
+# about to start, or it refuses the wrong things and permits the fatal ones.
+#
+# CLUSTER_MB is MEASURED -- `docker stats kind-control-plane` reads 573 MiB idle on
+# this box -- and is charged ONCE, only when the cluster still has to be created.
+# Every workspace after that shares it.
+CLUSTER_MB = 600
+
+# KUBE_CHART_MB is what the CHART costs beyond the app itself, and it applies to
+# both deployments. Measured, and it corrected an assumption: a "monolith" on this
+# chart is FIVE pods, not two -- it runs NATS (two pods plus nats-box) regardless
+# of `microservices.enabled`, which Compose's monolith does not. A live monolith
+# workspace plus a fresh cluster took the host from 8322 MB available to 6351, so
+# 1971 MB total with NATS still starting; against WORKSPACE_MB + CLUSTER_MB = 1700
+# that leaves roughly this much unaccounted for.
+KUBE_CHART_MB = 500
+
+# MICROSERVICES_MB is now HALF measured, and the halves are worth separating.
+#
+# MEASURED: a microservices workspace on chart 7.0.2 is nine pods against a
+# monolith's five, and the four extra are `account`, `authorization`,
+# `ddp-streamer` and `presence`. Not five -- this chart version ships no
+# `stream-hub` deployment, which the earlier estimate assumed it did.
+#
+# STILL ESTIMATED: what those four cost. The memory delta could NOT be measured,
+# and the reason is worth recording so nobody trusts the number more than it
+# deserves: both readings -- 1971 MB for the monolith, 1787 MB for microservices --
+# were taken at readiness, while several pods were still ContainerCreating. They
+# are early reads, they are within noise of each other, and the microservices one
+# came out LOWER, which cannot be true. A real figure needs a settle-time wait and
+# per-pod `docker stats`.
+#
+# So this is 4 pods x ~200 MB, and it stays deliberately on the generous side:
+# under-charging lets through a create that OOMs a swapless host, where the kernel
+# picks its own victim and destroys somebody else's work.
+MICROSERVICES_MB = 800
+
 #: Left unspent: for the OS, Docker, the page cache -- and, mostly, for GROWTH.
 #: A fifth of the host, never below 1 GB.
 #:
@@ -157,6 +204,41 @@ def capacity() -> dict:
             "room": max(0, avail_mb - reserve) // WORKSPACE_MB}
 
 
+def _kube_overhead_mb(req: "CreateReq") -> int:
+    """What Kubernetes adds to a workspace's memory bill, in MB.
+
+    Zero for Compose, which is every workspace today. The control plane is charged
+    only when it still has to be created: it is shared, so billing it to the second
+    and third workspace would refuse creates the host could actually hold -- and a
+    capacity check that is wrong in the safe direction still stops people using the
+    tool, which is how they learn to pass --force by reflex.
+    """
+    from rc_repro.services import topology
+    if topology.normalize(getattr(req, "runtime", "")) != topology.KUBERNETES:
+        return 0
+    # The chart's own baseline, on both deployments -- see KUBE_CHART_MB.
+    need = KUBE_CHART_MB
+    try:
+        from rc_repro.services import k8s
+        # Specifically OUR cluster, not "a reachable cluster". rc-repro creates its
+        # own, so somebody else's cluster being up does not mean the control plane
+        # is already paid for. Charging on `cluster_reachable` billed zero on a box
+        # whose only cluster belonged to someone else.
+        if not k8s.preflight().cluster_exists:
+            need += CLUSTER_MB
+    except Exception:  # noqa: BLE001 - an unprobeable cluster is charged for
+        need += CLUSTER_MB
+    # An empty deployment means "that runtime's default", which for Kubernetes is
+    # microservices -- the expensive one. Reading empty as free would under-charge
+    # the common case, and `check_capacity` can be reached with an unresolved
+    # request from `restore` and the GUI as well as from `up`.
+    deployment = getattr(req, "deployment", "") or topology.DEPLOYMENTS[
+        topology.KUBERNETES][0]
+    if deployment == topology.MICROSERVICES:
+        need += MICROSERVICES_MB
+    return need
+
+
 def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_emit) -> None:
     """Refuse to create a workspace the host cannot hold.
 
@@ -184,6 +266,11 @@ def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_em
     need = WORKSPACE_MB + PRESET_MB.get(preset_name, 0)
     if req.monitor:
         need += MONITORING_MB
+    # A Kubernetes workspace is not a Compose workspace with a different label. It
+    # brings a control plane if there is not one yet, and microservices runs six
+    # more processes than a monolith -- charging it as Compose would let through
+    # exactly the create this function exists to refuse.
+    need += _kube_overhead_mb(req)
 
     reserve = host_reserve_mb(total_mb)
     headroom = available_mb - reserve
@@ -201,7 +288,7 @@ def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_em
     swap_note = ("\n  This host has NO SWAP, so there is no buffer at all: memory "
                  "pressure becomes an OOM kill rather than slowdown."
                  if swap_mb == 0 else "")
-    raise NotReadyError(
+    raise PreflightError(
         f"not enough memory: this workspace needs about {need} MB and only "
         f"{max(0, headroom)} MB is free to use "
         f"({available_mb} MB available, {reserve} MB kept for the OS, Docker and "
@@ -448,6 +535,17 @@ class CreateReq:
     force: bool = False
     monitor: bool = False
     stats: bool = False
+    # The three axes (services/topology.py). Empty/0 means "that runtime's
+    # default", never "unset but meaningful" -- resolve_axes turns them into
+    # canonical values, and writes the deployment back out as a preset + params so
+    # the rest of create is unchanged.
+    runtime: str = ""
+    deployment: str = ""
+    replicas: int = 0
+    # Kubernetes only. The operator brings SCRAM auth and owns the MongoDB
+    # bootstrap; it is opt-in because its default would replace a path proven on a
+    # live cluster with one that is not. See services/k8s.py.
+    mongo_operator: bool = False
     # HTTPS. Two ways in, matching the official docs' DOMAIN + LETSENCRYPT_EMAIL:
     #   --domain [+ --email]  a Let's Encrypt certificate for a public hostname
     #   --https               a certificate from rc-repro's own local CA, no domain
@@ -663,6 +761,50 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
 
 def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
                          stream_output: bool = False) -> dict:
+    # An existing workspace's RECORDED runtime beats the flag default. Without this,
+    # `rc-repro up -v 8.5.1 --name X` on a Kubernetes workspace defaulted to docker
+    # and ran `docker compose up` against a workspace with no compose file:
+    #
+    #     'rc8-5-1' already exists - bringing it back up.
+    #     no configuration file provided: not found
+    #     error: `docker compose up` failed
+    #
+    # The flag says what to CREATE. What already exists is a fact, not a preference,
+    # and `--runtime` is only consulted when there is nothing to consult instead.
+    # Read BEFORE resolve_axes: it normalises an empty --runtime to "docker",
+    # after which `not req.runtime` is never true and this could not fire.
+    existing = _derive_for(req)
+    if not req.runtime and existing and runner.exists(existing):
+        req.runtime = topology.of_repro(existing)
+    # Runtime x deployment x scenario, decided before anything else looks at the
+    # request. The resolved axes are written BACK onto `req` as a preset name and
+    # `--set` params, so every reader below -- name derivation, the preset loader,
+    # capacity, repro.json -- is untouched and `--deployment multi-instance
+    # --replicas 3` reaches compose.build by the exact path `--preset
+    # multi-instance --set instances=3` always did.
+    axes = topology.resolve_axes(runtime=req.runtime, deployment=req.deployment,
+                                 replicas=req.replicas, preset=req.preset,
+                                 params=req.params)
+    topology.require_registered(axes.runtime)
+    for hint in axes.hints:
+        info(emit, hint, phase="plan")
+    req.preset, req.params = axes.preset, axes.params
+    req.runtime, req.deployment, req.replicas = (axes.runtime, axes.deployment,
+                                                 axes.replicas)
+    if req.runtime == topology.KUBERNETES:
+        # A PARALLEL path, not a branch woven through this function. Everything
+        # below is compose-shaped -- host ports, a compose document, `docker
+        # compose up` -- and two front-ends depend on it behaving exactly as it
+        # does. Handing Kubernetes off here keeps the Docker default byte-identical
+        # and puts the Kubernetes sequence in the module that owns it.
+        #
+        # TLS is refused rather than ignored. `_resolve_tls` runs BELOW this line,
+        # so `--https` on a Kubernetes workspace did nothing at all and said nothing
+        # about it -- the workspace came up on plain http and the flag evaporated.
+        # Silently doing less than asked is the failure this whole runtime split has
+        # produced most often, so it is named here rather than discovered later.
+        _refuse_unsupported_on_kubernetes(req)
+        return _create_kubernetes(req, emit=emit)
     require_docker()
     cfg = config.load_config()
 
@@ -779,6 +921,10 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
         host_port=host_port, version_source=resolved.source, pinned=req.pin,
         public_url=public,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    # Stamped on every create, compose included, so "absent" keeps meaning exactly
+    # one thing: a workspace older than the key. See services/topology.py.
+    topology.stamp(meta.extra, req.runtime or topology.DOCKER)
+    meta.extra[config.EXTRA_DEPLOYMENT] = req.deployment or topology.MONOLITH
     if pre.post_ready:
         meta.extra["post_ready"] = pre.post_ready
     if pre.notes:
@@ -1021,6 +1167,14 @@ def _up(name: str, *, pull: bool, emit: Emit, stream_output: bool) -> int:
 # --- readiness / finalize -----------------------------------------------------
 
 def wait_serving(meta: runner.Metadata, emit: Emit, timeout: float) -> dict:
+    if topology.of_meta(meta) == topology.KUBERNETES:
+        # `rc_state` asks docker whether a CONTAINER is running, so `ready` on a
+        # Kubernetes workspace answered "Rocket.Chat container is not running" about
+        # a workspace whose pods were fine. It also re-establishes the port-forward,
+        # which is the whole reason `ready` is the right place to ask: a forward
+        # dies with its pod, and this is the command someone runs when the URL is
+        # not answering.
+        return _wait_serving_kubernetes(meta, emit, timeout)
     seen = {"restarts": 0}
 
     def is_alive() -> bool:
@@ -1123,6 +1277,7 @@ _PRESET_LINKS = {
     "saml": [("Keycloak", 0)],
     "oidc": [("Keycloak", 0)],
     "livechat": [("Widget site", 0)],
+    "ldap": [("phpLDAPadmin", 0)],
 }
 
 
@@ -1214,8 +1369,16 @@ def list_repros() -> list[dict]:
         rc_status = status_map.get(m.project, "")
         # `states` is only consulted for "does this project have ANY container",
         # never for the state itself -- see repro_state().
-        state = "?" if not docker_up else repro_state(rc_status, bool(states.get(m.project)))
+        # A Kubernetes workspace has no compose project, so asking docker whether
+        # its containers exist answered `down` for a workspace that was running --
+        # the state column was reporting on the wrong runtime entirely.
+        if topology.of_meta(m) == topology.KUBERNETES:
+            state = kubernetes_state(m.name, m)
+        else:
+            state = "?" if not docker_up else repro_state(
+                rc_status, bool(states.get(m.project)))
         uptime, health = _uptime_health(rc_status)
+        runtime = topology.of_meta(m)
         monitored = bool(isinstance(m.extra, dict) and m.extra.get("monitoring"))
         extra_ = m.extra if isinstance(m.extra, dict) else {}
         owner = extra_.get("owner") or extra_.get("created_by", "")
@@ -1223,6 +1386,11 @@ def list_repros() -> list[dict]:
                     "owner": owner, "made_by": extra_.get("created_by", ""),
                     "rc_version": m.rc_version, "mongo_tag": m.mongo_tag,
                     "host_port": m.host_port, "root_url": m.root_url, "state": state,
+                    # Which runtime, so a row can say so. A Compose and a Kubernetes
+                    # workspace differ in what every other command will do to them --
+                    # which commands refuse, where the data lives, how to reach it --
+                    # and the list was the one place both looked identical.
+                    "runtime": runtime,
                     # The https URL when `up --https` was used; "" otherwise. The CLI
                     # and GUI show this in preference to root_url, which stays http.
                     "public_url": m.public_url, "tls": m.extra.get("tls", "") if isinstance(m.extra, dict) else "",
@@ -1308,6 +1476,15 @@ def detail(name: str) -> dict:
         d["env"] = _env_rows(runner.read_compose(target), m.extra.get("env")
                              if isinstance(m.extra, dict) else None)
         return d
+    if topology.of_meta(m) == topology.KUBERNETES:
+        # Same reason as `list_repros`. The panel's containers/env/health blocks are
+        # compose-shaped and stay empty rather than being faked: an empty list is a
+        # readable absence, and invented rows would be a plausible wrong answer.
+        d["state"] = kubernetes_state(target, m)
+        d["containers"] = []
+        d["uptime"] = ""
+        d["health"] = ""
+        return d
     containers = runner.container_details(target)
     rc = [c for c in containers if c["service"] == "rocketchat" or c["service"].startswith("rocketchat-")]
     rc_status = next((c["status"] for c in rc), "")
@@ -1330,12 +1507,21 @@ def detail(name: str) -> dict:
 
 def set_state(name: str, action: str) -> None:
     target = resolve_name(name)
+    # Guarded here rather than in each front-end: the CLI's `stop`/`start`/`restart`
+    # and the GUI's always-enabled buttons both arrive through this one function, so
+    # one guard covers both and cannot drift between them.
+    #
     # Looked up by a hashable key: `action` arrives from a JSON body, and a dict or
     # list reached .get() and raised "unhashable type" -- a 500 rather than the
-    # "unknown action" this already knows how to say.
+    # "unknown action" this already knows how to say. Validated BEFORE the runtime
+    # split so a bad action is rejected the same way on both.
     if not isinstance(action, str):
         raise ValidationError(f"action must be a string (want start|stop|restart), "
                               f"got {type(action).__name__}")
+    if action not in ("start", "stop", "restart"):
+        raise ValidationError(f"unknown action {action!r} (want start|stop|restart)")
+    if topology.of_repro(target) == topology.KUBERNETES:
+        return _set_state_kubernetes(target, action)
     fn = {"start": runner.start, "stop": runner.stop, "restart": runner.restart}.get(action)
     if fn is None:
         raise ValidationError(f"unknown action {action!r} (want start|stop|restart)")
@@ -1356,6 +1542,35 @@ def set_state(name: str, action: str) -> None:
                 hint = (f" - {target!r} was `down`ed, so it has no containers to "
                         "start; recreate them from its stored metadata instead")
             raise DockerError(f"`docker compose {action}` failed for {target!r}{hint}")
+
+
+def _set_state_kubernetes(target: str, action: str) -> None:
+    """stop/start/restart by scaling, which is the nearest true thing Kubernetes has.
+
+    Compose's contract is what this has to match, not Kubernetes' vocabulary: `stop`
+    gives the memory back and keeps the data, `start` brings the same workspace back
+    on the same port. Scaling to 0 does exactly that -- the PersistentVolumeClaim is
+    untouched, so this is as far from `down --volumes` as `docker compose stop` is.
+
+    The port-forward is a real difference and is handled rather than ignored: it dies
+    with the pod, so `stop` kills it deliberately (leaving it would publish a port
+    that answers nothing) and `start` hands back to `ready`, which re-establishes it.
+    """
+    from rc_repro.services import k8s
+
+    meta = runner.read_meta(target)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    context = str(extra.get("context") or k8s.CONTEXT)
+    with runner.repro_lock(target, timeout=_INTERACTIVE_LOCK_WAIT):
+        if action in ("stop", "restart"):
+            k8s.stop_workspace(target, context=context)
+            pid = extra.get("port_forward_pid")
+            if pid:
+                _stop_port_forward(int(pid))
+                runner.update_meta(target,
+                                   lambda m: m.extra.pop("port_forward_pid", None))
+        if action in ("start", "restart"):
+            k8s.start_workspace(target, context=context)
 
 
 def _clear_default_if(name: str) -> None:
@@ -1470,6 +1685,54 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
     # `down --volumes` during an upgrade destroys the workspace while its
     # pre-upgrade bundle survives, so `upgrade --rollback` can never find it again.
     with runner.repro_lock(target, timeout=_INTERACTIVE_LOCK_WAIT):
+        if topology.of_repro(target) == topology.KUBERNETES:
+            # Deliberately BELOW the confirmation, the ownership gate and the audit
+            # record: all three are about whose data is being destroyed, which does
+            # not depend on the runtime, and duplicating them here is how one
+            # runtime quietly loses a check the other keeps. Inside the lock for
+            # the same reason compose is.
+            #
+            # Without this dispatch, `down` reached for a compose project that is
+            # not there and answered "no configuration file provided: not found" --
+            # a workspace that could be CREATED and never removed, which is worse
+            # than not being able to create one.
+            from rc_repro.services import k8s
+            meta = runner.read_meta(target)
+            context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
+            pid = (meta.extra or {}).get("port_forward_pid")
+            if pid:
+                _stop_port_forward(int(pid))
+            # A preset's UI forwards too, or `down` leaves 8082 bound to a namespace
+            # that no longer exists -- and the NEXT workspace using that preset finds
+            # the port taken by a corpse.
+            for ui_pid in (meta.extra or {}).get("scenario_forwards", {}).values():
+                try:
+                    _stop_port_forward(int(ui_pid))
+                except (TypeError, ValueError):
+                    pass
+            found = k8s.delete_namespace(target, context=context, volumes=volumes,
+                                         emit=emit)
+            if volumes:
+                shutil.rmtree(runner.workspace(target), ignore_errors=True)
+                _clear_default_if(target)
+            # Docker's nouns are wrong here. "containers, data volume, and
+            # record" for a workspace that has a namespace and a PVC says nothing
+            # about what actually went away -- and `helm uninstall` does NOT delete
+            # a PVC, so the difference between these two paths is precisely the
+            # thing the user needs told.
+            if volumes:
+                info(emit, f"{target!r} removed — namespace "
+                           f"{k8s.namespace_for(target)}, its "
+                           "PersistentVolumeClaim and the local record",
+                     phase="done")
+            else:
+                info(emit, f"{target!r} down — the {k8s.RELEASE} release is "
+                           f"uninstalled; namespace {k8s.namespace_for(target)} "
+                           "and its PersistentVolumeClaim are KEPT, so `up` again "
+                           "reuses the data. `down --volumes` deletes it.",
+                     phase="done")
+            return {"name": target, "removed": volumes, "found": found,
+                    "runtime": topology.KUBERNETES}
         # BEFORE `down`, not after: compose cannot remove a network that still has
         # an active endpoint, and the edge attached to it is exactly that -- so
         # leaving it attached makes `down` fail with "network has active
@@ -1492,6 +1755,7 @@ def prunable() -> list[str]:
     """Names of repros that are safe to prune: not pinned and with no containers
     (a plain `down`). Raises DockerError if docker can't be queried — deleting on
     that ambiguity would be destructive."""
+
     require_docker()
     states = runner.project_states()
     if states is None:
@@ -1535,3 +1799,378 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         removed.append(name)
         info(emit, f"pruned {name!r}", phase="done")
     return {"targets": targets, "removed": removed}
+
+
+#: What `up` accepts on Compose and cannot honour on Kubernetes, with the reason.
+#: Each of these was ACCEPTED and silently dropped: the create succeeded, said
+#: nothing, and produced a workspace that was not what was asked for. `--preset ldap`
+#: is the clearest -- the Kubernetes path's only `presets.load` is a hardcoded
+#: "default", so the preset name was written into repro.json and nothing else
+#: happened. `rc-repro list` then showed "ldap" for a workspace with no LDAP in it.
+#:
+#: This is the failure mode of the whole runtime split, and it has now produced
+#: `--seed`, `--https`, `mongo_flavor`, `mongo_shell` and these. A refusal that names
+#: the missing thing is worth more than a create that quietly does less.
+_KUBERNETES_UNSUPPORTED: tuple[tuple[str, str], ...] = (
+    # `https`, not `tls`. The first cut of this guard read `getattr(req, "tls", "")`
+    # -- a field CreateReq does not have -- so it returned "" every time and the
+    # refusal never fired once. It was shipped, described in a commit message, and
+    # was dead code: `--https` went on being silently dropped exactly as before. A
+    # guard keyed on a name nobody checks is worse than no guard, because the
+    # docstring then says the case is handled. Hence the loop reads real fields and
+    # the test drives it through CreateReq rather than a hand-made object.
+    ("https", "HTTPS needs an ingress controller and cert-manager, not the Traefik "
+              "edge Compose uses"),
+    ("domain", "a public domain needs the ingress that HTTPS needs"),
+    ("reg_token", "the EE registration token is injected through the preset "
+                  "environment, which this runtime does not apply yet"),
+    ("fresh", "--fresh means DELETE this workspace's data, and the Kubernetes path "
+              "keeps the PersistentVolumeClaim — use `rc-repro down --name <n> "
+              "--volumes` first, which does delete it"),
+)
+
+
+def _refuse_unsupported_on_kubernetes(req: CreateReq) -> None:
+    """Refuse what this runtime cannot honour, rather than accepting and dropping it.
+
+    Ordered so the most consequential is reported first when several are set: being
+    told about `--fresh` matters more than being told about `--reg-token`, because
+    one of them is about data.
+    """
+    for name, why in _KUBERNETES_UNSUPPORTED:
+        if getattr(req, name, None):
+            raise ValidationError(
+                f"--{name.replace('_', '-')} is not supported on Kubernetes yet: "
+                f"{why}. Use --runtime docker for a workspace that needs it.")
+    # A preset reaches Kubernetes when it has an adapter for it -- the Scenario
+    # contract from #3. Those that do not are still refused, because being recorded
+    # and not applied is what this guard exists to prevent; but the refusal is now
+    # per preset rather than a blanket "not supported", and it names the ones that
+    # DO work so the answer is actionable.
+    if req.preset and req.preset != "default":
+        works = ", ".join(sorted(presets.scenario_names())) or "none yet"
+        try:
+            resolved_preset = presets.resolve(req.preset, topology.KUBERNETES,
+                                              req.params or {})
+        except ValueError as exc:
+            raise ValidationError(
+                f"preset {req.preset!r} cannot be resolved for Kubernetes: {exc}. "
+                f"Presets with a Kubernetes adapter: {works}. Or use "
+                f"--runtime docker, where every preset works.") from exc
+        # RESOLVING is not the same as WORKING. A preset with no scenario adapter
+        # comes back with its Compose `services` intact -- Keycloak, Mailpit, MinIO
+        # -- and this runtime builds no compose document, so those containers would
+        # simply never exist while the settings pointing at them were applied. That
+        # is the silent-drop shape again, one level further in: the workspace boots,
+        # the preset is recorded, and the scenario it names is not there.
+        if resolved_preset.services and not resolved_preset.kubernetes_manifests:
+            raise ValidationError(
+                f"preset {req.preset!r} needs backing services "
+                f"({', '.join(sorted(resolved_preset.services))}) and has no "
+                f"Kubernetes adapter to create them, so they would be missing while "
+                f"Rocket.Chat was configured to use them. Presets with an adapter: "
+                f"{works}. Or use --runtime docker, where every preset works.")
+
+
+def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
+    """The Kubernetes half of `_create_repro_locked`.
+
+    Shares everything that is not runtime-specific -- name derivation, version
+    resolution, the capacity refusal, host-port allocation, repro.json -- and
+    delegates only the sequence that differs. A workspace created here is a
+    workspace like any other: `list`, `info`, `logs` and `down` find it because it
+    has a repro.json, which is what `runner.exists()` now looks for.
+    """
+    from rc_repro.services import k8s
+
+    repro_name = _derive_for(req)
+    _require_valid_name(repro_name)
+    # NO refusal for an existing workspace. `down` tells the user "bring it back:
+    # rc-repro up ...", and this raised "already exists, down first or --force" at
+    # them -- two messages in the same tool contradicting each other about the same
+    # workspace. Compose reuses; so does this. The namespace and its PVC survived a
+    # plain `down`, which is exactly what makes bringing it back meaningful.
+    reused = runner.exists(repro_name)
+    if reused:
+        info(emit, f"{repro_name!r} already exists — bringing it back up",
+             phase="plan")
+    check_capacity(req, req.preset, emit)
+
+    try:
+        resolved = versions.resolve(req.version, offline=req.offline)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    if req.rc_image:
+        resolved.rc_image = req.rc_image
+    if req.mongo:
+        versions.apply_mongo_override(resolved, req.mongo)
+
+    # A workspace that comes back must come back at the SAME address. Allocating
+    # afresh moved it from :3382 to :3000 on the `up` after a `down` -- so every
+    # bookmark, every curl in a ticket and the URL the user had just been shown all
+    # pointed at nothing. An explicit --port still wins; otherwise the recorded one
+    # does, and only a genuinely new workspace allocates.
+    recorded = 0
+    if reused:
+        try:
+            recorded = int(runner.read_meta(repro_name).host_port or 0)
+        except (OSError, ValueError, TypeError):
+            recorded = 0
+    host_port = req.port or recorded or pick_host_port(
+        0, presets.load("default", {}), exclude=repro_name)
+    # Same resolution order Compose uses: the flag, then the box-level config, then
+    # loopback. This was dropped entirely on the Kubernetes path.
+    cfg = config.load_config()
+    bind_host = req.bind or cfg.get("bind_host") or config.DEFAULT_BIND_HOST
+    root = f"http://localhost:{host_port}"
+    microservices = req.deployment == topology.MICROSERVICES
+    # Resolved ONCE: the same object builds the workspace and supplies its notes,
+    # so what was applied and what is printed cannot disagree.
+    preset_for_notes = presets.resolve(req.preset or "default", topology.KUBERNETES,
+                                       req.params or {})
+    out = k8s.create_workspace(
+        name=repro_name, resolved=resolved, host_port=host_port,
+        microservices=microservices, replicas=req.replicas or 1,
+        owner=req.actor, bind_host=bind_host,
+        use_operator=req.mongo_operator,
+        # Resolved through the KUBERNETES adapter, so a scenario yields native
+        # manifests here and a compose service on the other runtime -- one intent,
+        # two renderings. `_refuse_unsupported_on_kubernetes` has already proved
+        # this resolves, so a failure here would be a bug rather than bad input.
+        preset=preset_for_notes,
+        emit=emit)
+
+    meta = runner.Metadata(
+        name=repro_name, project=out["namespace"], rc_version=resolved.rc_version,
+        rc_image=resolved.rc_image, mongo_tag=resolved.mongo_tag,
+        mongo_flavor=resolved.mongo_flavor, preset=req.preset, root_url=root,
+        host_port=host_port, version_source=resolved.source, pinned=req.pin,
+        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    topology.stamp(meta.extra, topology.KUBERNETES)
+    meta.extra[config.EXTRA_DEPLOYMENT] = req.deployment or topology.MICROSERVICES
+    meta.extra.update({k: v for k, v in out.items() if k != "microservices"})
+    if req.replicas > 1:
+        meta.extra["instances"] = req.replicas
+    if req.actor:
+        meta.extra["created_by"] = req.actor
+    # rc-repro keeps its OWN kubeconfig so creating a cluster cannot move the user's
+    # current-context. The cost is that a bare `kubectl` sees nothing, which is
+    # confusing rather than safe unless we say so -- so the export comes FIRST and
+    # every command below it works once pasted.
+    kubeconfig = k8s.owned_kubeconfig()
+    ns = out["namespace"]
+    pods = 9 if microservices else 5
+    # The port-forward is the ONLY way in without an ingress, and it dies with its
+    # pod -- so the command to re-establish it belongs here rather than in someone's
+    # memory. It carries the bind host, because a workspace created with
+    # `--bind 0.0.0.0` needs `--address 0.0.0.0` to come back the same way.
+    addr = ("" if bind_host in ("", "127.0.0.1", "localhost")
+            else f"--address {bind_host} ")
+    reach = (f"reachable on this box at {root}" if not addr else
+             f"reachable at {root} and, from other machines, at "
+             f"http://<this-box>:{host_port} — it publishes on {bind_host} and the "
+             "workspace runs admin/admin123, so keep it off untrusted networks")
+    # What is IN the namespace versus what is shared by the cluster, stated rather
+    # than left to be discovered. The guide installs the MongoDB operator into the
+    # Rocket.Chat namespace because it assumes one Rocket.Chat per cluster; rc-repro
+    # runs several, its CRDs are cluster-scoped, and a second per-namespace install
+    # collides on them. So the deviation is deliberate and has to be visible here --
+    # otherwise the first person to run the guide's `kubectl -n <ns> get pods` finds
+    # no operator and reasonably concludes it was never installed.
+    if out.get("mongo_managed_by") == "operator":
+        mongo_note = (
+            f"MongoDB {resolved.mongo_tag} via the official operator, with SCRAM "
+            f"auth — {out.get('mongo_image', '')}")
+        shared = [
+            f"the operator itself is SHARED: one install in {k8s.OPERATOR_NAMESPACE} "
+            f"watching every namespace, not one per workspace as the official guide "
+            f"shows. Its CRDs are cluster-scoped, so a per-workspace install would "
+            f"collide at the second workspace. Nothing of it lives in {ns} except "
+            f"the database, its Secrets and its ServiceAccount:",
+            f"    kubectl -n {k8s.OPERATOR_NAMESPACE} get pods    # the operator",
+            f"    kubectl -n {ns} get mongodbcommunity              # this workspace's DB",
+        ]
+    else:
+        mongo_note = (
+            f"MongoDB {resolved.mongo_tag} as a plain StatefulSet — "
+            f"{out.get('mongo_image', '')}, NO authentication. This path is "
+            f"rc-repro's own: the official guide documents only the operator, which "
+            f"needs MongoDB "
+            f"{'.'.join(str(n) for n in k8s.OPERATOR_MIN_MONGO)}+. Add "
+            f"--mongo-operator for the documented path with auth.")
+        shared = []
+    meta.extra["notes"] = [
+        f"{'microservices' if microservices else 'monolith'} on "
+        f"{out['context']} — about {pods} pods, namespace {ns}",
+        mongo_note,
+        *shared,
+        reach,
+        "the port-forward dies with its pod; bring it back with:",
+        f"    kubectl -n {ns} port-forward {addr}"
+        f"deployment/{out['release']}-rocketchat {host_port}:3000",
+        "rc-repro keeps its own kubeconfig; a bare kubectl will not see this:",
+        f"    export KUBECONFIG={kubeconfig}",
+        f"    kubectl -n {ns} get pods",
+        f"    kubectl -n {ns} logs -l app.kubernetes.io/name=rocketchat -f",
+        f"    helm -n {ns} get values {out['release']}",
+        "monitoring is shared the same way: `rc-repro monitor --name "
+        f"{repro_name}` installs one Prometheus + Grafana in "
+        f"{k8s.OPERATOR_NAMESPACE} for the whole cluster, and `--off` leaves it up "
+        "while any other workspace still wants it.",
+        "logs, stats and backup have no Kubernetes path yet — each refuses and "
+        "names the kubectl command that does the job.",
+    ]
+    # A preset's own notes, which the Compose path already surfaces via
+    # `meta.extra["notes"] = pre.notes`. This path builds its own list, so without
+    # this the preset's UI URL and credentials existed and were never printed --
+    # exactly the "it works and nobody can tell" shape.
+    # A preset's self-configuration actions, recorded exactly as the Compose path
+    # records them. Without this the OIDC preset would create no OAuth provider and
+    # the SAML preset no provider settings -- both recorded and neither applied,
+    # which is the silent-drop shape this runtime keeps producing.
+    if getattr(preset_for_notes, "post_ready", None):
+        meta.extra["post_ready"] = preset_for_notes.post_ready
+    scenario_notes = list(getattr(preset_for_notes, "notes", None) or [])
+    if scenario_notes:
+        meta.extra["notes"] = scenario_notes + list(meta.extra["notes"])
+    # No compose document, so `write` is given an empty one rather than a fake:
+    # a file that looks like a compose project but is not would be worse than none.
+    ws = runner.workspace(repro_name)
+    ws.mkdir(parents=True, exist_ok=True)
+    runner.atomic_write(ws / "repro.json",
+                        json.dumps(asdict(meta), indent=2))
+    # --wait and --seed were ignored here, so `up --seed` ran the seeder the instant
+    # helm returned and failed with "can't seed - repro not ready". The CLI already
+    # forces wait=True when seeding; this path simply never read it.
+    result = {"name": repro_name, "meta": asdict(meta), "url": root,
+              "reused": reused, "runtime": topology.KUBERNETES}
+    # A preset with post_ready actions MUST wait, or there is nothing to configure
+    # against -- the same rule the Compose path applies at `wait = req.wait or
+    # bool(pre.post_ready) or req.seed`.
+    if req.wait or req.seed or bool(meta.extra.get("post_ready")):
+        # wait_and_finalize, not bare wait_serving: it also finalizes the setup
+        # wizard over REST and runs the preset's post_ready actions. Waiting and
+        # stopping there left every self-configuring preset half-applied.
+        result.update(wait_and_finalize(meta, emit, timeout=600.0))
+        result["ready"] = True
+    if req.seed:
+        result["seed"] = run_seed_inline(meta, req.seed_profile, req.stats, emit)
+    # `--monitor` last, and only once the workspace is serving: attaching turns on
+    # RC's own Prometheus_Enabled over REST, which needs a workspace that answers.
+    # Ignoring the flag here is what `--seed` did, and it produced a create that
+    # silently did less than it was asked for.
+    if req.monitor:
+        if not (req.wait or req.seed):
+            wait_serving(meta, emit, timeout=600.0)
+        from rc_repro.services import monitor as monitorsvc
+        # An add-on failing does not un-create the workspace. The first live run of
+        # this failed on the monitoring chart and exited 7 with `montest` up,
+        # serving, and listed as running -- a create reported as failed while its
+        # result was sitting there working. The workspace is the deliverable; say
+        # what went wrong with the extra and name the command that retries it.
+        try:
+            result["monitoring"] = monitorsvc.attach(repro_name, emit)
+        except ReproError as exc:
+            warn(emit, f"the workspace is up, but monitoring did not attach: {exc}",
+                 phase="monitor")
+            warn(emit, f"retry it with: rc-repro monitor --name {repro_name}",
+                 phase="monitor")
+            result["monitoring"] = {"monitoring": False, "error": str(exc)}
+    info(emit, f"{root}  admin / {config.ADMIN_PASSWORD}", phase="done", pct=100)
+    return result
+
+
+def _stop_port_forward(pid: int) -> None:
+    """Kill a workspace's port-forward, if it is still ours to kill.
+
+    Best-effort and deliberately narrow: a recorded pid can have been recycled by
+    the OS, so this checks the process is still a kubectl port-forward before
+    signalling it. Killing an unrelated process because a pid was reused is a much
+    worse failure than leaving a dead forward recorded.
+    """
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return
+    if "port-forward" not in cmdline:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def kubernetes_state(name: str, meta) -> str:
+    """`running` / `down` for a Kubernetes workspace.
+
+    `repro_state()` asks docker whether the project's containers exist, so it called
+    a live Kubernetes workspace `down` -- the state column was reporting on the
+    wrong runtime entirely.
+    """
+    from rc_repro.services import k8s
+    context = str((getattr(meta, "extra", None) or {}).get("context") or k8s.CONTEXT)
+    if k8s.namespace_for(name) not in k8s.workspace_namespaces(context):
+        return "down"
+    # The namespace EXISTING is not the workspace running. A plain `down` keeps the
+    # namespace and its PVC on purpose and uninstalls the release, so a torn-down
+    # workspace reported "starting" -- and would have reported it forever, because
+    # nothing was coming. Ask for the workload instead.
+    if not k8s.workload_exists(name, context=context):
+        return "down"
+    # Scaled to zero is STOPPED, not starting. `stop` is implemented as scale-to-zero
+    # -- there is no other "stopped" on this runtime -- and without this the column
+    # said "starting" for a workspace that had been deliberately stopped and was
+    # never going to move. The word has to match the verb the user just used.
+    if k8s.desired_replicas(name, context=context) == 0:
+        return "stopped"
+    return "running" if k8s.workspace_ready(name, context=context) else "starting"
+
+
+def _wait_serving_kubernetes(meta: runner.Metadata, emit: Emit,
+                             timeout: float) -> dict:
+    """Wait for a Kubernetes workspace to serve, and make sure it is reachable.
+
+    Two jobs, because on this runtime they are different questions. The pod being
+    Ready is Kubernetes' answer; the URL answering also needs a live port-forward,
+    and a forward dies with its pod. `ready` is exactly when someone asks "why is
+    the URL not answering", so it re-establishes one rather than reporting a
+    healthy workspace the caller still cannot reach.
+    """
+    import time as _time
+
+    from rc_repro.services import k8s
+
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    context = str(extra.get("context") or k8s.CONTEXT)
+    namespace = str(extra.get("namespace") or k8s.namespace_for(meta.name))
+    deadline = _time.monotonic() + timeout
+    last = 0.0
+    while _time.monotonic() < deadline:
+        if k8s.workspace_ready(meta.name, context=context):
+            pid = k8s.ensure_port_forward(
+                meta.name, namespace=namespace, context=context,
+                host_port=meta.host_port, pid=extra.get("port_forward_pid"),
+                bind_host=str(extra.get("bind_host") or ""), emit=emit)
+            if pid and pid != extra.get("port_forward_pid"):
+                runner.update_meta(meta.name,
+                                   lambda m: m.extra.update({"port_forward_pid": pid}))
+            # The pod being Ready is not the URL answering. `kubectl port-forward`
+            # returns a pid before it binds the socket, so declaring ready here on
+            # the strength of the pid alone is a guess -- and after `restart` it was
+            # a wrong one: `ready` exited 0 and the very next request to the URL it
+            # had just confirmed got nothing at all. Confirm the socket, and if it
+            # is not up yet go round again rather than reporting a workspace the
+            # caller cannot reach.
+            if k8s.forward_reachable(meta.host_port):
+                info(emit, f"{meta.name!r} is serving at {meta.root_url}",
+                     phase="ready", pct=100)
+                return {"ready": True, "url": meta.root_url}
+            extra = dict(extra, port_forward_pid=pid)
+        now = _time.monotonic()
+        if now - last > 15:
+            last = now
+            info(emit, f"waiting for Rocket.Chat in {namespace}", phase="wait")
+        _time.sleep(3.0)
+    raise NotReadyError(
+        f"Rocket.Chat did not become ready within {int(timeout)}s. "
+        f"kubectl -n {namespace} get pods")

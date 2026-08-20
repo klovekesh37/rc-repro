@@ -105,6 +105,8 @@ def build(params: dict) -> Preset:
         requires_license=False,
         source="built-in (dynamic)",
         files=[("saml/keycloak-realm.json", _keycloak.realm_json([_client()], users))],
+        kubernetes_manifests=[_keycloak.manifests(
+            _keycloak.realm_json([_client()], users), _KC_PORT)],
         params_help={"users": "number of Keycloak test users (default 5)"},
         ports=list(config.PRESET_PORTS["saml"]),
         notes=[

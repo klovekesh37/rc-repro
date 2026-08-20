@@ -25,6 +25,7 @@ from rc_repro.perf.timings import fmt_ms
 from rc_repro.services import data as datasvc
 from rc_repro.services import envvars as envsvc
 from rc_repro.services import lifecycle as lcsvc
+from rc_repro.services import topology
 from rc_repro.services.events import Event, null_emit
 
 app = typer.Typer(
@@ -208,9 +209,16 @@ def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | No
     followed by multi-instance URLs. Title is the repro name only — kept pure
     ASCII so box-drawing alignment can't be thrown off by wide/emoji glyphs
     (status like "✓ ready" is printed on its own line by the caller)."""
+    # `mongo_flavor` describes a COMPOSE image choice, and the Kubernetes path makes
+    # its own -- so printing it there claimed an image that workspace does not run.
+    # Where the runtime recorded what it actually built, say that instead.
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    managed_by = extra.get("mongo_managed_by", "")
+    mongo = (f"{meta.mongo_tag} (via the {managed_by})" if managed_by
+             else f"{meta.mongo_tag} ({meta.mongo_flavor})")
     rows = [
         ("Rocket.Chat", meta.rc_version),
-        ("MongoDB", f"{meta.mongo_tag} ({meta.mongo_flavor})"),
+        ("MongoDB", mongo),
         ("Preset", meta.preset),
         # external_url, not root_url: with --https the browser wants the https URL,
         # while root_url stays the plain http one rc-repro's own API calls use.
@@ -265,7 +273,11 @@ def _render_create_result(result: dict) -> None:
 @app.command()
 def up(
     version: str = typer.Option(..., "--version", "-v", help="Rocket.Chat version, e.g. 6.5.3"),
-    preset: str = typer.Option("default", "--preset", "-p", help="preset to apply"),
+    preset: str = typer.Option("default", "--preset", "-p", help="scenario to apply: ldap, saml, oidc, email, s3_minio, livechat, airgapped"),
+    runtime: str = typer.Option("", "--runtime", help="where it runs: docker (default) | kubernetes"),
+    deployment: str = typer.Option("", "--deployment", help="how RC is arranged. docker: monolith (default) | multi-instance. kubernetes: microservices (default) | monolith"),
+    replicas: int = typer.Option(0, "--replicas", help="Rocket.Chat instances (needs --deployment multi-instance on docker)"),
+    mongo_operator: bool = typer.Option(False, "--mongo-operator", help="kubernetes: manage MongoDB with the official operator (adds SCRAM auth; needs MongoDB 6.0+)"),
     name: str = typer.Option("", "--name", "-n", help="repro name (default: derived)"),
     port: int = typer.Option(0, "--port", help="host port (default: first free >= 3000)"),
     root_url: str = typer.Option("", "--root-url", help="override ROOT_URL"),
@@ -301,6 +313,8 @@ def up(
         params=_parse_set_params(set_), seed=False, pin=pin,
         wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
         force=force, monitor=monitor, actor=_cli_actor(),
+        runtime=runtime, deployment=deployment, replicas=replicas,
+        mongo_operator=mongo_operator,
         https=https, domain=domain, acme_email=email,
         env={**envsvc.parse_set(env or []), **envsvc.as_setting(setting or [])},
     )
@@ -480,13 +494,23 @@ def down(
             ui.warn(f"deleting {target!r}, owned by {owner}.")
     try:
         # confirm=True: the prompt above (or --yes) already gated it.
-        lcsvc.teardown(target, volumes=volumes, confirm=True)
+        out = lcsvc.teardown(target, volumes=volumes, confirm=True)
     except errors.ReproError as exc:
         _fail(exc)
+    # The nouns depend on the runtime, and this line hardcoded Docker's. A
+    # Kubernetes workspace has no containers and no Docker volume -- it has a
+    # namespace and a PersistentVolumeClaim -- and `helm uninstall` does NOT delete
+    # a PVC, so which of the two paths kept the data is exactly what needs saying.
+    # The service layer already knows; asking it beats guessing here.
+    kube = (out or {}).get("runtime") == topology.KUBERNETES
+    what = ("namespace, PersistentVolumeClaim and record" if kube
+            else "containers, data volume, and record")
     if volumes:
-        ui.ok(f"✓ {target!r} removed (containers, data volume, and record).")
+        ui.ok(f"✓ {target!r} removed ({what}).")
     else:
-        ui.ok(f"✓ {target!r} down (data kept).")
+        kept = ("the namespace and its PersistentVolumeClaim are kept" if kube
+                else "data kept")
+        ui.ok(f"✓ {target!r} down ({kept}).")
         typer.echo(f"  bring it back: rc-repro up --version <same> --name {target}")
         typer.echo("  delete for good: add --volumes, or run `rc-repro prune`")
 
@@ -508,6 +532,12 @@ def monitor(
             res = monitorsvc.detach(target, emit=_cli_emit)
             ui.ok(f"✓ monitoring detached from {res['name']!r}"
                   + ("" if res["rc_setting_reset"] else " (metrics setting left as-is — repro not reachable)"))
+            # On Kubernetes the stack is shared, so "detached" does not mean
+            # "gone" -- and a user who came to free memory needs to know which
+            # of the two happened.
+            if res.get("stack_removed") is False:
+                ui.note("the shared monitoring stack stays up — other workspaces "
+                        "on this cluster are still using it")
         else:
             res = monitorsvc.attach(target, emit=_cli_emit)
             ui.ok(f"✓ monitoring attached to {res['name']!r}")
@@ -547,6 +577,14 @@ def prune(
         typer.echo("Nothing to prune.")
 
 
+def _say_reattach(target: str) -> None:
+    """Tell a Kubernetes workspace's owner how to get its URL answering again."""
+    from rc_repro.services import topology
+    if topology.of_repro(target) != topology.KUBERNETES:
+        return
+    ui.note(f"the URL needs its port-forward back: rc-repro ready --name {target}")
+
+
 @app.command()
 def start(name: str = typer.Option("", "--name", "-n")) -> None:
     """Resume a stopped repro (fast, no rebuild)."""
@@ -560,6 +598,11 @@ def start(name: str = typer.Option("", "--name", "-n")) -> None:
         ui.die(f"could not start {target!r} — if it was `down`ed, use "
                "`rc-repro up` to recreate it", exit_code=exc.exit_code)
     ui.ok(f"✓ {target!r} started.")
+    # On Kubernetes the published port is a port-forward, and it died with the pod
+    # that `stop` scaled away. Compose republishes its ports itself; this does not,
+    # so a `start` that said nothing here would leave a URL that answers nothing and
+    # no clue why.
+    _say_reattach(target)
 
 
 @app.command()
@@ -582,6 +625,7 @@ def restart(name: str = typer.Option("", "--name", "-n")) -> None:
     except errors.ReproError as exc:
         _fail(exc)
     ui.ok(f"✓ {target!r} restarted.")
+    _say_reattach(target)
 
 
 @app.command()
@@ -604,12 +648,16 @@ def list_cmd() -> None:
     # and anything parsing it -- is unchanged.
     shared = any(r.get("created_by") for r in repros)
     owner_h = f"{'OWNER':<12} " if shared else ""
-    typer.echo(f"{'NAME':<20} {owner_h}{'RC':<9} {'MONGO':<7} {'PORT':<6} {'STATE':<10} URL")
+    typer.echo(f"{'NAME':<20} {owner_h}{'RC':<9} {'MONGO':<7} {'WHERE':<8} "
+               f"{'PORT':<6} {'STATE':<10} URL")
     for r in repros:
         flag = "*" if r["default"] else (" " if not r["pinned"] else "·")
         owner = f"{(r.get('created_by') or '-'):<12} " if shared else ""
         typer.echo(
             f"{flag}{r['name']:<19} {owner}{r['rc_version']:<9} {r['mongo_tag']:<7} "
+            # "compose"/"k8s" rather than the canonical names: this is a narrow
+            # column read at a glance, and the canonical value is in `info`.
+            f"{('k8s' if r.get('runtime') == topology.KUBERNETES else 'compose'):<8} "
             f"{r['host_port']:<6} {r['state']:<10} {r.get('public_url') or r['root_url']}"
         )
     typer.echo("\n* = default repro   · = pinned")
@@ -1486,6 +1534,11 @@ def stats(
     """Sample a repro's container CPU/RAM (peak over a window, or --watch live)."""
     _require_docker()
     m = runner.read_meta(_resolve_name(name))
+    try:
+        topology.require_compose(m.name, "stats",
+                                 instead="Install metrics-server and use `kubectl top`.")
+    except errors.ReproError as exc:
+        _fail(exc)
     if watch:
         typer.echo(f"Live stats for {m.name!r} (Ctrl-C to stop)…")
         try:
@@ -2358,6 +2411,12 @@ def logs(
     """Tail a repro's logs."""
     _require_docker()
     target = _resolve_name(name)
+    try:
+        topology.require_compose(
+            target, "logs",
+            instead=f"Use `kubectl -n rc-repro-{target} logs -l app.kubernetes.io/name=rocketchat -f`.")
+    except errors.ReproError as exc:
+        _fail(exc)
     runner.logs(target, follow=follow, tail=tail or None)
 
 

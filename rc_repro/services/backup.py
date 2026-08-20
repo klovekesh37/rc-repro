@@ -41,7 +41,7 @@ from packaging.version import InvalidVersion, Version
 from rc_repro import config, runner
 from rc_repro.errors import (ConflictError, DockerError, NotFoundError,
                              NotReadyError, ReproError, ValidationError)
-from rc_repro.services import lifecycle
+from rc_repro.services import lifecycle, topology
 from rc_repro.services.events import Emit, info, null_emit, warn
 
 #: Bundle layout. `schema` is checked on read: a future rc-repro that changes the
@@ -107,6 +107,48 @@ def database_of(name: str) -> str:
     return db or DEFAULT_DATABASE
 
 
+def _kube(name: str) -> str:
+    """The kube context for a Kubernetes workspace, or "" if it is a Compose one.
+
+    One question asked in one place. backup.py's LOGIC -- the bundle format, the
+    manifest, the safety checks -- is runtime-agnostic and stays shared; only the
+    five places that actually touch a container differ, and each consults this.
+    """
+    from rc_repro.services import topology
+    if topology.of_repro(name) != topology.KUBERNETES:
+        return ""
+    meta = runner.read_meta(name)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    from rc_repro.services import k8s
+    return str(extra.get("context") or k8s.CONTEXT)
+
+
+def _exec_capture(name: str, argv: list[str], timeout: float | None = None):
+    ctx = _kube(name)
+    if ctx:
+        from rc_repro.services import k8s
+        return k8s.exec_capture(name, argv, context=ctx, timeout=timeout)
+    return runner.compose_exec_capture(name, MONGO_SERVICE, argv, timeout=timeout)
+
+
+def _exec_to_file(name: str, argv: list[str], dest, timeout: float | None = None):
+    ctx = _kube(name)
+    if ctx:
+        from rc_repro.services import k8s
+        return k8s.exec_to_file(name, argv, dest, context=ctx, timeout=timeout)
+    return runner.compose_exec_to_file(name, MONGO_SERVICE, argv, dest,
+                                       timeout=timeout)
+
+
+def _exec_from_file(name: str, argv: list[str], src, timeout: float | None = None):
+    ctx = _kube(name)
+    if ctx:
+        from rc_repro.services import k8s
+        return k8s.exec_from_file(name, argv, src, context=ctx, timeout=timeout)
+    return runner.compose_exec_from_file(name, MONGO_SERVICE, argv, src,
+                                         timeout=timeout)
+
+
 def _require_mongo_tools(name: str) -> None:
     """Fail early and clearly if the Mongo image has no database tools.
 
@@ -114,12 +156,12 @@ def _require_mongo_tools(name: str) -> None:
     assumed because the bitnami-legacy flavor is a different image and a missing
     binary would otherwise surface as an empty archive.
     """
-    rc, _ = runner.compose_exec_capture(
-        name, MONGO_SERVICE, ["sh", "-c", "command -v mongodump && command -v mongorestore"],
+    rc, _ = _exec_capture(
+        name, ["sh", "-c", "command -v mongodump && command -v mongorestore"],
         timeout=PROBE_TIMEOUT)
     if rc != 0:
         raise NotReadyError(
-            f"the mongodb container for {name!r} has no mongodump/mongorestore, or is "
+            f"the mongodb for {name!r} has no mongodump/mongorestore, or is "
             "not running. Start the repro (`rc-repro start`) and try again.")
 
 
@@ -134,8 +176,7 @@ def warn_low_fd_limit(name: str, emit: Emit = null_emit) -> int:
     recreated. Restore works anyway (see --numParallelCollections), but this is the
     difference between a slow restore and a mongod that panics, so say it.
     """
-    rc, out = runner.compose_exec_capture(
-        name, MONGO_SERVICE, ["sh", "-c", "ulimit -n"], timeout=PROBE_TIMEOUT)
+    rc, out = _exec_capture(name, ["sh", "-c", "ulimit -n"], timeout=PROBE_TIMEOUT)
     try:
         limit = int((out or "").strip().splitlines()[0])
     except (ValueError, IndexError):
@@ -149,6 +190,11 @@ def warn_low_fd_limit(name: str, emit: Emit = null_emit) -> int:
 
 
 def _rc_services(name: str) -> list[str]:
+    # On Kubernetes there is no compose file to read service names out of, and none
+    # is needed: `_Quiesced` scales by label instead. The list is a Compose concept,
+    # so it is empty there rather than faked.
+    if _kube(name):
+        return []
     svcs = runner.rc_services(name)
     if not svcs:
         raise DockerError(f"{name!r} has no rocketchat service in its compose file")
@@ -173,7 +219,15 @@ class _Quiesced:
             return self
         info(self.emit, "stopping Rocket.Chat so the dump is consistent "
                         "(Mongo keeps running)", phase="backup", pct=10)
-        runner.stop_services(self.name, self.services)
+        ctx = _kube(self.name)
+        if ctx:
+            from rc_repro.services import k8s
+            # ONLY Rocket.Chat. `stop_workspace` would take MongoDB with it, and a
+            # dump needs the database up and only its writers quiesced -- the same
+            # distinction runner draws between `stop()` and `stop_services()`.
+            k8s.scale_rocketchat(self.name, replicas=0, context=ctx)
+        else:
+            runner.stop_services(self.name, self.services)
         return self
 
     def __exit__(self, *exc):
@@ -184,7 +238,13 @@ class _Quiesced:
         # is precisely the outcome this class exists to prevent. Raising here would
         # mask an in-flight exception, so it warns instead -- loudly, and naming the
         # command that fixes it.
-        if runner.start_services(self.name, self.services) != 0:
+        ctx = _kube(self.name)
+        if ctx:
+            from rc_repro.services import k8s
+            failed = k8s.scale_rocketchat(self.name, replicas=1, context=ctx) != 0
+        else:
+            failed = runner.start_services(self.name, self.services) != 0
+        if failed:
             warn(self.emit,
                  f"Rocket.Chat did not come back up on {self.name!r} - the data is "
                  f"safe, but the workspace is stopped. Start it with "
@@ -202,8 +262,12 @@ def create(name: str, *, out: str = "", note: str = "", live: bool = False,
     keyword of its own, so a service function taking one can never be submitted as
     a job with its note set.
     """
-    lifecycle.require_docker()
     target = lifecycle.resolve_name(name)
+    # Docker is required only when Docker is what runs it. Everything below this is
+    # runtime-agnostic: the bundle, the manifest and the safety checks are the same
+    # on both, and only the five places that touch a container differ.
+    if not _kube(target):
+        lifecycle.require_docker()
     with runner.repro_lock(target):
         return _create_locked(target, out=out, note=note, live=live, emit=emit)
 
@@ -230,9 +294,8 @@ def _create_locked(target: str, *, out: str = "", note: str = "", live: bool = F
         with _Quiesced(target, services, emit, skip=live):
             info(emit, f"dumping database {database!r}", phase="backup", pct=30)
             started = time.monotonic()
-            rc, err = runner.compose_exec_to_file(
-                target, MONGO_SERVICE,
-                ["mongodump", "--archive", "--gzip", "--db", database],
+            rc, err = _exec_to_file(
+                target, ["mongodump", "--archive", "--gzip", "--db", database],
                 archive, timeout=DUMP_TIMEOUT)
         if rc != 0:
             raise DockerError(f"mongodump failed for {target!r}: {err.strip()[:600]}")
@@ -254,6 +317,12 @@ def _create_locked(target: str, *, out: str = "", note: str = "", live: bool = F
             "mongo_flavor": meta.mongo_flavor,
             "preset": meta.preset,
             "params": (meta.extra or {}).get("params") or {},
+            # The axes, so a restore rebuilds the workspace it captured rather
+            # than inferring the deployment from the preset name. Absent in
+            # archives taken before these keys existed, where the inference is
+            # still correct -- see topology.axes_of_meta.
+            "runtime": topology.of_meta(meta),
+            "deployment": (meta.extra or {}).get(config.EXTRA_DEPLOYMENT) or "",
             "env_overrides": (meta.extra or {}).get("env") or {},
             # Named volumes other than Mongo's: their CONTENT is not captured, and
             # restore warns when this is non-empty. Recording it is what makes that
@@ -492,7 +561,12 @@ def restore(bundle: str | Path, *, name: str = "", new: bool = False,
       new        restore(b, new=True)       -- create a fresh repro from the manifest
       other      restore(b, name="other")   -- an existing, different repro
     """
-    lifecycle.require_docker()
+    # Docker only when Docker is what runs the TARGET. `new=True` has no target yet,
+    # so it is checked below once the name is known -- and restoring into a fresh
+    # workspace still creates a Compose one, because a bundle carries no runtime.
+    existing = lifecycle.resolve_name(name) if name and not new else ""
+    if not (existing and _kube(existing)):
+        lifecycle.require_docker()
     path = Path(bundle).expanduser()
     manifest = read_manifest(path)
 
@@ -543,9 +617,8 @@ def _drop_database(name: str, database: str, emit: Emit = null_emit) -> None:
         pass
     info(emit, f"dropping database {database!r} so the restore is exact",
          phase="restore", pct=40)
-    rc, out = runner.compose_exec_capture(
-        name, MONGO_SERVICE,
-        [shell, database, "--quiet", "--eval", "db.dropDatabase()"],
+    rc, out = _exec_capture(
+        name, [shell, database, "--quiet", "--eval", "db.dropDatabase()"],
         timeout=PROBE_TIMEOUT)
     if rc != 0:
         # Not fatal: --drop below still clears every collection the bundle carries,
@@ -571,10 +644,17 @@ def _create_from_manifest(target: str, manifest: dict, emit: Emit) -> None:
             "--name for a different one")
     info(emit, f"creating {target!r} at Rocket.Chat {manifest.get('rc_version')} "
                f"(preset {manifest.get('preset') or 'default'})", phase="create", pct=5)
+    # An archive that recorded its axes rebuilds from them; an older one falls
+    # back to inferring them from the preset name, which is what that name meant.
+    axes = ({"runtime": str(manifest.get("runtime") or ""),
+             "deployment": str(manifest.get("deployment") or ""),
+             "preset": "default"}
+            if manifest.get("deployment") else
+            {"preset": str(manifest.get("preset") or "default")})
     req = lifecycle.CreateReq(
         version=str(manifest.get("rc_version") or ""),
-        preset=str(manifest.get("preset") or "default"),
         name=target,
+        **axes,
         mongo=str(manifest.get("mongo_tag") or ""),
         params=dict(manifest.get("params") or {}),
         env=dict(manifest.get("env_overrides") or {}),
@@ -648,8 +728,7 @@ def _restore_locked(target: str, path: Path, manifest: dict, emit: Emit, *,
             _drop_database(target, database, emit)
             info(emit, f"restoring into database {database!r}", phase="restore", pct=50)
             started = time.monotonic()
-            rc, out = runner.compose_exec_from_file(
-                target, MONGO_SERVICE, argv, archive, timeout=DUMP_TIMEOUT)
+            rc, out = _exec_from_file(target, argv, archive, timeout=DUMP_TIMEOUT)
             elapsed = round(time.monotonic() - started, 1)
         if rc != 0:
             raise DockerError(f"mongorestore failed for {target!r}: {out.strip()[-800:]}")

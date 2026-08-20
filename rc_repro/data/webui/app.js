@@ -292,6 +292,13 @@ function card(r) {
   if (r.default) r1.append(el("span", { class: "star", title: "used by CLI commands with no --name" }, "★"));
   r1.append(el("span", { class: "ver" }, r.rc_version || "?"));
   const bits = [r.preset, ":" + r.host_port, r.created_by].filter(Boolean);
+  // Runtime is shown only when it is NOT the default. Compose is the overwhelming
+  // majority, so labelling every row "docker" would be noise on the common case and
+  // make the rare one harder to spot rather than easier. What matters is that a
+  // Kubernetes workspace never looks like a Compose one: which commands refuse,
+  // where the data lives and how to reach it all differ, and the list was the one
+  // place the two were indistinguishable.
+  if (r.runtime && r.runtime !== "docker") bits.push(r.runtime === "kubernetes" ? "k8s" : r.runtime);
   if (r.monitoring) bits.push("monitored");
   row.append(r1, el("span", { class: "meta" }, bits.join(" · ")));
   row.append(el("span", { class: "r3" },
@@ -2386,7 +2393,18 @@ async function openCreate(preset) {
     if (Array.isArray(s.privileged_fields) && s.privileged_fields.length) {
       PRIVILEGED_FIELDS = s.privileged_fields;
     }
+    if (Array.isArray(s.runtimes) && s.runtimes.length) {
+      RUNTIMES = s.runtimes;
+      const rsel = $("#runtime-select");
+      const want = rsel.value || s.default_runtime;
+      rsel.innerHTML = "";
+      for (const r of RUNTIMES) {
+        rsel.append(el("option", { value: r.name }, RUNTIME_LABEL[r.name] || r.name));
+      }
+      rsel.value = RUNTIMES.some((r) => r.name === want) ? want : RUNTIMES[0].name;
+    }
   } catch (_) { ACME_EMAIL_REMEMBERED = false; MAY_SET_PRIVILEGED = false; }
+  renderRuntimeAxes();
   syncHttpsFields();
   const sel = $("#preset-select");
   sel.innerHTML = "";
@@ -2415,6 +2433,66 @@ async function openCreate(preset) {
   }
   $("#create-dialog").showModal();
 }
+// ---- the three axes: where it runs, how it is arranged, how many -------------
+// Populated from /api/settings, never from a list written here. The same reasoning
+// as PRIVILEGED_FIELDS a few lines up: two places deciding the same thing is how
+// the dialog ends up offering a combination the service layer refuses.
+let RUNTIMES = [];
+
+const RUNTIME_LABEL = { docker: "Docker Compose", kubernetes: "Kubernetes (kind)" };
+const DEPLOYMENT_LABEL = {
+  monolith: "monolith — one Rocket.Chat",
+  "multi-instance": "multi-instance — several behind a load balancer",
+  microservices: "microservices — split into services",
+};
+// What CHANGES when you pick one, said where the choice is made. Not decoration:
+// the runtime decides which other commands will work on this workspace for the
+// rest of its life, and that is not recoverable from the word "Kubernetes".
+const RUNTIME_HINT = {
+  docker: "",
+  kubernetes: "Its own kind cluster, one namespace per workspace. HTTPS is not "
+    + "available here yet; everything else works.",
+};
+
+// TWO functions, not one, and the split is load-bearing. Changing the RUNTIME
+// repopulates the arrangement list and resets it; changing the ARRANGEMENT must
+// only show or hide the fields that depend on it. Wiring one function to both
+// events made every arrangement choice snap straight back to the runtime's
+// default -- picking `monolith` on Kubernetes recorded `microservices`, and the
+// dialog looked right the whole time. Found by clicking it, not by a test.
+function renderRuntimeAxes() {
+  const rt = $("#runtime-select").value;
+  const spec = RUNTIMES.find((r) => r.name === rt);
+  const dsel = $("#deployment-select");
+  dsel.innerHTML = "";
+  for (const d of (spec ? spec.deployments : [])) {
+    dsel.append(el("option", { value: d }, DEPLOYMENT_LABEL[d] || d));
+  }
+  // The RUNTIME'S default, rather than carrying the previous runtime's over. Both
+  // offer `monolith`, so preserving looked considerate and produced a real
+  // divergence: `--runtime k8s` on the CLI defaults to microservices, and the
+  // dialog would have handed you monolith because that is what Compose had
+  // selected a moment earlier. The value sitting there was never a choice.
+  dsel.value = spec ? spec.default_deployment : "";
+  $("#runtime-hint").textContent = RUNTIME_HINT[rt] || "";
+
+  const kube = rt === "kubernetes";
+  $("#mongo-operator-row").hidden = !kube;
+  // HTTPS is refused by the service layer on Kubernetes -- there is no ingress yet.
+  // Hidden rather than disabled: a greyed-out control invites "why can't I?", and
+  // the hint above already says so in a sentence.
+  const https = $("#create-https-block");
+  if (https) https.hidden = kube;
+  syncDeploymentFields();
+}
+
+function syncDeploymentFields() {
+  // --replicas means something on both runtimes, but nothing at all on a monolith.
+  // Offering a field that is silently ignored is how `--seed` and `--https` were
+  // quietly dropped on this runtime.
+  $("#replicas-row").hidden = $("#deployment-select").value === "monolith";
+}
+
 function renderPresetParams() {
   const p = PRESETS.find((x) => x.name === $("#preset-select").value);
   $("#preset-desc").textContent = p ? p.description : "";
@@ -2519,8 +2597,18 @@ async function submitCreate() {
     preset: f.preset.value,
     port: f.port.value ? parseInt(f.port.value, 10) : 0,
     monitor: f.monitor.checked, seed: f.seed.checked, wait: f.wait.checked,
+    // Always sent, both of them. Omitting `runtime` would let the service layer's
+    // default decide, which is the same answer today and would silently stop being
+    // so the moment that default moved -- and the dialog would still be showing the
+    // old one.
+    runtime: f.runtime ? f.runtime.value : "docker",
+    deployment: f.deployment ? f.deployment.value : "",
     params: {},
   };
+  if (f.replicas && !$("#replicas-row").hidden && f.replicas.value) {
+    req.replicas = parseInt(f.replicas.value, 10);
+  }
+  if (f.mongo_operator && f.mongo_operator.checked) req.mongo_operator = true;
   if (f.seed.checked && f.seed_profile) req.seed_profile = f.seed_profile.value;
   if (!req.version) { toast("version is required"); return; }
   for (const inp of f.querySelectorAll("input[name^='set:']")) {
@@ -2832,6 +2920,8 @@ $("#scope-filter").addEventListener("change", (e) => {
   view.scope = e.target.value; localStorage.setItem("rc_scope", view.scope); render();
 });
 $("#preset-select").addEventListener("change", renderPresetParams);
+$("#runtime-select").addEventListener("change", renderRuntimeAxes);
+$("#deployment-select").addEventListener("change", syncDeploymentFields);
 $("#https-mode").addEventListener("change", syncHttpsFields);
 // The profile only means anything when seeding is on, so don't show it otherwise.
 function syncCreateSeed() {

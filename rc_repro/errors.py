@@ -144,6 +144,33 @@ GATE_CODES: dict[str, str] = {
 }
 
 
+def as_payload(exc: ReproError) -> dict:
+    """A failure as a machine-readable dict, for any front-end that speaks JSON.
+
+    This module's docstring promises that `code` is "the stable identifier a
+    machine-readable payload reports, so callers branch on it rather than on
+    prose". It was a promise nothing kept: the web layer answered
+    `{"error": ..., "kind": "<ClassName>"}`, and a Python class name is not a
+    stable identifier -- renaming a class is a refactor, renaming a `code` is a
+    breaking change. A caller branching on `kind` was branching on the one field
+    nobody had agreed not to move.
+
+    `kind` is still emitted, because it costs nothing and something may already
+    read it. New callers should use `code`.
+
+    `AuthorityGateError` gets its gate inlined. `as_gate()` was written "for a
+    machine-readable error payload" and had no caller at all, so the one thing a
+    gate exists to communicate -- `approve_with`, the exact command for a human to
+    run -- never left the process.
+    """
+    body = {"error": str(exc), "code": exc.code, "kind": type(exc).__name__}
+    if isinstance(exc, AuthorityGateError):
+        body["gate"] = exc.as_gate()
+    elif getattr(exc, "details", None):
+        body["details"] = dict(exc.details)
+    return body
+
+
 #: Every exit code this taxonomy can produce, with a short machine-readable
 #: label. Front-ends publish this rather than hardcoding the numbers, so the map
 #: has exactly one definition.

@@ -33,11 +33,13 @@ from starlette.routing import Match
 from rc_repro import config
 from rc_repro import presets as presets_mod
 from rc_repro import runner
-from rc_repro.errors import NotReadyError, ReproError, ValidationError
+from rc_repro.errors import (NotReadyError, ReproError, ValidationError,
+                            as_payload as error_body)
 from rc_repro.services import data as datasvc
 from rc_repro.services import audit as auditsvc
 from rc_repro.services import lifecycle as lc
 from rc_repro.services import sessions
+from rc_repro.services import topology
 from rc_repro.web import jobs as jobs_mod
 from rc_repro.web import signin as signin_page
 from rc_repro.web.jobs import JobManager
@@ -791,8 +793,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
 
     @app.exception_handler(ReproError)
     async def _repro_error(_: Request, exc: ReproError):
-        return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
-                            status_code=exc.http_status)
+        return JSONResponse(error_body(exc), status_code=exc.http_status)
 
     # --- the session: sign in, sign out, who am I -----------------------------
     def _client(request: Request) -> str:
@@ -1253,7 +1254,18 @@ def create_app(allow_hosts: list[str] | None = None, *,
                 # everybody and failing the create.
                 "may_set_privileged": lc.may_set_privileged_fields(
                     getattr(request.state, "actor", "") or ""),
-                "privileged_fields": list(lc.PRIVILEGED_CREATE_FIELDS)}
+                "privileged_fields": list(lc.PRIVILEGED_CREATE_FIELDS),
+                # The runtime/deployment axes, from the one table that defines them,
+                # so the dialog cannot offer a combination the service layer refuses.
+                # The same reasoning as `privileged_fields` directly above: two
+                # places deciding the same thing is how the form ends up rendering a
+                # field the API rejects, which is exactly what happened there.
+                "runtimes": [
+                    {"name": rt, "deployments": list(deps),
+                     "default_deployment": deps[0]}
+                    for rt, deps in topology.DEPLOYMENTS.items()
+                ],
+                "default_runtime": topology.DOCKER}
 
     @app.get("/api/machine")
     def machine():
@@ -1317,6 +1329,8 @@ def create_app(allow_hosts: list[str] | None = None, *,
     def stats(name: str):
         from rc_repro.perf import resources as R
         target = lc.resolve_name(name)
+        topology.require_compose(target, "stats",
+                                 instead="Install metrics-server and use `kubectl top`.")
         ids = runner.container_ids(target)
         prefix = f"{config.PROJECT_PREFIX}{target}-"
         cpu = mem = 0.0
@@ -1417,10 +1431,17 @@ def create_app(allow_hosts: list[str] | None = None, *,
             # against the log itself.
             auditsvc.record("logs-open", target)
         except ReproError as exc:
-            await ws.send_json({"error": str(exc)}); await ws.close(); return
+            await ws.send_json(error_body(exc)); await ws.close(); return
 
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue(maxsize=WS_QUEUE_MAX)
+        # A Kubernetes workspace has no compose project, so the stream would
+        # open, produce nothing, and look like a quiet workspace rather than an
+        # unsupported one. Refused before the socket carries anything.
+        try:
+            topology.require_compose(target, "logs", instead="Use kubectl logs.")
+        except ReproError as exc:
+            await ws.send_json(error_body(exc)); await ws.close(); return
         proc = open_log_process(runner.workspace(target), _clamp_tail(tail))
 
         dropped = [0]
@@ -1552,8 +1573,8 @@ def create_app(allow_hosts: list[str] | None = None, *,
         """
         target = lc.resolve_name(name)
         meta = runner.read_meta(target)
-        req = lc.CreateReq(version=meta.rc_version, preset=meta.preset,
-                           name=target, wait=True, offline=True)
+        req = lc.CreateReq(version=meta.rc_version, name=target, wait=True,
+                           offline=True, **topology.axes_of_meta(meta))
         job = jobs.submit("up", lc.create_repro, req, stream_output=True, label=target)
         return {"job_id": job.id}
 

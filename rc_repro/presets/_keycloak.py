@@ -9,6 +9,90 @@ from __future__ import annotations
 
 import json
 
+UI_PORT_LABEL = "rc-repro.io/ui-port"
+
+
+def manifests(realm: str, host_port: int, http_port: int | None = None,
+              *, workspace: str = "__RC_REPRO_NAME__") -> str:
+    """The same Keycloak, as native Kubernetes resources.
+
+    Deliberately NOT a Scenario with two adapters like `ldap`. Keycloak's intent
+    survives the crossing untouched: the realm JSON is byte-identical, the settings
+    Rocket.Chat needs are identical, and the post_ready actions are REST calls that
+    do not care. Only the container's packaging differs, so `saml` and `oidc` carry
+    BOTH renderings on one Preset and each runtime reads the half it understands.
+
+    THE HOSTNAME TRANSFERS, which is the part worth stating. `keycloak:<port>` has
+    to resolve identically from Rocket.Chat's backend and from the browser, because
+    OIDC uses one URL for the authorize redirect AND the token exchange. On Compose
+    that is the project network plus a `127.0.0.1 keycloak` hosts entry. Here it is
+    a Service literally named `keycloak` plus the same hosts entry, with the port
+    forwarded to the same number. The gotcha and its workaround are unchanged, which
+    is the whole point of publishing on the registry's port.
+    """
+    import yaml
+
+    container_port = http_port or 8080
+    labels = {
+        "app": "rc-repro-keycloak",
+        "app.kubernetes.io/managed-by": "rc-repro",
+        "rc-repro.io/component": "keycloak",
+        "rc-repro.io/repro": workspace,
+        UI_PORT_LABEL: str(host_port),
+    }
+    env = [{"name": "KC_BOOTSTRAP_ADMIN_USERNAME", "value": "admin"},
+           {"name": "KC_BOOTSTRAP_ADMIN_PASSWORD", "value": "admin"},
+           # See service() for why: without it, anything terminating TLS in front
+           # serves an https console that requests http assets, and the browser
+           # blocks every one.
+           {"name": "KC_PROXY_HEADERS", "value": "xforwarded"}]
+    if http_port:
+        env.append({"name": "KC_HTTP_PORT", "value": str(http_port)})
+    config_map = {
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": "keycloak-realm", "labels": labels},
+        "data": {"rcrepro-realm.json": realm},
+    }
+    deployment = {
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": "keycloak", "labels": labels},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": labels["app"]}},
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": {"containers": [{
+                    "name": "keycloak",
+                    "image": KC_IMAGE,
+                    "args": ["start-dev", "--import-realm"],
+                    "env": env,
+                    "ports": [{"containerPort": container_port}],
+                    # subPath, so the ConfigMap lands as a FILE next to Keycloak's
+                    # own import directory rather than replacing the directory.
+                    "volumeMounts": [{
+                        "name": "realm",
+                        "mountPath": "/opt/keycloak/data/import/rcrepro-realm.json",
+                        "subPath": "rcrepro-realm.json",
+                    }],
+                }],
+                "volumes": [{"name": "realm",
+                             "configMap": {"name": "keycloak-realm"}}]},
+            },
+        },
+    }
+    service = {
+        "apiVersion": "v1", "kind": "Service",
+        # `keycloak`, so RC's pod resolves exactly the hostname the realm and the
+        # settings already name.
+        "metadata": {"name": "keycloak", "labels": labels},
+        "spec": {"selector": {"app": labels["app"]},
+                 "ports": [{"name": "http", "port": host_port,
+                            "targetPort": container_port}]},
+    }
+    return "---\n".join(yaml.safe_dump(d, sort_keys=False)
+                        for d in (config_map, deployment, service))
+
+
 KC_IMAGE = "quay.io/keycloak/keycloak:26.0"
 REALM = "rcrepro"
 _DOMAIN = "example.com"

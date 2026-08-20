@@ -43,6 +43,7 @@ PRESET_PORTS: dict[str, tuple[int, ...]] = {
     "email": (8025,),         # Mailpit web UI / API
     "s3_minio": (9000, 9001), # MinIO S3 API + console
     "livechat": (8090,),      # demo "customer website" embedding the widget
+    "ldap": (8082,),          # phpLDAPadmin — browse the directory the preset seeded
 }
 
 # Host ports for the --monitor add-on (Prometheus, Grafana). Not a preset, so
@@ -62,6 +63,17 @@ MONGO_OPLOG_URL = "mongodb://mongodb:27017/local?replicaSet=rs0"
 # Key under Metadata.extra where the email preset records Mailpit's URL, so
 # rcapi.login can fetch email-2FA codes for rc-repro's own admin calls.
 EXTRA_MAILPIT_URL = "mailpit_url"
+
+# Key under Metadata.extra naming the runtime a workspace runs on. ABSENT means
+# docker -- every workspace created before this key existed is a compose one, and
+# `services/topology.py` reads a missing value as such rather than migrating
+# repro.json. See that module for why the default is silent.
+EXTRA_RUNTIME = "runtime"
+
+# Key under Metadata.extra naming HOW Rocket.Chat is arranged (monolith /
+# multi-instance / microservices). Absent on a workspace older than the key, where
+# the deployment can still be recovered: it WAS the preset name.
+EXTRA_DEPLOYMENT = "deployment"
 
 # RC's REST rate limiter — disabled for the duration of a load test (and the
 # seed) so the offered load isn't throttled into a false result, then restored.

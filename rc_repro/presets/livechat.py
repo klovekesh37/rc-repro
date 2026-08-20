@@ -157,6 +157,13 @@ def build(params: dict) -> Preset:
         "  --reg-token to enable them, else configure manually.",
     ]
 
+    kube = _common._k8s_manifests(
+        name="widget-site", image="docker.io/nginx:alpine",
+        ports=[(_WIDGET_PORT, 80)],
+        files={"index.html": _widget_page()},
+        mounts=[{"name": "files", "mountPath": "/usr/share/nginx/html/index.html",
+                 "subPath": "index.html"}],
+        ui={"widget-site": (_WIDGET_PORT, 80)})
     return Preset(
         name="livechat",
         description=(
@@ -171,6 +178,7 @@ def build(params: dict) -> Preset:
         source="built-in (dynamic)",
         files=[("livechat/index.html", _widget_page())],
         ports=list(config.PRESET_PORTS["livechat"]),
+        kubernetes_manifests=[kube],
         params_help={
             "agents": "agents to create + assign to the department (default 1; admin is always an agent)",
             "registration": "show the pre-chat registration form (default false)",

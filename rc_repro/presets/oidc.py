@@ -101,6 +101,11 @@ def build(params: dict) -> Preset:
         requires_license=False,
         source="built-in (dynamic)",
         files=[("oidc/keycloak-realm.json", _keycloak.realm_json([_oidc_client()], users))],
+        # The same Keycloak as native resources. One Preset carries both renderings
+        # because the intent is identical either way -- see _keycloak.manifests.
+        kubernetes_manifests=[_keycloak.manifests(
+            _keycloak.realm_json([_oidc_client()], users), _KC_PORT,
+            http_port=_KC_PORT)],
         params_help={"users": "number of Keycloak test users (default 5)"},
         ports=list(config.PRESET_PORTS["oidc"]),
         post_ready=[
