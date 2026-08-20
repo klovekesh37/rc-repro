@@ -2429,7 +2429,10 @@ def test_a_cluster_rc_repro_did_not_create_is_marked_external(monkeypatch):
     the cluster itself is never its to remove."""
     from rc_repro.services import k8s
 
-    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    # No kind: the bring-your-own path, where the cluster kubectl points at is
+    # adopted. With kind INSTALLED rc-repro creates its own instead of adopting
+    # anyone's, so that is not the setup this rule is about.
+    monkeypatch.setattr(k8s, "which", lambda t: "" if t == "kind" else f"/usr/bin/{t}")
     monkeypatch.setattr(k8s, "run", _fake_run({
         "get clusters": (0, "somebody-elses\n"),
         "config current-context": (0, "kind-somebody-elses\n"),
@@ -2442,8 +2445,10 @@ def test_a_cluster_rc_repro_did_not_create_is_marked_external(monkeypatch):
     assert pre.cluster_exists is False, "ours is not among them"
     assert pre.provider == k8s.PROVIDER_EXTERNAL
     assert pre.context == "kind-somebody-elses"
+    assert pre.will_create is False, "a cluster rc-repro cannot make is never one it creates"
 
     # And ours, when it IS there, is the one rc-repro may manage fully.
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
     monkeypatch.setattr(k8s, "run", _fake_run({
         "get clusters": (0, f"{k8s.CLUSTER_NAME}\n"),
         "/readyz": (0, "ok"),
@@ -2483,8 +2488,8 @@ def test_the_cluster_in_use_is_not_also_listed_as_another_cluster(monkeypatch, t
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
     monkeypatch.setattr(k8s, "run", _fake_run({
-        "get clusters": (0, "kind\n"),
-        "config current-context": (0, "kind-kind\n"),
+        "get clusters": (0, f"{k8s.CLUSTER_NAME}\nsomebody-elses\n"),
+        "config current-context": (0, f"{k8s.CONTEXT}\n"),
         "/readyz": (0, "ok"),
         "get storageclass": (0, '{"items": [{"metadata": {"name": "standard",'
                                 ' "annotations": {"storageclass.kubernetes.io/'
@@ -2493,9 +2498,47 @@ def test_the_cluster_in_use_is_not_also_listed_as_another_cluster(monkeypatch, t
         "version": (0, "v9.9.9"),
     }))
     msgs = [r["message"] for r in doctor.run_checks()["checks"]]
-    assert any("Using your cluster 'kind-kind'" in m for m in msgs), msgs
-    assert not any("other kind cluster" in m for m in msgs), \
+    assert any(f"Cluster {k8s.CLUSTER_NAME!r} reachable" in m for m in msgs), msgs
+    others = [m for m in msgs if "other kind cluster" in m]
+    assert len(others) == 1 and "somebody-elses" in others[0], others
+    assert k8s.CLUSTER_NAME not in others[0], \
         "the cluster in use was counted again as an 'other' one"
+
+
+def test_doctor_names_the_cluster_up_would_actually_use(monkeypatch, tmp_path):
+    """A box with BOTH kind and k3s. `doctor` resolved the cluster itself -- kind's
+    if one existed, else whatever kubectl pointed at -- and `up` asked
+    `plan_cluster`, which creates rc-repro's own whenever kind is installed. With
+    kind present but no cluster yet and k3s running, the two disagreed: the report
+    said "Using your cluster 'default' (k3s)" and `up` went and built a kind
+    cluster. A preflight whose whole job is predicting a boot cannot be a second
+    opinion about it."""
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "run", _fake_run({
+        "get clusters": (0, "\n"),            # kind installed, no cluster yet
+        "config current-context": (0, "default\n"),   # ...but k3s is up and active
+        "/readyz": (0, "ok"),
+        "get storageclass": (0, '{"items": []}'),
+        "get namespace": (0, ""),
+        "version": (0, "v9.9.9"),
+    }))
+
+    plan = k8s.plan_cluster()
+    pre = k8s.preflight()
+    assert pre.context == plan.context, "doctor and up must name the same cluster"
+    assert pre.will_create is plan.create
+
+    msgs = [r["message"] for r in doctor.run_checks()["checks"]]
+    assert not any("Using your cluster 'default'" in m for m in msgs), \
+        "reported a cluster that up would not touch"
+    assert any(f"No cluster yet — {k8s.CLUSTER_NAME!r} is created on first use" in m
+               for m in msgs), msgs
+    # ...and the one being set aside is still named, or the next question is why
+    # rc-repro is building a second cluster next to a working one.
+    assert any("will NOT be used" in m and "'default'" in m for m in msgs), msgs
 
 
 def test_missing_storage_is_a_refusal_because_nothing_would_ever_log_it():

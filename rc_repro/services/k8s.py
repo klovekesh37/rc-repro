@@ -167,6 +167,10 @@ class Preflight:
     #: the cluster.
     context: str = ""
     provider: str = ""
+    #: Whether this call would BRING THE CLUSTER INTO EXISTENCE. Reported rather
+    #: than inferred from `cluster_reachable`, because "not answering" and "not made
+    #: yet" are different sentences and send a reader to different places.
+    will_create: bool = False
     #: Why the cluster question could not be ANSWERED, as opposed to answered no.
     #: `kind get clusters` fails when Docker is down, and returns nothing when there
     #: are simply no clusters -- both give an empty list. Reporting the first as
@@ -512,15 +516,29 @@ def preflight(context: str = "") -> Preflight:
     if not out.tools["kubectl"].present:
         return out
 
+    # THE SAME FUNCTION `up` USES, and that is the whole point of the call. An
+    # earlier version resolved the context itself -- `kind` cluster if one existed,
+    # else whatever `kubectl` pointed at -- which agreed with `plan_cluster` on every
+    # box that had only one of the two and disagreed on the box that had both: with
+    # `kind` installed but no cluster yet and k3s running, `doctor` reported "Using
+    # your cluster 'default' (k3s)" while `up` went and created a kind cluster. A
+    # preflight whose job is to predict a boot must not be a second opinion about it.
     if context:
         out.context = context
-    elif out.cluster_exists:
-        out.context = CONTEXT
     else:
-        out.context = active_context()
+        try:
+            plan = plan_cluster()
+        except PreflightError:
+            plan = None
+        if plan:
+            out.context = plan.context
+            out.will_create = plan.create
     out.provider = PROVIDER_KIND if out.context == CONTEXT else PROVIDER_EXTERNAL
 
-    if not out.context:
+    if not out.context or out.will_create:
+        # Nothing to probe: the cluster this create would use does not exist yet, and
+        # asking the OTHER cluster for its storage classes would describe a machine
+        # rc-repro is not about to use.
         return out
     out.cluster_reachable = reachable(out.context)
     if not out.cluster_reachable:

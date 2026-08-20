@@ -464,15 +464,28 @@ def run_checks() -> dict:
                 # absent would send them to create one that is already there.
                 line(needed, f"Could not tell whether cluster {k8s.CLUSTER_NAME!r} "
                              f"exists ({pre.probe_failed}) — kind needs Docker", check="kubernetes-cluster")
-            elif pre.context:
-                line(needed, f"Cluster {pre.context!r} is configured but its API "
-                             "server is not answering", check="kubernetes-cluster")
-            elif pre.can_provision:
+            elif pre.will_create:
+                # Ordered BEFORE the not-answering branch, which would otherwise
+                # claim a cluster nobody has made yet is broken.
                 line("fail" if in_use else "ok",
                      f"No cluster yet — {k8s.CLUSTER_NAME!r} is created on first use"
                      if not in_use else
                      f"Cluster {k8s.CLUSTER_NAME!r} is gone and its workspaces "
                      "cannot be reached", check="kubernetes-cluster")
+                # The box that has BOTH. Saying which one is about to be used is not
+                # enough on its own -- someone with a running k3s and no kind cluster
+                # needs to be told their cluster was seen and set aside, or the next
+                # question is why rc-repro is building a second one.
+                other = k8s.active_context()
+                if other and other != pre.context and k8s.reachable(other):
+                    line("ok", f"Your cluster {other!r} "
+                               f"({k8s.distribution(other) or 'unknown'}) is running and "
+                               f"will NOT be used — rc-repro creates its own while kind "
+                               f"is installed. Uninstall kind to use {other!r} instead",
+                         check="kubernetes-other-clusters")
+            elif pre.context:
+                line(needed, f"Cluster {pre.context!r} is configured but its API "
+                             "server is not answering", check="kubernetes-cluster")
             elif pre.tools_ready:
                 # kubectl and helm but no kind and no kubeconfig: usable the moment
                 # a cluster is pointed at, and the two ways to get one are named.
