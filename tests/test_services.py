@@ -5830,3 +5830,95 @@ def test_removing_the_operator_never_fails_a_teardown(monkeypatch):
     events = []
     assert k8s.remove_operator(context="default", emit=events.append) is False
     assert any("could not be uninstalled" in e.message for e in events)
+
+
+def test_down_volumes_takes_the_monitoring_stack_with_it(monkeypatch, tmp_path):
+    """Reported from a live k3s box: after `down --volumes` the monitoring stack was
+    still running -- ten pods and ~840 MB, wanted by nobody, because the workspace that
+    asked for it had been destroyed.
+
+    `remove_monitoring` could always do this. It was only ever called by `monitor --off`,
+    so the teardown walked past the most expensive thing rc-repro installs. On Compose
+    there was nothing to fix: the stack is part of the workspace's own compose project
+    and goes down with it.
+    """
+    import json as _json
+
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    (tmp_path / "repros" / "mon").mkdir(parents=True)
+    (tmp_path / "repros" / "mon" / "repro.json").write_text(_json.dumps({
+        "name": "mon", "project": "p", "rc_version": "8.5.1", "rc_image": "i",
+        "mongo_tag": "8.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3001", "host_port": 3001, "version_source": "x",
+        "extra": {"runtime": "kubernetes", "namespace": "rc-repro-mon",
+                  "context": "default", "monitoring": True,
+                  "grafana_pid": 4242}}))
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr(k8s, "delete_namespace", lambda *a, **k: True)
+    called = {}
+    monkeypatch.setattr(k8s, "remove_operator",
+                        lambda **kw: called.setdefault("operator", kw) is None)
+    monkeypatch.setattr(k8s, "remove_monitoring",
+                        lambda **kw: called.setdefault("monitoring", kw) is None)
+
+    stopped = []
+    monkeypatch.setattr(lc, "_stop_port_forward", stopped.append)
+    lc.teardown("mon", volumes=True, confirm=True)
+    assert "monitoring" in called, "the monitoring stack was left running"
+    # And the Grafana forward, which targets a deployment in `rc-repro-system` and so
+    # SURVIVES the workspace: it went on holding :5050 after the workspace was destroyed,
+    # and the next `up --monitor` was refused for a port held by a corpse.
+    assert 4242 in stopped, "the Grafana port-forward was left holding its host port"
+    # The namespace being destroyed must not be counted as still wanting it: the count
+    # reads a label on the namespace, and a namespace still Terminating is still listed
+    # and still labelled.
+    assert called["monitoring"]["excluding"] == "rc-repro-mon"
+    assert called["operator"]["excluding"] == "rc-repro-mon"
+
+    # A plain `down` keeps the namespace and the data, so the workspace can come back and
+    # the stack it wants must stay with it.
+    called.clear()
+    (tmp_path / "repros" / "mon").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repros" / "mon" / "repro.json").write_text(_json.dumps({
+        "name": "mon", "project": "p", "rc_version": "8.5.1", "rc_image": "i",
+        "mongo_tag": "8.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3001", "host_port": 3001, "version_source": "x",
+        "extra": {"runtime": "kubernetes", "namespace": "rc-repro-mon",
+                  "context": "default", "monitoring": True}}))
+    stopped.clear()
+    lc.teardown("mon", volumes=False, confirm=True)
+    assert called == {}, "a plain `down` must leave both alone — the workspace comes back"
+    assert 4242 not in stopped, \
+        "and Grafana stays reachable for a workspace that is coming back"
+    assert topology.KUBERNETES  # the branch under test is the Kubernetes one
+
+
+def test_the_workspace_being_destroyed_does_not_vote_to_keep_the_stack(monkeypatch):
+    """The reference count reads a label on the workspace namespace, and
+    `workspace_namespaces` does not filter by phase -- a namespace still Terminating is
+    still listed and still labelled. Without excluding it, a teardown asking "does
+    anyone else still want this?" is answered yes by the workspace it is deleting.
+    """
+    import subprocess as sp
+
+    from rc_repro.services import k8s
+
+    def run(argv, timeout=None, own=False):
+        j = " ".join(argv)
+        if "get namespace" in j and "-l" in j:
+            return sp.CompletedProcess(argv, 0, "namespace/rc-repro-going\n", "")
+        if "get namespace rc-repro-going" in j or "jsonpath" in j and "monitoring" in j:
+            return sp.CompletedProcess(argv, 0, "true", "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", run)
+    events = []
+    # Not excluded: the dying workspace keeps its own stack alive forever.
+    assert k8s.remove_monitoring(context="default", emit=events.append) is False
+    assert any("still used by going" in e.message for e in events)
+    # Excluded: nothing else wants it, so it goes.
+    events.clear()
+    assert k8s.remove_monitoring(context="default", excluding="rc-repro-going",
+                                 emit=events.append) is True

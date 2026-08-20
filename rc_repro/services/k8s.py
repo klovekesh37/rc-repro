@@ -2672,7 +2672,8 @@ def operator_installed(context: str) -> bool:
     return OPERATOR_RELEASE in (res.stdout or "").split()
 
 
-def remove_operator(*, context: str, emit: Emit = null_emit) -> bool:
+def remove_operator(*, context: str, excluding: str = "",
+                    emit: Emit = null_emit) -> bool:
     """Uninstall the shared MongoDB operator once nothing is using it any more.
 
     `down --volumes` means delete everything, so leaving an operator running afterwards
@@ -2698,7 +2699,11 @@ def remove_operator(*, context: str, emit: Emit = null_emit) -> bool:
     """
     if not operator_installed(context):
         return False
-    still = mongodb_resources(context)
+    # `excluding` for the same reason `remove_monitoring` takes it: the workspace being
+    # destroyed must not be counted as still needing the operator. Its MongoDBCommunity
+    # is normally gone by the time the namespace finishes, but "normally" is a race, and
+    # losing it leaves the operator running with nothing at all using it.
+    still = [ns for ns in mongodb_resources(context) if ns != excluding]
     if still:
         info(emit, "leaving the MongoDB operator up — still used by "
                    + ", ".join(n.removeprefix(NAMESPACE_PREFIX) for n in still),
@@ -2871,15 +2876,22 @@ def wait_for_grafana(*, context: str, emit: Emit = null_emit,
          phase="monitor")
 
 
-def remove_monitoring(*, context: str, emit: Emit = null_emit) -> bool:
+def remove_monitoring(*, context: str, excluding: str = "",
+                     emit: Emit = null_emit) -> bool:
     """Uninstall the shared stack. Returns False if another workspace still wants it.
 
     Shared, so `--off` on one workspace must not blind the others. This is the whole
     behavioural difference from Compose, where the stack belongs to a project and
     detaching it is unambiguous.
+
+    `excluding` is the namespace of a workspace being DESTROYED, and it exists because
+    the count reads a label on the namespace while `workspace_namespaces` does not
+    filter by phase: a namespace still Terminating is still listed and still labelled,
+    so a teardown asking "does anyone else want this?" would be told yes by the
+    workspace it is in the middle of deleting.
     """
     others = [n for n in workspace_namespaces(context)
-              if monitoring_wanted(n, context=context)]
+              if n != excluding and monitoring_wanted(n, context=context)]
     if others:
         info(emit, "leaving the monitoring stack up — still used by "
                    + ", ".join(sorted(n.removeprefix(NAMESPACE_PREFIX) for n in others)),

@@ -2320,7 +2320,27 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
                 # the finalizer. `--volumes` means delete everything, so an operator
                 # left running afterwards is the wrong answer -- and `remove_operator`
                 # refuses while any other workspace still needs it.
-                k8s.remove_operator(context=context, emit=emit)
+                ns = k8s.namespace_for(target)
+                # The GRAFANA forward, which `monitor --off` stops and this path did not.
+                # It targets a deployment in `rc-repro-system`, so unlike the workspace's
+                # own forward it survives the workspace -- and it went on holding :5050
+                # after the workspace was destroyed, so the next `up --monitor` was
+                # refused for a port held by a corpse. Measured exactly that way. Only on
+                # `--volumes`: after a plain `down` the stack and its label are kept on
+                # purpose, and Grafana stays reachable for a workspace coming back.
+                gpid = (meta.extra or {}).get("grafana_pid")
+                if gpid:
+                    _stop_port_forward(int(gpid))
+                k8s.remove_operator(context=context, excluding=ns, emit=emit)
+                # AND the monitoring stack, which had the same hole and is far more
+                # expensive: ten pods and ~840 MB left running after the workspace that
+                # asked for them was destroyed. `remove_monitoring` has always been able
+                # to do this -- reference-counted on a namespace label, Grafana's custom
+                # resources deleted before the operator that finalises them -- and only
+                # `monitor --off` ever called it, so `down --volumes` walked past it.
+                # On Compose there was nothing to fix: the stack is part of the
+                # workspace's own compose project and goes down with it.
+                k8s.remove_monitoring(context=context, excluding=ns, emit=emit)
                 shutil.rmtree(runner.workspace(target), ignore_errors=True)
                 _clear_default_if(target)
             # Docker's nouns are wrong here. "containers, data volume, and
