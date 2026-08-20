@@ -1550,11 +1550,26 @@ def kubernetes_note_groups(meta: runner.Metadata) -> list[dict]:
         # port-forward before anything that reaches Rocket.Chat itself, so the three
         # groups now read top to bottom as: point your tools here, open the way in,
         # then look at what is inside.
-        note_group("1 · Point kubectl and helm at this cluster", body=[
+        # WHICH kubeconfig, and it is not the same answer on both clusters. rc-repro
+        # keeps its own only for the cluster it CREATED: every call is
+        # `own=is_ours(context)`, so on a cluster rc-repro adopted it uses the config
+        # you already set up and writes nothing of its own. The note said "export
+        # KUBECONFIG=<rc-repro's own>" unconditionally -- wrong three ways on an
+        # adopted cluster: rc-repro created no cluster, that file does not describe
+        # yours, and your kubectl was already pointed at the right one. Following it
+        # broke the shell it was pasted into.
+        (note_group("1 · Point kubectl and helm at this cluster", body=[
             "rc-repro keeps its own kubeconfig so creating a cluster cannot move the "
             "context you were using. A bare `kubectl` will not see this workspace "
             "until it is pointed here, and every command below assumes it:"],
-            commands=[f"export KUBECONFIG={k8s.owned_kubeconfig()}"]),
+            commands=[f"export KUBECONFIG={k8s.owned_kubeconfig()}"])
+         if k8s.is_ours(context) else
+         note_group("1 · Your kubectl already reaches this workspace", body=[
+             f"This workspace lives in a cluster you supplied, so there is nothing to "
+             f"export -- rc-repro used the kubeconfig you already have and wrote none "
+             f"of its own. Every command below runs against context {context!r}; add "
+             f"`--context {context}` to any of them if you work in more than one."],
+             commands=[f"kubectl config current-context   # expect {context}"])),
         note_group("2 · Open the way in", body=[
             f"Rocket.Chat is reached through a port-forward, which is tied to its pod "
             f"and dies with it. This is the one rc-repro started, so run it again if "

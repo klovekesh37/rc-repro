@@ -2505,6 +2505,38 @@ def test_the_cluster_in_use_is_not_also_listed_as_another_cluster(monkeypatch, t
         "the cluster in use was counted again as an 'other' one"
 
 
+def test_the_kubeconfig_note_matches_which_cluster_the_workspace_is_in(monkeypatch):
+    """The note said `export KUBECONFIG=<rc-repro's own>` on every Kubernetes
+    workspace. On a cluster rc-repro ADOPTED that is wrong three ways -- it created no
+    cluster, that file does not describe yours, and your kubectl already pointed at the
+    right one -- so pasting step 1 broke the shell it was pasted into. rc-repro only
+    keeps its own kubeconfig for the cluster it created (`own=is_ours(context)`), and
+    the note has to say the same thing the code does."""
+    from rc_repro import runner
+    from rc_repro.services import k8s, lifecycle as lc
+
+    def note_text(context):
+        meta = runner.Metadata(
+            name="w", project=k8s.namespace_for("w"), rc_version="8.5.1",
+            rc_image="registry.rocket.chat/rocketchat/rocket.chat:8.5.1",
+            mongo_tag="8.0", mongo_flavor="community", preset="default",
+            root_url="http://localhost:3000", host_port=3000,
+            version_source="shipped")
+        meta.extra.update({"runtime": "kubernetes", "namespace": k8s.namespace_for("w"),
+                           "context": context, "deployment": "monolith"})
+        return "\n".join(lc.flatten_notes(lc.note_groups_of(meta)))
+
+    ours = note_text(k8s.CONTEXT)
+    assert "export KUBECONFIG=" in ours, ours
+    assert str(k8s.owned_kubeconfig()) in ours
+
+    adopted = note_text("default")
+    assert "export KUBECONFIG=" not in adopted, \
+        "told the user to export a kubeconfig that does not describe their cluster"
+    assert str(k8s.owned_kubeconfig()) not in adopted
+    assert "'default'" in adopted, adopted
+
+
 def test_doctor_names_the_cluster_up_would_actually_use(monkeypatch, tmp_path):
     """A box with BOTH kind and k3s. `doctor` resolved the cluster itself -- kind's
     if one existed, else whatever kubectl pointed at -- and `up` asked
