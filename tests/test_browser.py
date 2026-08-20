@@ -90,8 +90,19 @@ def page(browser):
 
 @pytest.fixture
 def serve(tmp_path, monkeypatch):
-    """A server factory bound to an isolated home."""
+    """A server factory bound to an isolated home.
+
+    The Kubernetes probe is stubbed for the whole file. Every page load fetches
+    /api/kubernetes for the footer, and `preflight()` shells out to kubectl half a dozen
+    times -- so on a developer machine that happens to have a cluster, ninety browser
+    tests would each spend seconds probing it, and NOTHING in the suite is allowed to
+    depend on a live cluster. The two tests that care about the footer's contents set
+    the value in the page instead.
+    """
+    from rc_repro.services import k8s
+
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "preflight", lambda *a, **k: k8s.Preflight())
 
     def _start(**kw):
         return _Server(create_app(allow_hosts=["127.0.0.1"], **kw), _free_port())
@@ -491,8 +502,8 @@ def test_the_doctor_dialog_renders_its_checks(serve, page, monkeypatch):
 
     with serve() as s:
         _sign_in(page, s.url)
-        page.wait_for_selector("#docker-badge")
-        page.click("#docker-badge")
+        page.wait_for_selector("#doctor-badge")
+        page.click("#doctor-badge")
         page.wait_for_selector("#doctor-dialog[open]")
         page.wait_for_function(
             "() => !document.querySelector('#doctor-body').textContent.includes('Checking')")
@@ -3072,3 +3083,67 @@ def test_the_restart_count_on_kubernetes_is_rocket_chats_own_pod(monkeypatch, tm
          "health": "healthy", "app": True, "restarts": 1, "started": ""}])
     # Rocket.Chat's own, not the worst in the namespace.
     assert lcsvc.detail("kub")["restarts"] == 1
+
+
+def test_the_header_is_the_doctor_button_and_the_footer_names_both_engines(
+        serve, page, monkeypatch):
+    """The header said "docker: up". That was the whole environment when Docker was the
+    only runtime; it is one engine of two now, and it made the one control that answers
+    "is this box usable" look like a status label.
+
+    So the header says what it DOES and the footer says what each engine is doing --
+    because a workspace can run in either and the answer for one says nothing about the
+    other.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#doctor-badge")
+        assert page.text_content("#doctor-badge").strip() == "doctor"
+        # The footer names both, whatever the cluster answer turns out to be here.
+        page.wait_for_function(
+            "() => !document.querySelector('#sb-engines').textContent.includes('k8s: ?')")
+        footer = page.text_content("#sb-engines")
+        assert footer.startswith("docker: "), footer
+        # "not set up" is what an empty Preflight means, and it is a real state: a box
+        # with no kubectl. The cluster-shaped wording is asserted below.
+        assert "k8s: not set up" in footer, footer
+        # And it is still the way to the report.
+        page.click("#doctor-badge")
+        page.wait_for_selector("#doctor-dialog[open]")
+        assert page.errors == [], page.errors
+
+
+def test_the_doctor_chip_goes_red_only_when_nothing_can_run_a_workspace(
+        serve, page, monkeypatch):
+    """Docker being down is not a broken box on a machine whose Kubernetes is up, and
+    colouring the chip red there would be crying wolf at somebody whose k3s works. Red
+    means nothing here can run a workspace at all."""
+    _stub_lifecycle(monkeypatch, _fake_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#doctor-badge")
+        classes = page.evaluate("""() => {
+          const badge = document.querySelector('#doctor-badge');
+          const out = {};
+          DOCKER_OK = false; KUBE = {usable: true, reachable: true,
+                                     distribution: 'k3s', context: 'default'};
+          paintEngines();
+          out.dockerDownKubeUp = badge.className;
+          out.footer = document.querySelector('#sb-engines').textContent;
+          DOCKER_OK = false; KUBE = {usable: false, reachable: false};
+          paintEngines();
+          out.bothDown = badge.className;
+          DOCKER_OK = true; KUBE = null;
+          paintEngines();
+          out.dockerOnly = badge.className;
+          return out;
+        }""")
+        assert "up" in classes["dockerDownKubeUp"], \
+            "a working k3s is not a broken box just because Docker is off"
+        assert "k3s default" in classes["footer"], classes["footer"]
+        assert "down" in classes["bothDown"], "nothing can run: that is red"
+        assert "up" in classes["dockerOnly"]
+        assert page.errors == [], page.errors

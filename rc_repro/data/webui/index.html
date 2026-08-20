@@ -11,7 +11,11 @@
     <button class="brand" title="Back to this machine"><span class="dollar">$</span> rc-repro</button>
     <!-- Status on the left, account on the right. Both badges keep the position
          they have always had; only the ground under them changed. -->
-    <button id="docker-badge" class="chip" title="Run the environment check">docker: ?</button>
+    <!-- The DOCTOR button, named for what it does. It said "docker: up", which was
+         the whole environment when Docker was the only runtime and is now one engine
+         of two -- and it made the one control that answers "is this box usable"
+         look like a status label. What each engine is doing moved to the footer. -->
+    <button id="doctor-badge" class="chip" title="Run the environment check">doctor</button>
     <button id="edge-badge" class="chip" title="The shared Traefik serving every https name" hidden></button>
     <div class="topbar-actions">
       <!-- ONE set of links, in a wrapper the narrow layout turns into a popover. A
@@ -97,7 +101,9 @@
   <footer class="statusbar">
     <span id="sb-count">—</span>
     <span id="sb-refreshed">Last refreshed: —</span>
-    <span class="sb-right" id="sb-docker">docker: ?</span>
+    <!-- Both engines, because a workspace can run in either and the answer for one
+         says nothing about the other. -->
+    <span class="sb-right" id="sb-engines">docker: ? · k8s: ?</span>
   </footer>
 
   <!-- Create dialog -->

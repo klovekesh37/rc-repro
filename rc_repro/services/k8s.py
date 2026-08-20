@@ -176,15 +176,23 @@ class Preflight:
 
     @property
     def tools_ready(self) -> bool:
-        """Whether Kubernetes can be USED. Provisioning is a separate question."""
-        return all(self.tools[n].present and self.tools[n].new_enough
-                   for n in CORE_TOOLS if n in self.tools)
+        """Whether Kubernetes can be USED. Provisioning is a separate question.
+
+        Keyed on CORE_TOOLS rather than on what happens to be in `self.tools`, because
+        `all()` over nothing is True: a Preflight carrying no tool information at all
+        claimed every tool was ready, which is "I have no idea" reported as "yes".
+        """
+        return all(n in self.tools and self.tools[n].present
+                   and self.tools[n].new_enough for n in CORE_TOOLS)
 
     @property
     def can_provision(self) -> bool:
-        """Whether rc-repro can CREATE a cluster, as opposed to use one."""
-        return all(self.tools[n].present and self.tools[n].new_enough
-                   for n in PROVISION_TOOLS if n in self.tools)
+        """Whether rc-repro can CREATE a cluster, as opposed to use one.
+
+        Same reasoning as `tools_ready`: no information is not a yes.
+        """
+        return all(n in self.tools and self.tools[n].present
+                   and self.tools[n].new_enough for n in PROVISION_TOOLS)
 
     @property
     def missing_tools(self) -> list[str]:

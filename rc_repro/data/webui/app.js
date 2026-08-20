@@ -198,14 +198,47 @@ async function loadRepros() {
     who.textContent = ME + (MY_ROLE && MY_ROLE !== "admin" ? ` · ${MY_ROLE}` : "");
     who.hidden = !ME;
     DOCKER_OK = !!health.docker;
-    const dockerTxt = "docker: " + (health.docker ? "up" : "down");
-    const badge = $("#docker-badge");
-    badge.textContent = dockerTxt; badge.className = "chip " + (health.docker ? "up" : "down");
-    $("#sb-docker").textContent = dockerTxt;
+    paintEngines();
     if (SELECTED && !ALL_REPROS.find((r) => r.name === SELECTED)) closeDetail();
     render();
     refreshHome();
   } catch (e) { toast(e.message); }
+}
+
+// ---- the two engines --------------------------------------------------------
+// `KUBE` is fetched on its own, NOT on the four-second poll: `preflight()` shells out
+// to kubectl several times, and /api/health is the cheap unauthenticated call every
+// open tab makes. Same reasoning as the edge badge, and the same facts `doctor`
+// reports, from the same probe -- so the footer and the report cannot disagree about
+// which cluster you are on.
+let KUBE = null;
+
+async function refreshKube() {
+  try { KUBE = await api("/api/kubernetes"); }
+  catch (_) { KUBE = null; }                    // no permission, or no gui extra
+  paintEngines();
+}
+
+// The footer says what each ENGINE is doing; the header button says what it does.
+// "docker: up" in the header was the whole environment when Docker was the only
+// runtime -- it is one engine of two now, and a workspace can run in either.
+function paintEngines() {
+  const k = KUBE || {};
+  const kube = !k.usable ? "not set up"
+    : k.reachable ? `${k.distribution || "cluster"} ${k.context || ""}`.trim()
+    : k.can_provision ? "no cluster yet" : "no cluster";
+  const el = $("#sb-engines");
+  if (el) el.textContent = `docker: ${DOCKER_OK ? "up" : "down"} · k8s: ${kube}`;
+  // Red only when NOTHING can run a workspace. Docker being down is not a broken box
+  // on a machine whose Kubernetes is up, and saying so would be crying wolf at
+  // somebody whose k3s is working perfectly.
+  const badge = $("#doctor-badge");
+  if (badge) {
+    const dead = !DOCKER_OK && !(k.usable && k.reachable);
+    badge.className = "chip " + (dead ? "down" : "up");
+    badge.title = dead ? "Nothing here can run a workspace — run the environment check"
+                       : "Run the environment check";
+  }
 }
 
 // ---- the edge ---------------------------------------------------------------
@@ -3637,7 +3670,9 @@ $("#btn-new").addEventListener("click", () => openCreate());
 $("#btn-scenarios").addEventListener("click", openScenarios);
 $("#btn-home").addEventListener("click", goHome);
 $(".brand").addEventListener("click", goHome);
-$("#btn-refresh").addEventListener("click", loadRepros);
+// Refresh re-probes the cluster too, which the poll deliberately does not: that is
+// what somebody presses after installing k3s or starting a cluster.
+$("#btn-refresh").addEventListener("click", () => { loadRepros(); refreshKube(); });
 
 // ---- theme ------------------------------------------------------------------
 // Stored per browser, not per account: it is a property of the screen you are
@@ -3764,7 +3799,7 @@ $("#call-form").addEventListener("submit", (e) => { e.preventDefault(); submitCa
 $("#call-close").addEventListener("click", () => $("#call-dialog").close());
 $("#call-copy").addEventListener("click", () =>
   CALL_TEXT ? copy(CALL_TEXT) : toast("nothing to copy — send a request first"));
-$("#docker-badge").addEventListener("click", openDoctor);
+$("#doctor-badge").addEventListener("click", openDoctor);
 $("#edge-badge").addEventListener("click", openEdge);
 $("#edge-close").addEventListener("click", () => $("#edge-dialog").close());
 $("#doctor-recheck").addEventListener("click", openDoctor);
@@ -3784,4 +3819,5 @@ document.addEventListener("visibilitychange", () => {
 });
 
 loadRepros();
+refreshKube();
 startPolling();
