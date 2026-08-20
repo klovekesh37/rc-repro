@@ -108,6 +108,25 @@ rc-repro up --version 8.6.1 --runtime kubernetes --deployment microservices --re
 `multi-instance` on Docker, `microservices` or `monolith` on Kubernetes. An illegal
 pair is refused with `VALIDATION_FAILED` before anything is created.
 
+### Which cluster it runs in
+
+One decision, made for you, and it is the only thing k3s and kind change:
+
+- **`kind` installed** — rc-repro creates and manages its own cluster,
+  `rc-repro-local`, on first use. `prune` deletes it once no rc-repro namespace is
+  left. Costs ~600 MB for the control plane, once per machine.
+- **`kind` not installed** — rc-repro uses the cluster `kubectl` already points at
+  (k3s, minikube, Docker Desktop, remote). It creates namespaces there and **never**
+  removes the cluster; `prune` cannot delete it.
+
+With both a `kind` binary and a running k3s on the box, **kind wins** — the binary
+being present is the test. Everything after provisioning is identical code on either.
+
+`rc-repro doctor --json` is the authority on which one applies and on what the
+cluster provides: `storage`, `ingress`, `loadbalancer` and `metrics` are reported as
+facts per cluster. A stock k3s has all four; a stock kind has storage only, so
+`stats` refuses there. Do not assume a capability from the distribution name.
+
 ### What Kubernetes refuses, and why
 
 These are refusals, not gaps — the refusal names the reason and the alternative:
@@ -152,9 +171,12 @@ you do.
 **requires `--yes`**, because there is nobody to prompt. Without `--volumes` the
 data is kept and `rc-repro up --version <same> --name <same>` brings it back.
 
-On Kubernetes, `down` leaves the shared kind cluster running on purpose — it is
-shared by every workspace. `rc-repro prune` reclaims it, and refuses while any
-rc-repro-owned namespace remains.
+On Kubernetes, `down` leaves the shared cluster running on purpose — it is shared by
+every workspace. `rc-repro prune` reclaims it **if rc-repro created it**, and refuses
+while any rc-repro-owned namespace remains; a cluster you supplied is never deleted.
+
+`down --volumes` also removes the shared MongoDB operator and the shared
+Prometheus/Grafana stack, once no other workspace still needs them.
 
 ## Things that will bite you
 
@@ -164,8 +186,9 @@ rc-repro-owned namespace remains.
   box does not have room. Free something rather than retrying.
 - **Version pairs matter.** rc-repro resolves the right MongoDB for a Rocket.Chat
   version. Do not override it unless you know why.
-- **Kubernetes costs more.** A cluster plus the chart is well over a Compose
-  workspace, and the first Kubernetes workspace also creates the cluster.
+- **Kubernetes costs more.** The chart is well over a Compose workspace, and where
+  `kind` is installed the first Kubernetes workspace also creates the cluster
+  (~600 MB more). Against an existing k3s that step is skipped.
 - **Everything binds `127.0.0.1`** unless told otherwise, because repros ship fixed
   weak credentials. Widening that is a decision for a human on a trusted network.
 

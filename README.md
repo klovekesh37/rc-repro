@@ -17,7 +17,8 @@ Prefer a browser? [`rc-repro serve`](#13-web-gui) does everything the CLI does.
 ## Contents
 
 **Start here** — [1 Install](#1-install) · [2 First workspace](#2-your-first-workspace) ·
-[3 Where it runs](#3-where-it-runs) · [4 Lifecycle](#4-everyday-lifecycle)
+[3 Where it runs](#3-where-it-runs) ([kind or k3s](#kind-or-k3s--which-cluster-you-get)) ·
+[4 Lifecycle](#4-everyday-lifecycle)
 
 **Fill it** — [5 Scenarios](#5-scenarios) · [6 Sample data](#6-sample-data) ·
 [7 Settings and env vars](#7-settings-and-env-vars) · [8 Backup, restore, upgrade](#8-backup-restore-upgrade)
@@ -36,8 +37,10 @@ Every command has `--help`, and it is written to be read: this file is the map.
 ## 1. Install
 
 **You need:** Docker with `docker compose` v2, running · Python 3.11+ · internet, for
-image pulls and version lookup. For `--runtime kubernetes` you also need
-[kind](https://kind.sigs.k8s.io/), `kubectl` and `helm` on `PATH`.
+image pulls and version lookup. For `--runtime kubernetes` you also need `kubectl` and
+`helm` on `PATH`, plus **either** [kind](https://kind.sigs.k8s.io/) — so rc-repro can
+create its own cluster — **or** a cluster `kubectl` already points at, such as
+[k3s](https://k3s.io/). See [§3](#3-where-it-runs) for which one gets used.
 
 ### A. As a tool you use (recommended)
 
@@ -135,20 +138,68 @@ rc-repro up -v 8.5.1 --name t4 --runtime kubernetes --deployment monolith
 | `kubernetes` | `microservices` (default) | Helm chart, ~9 pods, real service split |
 | `kubernetes` | `monolith` | Helm chart, ~5 pods |
 
-**Kubernetes runs in a shared `kind` cluster** that rc-repro creates on first use and
-every workspace after that reuses. Each workspace is a namespace
-(`rc-repro-<name>`), reached on `http://localhost:<port>` through a `kubectl
-port-forward` that rc-repro starts. rc-repro keeps **its own kubeconfig** under
-`RC_REPRO_HOME`, so creating a cluster never moves your current context.
-
-`kind` is therefore required to *create* one. Everything rc-repro then does inside a
-namespace is plain Kubernetes and behaves the same on k3s, minikube, Docker Desktop or
-a remote cluster — `doctor` probes whatever `kubectl` points at and reports it as
-yours — but `up` does not yet target an existing cluster, and refuses with a preflight
-error rather than guessing when `kind` is absent.
+**Every Kubernetes workspace is a namespace** (`rc-repro-<name>`) in a cluster shared
+by all of them, reached on `http://localhost:<port>` through a `kubectl port-forward`
+that rc-repro starts. rc-repro keeps **its own kubeconfig** under `RC_REPRO_HOME`, so
+nothing it does can move the context you were using.
 
 `--mongo-operator` manages MongoDB with the official community operator (adds SCRAM
 auth, needs MongoDB 6.0+); without it MongoDB is a plain StatefulSet with no auth.
+
+### kind or k3s — which cluster you get
+
+rc-repro does not require a *particular* Kubernetes. It needs one, and there are two
+ways to have one, so there is exactly one decision and it is made for you:
+
+> **If `kind` is installed, rc-repro creates and manages its own cluster. If it is
+> not, rc-repro uses the cluster `kubectl` is already pointed at.**
+
+That is the whole difference — **one step, provisioning**. Everything after it is
+plain Kubernetes and is the same code either way: the namespace, the Helm release, the
+PVC, the port-forward, `logs`, `seed`, `backup`, `upgrade`, `monitor`.
+
+| | `kind` installed | `kind` not installed |
+|---|---|---|
+| Cluster | rc-repro creates `rc-repro-local` on first use | yours — k3s, minikube, Docker Desktop, a remote one |
+| Cost | ~600 MB for the control plane, once per machine | nothing; it is already running |
+| `down --volumes` | removes the namespace, PVC, and the shared operator and monitoring stack once nothing else wants them | identical |
+| `prune` | deletes the cluster once no rc-repro namespace is left | **never** — it is not rc-repro's to delete |
+| HTTPS / `--domain` | refused on this runtime (see below), whatever the cluster provides | same |
+
+**On a box with both, `kind` wins** — the binary being present is the test, so a
+kind user's workflow is unchanged by k3s existing. `doctor` says so out loud rather
+than leaving you to find out:
+
+```
+✓ No cluster yet — 'rc-repro-local' is created on first use
+✓ Your cluster 'default' (k3s) is running and will NOT be used — rc-repro creates
+  its own while kind is installed. Uninstall kind to use 'default' instead
+```
+
+**What differs is what the cluster already provides**, not what rc-repro does with it.
+`doctor` probes and reports all of it, because these are the facts that decide whether
+a volume binds and whether `stats` works:
+
+```
+✓ Using your cluster 'default' (k3s, 1 node, amd64) — rc-repro creates namespaces
+  in it and never removes the cluster itself
+✓ Storage: local-path (default)
+✓ Ingress: traefik — a hostname can be served from this cluster
+✓ Load balancer: working — traefik has 172.16.0.2
+✓ Metrics: metrics-server answering — `rc-repro stats` works here
+```
+
+A stock k3s ships storage, Traefik, a load balancer and metrics-server; a stock kind
+ships storage only, so `stats` refuses there and says how to install metrics-server.
+Neither is a fault — a workspace reached by port-forward needs no ingress at all — and
+`doctor` reports each as a fact rather than a warning, so the two clusters can be
+compared at a glance.
+
+**The ownership rule is what makes adopting your cluster safe:** rc-repro owns the
+namespaces it labels and never the cluster. In a cluster you supplied it creates
+namespaces, removes them on `down`, and leaves everything else — including the cluster
+itself — alone. `prune` cannot reach it: deleting a cluster needs the `kind` binary and
+only ever targets `rc-repro-local`.
 
 **What Kubernetes refuses, and why** — each refusal names the reason and the alternative:
 
@@ -161,8 +212,15 @@ auth, needs MongoDB 6.0+); without it MongoDB is a plain StatefulSet with no aut
 | `stats` | needs metrics-server in the cluster; the refusal says how to install it |
 
 `logs`, `env` (read), `upgrade`, `backup`, `restore`, `seed`, `monitor`, `api`, `pat`
-and `token` all work on both. `down` leaves the shared cluster running on purpose;
-`rc-repro prune` reclaims it, and refuses while any rc-repro namespace remains.
+and `token` all work on both, and on either cluster. `down` leaves the shared cluster
+running on purpose. `rc-repro prune` reclaims it **if rc-repro created it**, and
+refuses while any rc-repro namespace remains; a cluster you supplied is never deleted.
+
+`down --volumes` means *delete everything*, so it also removes the shared MongoDB
+operator and the shared Prometheus/Grafana stack — but only once no other workspace
+still needs them, and only in that order. The custom resources have to go while the
+operator is still alive to clear their finalizers; removing the operator first leaves
+the namespace stuck in `Terminating` with nothing left to finalise it.
 
 ---
 
@@ -705,7 +763,7 @@ is emitted only for RC < 8.
 ├── backups/  reports/  loadtests/
 ├── acme/                     # ACME state; dns.env, issued.json
 ├── edge/                     # the shared edge and one file per route
-├── clients/kubernetes/       # rc-repro's own kubeconfig
+├── clients/kubernetes/       # rc-repro's own kubeconfig — never your ~/.kube/config
 └── repros/<name>/
     ├── docker-compose.yml    # generated — re-run `up` rather than editing it
     └── repro.json            # the record: version, runtime, ports, seed, notes
