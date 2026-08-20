@@ -3097,15 +3097,16 @@ function syncBindHint() {
   const wide = WIDE_BINDS.includes(String(DEFAULT_BIND_HOST || ""));
   if (!remote || wide) { hint.hidden = true; hint.textContent = ""; return; }
   hint.hidden = false;
+  // ONE LINE. This was four sentences explaining loopback, and it sits above a form
+  // somebody is already filling in -- so it restated what the reader could infer and
+  // buried the only part that is a decision. It also led with `0.0.0.0`, which on a
+  // public box publishes admin/admin123 to the internet; the hostname it can have
+  // instead goes through the same front door as this GUI and was never mentioned.
   hint.textContent =
-    `You are using this GUI from ${remote}, so it is not on the same machine as the `
-    + `workspaces. They publish on ${DEFAULT_BIND_HOST} by default, which is the `
-    + `server's own loopback — a workspace created as-is will not answer here. `
+    `Workspaces bind ${DEFAULT_BIND_HOST}, so they will not answer from here — give it a `
     + (MAY_SET_PRIVILEGED
-        ? `Set Bind host to 0.0.0.0 under Advanced options to reach it from here.`
-        : `Ask an admin to run \`rc-repro config set bind_host 0.0.0.0\` once for `
-          + `this box.`)
-    + ` Workspaces ship a fixed admin/admin123, so only on a network you trust.`;
+        ? `hostname below, or Bind host 0.0.0.0 (which publishes admin/admin123).`
+        : `hostname below, or ask an admin to set bind_host.`);
 }
 // ---- the three axes: where it runs, how it is arranged, how many -------------
 // Populated from /api/settings, never from a list written here. The same reasoning

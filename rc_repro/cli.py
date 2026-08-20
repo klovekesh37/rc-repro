@@ -967,6 +967,14 @@ _CONFIG_KEYS: dict[str, str] = {
     # -- without a way to rehearse against staging, a misconfigured first attempt
     # locks the hostname out for a week.
     "acme.staging": "acme_staging",
+    # `http` | `tlsalpn` | `dns`. Normally derived and never asked for -- dns-01 when
+    # credentials exist, TLS-ALPN otherwise -- and this exists because a real box had
+    # NEITHER available: TLS-ALPN validation failed on every attempt with `remote error:
+    # tls: unrecognized name`, and dns-01 was impossible because the operator had the
+    # machine and not the zone. http-01 validates on :80, which needs only host access,
+    # and there was no way to select it. Setting it turns the edge's :80 redirect off,
+    # because that redirect would send Let's Encrypt away from the challenge path.
+    "acme.challenge": "acme_challenge",
     # Only needed when the variable names in dns.env do not identify the provider
     # on their own; normally it is inferred.
     "acme.dns_provider": "acme_dns_provider",
@@ -1146,9 +1154,50 @@ def users_cmd(
     _err(f"unknown action {action!r} (want: list | add | passwd | remove | role)")
 
 
+def _report_gui_tls(domain: str, tries: int = 10, pause: float = 2.0) -> None:
+    """Say whether `domain` is really being served over TLS yet, and why not.
+
+    Polled rather than asked once: ACME takes a few seconds on a good day, so a single
+    probe would report "not yet" for every healthy start and teach people to ignore it.
+    Never fatal -- the GUI is about to serve, and a certificate that has not arrived is
+    a thing to say rather than a reason to refuse.
+    """
+    import time
+
+    from rc_repro import tls as tlsmod
+    from rc_repro.services import edge as edgesvc
+
+    for attempt in range(tries):
+        got = tlsmod.verify("127.0.0.1", 443, sni=domain, timeout=5.0)
+        if got.get("serving") and not got.get("fallback"):
+            ui.ok(f"https://{domain} is serving a real certificate "
+                  f"({got.get('issuer', '')})".rstrip(" ()"))
+            return
+        why = edgesvc.acme_failure(domain)
+        if why:
+            # Conclusive: Let's Encrypt has answered and said no. Stop waiting.
+            ui.warn(f"  ⚠ https://{domain} has NO certificate yet, and Let's Encrypt "
+                    f"refused:\n      {why}")
+            ui.hint(f"  The GUI itself is fine — this is the name, not the server. "
+                    f"Check that {domain} resolves to this host's public address and "
+                    f"that :443 is reachable from the internet (rc-repro validates over "
+                    f"TLS-ALPN on 443, not :80), then `rc-repro edge restart`.")
+            ui.hint("  Full detail: `rc-repro edge logs --tail 50`")
+            return
+        if attempt < tries - 1:
+            if attempt == 0:
+                ui.note(f"  waiting for the certificate for {domain}…")
+            time.sleep(pause)
+    ui.warn(f"  ⚠ https://{domain} is not serving a real certificate yet. Traefik "
+            f"requests it in the background, so this may still complete.")
+    ui.hint("  Watch it: `rc-repro edge logs -f`   ·   check it: `rc-repro tls-status`")
+
+
 @app.command(name="edge")
 def edge_cmd(
-    action: str = typer.Argument("status", help="status | start | stop | restart"),
+    action: str = typer.Argument("status", help="status | start | stop | restart | logs"),
+    follow: bool = typer.Option(False, "--follow", "-f", help="follow the log (logs)"),
+    tail: int = typer.Option(200, "--tail", help="how many lines of log to show"),
 ) -> None:
     """The shared Traefik that serves every HTTPS name on this box.
 
@@ -1161,6 +1210,19 @@ def edge_cmd(
     every name with no re-registration.
     """
     from rc_repro.services import edge as edgesvc
+
+    if action == "logs":
+        # WHERE HTTPS FAILS, and there was no way to read it from here. Traefik requests
+        # certificates in the background after it starts, so a name can be routed and the
+        # edge healthy while issuance fails, and this is the only record of why.
+        if not edgesvc.installed():
+            ui.note("no edge yet — nothing to show. It starts with the first `--https` "
+                    "or `--domain` workspace, or `serve --domain`.")
+            return
+        if not edgesvc.running():
+            ui.warn("the edge is STOPPED — this is whatever it said before it stopped. "
+                    "`rc-repro edge start`")
+        raise typer.Exit(edgesvc.logs(tail=tail, follow=follow))
 
     if action == "status":
         st = edgesvc.status()
@@ -1177,6 +1239,18 @@ def edge_cmd(
         if not st["running"]:
             ui.warn("  ⚠ every https name on this box is unreachable while it is "
                     "stopped — `rc-repro edge start`")
+        # Declared and unservable, which is silent apart from a log nobody was
+        # pointed at. Reported BEFORE the early return below, or the box where it
+        # matters most -- one with a GUI name and no workspace routes -- never shows it.
+        orphans = edgesvc.orphan_certs()
+        if orphans:
+            ui.warn(f"  ⚠ {len(orphans)} name(s) declared with no certificate file — "
+                    f"{', '.join(orphans[:3])}{'…' if len(orphans) > 3 else ''}. Traefik "
+                    f"logs 'failed to find any PEM data' for each, once a second, and "
+                    f"serves none of them. `rc-repro edge logs`; if "
+                    f"{edgesvc.certs_dir()} is root-owned (Docker creates a missing "
+                    f"bind-mount target that way), `sudo chown -R $(id -u):$(id -g) "
+                    f"{edgesvc.certs_dir()}` and re-run `up` for those workspaces.")
         if not st["routes"]:
             ui.hint("  no names registered yet.")
             return
@@ -1197,7 +1271,7 @@ def edge_cmd(
             edgesvc.down()
             ui.ok("✓ edge stopped; :80 and :443 are free.")
         if action in ("start", "restart"):
-            if edgesvc.up(pull=False) != 0:
+            if edgesvc.up(pull=False).returncode != 0:
                 _err("the edge did not start. Check nothing else holds :80 or :443:\n"
                      "    sudo lsof -i :443")
             ui.ok("✓ edge running — every registered name is served again.")
@@ -1322,6 +1396,21 @@ def tls_status(name: str = typer.Option("", "--name", "-n")) -> None:
     serves nothing usable. This makes the real TLS connection and says so.
     """
     from rc_repro import tls as tlsmod
+    from rc_repro.services import edge as edgesvc
+
+    # THE GUI'S OWN NAME, when no workspace was asked for. `serve --domain` gives this
+    # box an https name that is not a workspace, so `tls-status` -- the one command whose
+    # entire job is "what is actually being served for this name" -- answered "no name
+    # given and no default repro set". That is the exact question somebody has when their
+    # GUI works on :7070 and not on its domain, and there was no command for it.
+    if not name and not config.load_config().get("default"):
+        gui_domain = edgesvc.served_domain()
+        if gui_domain:
+            ui.note(f"Checking the GUI's own name, {gui_domain} "
+                    f"(no workspace given; `--name <n>` for one)")
+            _report_gui_tls(gui_domain, tries=1, pause=0)
+            raise typer.Exit(0)
+
     m = runner.read_meta(_resolve_name(name))
     if not m.public_url:
         ui.warn(f"  ⚠ {m.name!r} was not created with --https - it serves plain HTTP "
@@ -3321,14 +3410,50 @@ def serve(
         raise typer.Exit(0)
 
     if door:
+        # PREFLIGHT BEFORE THE EDGE. `serve --domain` had none: it went straight to
+        # `docker compose up` in the edge's project, so an engine problem arrived as
+        # "the edge did not start" with `docker ps -a` empty -- no container, nothing to
+        # inspect. Reported from a fresh EC2 box, where `docker` was installed and the
+        # COMPOSE PLUGIN was not; `docker ps` works there and every `docker compose`
+        # call fails. `up` has always called require_docker(); this path never did, and
+        # it is the one people reach for first on a server.
+        # ONE preflight, shared with `up`. `require_docker` checks the engine AND the
+        # compose plugin, which is the pair that made this path fail with nothing to
+        # read: `docker ps` worked, every `docker compose` call did not, and the edge
+        # simply "did not start".
+        lcsvc.require_docker()
         ui.note("starting the edge (one Traefik, :80 and :443 for every name)…")
-        edgesvc.write(door)
-        if not edgesvc.ensure_running(acme_email=email):
+        # RENDERED, not raised. `up()` refuses with a ConflictError when another home's
+        # edge already holds the port -- a real, expected, actionable condition -- and
+        # nothing here caught it, so it reached the top as a Python TRACEBACK with the
+        # source of cli.py printed at somebody trying to start a server. Every other
+        # command in this file wraps its service call; this one did not.
+        try:
+            edgesvc.write(door)
+            started = edgesvc.ensure_running(acme_email=email,
+                                         acme_staging=door.acme_staging)
+        except errors.ReproError as exc:
+            _fail(exc)
+        if not started:
             holder = edgesvc.port_holder(443)
+            # DOCKER'S OWN REASON first. This said only "the edge did not start." on a
+            # fresh EC2 box where `docker ps -a` was empty -- no container to inspect,
+            # no port holder to name, and the compose error captured and discarded.
             _err("the edge did not start"
-                 + (f" — {holder} is holding :443.\n" if holder else ".\n")
-                 + f"  Its compose project is `{edgesvc.PROJECT}` in "
-                 f"{edgesvc.edge_dir()}; `rc-repro edge status` reports it.")
+                 + (f" — {holder} is holding :443." if holder else ".")
+                 + (f"\n  docker said: {started.why}" if started.why else "")
+                 + f"\n  Its compose project is `{edgesvc.PROJECT}` in "
+                 f"{edgesvc.edge_dir()}; `rc-repro edge status` reports it."
+                 + f"\n  Full output: cd {edgesvc.edge_dir()} && docker compose -p "
+                 f"{edgesvc.PROJECT} up")
+        # DID THE NAME ACTUALLY GET A CERTIFICATE? Nothing asked. Traefik obtains them
+        # in the BACKGROUND after it starts, so the edge comes up, the route loads, and
+        # this printed `https://<domain>/` as though it worked -- while the name served
+        # Traefik's own default certificate and a 404 for as long as issuance kept
+        # failing. Reported by someone whose GUI was fine on :7070 and dead on its
+        # domain, with the reason sitting in a container log there was no command to
+        # read. A URL this prints should have been checked.
+        _report_gui_tls(domain)
         url = f"https://{domain}/"
     else:
         # The host somebody can actually TYPE. Printing `localhost` while bound to

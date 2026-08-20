@@ -1375,10 +1375,13 @@ def test_doctor_warns_before_inotify_runs_out(tmp_path):
     """
     from rc_repro.services import doctor
 
-    def at(limit, clusters):
+    def at(limit, clusters, in_use=0):
         f = tmp_path / f"lim{limit}"
         f.write_text(str(limit))
-        return doctor.inotify_headroom(clusters, path=str(f))
+        # `in_use` pinned: the verdict is about what is LEFT now, so leaving it unset
+        # would read this machine's live consumption and make the thresholds below
+        # depend on whatever else happens to be watching files while the suite runs.
+        return doctor.inotify_headroom(clusters, path=str(f), in_use=in_use)
 
     # Plenty of room: say so, so the number is visible before it bites.
     assert at(4096, 1)[0][0] == "ok"
@@ -1391,6 +1394,18 @@ def test_doctor_warns_before_inotify_runs_out(tmp_path):
 
     # Between need and 2x need is tight rather than broken.
     assert at(128, 2)[0][0] == "warn"
+
+    # THE DEFECT: a limit high enough on paper, already spent. `in_use` was a parameter
+    # the body never read, so this printed a green tick -- "inotify instances: 128 (~60
+    # needed here)" -- while Traefik was failing with EMFILE and loading no dynamic
+    # configuration at all. Measured on this box during the HTTPS work.
+    status, msg = at(128, 1, in_use=120)[0]
+    assert status == "fail", f"passed a limit with nothing left: {msg}"
+    assert "in use" in msg, "say what is consuming it, or the number looks fine"
+
+    # And consumption is reported even when the verdict is ok, so the margin is visible
+    # before it closes.
+    assert "in use" in at(4096, 1, in_use=30)[0][1]
 
     # Not Linux: the file is absent, and a limit that does not apply is not a finding.
     assert doctor.inotify_headroom(1, path=str(tmp_path / "absent")) == []
@@ -2571,6 +2586,66 @@ def test_doctor_names_the_cluster_up_would_actually_use(monkeypatch, tmp_path):
     # ...and the one being set aside is still named, or the next question is why
     # rc-repro is building a second cluster next to a working one.
     assert any("will NOT be used" in m and "'default'" in m for m in msgs), msgs
+
+
+def test_doctor_reports_the_cluster_that_took_the_edge_s_port(monkeypatch, tmp_path):
+    """Silent until now, and it breaks a working setup. k3s's ServiceLB claims host
+    :80/:443 with a hostPort -- CNI portmap DNAT, not a socket bind -- so nothing errors,
+    no pod fails, and kube-proxy's KUBE-SERVICES chain gets the packet before Docker's.
+    Measured on this box: the edge's own GUI name answered 404 through the host and 502
+    direct to the edge, with nothing connecting the two.
+
+    The cluster that does it need not be the one rc-repro is USING. On the box where this
+    was measured it was not: rc-repro had chosen kind, which has no LoadBalancer, while
+    the k3s alongside it held the port."""
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    chosen = k8s.Preflight(tools={
+        n: k8s.Tool(name=n, path=f"/usr/bin/{n}", version=(9, 9, 9), raw="v9.9.9")
+        for n in ("kubectl", "helm")})
+    # NOT reachable, deliberately: rc-repro's own cluster does not exist yet, which is
+    # the state the box was in when this fired for real. The check used to live inside
+    # the reachable-cluster block, so on exactly that box it never ran.
+    chosen.context = k8s.CONTEXT
+    chosen.distribution = "kind"
+    chosen.cluster_reachable = False
+    chosen.will_create = True
+    monkeypatch.setattr(k8s, "preflight", lambda *a, **k: chosen)
+    monkeypatch.setattr(k8s, "active_context", lambda: "default")
+    monkeypatch.setattr(k8s, "reachable", lambda ctx=None: True)
+    monkeypatch.setattr(k8s, "loadbalancer_service",
+                        lambda ctx: ("traefik", "172.16.0.2") if ctx == "default" else ("", ""))
+    monkeypatch.setattr(k8s, "cert_manager_installed", lambda ctx: False)
+    monkeypatch.setattr(doctor, "_is_local_address", lambda ip: ip == "172.16.0.2")
+
+    from rc_repro.services import edge as edgesvc
+    monkeypatch.setattr(edgesvc, "installed", lambda: True)
+    monkeypatch.setattr(edgesvc, "registered", lambda: [])
+    monkeypatch.setattr(edgesvc, "current",
+                        lambda: type("E", (), {"domain": "gui.example.test"})())
+
+    rows = doctor.run_checks()["checks"]
+    hit = [r for r in rows if r.get("check") == "kubernetes-edge-port"]
+    assert hit, [r["message"][:60] for r in rows]
+    assert hit[0]["status"] == "warn", hit[0]
+    assert "'default'" in hit[0]["message"], "name the cluster that took it"
+    assert "172.16.0.2" in hit[0]["message"], "and the address"
+    # The GUI's own name is what breaks, and counting workspace routes alone reported
+    # "0 names" about a real outage.
+    assert "gui.example.test" in hit[0]["message"], hit[0]["message"]
+
+    # No edge, no conflict: the cluster holding the port is then simply how it works.
+    monkeypatch.setattr(edgesvc, "installed", lambda: False)
+    assert not [r for r in doctor.run_checks()["checks"]
+                if r.get("check") == "kubernetes-edge-port"]
+
+    # The capability facts -- cert-manager among them -- belong to a cluster that
+    # ANSWERS, and there is none here. They are covered where a reachable one is stubbed;
+    # asserting them in this test is what tied the port check to reachability originally.
+    assert not [r for r in doctor.run_checks()["checks"]
+                if r.get("check") == "kubernetes-cert-manager"], \
+        "described a cluster that is not there"
 
 
 def test_missing_storage_is_a_refusal_because_nothing_would_ever_log_it():
@@ -4415,6 +4490,122 @@ def test_detaching_monitoring_leaves_it_up_for_the_workspaces_still_using_it(
     calls.clear()
     assert k8s.remove_monitoring(context=k8s.CONTEXT) is True
     assert any("uninstall" in a for argv in calls for a in argv), calls
+
+
+def test_a_missing_compose_plugin_is_a_preflight_not_a_mid_create_crash(monkeypatch):
+    """`docker_available()` runs `docker info`, which says nothing about the compose
+    plugin -- and a box can have one without the other. Reported from a fresh Amazon
+    Linux EC2 instance where `docker ps` worked and both entry points died from the
+    middle of their work with docker's own unhelpful pair:
+
+        docker: 'compose' is not a docker command.
+        unknown shorthand flag: 'd' in -d
+
+    `serve --domain` reported only "the edge did not start" with `docker ps -a` empty."""
+    from rc_repro import errors, runner
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+
+    monkeypatch.setattr(runner, "compose_version", lambda: None)
+    try:
+        lc.require_docker()
+    except errors.PreflightError as exc:
+        assert "not installed" in str(exc), exc
+        assert "docker-compose-plugin" in str(exc), "name the package to install"
+        assert exc.exit_code == 3, "an unusable environment is a preflight, not a crash"
+    else:
+        raise AssertionError("accepted a box with no compose plugin")
+
+    # v1 is not enough either, and it says which version it found.
+    monkeypatch.setattr(runner, "compose_version", lambda: "1.29.2")
+    try:
+        lc.require_docker()
+    except errors.PreflightError as exc:
+        assert "1.29.2" in str(exc), exc
+    else:
+        raise AssertionError("accepted Compose v1")
+
+    # And v2 passes, which is every working box.
+    monkeypatch.setattr(runner, "compose_version", lambda: "2.29.1")
+    lc.require_docker()
+
+
+def test_finalizers_are_cleared_the_moment_the_deletes_stop_working(monkeypatch):
+    """Nine minutes of silence, measured on a live workspace. The Grafana operator was
+    already gone -- only the MongoDB operator was left in `rc-repro-system` -- while
+    twelve grafana-operator resources remained, one carrying
+    `operator.grafana.com/finalizer` and a deletionTimestamp ten minutes old, with the
+    release stuck in `uninstalling`. Every step paid its full timeout for nothing: four
+    60-second deletes that could never finish, then a five-minute `helm uninstall
+    --wait`, and only then the fallback that clears the finalizers -- which worked at
+    once. The clearing has to happen when the deletes are seen to have failed, not nine
+    minutes later."""
+    import subprocess
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(k8s, "release_installed", lambda *a, **k: True)
+    monkeypatch.setattr(k8s, "workspace_namespaces", lambda ctx: [])
+    calls = []
+
+    # The delete never works and the resources never go: exactly the live shape.
+    def fake_run(argv, **kw):
+        calls.append(" ".join(argv))
+        joined = " ".join(argv)
+        if "get" in argv and "jsonpath={.items[*].metadata.name}" in joined:
+            return subprocess.CompletedProcess(argv, 0, "wedged-one", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", fake_run)
+    assert k8s.remove_monitoring(context=k8s.CONTEXT) is True
+
+    patch_at = [i for i, c in enumerate(calls) if "finalizers" in c]
+    uninstall_at = [i for i, c in enumerate(calls) if "uninstall" in c]
+    assert patch_at, "never cleared the finalizers"
+    assert uninstall_at, "never uninstalled the release"
+    assert min(patch_at) < min(uninstall_at), (
+        "cleared the finalizers only AFTER helm had already waited: " + str(calls))
+
+    # And the per-kind deadline is short, because a delete still running after it is
+    # waiting on something nothing will clear.
+    deletes = [c for c in calls if " delete " in f" {c} "]
+    assert deletes, calls
+    assert all(f"--timeout={k8s.GRAFANA_DELETE_WAIT}s" in c for c in deletes), deletes
+    assert k8s.GRAFANA_DELETE_WAIT <= 20, "a doomed delete must not block for a minute"
+
+
+def test_detaching_monitoring_reports_progress_rather_than_going_quiet(monkeypatch, tmp_path):
+    """A GUI job showed "running" with an empty log for nine minutes, which is
+    indistinguishable from a hang -- and that is how the finalizer wait above was
+    reported. Both detach paths emitted almost nothing until they had finished."""
+    from rc_repro import runner
+    from rc_repro.services import monitor as monsvc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    meta = runner.Metadata(
+        name="w", project="rc-repro-w", rc_version="8.5.1",
+        rc_image="img", mongo_tag="8.0", mongo_flavor="community",
+        preset="default", root_url="http://localhost:3000", host_port=3000,
+        version_source="shipped")
+    meta.extra.update({"runtime": "kubernetes", "namespace": "rc-repro-w",
+                       "context": "kind-rc-repro-local", "monitoring": True})
+    ws = runner.workspace("w"); ws.mkdir(parents=True, exist_ok=True)
+    import json
+    from dataclasses import asdict
+    runner.atomic_write(ws / "repro.json", json.dumps(asdict(meta), indent=2))
+
+    from rc_repro.services import k8s
+    monkeypatch.setattr(k8s, "set_monitoring_label", lambda *a, **k: None)
+    monkeypatch.setattr(k8s, "remove_monitoring", lambda **k: True)
+    monkeypatch.setattr(monsvc.lifecycle, "login",
+                        lambda m: (_ for _ in ()).throw(RuntimeError("down")))
+
+    seen = []
+    monsvc._detach_kubernetes("w", emit=lambda e: seen.append(e))
+    # Something BEFORE the terminal event, or the log is empty while it works.
+    assert len(seen) >= 3, [e.message for e in seen]
+    assert any(e.phase == "monitor" for e in seen), [e.phase for e in seen]
+    assert seen[-1].phase == "done", seen[-1].phase
 
 
 def test_grafana_is_forwarded_from_the_instance_not_the_operator():

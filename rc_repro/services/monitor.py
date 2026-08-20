@@ -131,13 +131,24 @@ def _detach_kubernetes(target: str, emit: Emit = null_emit) -> dict:
     m = runner.read_meta(target)
     namespace, context = _kube_target(m)
     rc_ok = False
+    # EMITTED, not silent. Removing the shared stack can take minutes -- it deletes
+    # operator custom resources and then uninstalls a release -- and this function used
+    # to say nothing at all until it was finished. A GUI job then showed "running" with
+    # an empty log for the whole time, which is indistinguishable from a hang; that is
+    # exactly how a nine-minute finalizer wait was reported as one.
+    info(emit, f"turning Rocket.Chat's metrics off in {m.name!r}", phase="monitor")
     try:
         auth = lifecycle.login(m)
         rc_ok = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                   monitoring.RC_METRICS_SETTING, False)
     except Exception:  # noqa: BLE001 - best-effort; the repro may be stopped
         pass
+    if not rc_ok:
+        info(emit, "the workspace did not answer, so its metrics setting was left as "
+                   "it is — the stack still comes down", phase="monitor")
     k8s.set_monitoring_label(namespace, context=context, wanted=False)
+    info(emit, "checking whether another workspace still wants the shared stack",
+         phase="monitor")
     removed = k8s.remove_monitoring(context=context, emit=emit)
     pid = (m.extra or {}).get("grafana_pid")
     if pid:
@@ -167,13 +178,22 @@ def _detach_locked(target: str, emit: Emit = null_emit) -> dict:
     m = runner.read_meta(target)
     doc = runner.read_compose(m.name)
     rc_ok = False
+    # Same reasoning as the Kubernetes path above: this had two emits and the last one
+    # was at the end, so there was nothing to tell "working" from "wedged".
+    info(emit, f"turning Rocket.Chat's metrics off in {m.name!r}", phase="monitor")
     try:
         auth = lifecycle.login(m)
         rc_ok = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                   monitoring.RC_METRICS_SETTING, False)
     except Exception:  # noqa: BLE001 - best-effort; the repro may be stopped
         pass
+    if not rc_ok:
+        info(emit, "the workspace did not answer, so its metrics setting was left as "
+                   "it is — the containers still come down", phase="monitor")
+    info(emit, f"removing {len(monitoring.SERVICES)} monitoring container(s)",
+         phase="monitor")
     runner.rm_services(m.name, list(monitoring.SERVICES))
+    info(emit, "removing the monitoring volumes", phase="monitor")
     # Remove the volumes while they are still DECLARED. `docker compose down -v`
     # only removes declared volumes, so dropping them from the doc below without
     # deleting them first orphans prometheus_tsdb/grafana_data/loki_data forever.

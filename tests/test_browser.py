@@ -1757,7 +1757,13 @@ def test_a_local_browser_is_told_none_of_this(serve, page, monkeypatch):
 def test_the_create_dialog_warns_a_remote_reader_about_the_default_bind(
         serve_public, public_page, monkeypatch):
     """The one fact a browser-only user cannot find out any other way: the workspace
-    they are about to create will answer on the server and nowhere else."""
+    they are about to create will answer on the server and nowhere else.
+
+    ONE LINE, and asserted as such. This was four sentences that restated what a reader
+    could infer -- which machine they are browsing from, what loopback means -- above a
+    form they were already filling in. The remote hostname is deliberately gone: it is in
+    the address bar. What cannot be inferred is the bind, and what is a decision is the
+    choice between a hostname and 0.0.0.0."""
     _stub_lifecycle(monkeypatch)
     usersvc.add("alice", PASSWORD, role="admin")
     with serve_public() as s:
@@ -1768,7 +1774,10 @@ def test_the_create_dialog_warns_a_remote_reader_about_the_default_bind(
         public_page.wait_for_selector("#create-bind-hint:not([hidden])")
         said = public_page.text_content("#create-bind-hint")
         assert "0.0.0.0" in said, said
-        assert PUBLIC_NAME in said, said
+        assert "hostname" in said, "the safer of the two options has to be offered"
+        assert "admin/admin123" in said, "and what 0.0.0.0 costs has to be attached to it"
+        # A ceiling, because this grew to 388 characters one clause at a time.
+        assert len(said) < 170, f"{len(said)} chars — this is a hint, not a paragraph"
         assert public_page.errors == [], public_page.errors
 
 

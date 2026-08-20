@@ -18,6 +18,14 @@ from rc_repro import cli, runner
 from rc_repro.services import lifecycle as lc
 from rc_repro.services import users
 
+def _ok_compose(*a, **k):
+    """A successful `docker compose` run. `edge.up()` returns the CompletedProcess now,
+    not its return code, so a failed start can say what docker said."""
+    import subprocess
+    return subprocess.CompletedProcess(["docker", "compose"], 0, "", "")
+
+
+
 cli_runner = CliRunner()
 GOOD = "correct-horse-battery"
 
@@ -263,9 +271,84 @@ def fronted(served, monkeypatch):
     monkeypatch.setattr(fdsvc, "has_acme", lambda: True)
     monkeypatch.setattr(fdsvc, "running", lambda: False)
     monkeypatch.setattr(fdsvc, "holders_of_443", lambda: [])
-    monkeypatch.setattr(fdsvc, "up", lambda **kw: calls.update(started=True) or 0)
+    monkeypatch.setattr(fdsvc, "up", lambda **kw: calls.update(started=True) or _ok_compose())
     served["fd"] = calls
     return served
+
+
+def test_serve_says_when_the_domain_has_no_certificate(tmp_path, monkeypatch, capsys):
+    """`serve --domain` printed `https://<domain>/` and checked nothing. Traefik obtains
+    certificates in the BACKGROUND after it starts, so the edge comes up, the route
+    loads, the URL is printed -- and the name serves Traefik's own default certificate
+    and a 404 for as long as issuance keeps failing. Reported by someone whose GUI was
+    fine on :7070 and dead on its domain, with the reason in a container log there was no
+    command to read."""
+    from rc_repro import cli, tls as tlsmod
+    from rc_repro.services import edge as fdsvc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    # Serving, but it is Traefik's fallback -- which is what a failed ACME looks like
+    # from outside, and is indistinguishable from success unless you look at `fallback`.
+    monkeypatch.setattr(tlsmod, "verify", lambda *a, **k: {
+        "serving": True, "fallback": True, "issuer": "CN = TRAEFIK DEFAULT CERT"})
+    monkeypatch.setattr(fdsvc, "acme_failure", lambda domain="", tail=400: (
+        "DNS problem: NXDOMAIN looking up A for gui.example.test - check that a DNS "
+        "record exists for this domain"))
+
+    cli._report_gui_tls("gui.example.test", tries=1, pause=0)
+    out = capsys.readouterr().out + capsys.readouterr().err
+    assert "NO certificate" in out, out
+    assert "NXDOMAIN" in out, "quote the reason, or the reader has nowhere to go"
+    assert "the name, not the server" in out, "say what is NOT broken"
+    assert "edge logs" in out, "point at where the detail lives"
+    assert "443" in out, "name the port the challenge actually uses"
+
+
+def test_serve_confirms_a_real_certificate_when_there_is_one(tmp_path, monkeypatch, capsys):
+    """The other half: a healthy start must say so, or a warning nobody ever sees
+    succeed is a warning people learn to ignore."""
+    from rc_repro import cli, tls as tlsmod
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(tlsmod, "verify", lambda *a, **k: {
+        "serving": True, "fallback": False, "issuer": "CN = R11, O = Let's Encrypt"})
+    cli._report_gui_tls("gui.example.test", tries=1, pause=0)
+    out = capsys.readouterr().out
+    assert "serving a real certificate" in out, out
+    assert "Let's Encrypt" in out, out
+
+
+def test_serve_renders_an_edge_refusal_instead_of_a_traceback(tmp_path, monkeypatch):
+    """`up()` refuses with a ConflictError when another home's edge already holds the
+    port -- expected and actionable -- and nothing on the serve path caught it, so it
+    reached the top as a Python TRACEBACK with cli.py source printed at somebody trying
+    to start a server. Every other command in that file wraps its service call."""
+    from typer.testing import CliRunner
+
+    from rc_repro import cli
+    from rc_repro.errors import ConflictError
+    from rc_repro.services import edge as fdsvc
+    from rc_repro.services import lifecycle as lc
+    from rc_repro.services import users as usersvc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    usersvc.add("someone", "correct-horse-battery", role="admin")
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr(cli.lcsvc, "require_docker", lambda: None)
+
+    def refuse(**kw):
+        raise ConflictError("another rc-repro edge is already running")
+
+    monkeypatch.setattr(fdsvc, "ensure_running", refuse)
+    monkeypatch.setattr(fdsvc, "write", lambda fd: None)
+    monkeypatch.setattr(fdsvc, "bridge_address", lambda: "172.17.0.1")
+
+    res = CliRunner().invoke(cli.app, [
+        "serve", "--domain", "gui.example.test", "--email", "a@b.test", "--no-open"])
+    assert res.exit_code == 8, res.output
+    assert "Traceback" not in res.output, res.output
+    assert "ConflictError" not in res.output, "a class name is not a message"
+    assert "another rc-repro edge is already running" in res.output, res.output
 
 
 def test_domain_binds_the_bridge_not_the_whole_network(fronted):

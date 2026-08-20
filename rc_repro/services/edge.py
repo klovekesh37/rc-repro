@@ -44,6 +44,8 @@ Two properties carried over from the first version because they were right:
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -142,14 +144,40 @@ class Edge:
 
     @classmethod
     def resolve(cls, domain: str, acme_email: str, **kw) -> "Edge":
-        """Build one, choosing the challenge the way the rest of the tool does."""
+        """Build one, choosing the challenge the way the rest of the tool does.
+
+        `acme.staging` is read here, and that is new: the field existed, `tls.py` built
+        the staging CA URL from it, `config set acme.staging true` mapped to it and
+        staging even got its own storage file so switching could never mix a staging
+        certificate into the production store -- and NOTHING wired it to the edge.
+        `serve --domain` called this without it, so the switch was unreachable for the
+        one component that requests certificates.
+
+        That mattered on the box that found it. Let's Encrypt allows five FAILED
+        authorizations per name per hour, a support box has a name per ticket, and every
+        restart abandons an in-flight challenge -- so a few restarts spend the budget for
+        the whole hour and the only safe way to test the plumbing is against staging,
+        which is what this switch is for.
+        """
+        from rc_repro import config as cfgmod
         from rc_repro import tls as tlsmod
 
         has_dns = bool(tlsmod.dns_env_vars())
         provider = tlsmod.infer_dns_provider()[0] if has_dns else ""
+        cfg = cfgmod.load_config()
+        kw.setdefault("acme_staging", bool(cfg.get("acme_staging")))
+        # Derived, but overridable -- because the derivation assumes one of the two
+        # automatic paths is available and a real box existed where neither was: TLS-ALPN
+        # validation failed on every attempt and the operator had no access to the DNS
+        # zone. `config set acme.challenge http` is the escape hatch for that, and it
+        # names the mechanism rather than a symptom.
+        forced = str(cfg.get("acme_challenge") or "").strip().lower()
+        challenge = (forced if forced in ("http", "tlsalpn", "dns")
+                     else ("dns" if has_dns else "tlsalpn"))
         return cls(domain=domain, acme_email=acme_email,
-                   acme_challenge="dns" if has_dns else "tlsalpn",
-                   acme_dns_provider=provider, wildcard=has_dns, **kw)
+                   acme_challenge=challenge,
+                   acme_dns_provider=provider,
+                   wildcard=has_dns and challenge == "dns", **kw)
 
     def covers(self, host: str) -> bool:
         """Whether the wildcard already covers `host`, so it needs no request.
@@ -179,6 +207,16 @@ def compose_doc(fd: Edge) -> dict:
         # A DIRECTORY, not a single file: this is what makes registration a matter
         # of writing one file per workspace, with no restart. Verified live -- a
         # second workspace was routed with the container's restart count at 0.
+        # INFO, not Traefik's default of ERROR. At ERROR a Traefik that is healthy but
+        # has not yet obtained a certificate logs NOTHING -- and that is exactly the
+        # state people get stuck in: the name serves Traefik's own default certificate,
+        # `docker logs` comes back empty, and an empty log reads as "no problem" when it
+        # means "no error YET". Measured on two boxes on the same day: the one with a
+        # real DNS failure had nine ERR lines and the one mid-issuance had none at all,
+        # which is exactly the wrong way round for diagnosis. INFO makes the ACME
+        # provider starting, each order and each challenge visible -- which is the
+        # question anybody reading this log actually has.
+        "--log.level=INFO",
         f"--providers.file.directory=/etc/traefik/{DYNAMIC_DIR}",
         "--providers.file.watch=true",
         # Container-internal ports, always 80/443 -- fd.http_port/https_port map
@@ -187,9 +225,17 @@ def compose_doc(fd: Edge) -> dict:
         "--entryPoints.web.address=:80",
         # Typing the bare hostname reaches nothing otherwise: browsers try http
         # first. Same redirect the official rocketchat-compose Traefik files use.
-        "--entryPoints.web.http.redirections.entryPoint.to=websecure",
-        "--entryPoints.web.http.redirections.entryPoint.scheme=https",
-        "--entryPoints.web.http.redirections.entryPoint.permanent=true",
+        # ...and :80 redirected to it, EXCEPT under http-01. An entryPoint redirection
+        # is a middleware on the entrypoint applied to every router on it -- measured:
+        # an explicit router for `/.well-known/acme-challenge/` on `web` still answered
+        # 301 -- so leaving it on would redirect Let's Encrypt away from the challenge it
+        # came to fetch. The cost is stated rather than hidden: while http-01 is in use,
+        # an `http://` URL does not upgrade itself.
+        *([] if fd.acme_challenge == "http" else [
+            "--entryPoints.web.http.redirections.entryPoint.to=websecure",
+            "--entryPoints.web.http.redirections.entryPoint.scheme=https",
+            "--entryPoints.web.http.redirections.entryPoint.permanent=true",
+        ]),
     ]
     # Only with an email to register the ACME account against. Without one the
     # edge still serves every LOCAL-CA name perfectly well -- which is what lets
@@ -265,6 +311,23 @@ def issue_local_cert(host: str) -> None:
 
     cert_pem, key_pem = tls_local.issue_leaf(host)
     certs_dir().mkdir(parents=True, exist_ok=True)
+    # WRITABLE? Docker creates a bind-mount target that does not exist, and it creates
+    # it as root -- so on a box where the edge started before any local certificate was
+    # issued, `edge/certs` is root-owned while `edge/dynamic` is not. The declaration
+    # then lands and the certificate does not, and Traefik retries the pair for ever:
+    #
+    #     Unable to append certificate /etc/traefik/certs/<host>.crt to store
+    #     error="tls: failed to find any PEM data in certificate input"
+    #
+    # Observed on a live box with two such orphans, logging once a second and serving
+    # nothing for either name. A PermissionError here used to surface as whatever the
+    # caller did with it; it is a fixable environment fault and says so.
+    if not os.access(certs_dir(), os.W_OK):
+        raise ValidationError(
+            f"cannot write certificates into {certs_dir()} — it is not writable by "
+            f"this user, so the name would be declared and never served.\n"
+            f"  Docker creates a missing bind-mount target as root. Give it back:\n"
+            f"    sudo chown -R $(id -u):$(id -g) {certs_dir()}")
     # And the watched directory: this writes the certificate DECLARATION into it,
     # and on the first `up --https` of a box that has no edge yet, nothing has
     # created it. atomic_write puts its temp file beside the target, so a missing
@@ -272,6 +335,14 @@ def issue_local_cert(host: str) -> None:
     dynamic_dir().mkdir(parents=True, exist_ok=True)
     runner.atomic_write(certs_dir() / f"{host}.crt", cert_pem)
     runner.atomic_write(certs_dir() / f"{host}.key", key_pem)
+    # Checked, because the declaration written below is what makes an absent certificate
+    # a permanent error loop rather than a missing file nobody references.
+    for part in ("crt", "key"):
+        if not (certs_dir() / f"{host}.{part}").stat().st_size:
+            raise ValidationError(
+                f"the {part} for {host} was written empty to {certs_dir()} — Traefik "
+                f"would log 'failed to find any PEM data' for it for ever. Check the "
+                f"space and permissions on that directory.")
     # Declared in the watched directory, so Traefik picks it up like any route.
     runner.atomic_write(
         dynamic_dir() / f"_cert-{host}.yml",
@@ -644,7 +715,43 @@ def has_acme() -> bool:
         return False
 
 
-def ensure_running(acme_email: str = "", acme_staging: bool = False) -> bool:
+def _why(res: subprocess.CompletedProcess, limit: int = 500) -> str:
+    """The line that explains a docker failure, not the first 500 characters of noise.
+
+    Same rule as `k8s.why`, and for the same reason: compose puts its diagnostics FIRST
+    and its error LAST, so taking a prefix reliably shows the least useful part.
+    """
+    text = "\n".join(t for t in ((res.stderr or ""), (res.stdout or "")) if t)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        low = ln.lower()
+        if low.startswith("error") or "error:" in low or "cannot" in low:
+            return ln[:limit]
+    return (lines[-1][:limit] if lines else "docker said nothing")
+
+
+@dataclass(frozen=True)
+class StartResult:
+    """Whether the edge came up, and if not, WHY.
+
+    A bool for two years, and the reason was captured and dropped on the floor:
+    `up()` ran `docker compose up` with `capture_output=True` and returned only the
+    return code, so both failure sites could do nothing but guess at `port_holder(443)`
+    and point at a directory. On a fresh EC2 box that produced "error: the edge did not
+    start." with `docker ps -a` empty -- no container, no clue, and the actual compose
+    error discarded one frame below.
+
+    `__bool__` is the ok flag so every existing `if not ensure_running(...)` keeps
+    meaning what it meant; `.why` is new information rather than a changed contract.
+    """
+    ok: bool
+    why: str = ""
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def ensure_running(acme_email: str = "", acme_staging: bool = False) -> "StartResult":
     """Start the edge if something now needs it, configured for what needs it.
 
     Lazily, on the first route -- never at install, never on plain `serve`. A
@@ -679,7 +786,22 @@ def ensure_running(acme_email: str = "", acme_staging: bool = False) -> bool:
                            acme_staging=acme_staging))
         down()                 # so the new flags are actually applied
     if running():
-        return True
+        # RUNNING IS NOT UP TO DATE. This returned True here, and the caller had already
+        # rewritten the compose file -- `serve --domain X --email Y` calls `write(door)`
+        # first -- so a changed resolver email, a changed domain or any new flag was
+        # written to disk and never applied. The container kept the command line it was
+        # created with, `serve` reported success, and nothing said the two disagreed.
+        # Found on a box whose `acme.json` held an account for a MIStyped address while
+        # the corrected one was being passed on every restart.
+        #
+        # `docker compose up -d` is the right instrument: it is idempotent and recreates
+        # the container ONLY if the resolved configuration changed, so this costs one
+        # compose call when nothing has and does the necessary thing when something has.
+        # The adoption loop below is skipped -- nothing else can be holding :443 while
+        # this edge has it.
+        res = up(pull=False)
+        return (StartResult(True) if res.returncode == 0
+                else StartResult(False, _why(res)))
     # Workspaces from before the edge run their own Traefik on 443, which is
     # exactly why the edge cannot start. Moving them across is now instant and
     # touches no data, so it happens automatically rather than behind a flag --
@@ -693,7 +815,10 @@ def ensure_running(acme_email: str = "", acme_staging: bool = False) -> bool:
             # One workspace that will not move must not stop the others, or the
             # edge. Whatever still holds the port is named by port_holder().
             continue
-    return up(pull=False) == 0
+    res = up(pull=False)
+    if res.returncode == 0:
+        return StartResult(True)
+    return StartResult(False, _why(res))
 
 
 def reattach_all() -> list[str]:
@@ -736,8 +861,14 @@ def foreign_edge() -> str:
     return ""
 
 
-def up(*, pull: bool = True) -> int:
-    """Start the edge. No network to create: it joins each workspace's own."""
+def up(*, pull: bool = True) -> subprocess.CompletedProcess:
+    """Start the edge, and return what docker said. No network to create: it joins
+    each workspace's own.
+
+    Returns the CompletedProcess rather than its return code, because the return code
+    was all the callers ever got and a failed start is precisely the moment the output
+    matters -- see `StartResult`.
+    """
     other = foreign_edge()
     if other:
         # Refuse rather than replace. `compose up` would happily take the other
@@ -754,13 +885,104 @@ def up(*, pull: bool = True) -> int:
             f"    RC_REPRO_HOME={Path(other).parent} rc-repro edge stop")
     if pull:
         _compose("pull")            # non-fatal, exactly as runner.up does it
-    rc = _compose("up", "-d", "--remove-orphans").returncode
-    if rc == 0:
+    res = _compose("up", "-d", "--remove-orphans")
+    if res.returncode == 0:
         # Every start, not just the first: a recreated container has none of its
         # previous attachments, and the route files that outlived it would then
         # all answer 502.
         reattach_all()
-    return rc
+    return res
+
+
+def acme_failure(domain: str = "", tail: int = 400) -> str:
+    """The last ACME failure the edge logged, for `domain` or for anything, or "".
+
+    Traefik requests certificates in the BACKGROUND after it starts, so the edge comes
+    up healthy, the route loads, `serve` prints an https URL -- and issuance can be
+    failing with nobody told. Reported exactly that way: a GUI whose name served
+    nothing, while the reason sat in a container log there was no command to read.
+
+    The reason is worth extracting rather than pointing at, because it is usually
+    conclusive and short:
+
+        DNS problem: NXDOMAIN looking up A for <name> - check that a DNS record exists
+    """
+    out = _compose_capture("logs", f"--tail={tail}")
+    if not out:
+        return ""
+    # ANSI FIRST. Traefik colours its own output, so the marker below is really
+    # `\x1b[36merror=\x1b[0m\x1b[31m\x1b[1m"` and a literal match finds nothing --
+    # which is how the first version of this returned the whole unreadable line.
+    out = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    hit = ""
+    for line in out.splitlines():
+        if "acme" not in line.lower():
+            continue
+        if "unable to obtain" not in line.lower() and "error" not in line.lower():
+            continue
+        if domain and domain not in line:
+            continue
+        hit = line
+    if not hit:
+        return ""
+    # Traefik logs one long structured line; the useful part is the quoted error.
+    marker = 'error="'
+    if marker in hit:
+        hit = hit.split(marker, 1)[1].split('"', 1)[0]
+    return " ".join(hit.replace("\\n", " ").split())[:400]
+
+
+def _compose_capture(*args: str) -> str:
+    """`docker compose` in the edge project, captured. "" if it could not run."""
+    try:
+        res = subprocess.run(["docker", "compose", "-p", PROJECT, *args],
+                             cwd=edge_dir(), text=True, capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (res.stdout or "") + (res.stderr or "")
+
+
+def orphan_certs() -> list[str]:
+    """Hostnames declared to the edge whose certificate file is missing or empty.
+
+    Each one is a name that will never serve and an error Traefik repeats for ever, so
+    it belongs in `status` rather than only in a log nobody was told about.
+    """
+    out = []
+    for decl in sorted(dynamic_dir().glob("_cert-*.yml")):
+        host = decl.name.removeprefix("_cert-").removesuffix(".yml")
+        crt = certs_dir() / f"{host}.crt"
+        try:
+            if not crt.is_file() or not crt.stat().st_size:
+                out.append(host)
+        except OSError:
+            out.append(host)
+    return out
+
+
+def logs(*, tail: int = 200, follow: bool = False) -> int:
+    """Stream or dump the edge's own log, and return the exit code.
+
+    The edge is where HTTPS actually succeeds or fails, and until now there was no way
+    to read it from rc-repro: `edge` offered status/start/stop/restart, so the answer to
+    "my name serves nothing" lived in a container whose name you had to know. Asked
+    verbatim by someone whose https name would not come up -- "where are the default
+    logs for it?".
+
+    It matters most for ACME. Traefik requests certificates in the BACKGROUND after it
+    starts, so a name can be routed, the edge can be healthy, and issuance can still be
+    failing -- and the only record of why is here:
+
+        "unable to obtain ACME certificate for domains ... error presenting token"
+
+    Not captured: this inherits stdout so `-f` behaves like `docker compose logs -f`,
+    which is the point of it.
+    """
+    argv = ["logs", f"--tail={tail}"]
+    if follow:
+        argv.append("-f")
+    return subprocess.run(["docker", "compose", "-p", PROJECT, *argv],
+                          cwd=edge_dir(), text=True).returncode
 
 
 def down() -> int:

@@ -16,6 +16,14 @@ from rc_repro import config
 from rc_repro.errors import ValidationError
 from rc_repro.services import edge as fd
 
+def _ok_compose(*a, **k):
+    """A successful `docker compose` run. `edge.up()` returns the CompletedProcess now,
+    not its return code, so a failed start can say what docker said."""
+    import subprocess
+    return subprocess.CompletedProcess(["docker", "compose"], 0, "", "")
+
+
+
 
 @pytest.fixture(autouse=True)
 def _home(tmp_path, monkeypatch):
@@ -572,6 +580,227 @@ def test_resolving_tls_never_starts_a_container(tmp_path, monkeypatch):
     lc._resolve_tls(req, "w", "127.0.0.1")
 
 
+def test_http_01_is_selectable_and_frees_the_challenge_path(tmp_path, monkeypatch):
+    """rc-repro offered exactly two challenges, derived and never asked for: dns-01 when
+    credentials exist, TLS-ALPN otherwise. A real box had NEITHER available -- TLS-ALPN
+    validation failed on every attempt with `remote error: tls: unrecognized name`, and
+    dns-01 was impossible because the operator had the machine and not the DNS zone. With
+    only host access and :80 open, http-01 was the one remaining option and there was no
+    way to select it.
+
+    Selecting it must also turn the :80 redirect OFF. An entryPoint redirection is a
+    middleware on the entrypoint applied to every router on it -- measured: an explicit
+    router for `/.well-known/acme-challenge/` on `web` still answered 301 -- so leaving
+    it on would redirect Let's Encrypt away from the challenge it came to fetch."""
+    from rc_repro import config as cfgmod
+    from rc_repro.services import edge as fd
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    cfgmod.save_config({"acme_challenge": "http"})
+    door = fd.Edge.resolve("gui.example.test", "a@b.test")
+    assert door.acme_challenge == "http"
+    args = fd.compose_doc(door)["services"]["edge"]["command"]
+    assert "--certificatesresolvers.le.acme.httpchallenge=true" in args, args
+    assert "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web" in args, args
+    assert not any("tlschallenge" in a for a in args), args
+    # THE POINT: :80 must stay available for the challenge.
+    assert not any("redirections" in a for a in args), args
+
+    # The default is unchanged -- TLS-ALPN with the redirect, exactly as before.
+    cfgmod.save_config({})
+    plain = fd.Edge.resolve("gui.example.test", "a@b.test")
+    assert plain.acme_challenge == "tlsalpn"
+    pargs = fd.compose_doc(plain)["services"]["edge"]["command"]
+    assert any("tlschallenge" in a for a in pargs), pargs
+    assert sum("redirections" in a for a in pargs) == 3, pargs
+
+    # A value nobody recognises falls back to the derivation rather than being passed
+    # through to Traefik, where it would be a startup failure.
+    cfgmod.save_config({"acme_challenge": "banana"})
+    assert fd.Edge.resolve("g.example.test", "a@b.test").acme_challenge == "tlsalpn"
+
+
+def test_the_staging_switch_actually_reaches_the_edge(tmp_path, monkeypatch):
+    """`acme.staging` existed everywhere except where it mattered. The field was on the
+    spec, `tls.py` built the staging CA URL from it, `config set acme.staging true`
+    mapped to it, and staging even had its own storage file so switching could never mix
+    a staging certificate into the production store -- and nothing wired it to the EDGE.
+    `serve --domain` called `Edge.resolve` without it, so the switch was unreachable for
+    the one component that requests certificates.
+
+    It matters on a rate-limited box: Let's Encrypt allows five FAILED authorizations per
+    name per hour, a support server has a name per ticket, and every restart abandons an
+    in-flight challenge -- so a handful of restarts spends the hour's budget and staging
+    is the only safe way left to test the plumbing."""
+    from rc_repro import config as cfgmod
+    from rc_repro.services import edge as fd
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    cfgmod.save_config({"acme_staging": True})
+    door = fd.Edge.resolve("gui.example.test", "a@b.test")
+    assert door.acme_staging is True
+
+    args = fd.compose_doc(door)["services"]["edge"]["command"]
+    assert any("acme-staging-v02.api.letsencrypt.org" in a for a in args), args
+    # A SEPARATE store, so flipping back to production cannot serve a staging cert.
+    assert any("acme-staging.json" in a for a in args), args
+
+    # And production stays production when the switch is off.
+    cfgmod.save_config({})
+    prod = fd.Edge.resolve("gui.example.test", "a@b.test")
+    assert prod.acme_staging is False
+    prod_args = fd.compose_doc(prod)["services"]["edge"]["command"]
+    assert not any("acme-staging" in a for a in prod_args), prod_args
+
+    # An explicit value still wins over the config, for a caller that knows.
+    forced = fd.Edge.resolve("gui.example.test", "a@b.test", acme_staging=True)
+    assert forced.acme_staging is True
+
+
+def test_a_running_edge_still_gets_a_changed_config_applied(tmp_path, monkeypatch):
+    """`ensure_running` returned True the moment the edge was RUNNING -- and the caller
+    had already rewritten the compose file, because `serve --domain X --email Y` calls
+    `write(door)` first. So a changed resolver email, a changed domain or any new flag
+    was written to disk and never applied: the container kept the command line it was
+    created with, `serve` reported success, and nothing said the two disagreed.
+
+    Found on a box whose `acme.json` held an ACME account for a mistyped address while
+    the corrected one was being passed on every restart."""
+    import subprocess
+    from rc_repro.services import edge as fd
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(fd, "installed", lambda: True)
+    monkeypatch.setattr(fd, "has_acme", lambda: True)
+    monkeypatch.setattr(fd, "served_domain", lambda: "gui.example.test")
+    monkeypatch.setattr(fd, "running", lambda: True)
+    monkeypatch.setattr(fd, "foreign_edge", lambda: "")
+    monkeypatch.setattr(fd, "reattach_all", lambda: [])
+    seen = []
+
+    def fake(*args, **kw):
+        seen.append(list(args))
+        return subprocess.CompletedProcess(list(args), 0, "", "")
+
+    monkeypatch.setattr(fd, "_compose", fake)
+    assert fd.ensure_running(acme_email="a@b.test")
+    # compose is asked to reconcile: it recreates only if the config changed, which is
+    # exactly the decision we want it to make rather than assuming nothing has.
+    assert any("up" in a for a in seen), seen
+
+    # And a compose that cannot reconcile is a failure with a reason, not a silent yes.
+    monkeypatch.setattr(fd, "_compose", lambda *a, **k: subprocess.CompletedProcess(
+        list(a), 1, "", "Error response from daemon: port is already allocated"))
+    bad = fd.ensure_running(acme_email="a@b.test")
+    assert not bad and "already allocated" in bad.why, bad
+
+
+def test_the_edge_logs_at_info_so_acme_is_visible(tmp_path, monkeypatch):
+    """Traefik's default log level is ERROR, and rc-repro set none -- so a Traefik that
+    is healthy but has NOT yet obtained a certificate logged nothing at all. That is
+    exactly the state people get stuck in: the name serves Traefik's own default
+    certificate, `docker logs` comes back empty, and an empty log reads as "nothing is
+    wrong" when it means "nothing has failed YET".
+
+    Measured on two boxes on the same day. The one with a real DNS failure had nine ERR
+    lines and no INF lines; the one mid-issuance had an empty log and a default
+    certificate. Diagnosis needs the second one to talk."""
+    from rc_repro.services import edge as fd
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    args = fd.compose_doc(fd.Edge.resolve("g.example.test", "a@b.test"))["services"]["edge"]["command"]
+    assert "--log.level=INFO" in args, args
+    # Before the file provider, so a provider that cannot start says so.
+    assert args.index("--log.level=INFO") < next(
+        i for i, a in enumerate(args) if "providers.file" in a), args
+    # A bare edge -- no domain, no ACME -- gets it too: `up --https` fails the same way.
+    bare = fd.compose_doc(fd.Edge())["services"]["edge"]["command"]
+    assert "--log.level=INFO" in bare, bare
+
+
+def test_a_failed_start_says_what_docker_said(tmp_path, monkeypatch):
+    """"error: the edge did not start." was the whole message, on a fresh EC2 box where
+    `docker ps -a` was empty -- no container to inspect, no port holder to name, and the
+    compose error captured with `capture_output=True` and dropped one frame below.
+    `up()` returned only a return code, so both failure sites could do nothing but guess.
+    """
+    import subprocess
+    from rc_repro.services import edge as fd
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(fd, "foreign_edge", lambda: "")
+    monkeypatch.setattr(fd, "running", lambda: False)
+    monkeypatch.setattr(fd, "holders_of_443", lambda: [])
+    monkeypatch.setattr(fd, "installed", lambda: True)
+    monkeypatch.setattr(fd, "has_acme", lambda: True)
+    monkeypatch.setattr(fd, "served_domain", lambda: "gui.example.test")
+    monkeypatch.setattr(fd, "reattach_all", lambda: [])
+    monkeypatch.setattr(fd, "_compose", lambda *a, **k: subprocess.CompletedProcess(
+        list(a), 1,
+        stdout="",
+        stderr='time="..." level=warning msg="a warning nobody needs"\n'
+               "Error response from daemon: failed to pull traefik:v3.1: "
+               "no space left on device\n"))
+
+    res = fd.ensure_running(acme_email="a@b.test")
+    assert not res, "a failed compose must not read as a start"
+    assert res.ok is False
+    # The LAST error line, not the first warning: compose puts diagnostics first.
+    assert "no space left on device" in res.why, res.why
+    assert "a warning nobody needs" not in res.why, res.why
+
+    # And success still reads as success at every existing call site.
+    monkeypatch.setattr(fd, "_compose", lambda *a, **k: subprocess.CompletedProcess(
+        list(a), 0, stdout="", stderr=""))
+    good = fd.ensure_running(acme_email="a@b.test")
+    assert good and good.ok and good.why == ""
+
+
+def test_a_certificate_that_cannot_be_written_is_refused_not_declared(tmp_path, monkeypatch):
+    """Docker creates a missing bind-mount target as ROOT, so on a box where the edge
+    started before any local certificate was issued, `edge/certs` is root-owned while
+    `edge/dynamic` is not. The declaration then landed and the certificate did not, and
+    Traefik retried the pair for ever -- "failed to find any PEM data in certificate
+    input", once a second, serving nothing for that name. Two such orphans were found on
+    a live box."""
+    import os
+    from rc_repro import errors
+    from rc_repro.services import edge as fd
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    fd.certs_dir().mkdir(parents=True, exist_ok=True)
+    fd.dynamic_dir().mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(os, "access", lambda p, mode: False)
+
+    try:
+        fd.issue_local_cert("w.rcrepro.localhost")
+    except errors.ReproError as exc:
+        assert "not writable" in str(exc), exc
+        assert "chown" in str(exc), "give the fix, not just the fault"
+    else:
+        raise AssertionError("declared a name whose certificate could not be written")
+
+    # And nothing was declared, so there is no permanent error loop to explain.
+    assert not list(fd.dynamic_dir().glob("_cert-*.yml"))
+
+
+def test_orphaned_declarations_are_reportable(tmp_path, monkeypatch):
+    """The state above, once it exists: a declaration with no certificate. Silent apart
+    from a log nobody was pointed at, so `edge status` has to be able to see it."""
+    from rc_repro.services import edge as fd
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    fd.certs_dir().mkdir(parents=True, exist_ok=True)
+    fd.dynamic_dir().mkdir(parents=True, exist_ok=True)
+    (fd.dynamic_dir() / "_cert-a.localhost.yml").write_text("tls: {}\n")
+    (fd.dynamic_dir() / "_cert-b.localhost.yml").write_text("tls: {}\n")
+    (fd.certs_dir() / "b.localhost.crt").write_text("-----BEGIN CERTIFICATE-----\n")
+    (fd.certs_dir() / "a.localhost.crt").write_text("")        # empty is as bad as absent
+
+    assert fd.orphan_certs() == ["a.localhost"]
+
+
 def test_ensure_running_writes_a_bare_config_when_there_is_none(tmp_path, monkeypatch):
     """The lazy start itself: `up --https` on a box with no configuration at all
     has to produce a working edge. (That it is CALLED from the create path, and
@@ -579,8 +808,8 @@ def test_ensure_running_writes_a_bare_config_when_there_is_none(tmp_path, monkey
     above; the container-level start is verified live, not here.)"""
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     monkeypatch.setattr(fd, "running", lambda: False)
-    monkeypatch.setattr(fd, "up", lambda pull=True: 0)
-    assert fd.ensure_running() is True
+    monkeypatch.setattr(fd, "up", lambda pull=True: _ok_compose())
+    assert fd.ensure_running()
     assert fd.installed(), "a bare edge config must have been written"
     assert not fd.route_path("_gui").exists(), "and no broken GUI route with it"
 
@@ -598,9 +827,9 @@ def test_a_legacy_workspace_is_moved_across_without_being_asked(tmp_path, monkey
     monkeypatch.setattr(fd, "_docker", lambda *a, **k: type(
         "P", (), {"returncode": 0, "stdout": ""})())
     started = []
-    monkeypatch.setattr(fd, "up", lambda pull=True: started.append(True) or 0)
+    monkeypatch.setattr(fd, "up", lambda pull=True: started.append(True) or _ok_compose())
 
-    assert fd.ensure_running() is True
+    assert fd.ensure_running()
     assert fd.registered() == ["legacy"], "its route must exist after the move"
     assert started == [True]
 
@@ -612,7 +841,7 @@ def test_one_workspace_that_will_not_move_does_not_block_the_others(tmp_path, mo
     monkeypatch.setattr(fd, "running", lambda: False)
     monkeypatch.setattr(fd, "_docker", lambda *a, **k: type(
         "P", (), {"returncode": 0, "stdout": ""})())
-    monkeypatch.setattr(fd, "up", lambda pull=True: 0)
+    monkeypatch.setattr(fd, "up", lambda pull=True: _ok_compose())
 
     real = fd.adopt
 
@@ -622,7 +851,7 @@ def test_one_workspace_that_will_not_move_does_not_block_the_others(tmp_path, mo
         return real(name)
 
     monkeypatch.setattr(fd, "adopt", flaky)
-    assert fd.ensure_running() is True
+    assert fd.ensure_running()
     assert fd.registered() == ["good"]
 
 
@@ -746,6 +975,11 @@ def test_a_broken_gui_route_from_an_older_version_is_repaired(tmp_path, monkeypa
     fd.write(fd.Edge())
     fd.route_path("_gui").write_text('rule: "Host(``)"\n')   # as the old code left it
     monkeypatch.setattr(fd, "running", lambda: True)
+    # A running edge now reconciles its compose file, so these have to stub the compose
+    # call too -- they used to return before reaching it.
+    monkeypatch.setattr(fd, "foreign_edge", lambda: "")
+    monkeypatch.setattr(fd, "reattach_all", lambda: [])
+    monkeypatch.setattr(fd, "_compose", _ok_compose)
 
     fd.ensure_running()
     assert not fd.route_path("_gui").exists()
@@ -755,6 +989,9 @@ def test_a_real_gui_route_is_left_alone(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     fd.write(fd.Edge(domain="gui.example.com", acme_email="o@e.com"))
     monkeypatch.setattr(fd, "running", lambda: True)
+    monkeypatch.setattr(fd, "foreign_edge", lambda: "")
+    monkeypatch.setattr(fd, "reattach_all", lambda: [])
+    monkeypatch.setattr(fd, "_compose", _ok_compose)
     fd.ensure_running()
     assert 'Host(`gui.example.com`)' in fd.route_path("_gui").read_text()
 

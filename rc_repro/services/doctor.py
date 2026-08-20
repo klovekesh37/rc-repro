@@ -8,8 +8,10 @@ environment is broken.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import socket
 
 import requests
 
@@ -93,6 +95,7 @@ CHECKS: tuple[str, ...] = (
     "kubernetes", "kubernetes-tools", "kubernetes-cluster",
     "kubernetes-storage", "kubernetes-ingress", "kubernetes-loadbalancer",
     "kubernetes-metrics", "kubernetes-other-clusters", "inotify",
+    "kubernetes-cert-manager", "kubernetes-edge-port",
 )
 
 
@@ -458,6 +461,16 @@ def run_checks() -> dict:
                 else:
                     line("ok", "Metrics: no metrics-server — `rc-repro stats` refuses "
                                "and says how to install it", check="kubernetes-metrics")
+                # A FACT like the four above it, for the same reason: HTTPS on this
+                # runtime needs an issuer in the cluster, and nothing else does.
+                if k8s.cert_manager_installed(pre.context):
+                    line("ok", "cert-manager: installed — a Certificate can be issued "
+                               "in this cluster", check="kubernetes-cert-manager")
+                else:
+                    line("ok", "cert-manager: not installed — installed on first use by "
+                               "a workspace that asks for a certificate",
+                         check="kubernetes-cert-manager")
+
             elif pre.probe_failed:
                 # NOT "does not exist". `kind` talks to Docker, so this is what a
                 # stopped Docker looks like -- and telling someone their cluster is
@@ -492,6 +505,61 @@ def run_checks() -> dict:
                 line(needed, "No Kubernetes cluster configured — install kind so "
                              "rc-repro can create one, or point kubectl at an "
                              "existing cluster (k3s, minikube, Docker Desktop)", check="kubernetes-cluster")
+
+        # OUTSIDE the reachable-cluster block, deliberately. This was inside it, so on a
+        # box where rc-repro's own cluster does not exist yet the check never ran -- and
+        # that is exactly the box where it fired for real: kind chosen and absent, k3s
+        # alongside it holding :443, the edge installed and its name dark. The conflict
+        # has nothing to do with whether rc-repro has a cluster.
+            # THE PORT, and it is silent today. k3s's ServiceLB claims host
+            # :80/:443 with a hostPort, which is CNI portmap DNAT rather than a
+            # socket bind -- so nothing errors, no pod fails, and kube-proxy's
+            # KUBE-SERVICES chain simply gets the packet before Docker's. Measured
+            # on this box: the edge's own GUI name answered 404 through the host and
+            # 502 direct to the edge, with nothing anywhere connecting the two.
+            #
+            # The CHOSEN cluster is not the only one that can do this, and on the box
+            # where it was measured it was not the one: rc-repro was using kind,
+            # which has no LoadBalancer, while the k3s alongside it held the port. So
+            # whatever `kubectl` points at is checked too -- a cluster rc-repro is
+            # not using can still take the edge's port away.
+            for ctx in dict.fromkeys([pre.context, k8s.active_context()]):
+                if not ctx:
+                    continue
+                # `loadbalancer_service`, not `loadbalancer_address`: the latter
+                # returns "traefik has 172.16.0.2" for the row above, and asking
+                # whether THAT is a local address is always False.
+                if ctx == pre.context and not pre.loadbalancer:
+                    continue          # already probed, and it has none
+                addr = k8s.loadbalancer_service(ctx)[1] if k8s.reachable(ctx) else ""
+                if not addr or not _is_local_address(addr):
+                    continue
+                try:
+                    from rc_repro.services import edge as edgesvc
+                    if not edgesvc.installed():
+                        break        # no edge, no conflict -- and none for any ctx
+                    fd = edgesvc.current()
+                    # The GUI's own name is served by the edge too, and on the box
+                    # where this was measured it was the ONLY affected name -- so
+                    # counting workspace routes alone would have said "0 names" about
+                    # a real outage.
+                    harmed = ([fd.domain] if fd and fd.domain else []) \
+                        + list(edgesvc.registered())
+                except Exception:  # noqa: BLE001 - a check must not break the report
+                    break
+                what = (", ".join(harmed[:3]) + ("…" if len(harmed) > 3 else "")
+                        if harmed else "every name it is given")
+                line("warn",
+                     f"cluster {ctx!r} holds this host's :443 at {addr}, so "
+                     f"rc-repro's edge cannot receive there: {what} answers from the "
+                     f"cluster through the host — a 404 and the cluster's own "
+                     f"certificate — while the edge itself is fine. A box serves "
+                     f"HTTPS for one runtime at a time: remove the edge on a "
+                     f"Kubernetes box, or give the host ports back with "
+                     f"`kubectl -n kube-system patch svc traefik -p "
+                     f"'{{\"spec\":{{\"type\":\"NodePort\"}}}}'`",
+                     check="kubernetes-edge-port")
+                break
 
         # "Other" must exclude the one we just said we are USING, or the report
         # describes the same cluster twice and the second mention reads as a
@@ -534,6 +602,51 @@ def run_checks() -> dict:
 INOTIFY_PER_CLUSTER = 60
 
 
+def _is_local_address(ip: str) -> bool:
+    """Whether `ip` is one of THIS host's own addresses.
+
+    Bind is the test, because bind is the question: a socket can only bind an address
+    the host holds. Cheaper and more portable than parsing `ip addr`, and it is the
+    same check the kernel would make.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((ip, 0))
+        return True
+    except OSError:
+        return False
+
+
+def inotify_in_use(proc: str = "/proc") -> int | None:
+    """How many inotify instances this UID already holds, or None if unknowable.
+
+    Counted rather than modelled, because modelling is what made this check useless:
+    see `inotify_headroom`. Only fds this user may read are visible -- the limit is
+    per-UID and container watchers run as root -- so a number here is a FLOOR, never
+    the whole picture, and the caller must not present it as one.
+    """
+    try:
+        uid = os.getuid()
+        pids = [d for d in os.listdir(proc) if d.isdigit()]
+    except (OSError, AttributeError):
+        return None
+    total = 0
+    for pid in pids:
+        base = f"{proc}/{pid}"
+        try:
+            if os.stat(base).st_uid != uid:
+                continue
+            for fd in os.listdir(f"{base}/fd"):
+                try:
+                    if os.readlink(f"{base}/fd/{fd}") == "anon_inode:inotify":
+                        total += 1
+                except OSError:
+                    continue
+        except OSError:
+            continue                      # the process went away, or is not ours
+    return total
+
+
 def inotify_headroom(clusters: int = 1, path: str = "/proc/sys/fs/inotify/max_user_instances",
                      in_use: int | None = None) -> list[tuple[str, str]]:
     """Whether the kernel will let another watcher start.
@@ -545,6 +658,20 @@ def inotify_headroom(clusters: int = 1, path: str = "/proc/sys/fs/inotify/max_us
     a broken route or a bad certificate, and is neither. It cost three full runs to
     find, and kind's own documentation raises these limits for multi-cluster use.
 
+    **It also used to pass while that was happening.** `in_use` was a parameter the
+    body never read: the check compared the LIMIT against a modelled
+    `clusters * INOTIFY_PER_CLUSTER` and never against consumption. So on a box whose
+    128 instances were already spoken for by Docker, k3s, MetalLB, cert-manager and the
+    edge, it printed a green tick -- "inotify instances: 128 (~60 needed here)" -- while
+    Traefik was failing with EMFILE and loading no dynamic configuration at all.
+    Measured during the HTTPS work, which is the exact scenario the docstring above was
+    written about. A model cannot see the other consumers; only a count can.
+
+    So consumption is read when it can be read, and the verdict is about what is LEFT
+    rather than about the ceiling. What can be read is a floor -- the limit is per-UID
+    and containers run as root -- so a comfortable-looking margin is reported without
+    the word that would make it a promise.
+
     Linux-only by construction: the file does not exist elsewhere, and a missing
     file is silence rather than a warning about a limit that does not apply.
     """
@@ -554,15 +681,24 @@ def inotify_headroom(clusters: int = 1, path: str = "/proc/sys/fs/inotify/max_us
     except (OSError, ValueError):
         return []
     need = max(1, clusters) * INOTIFY_PER_CLUSTER
-    if limit >= need * 2:
-        return [("ok", f"inotify instances: {limit} (kind and Traefik watch files; "
-                       f"~{need} needed here)")]
-    if limit >= need:
-        return [("warn", f"inotify instances: {limit}, and about {need} are needed for "
-                         f"{max(1, clusters)} cluster(s) — tight. Raise it with "
+    used = inotify_in_use() if in_use is None else in_use
+    free = limit if used is None else max(0, limit - used)
+    seen = "" if used is None else f", {used} already in use by this user"
+    # Three tiers, all on what is LEFT rather than on the ceiling. The old order asked
+    # `limit >= need` after this, which meant the `fail` tier could not be reached once
+    # consumption was subtracted -- a box with no room at all would have been reported
+    # as merely tight.
+    if free < need:
+        return [("fail", f"inotify instances: {limit}{seen} — about {free} left for the "
+                         f"~{need} that {max(1, clusters)} cluster(s) want. Traefik will "
+                         f"start, load NO dynamic configuration and serve its own "
+                         f"default certificate, which looks like a broken route rather "
+                         f"than a kernel limit. `sudo sysctl -w "
+                         f"fs.inotify.max_user_instances=1024`")]
+    if free < need * 2:
+        return [("warn", f"inotify instances: {limit}{seen} — about {free} left against "
+                         f"the ~{need} wanted, which is tight. A watcher that cannot "
+                         f"start makes Traefik serve its own default certificate. "
                          f"`sudo sysctl -w fs.inotify.max_user_instances=1024`")]
-    return [("fail", f"inotify instances: only {limit}, about {need} needed for "
-                     f"{max(1, clusters)} cluster(s). Traefik will start, load NO "
-                     f"dynamic configuration and serve its own default certificate — "
-                     f"which looks like a broken route, not a kernel limit. "
-                     f"`sudo sysctl -w fs.inotify.max_user_instances=1024`")]
+    return [("ok", f"inotify instances: {limit}{seen} (kind and Traefik watch files; "
+                   f"~{need} needed here)")]

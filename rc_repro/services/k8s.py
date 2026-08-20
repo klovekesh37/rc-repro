@@ -408,13 +408,17 @@ def metrics_available(context: str = CONTEXT) -> bool:
                own=is_ours(context)).returncode == 0
 
 
-def loadbalancer_address(context: str = CONTEXT) -> str:
-    """An address some LoadBalancer Service actually got, or "".
+def loadbalancer_service(context: str = CONTEXT) -> tuple[str, str]:
+    """`(service name, address)` for the first LoadBalancer Service that has one.
 
-    EVIDENCE, not a capability claim: "no address" means either no controller or nobody
-    asked for one, and those cannot be told apart from outside. Reported as what it is,
-    because a cluster that has given a Service a real address has demonstrably got a
-    load balancer -- which on k3s is ServiceLB and on kind is nothing at all.
+    Split out from `loadbalancer_address`, which returns a SENTENCE for the report --
+    "traefik has 172.16.0.2". That was the only caller for a while, and the first
+    caller that needed the address itself got the sentence and silently did nothing
+    with it: `_is_local_address("traefik has 172.16.0.2")` is False, so a `doctor`
+    check written against it never fired. A value shaped for a screen is not a value.
+
+    This is also the address the Kubernetes HTTPS work needs -- the endpoint an edge
+    passes TLS through to -- so it is a seam rather than a helper for one check.
     """
     res = run(["kubectl", "--context", context, "get", "svc", "-A", "-o",
                "jsonpath={range .items[?(@.spec.type=='LoadBalancer')]}"
@@ -422,12 +426,26 @@ def loadbalancer_address(context: str = CONTEXT) -> str:
                "{.status.loadBalancer.ingress[0].hostname} {end}"],
               own=is_ours(context))
     if res.returncode != 0:
-        return ""
+        return "", ""
     for pair in (res.stdout or "").split():
         name, _, addr = pair.partition("=")
         if addr:
-            return f"{name} has {addr}"
-    return ""
+            return name, addr
+    return "", ""
+
+
+def loadbalancer_address(context: str = CONTEXT) -> str:
+    """Evidence that a LoadBalancer works here, phrased for the report, or "".
+
+    EVIDENCE, not a capability claim: "no address" means either no controller or nobody
+    asked for one, and those cannot be told apart from outside. Reported as what it is,
+    because a cluster that has given a Service a real address has demonstrably got a
+    load balancer -- which on k3s is ServiceLB and on kind is nothing at all.
+
+    For the address itself, call `loadbalancer_service`.
+    """
+    name, addr = loadbalancer_service(context)
+    return f"{name} has {addr}" if addr else ""
 
 
 def nodes_summary(context: str = CONTEXT) -> tuple[int, list[str]]:
@@ -2848,6 +2866,25 @@ GRAFANA_WAIT_TRIES = 48
 GRAFANA_WAIT_INTERVAL = 5.0
 
 
+#: cert-manager's namespace is baked into its own manifests and its CRDs are
+#: cluster-scoped, so it is not one of ours to place.
+CERT_MANAGER_NAMESPACE = "cert-manager"
+
+
+def cert_manager_installed(context: str) -> bool:
+    """Whether cert-manager can issue in this cluster.
+
+    Keyed on the CRD rather than on a Deployment name or a helm release: the release
+    can be named anything, and `installCRDs` versus `crds.enabled` differ by
+    cert-manager version -- but nothing can issue a Certificate without the CRD, and
+    its absence is exactly the failure that reads as "no matches for kind
+    ClusterIssuer".
+    """
+    res = run(["kubectl", "--context", context, "get", "crd",
+               "certificates.cert-manager.io", "-o", "name"], own=is_ours(context))
+    return res.returncode == 0 and "certificates.cert-manager.io" in (res.stdout or "")
+
+
 def monitoring_installed(context: str) -> bool:
     """Whether this cluster already has the shared stack."""
     res = run(["helm", "status", MONITORING_RELEASE, "--kube-context", context,
@@ -2928,6 +2965,51 @@ def wait_for_grafana(*, context: str, emit: Emit = null_emit,
          phase="monitor")
 
 
+#: The grafana-operator custom resources this chart creates, in the order they must be
+#: deleted -- children before the Grafana instance that owns them.
+GRAFANA_KINDS: tuple[str, ...] = ("grafanadashboard", "grafanadatasource",
+                                  "grafanafolder", "grafana")
+#: How long ONE kind's delete may block. Short on purpose: a delete that has not
+#: finished in this long is waiting on a finalizer nothing will clear, and the useful
+#: response is to clear it, not to keep waiting. It was 60s per kind, and four of them
+#: ran before a five-minute `helm uninstall --wait` that was also doomed.
+GRAFANA_DELETE_WAIT = 15
+
+
+def grafana_leftovers(context: str) -> list[tuple[str, str]]:
+    """`(kind, name)` for every grafana-operator resource still present.
+
+    Read AFTER a delete has been asked for and given a deadline, so a non-empty
+    result means "these are not going to go on their own".
+    """
+    out: list[tuple[str, str]] = []
+    for kind in GRAFANA_KINDS:
+        res = run(["kubectl", "--context", context, "-n", MONITORING_NAMESPACE,
+                   "get", kind, "-o", "jsonpath={.items[*].metadata.name}"],
+                  own=is_ours(context))
+        if res.returncode != 0:
+            continue                      # the CRD is not installed; nothing to find
+        out.extend((kind, n) for n in (res.stdout or "").split())
+    return out
+
+
+def clear_grafana_finalizers(context: str) -> int:
+    """Strip the operator finalizer from whatever is left, so the delete completes.
+
+    A last resort, and safe as one: the operator that put the finalizer there is gone,
+    so there is nothing whose cleanup we are skipping -- and the alternative is a
+    namespace that sits in Terminating for ever and a release the next `--monitor`
+    cannot install into.
+    """
+    cleared = 0
+    for kind, name in grafana_leftovers(context):
+        res = run(["kubectl", "--context", context, "-n", MONITORING_NAMESPACE,
+                   "patch", kind, name, "--type=merge", "-p",
+                   '{"metadata":{"finalizers":[]}}'], own=is_ours(context))
+        cleared += 1 if res.returncode == 0 else 0
+    return cleared
+
+
 def remove_monitoring(*, context: str, excluding: str = "",
                      emit: Emit = null_emit) -> bool:
     """Uninstall the shared stack. Returns False if another workspace still wants it.
@@ -2969,24 +3051,41 @@ def remove_monitoring(*, context: str, excluding: str = "",
     # -- after which the release is gone, the CR is wedged, and the next install
     # fails on an object that no longer belongs to any release. Observed on the
     # first real uninstall.
-    for kind in ("grafanadashboard", "grafanadatasource", "grafanafolder", "grafana"):
+    #
+    # The ordering above is right and it is not sufficient, because it assumes the
+    # operator is ALIVE. Measured on a live workspace: the Grafana operator was
+    # already gone -- `rc-repro-system` held only the MongoDB operator while nine
+    # GrafanaDashboards, one GrafanaFolder and two GrafanaDatasources remained, the
+    # folder carrying `operator.grafana.com/finalizer` and a deletionTimestamp ten
+    # minutes old, with the release stuck in `uninstalling`. Every step then paid its
+    # full timeout for nothing: 4 x 60s on deletes that could never finish, then 5
+    # MINUTES on `helm uninstall --wait`, and only after all of it did the fallback
+    # below clear the finalizers -- which worked instantly. Nine minutes of silence,
+    # and the fix was the last thing tried.
+    #
+    # So the deletes get a SHORT deadline and are then CHECKED. Whether the operator
+    # is running is deliberately not the test: this chart has renamed its operator
+    # Deployment between versions, and what actually matters is whether the resources
+    # went. If they are still there after the deadline, nothing is going to clear
+    # them, so clear the finalizers now rather than in nine minutes' time.
+    info(emit, "removing the Grafana resources", phase="monitor")
+    for kind in GRAFANA_KINDS:
         run(["kubectl", "--context", context, "-n", MONITORING_NAMESPACE, "delete",
-             kind, "--all", "--ignore-not-found", "--timeout=60s"],
+             kind, "--all", "--ignore-not-found", f"--timeout={GRAFANA_DELETE_WAIT}s"],
             timeout=APPLY_TIMEOUT, own=is_ours(context))
+    stuck = grafana_leftovers(context)
+    if stuck:
+        warn(emit, f"{len(stuck)} Grafana resource(s) will not delete — nothing is left "
+                   "to clear their finalizers, so clearing them now", phase="monitor")
+        clear_grafana_finalizers(context)
+    info(emit, "uninstalling the monitoring release", phase="monitor")
     res = run(["helm", "uninstall", MONITORING_RELEASE, "--kube-context", context,
                "-n", MONITORING_NAMESPACE, "--wait", "--timeout", "5m"],
               timeout=INSTALL_TIMEOUT, own=is_ours(context))
     if res.returncode != 0:
         # The release is removed either way; a stuck finalizer must not leave the
         # cluster in a state the next `--monitor` cannot install into.
-        for kind in ("grafanafolder", "grafanadashboard", "grafanadatasource"):
-            for name in (run(["kubectl", "--context", context, "-n",
-                              MONITORING_NAMESPACE, "get", kind, "-o",
-                              "jsonpath={.items[*].metadata.name}"],
-                             own=is_ours(context)).stdout or "").split():
-                run(["kubectl", "--context", context, "-n", MONITORING_NAMESPACE,
-                     "patch", kind, name, "--type=merge", "-p",
-                     '{"metadata":{"finalizers":[]}}'], own=is_ours(context))
+        clear_grafana_finalizers(context)
         warn(emit, "the monitoring stack needed its finalizers cleared by hand: "
                    + why(res), phase="monitor")
     return True

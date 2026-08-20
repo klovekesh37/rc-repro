@@ -468,3 +468,37 @@ def test_a_workspace_that_is_not_answering_yet_exits_five_not_one(monkeypatch, t
     res = runner.invoke(cli.app, ["api", "--name", "w", "GET", "/api/v1/me"])
     assert res.exit_code == 1, res.output
     assert "ready" not in res.output.lower(), res.output
+
+def test_no_private_function_is_registered_as_a_command():
+    """A guard against a real accident. Inserting a helper directly above a decorated
+    command puts it BETWEEN `@app.command(...)` and its function, so the decorator binds
+    the HELPER and the real command is orphaned -- silently. It happened to `edge`:
+    `rc-repro edge --help` started reporting `Usage: rc-repro edge [OPTIONS] {domain}`
+    with a `--tries` option, `edge status` stopped existing, and `edge logs --tail 2`
+    answered "No such option: --tail". Nothing failed; the command was simply somebody
+    else's function.
+
+    Naming is the invariant that catches it: every callback registered with Typer is a
+    command somebody types, so none of them may be private."""
+    from rc_repro import cli
+
+    bound = [(c.name or c.callback.__name__, c.callback.__name__)
+             for c in cli.app.registered_commands]
+    private = [(name, fn) for name, fn in bound if fn.startswith("_")]
+    assert not private, (
+        "a private helper is registered as a CLI command, which means a decorator "
+        f"is attached to the wrong function: {private}")
+
+
+def test_every_documented_edge_action_is_reachable():
+    """The same accident again, from the user's side: `edge` advertises five actions in
+    its own help, and all five have to exist."""
+    from rc_repro import cli
+
+    edge = next(c for c in cli.app.registered_commands if (c.name or "") == "edge")
+    assert edge.callback.__name__ == "edge_cmd", edge.callback.__name__
+    import inspect
+    src = inspect.getsource(edge.callback)
+    for action in ("status", "start", "stop", "restart", "logs"):
+        assert f'"{action}"' in src, f"`edge {action}` is advertised and unhandled"
+

@@ -947,6 +947,24 @@ def compose_version() -> str | None:
     return _first_line(["docker", "compose", "version", "--short"])
 
 
+def compose_standalone_version() -> str | None:
+    """The version of a STANDALONE `docker-compose` binary, or None.
+
+    Asked only when `docker compose` has already failed, and it changes the answer
+    completely. Compose v2 ships as a docker CLI PLUGIN, and the same binary also works
+    when invoked directly -- so a box can have `docker-compose` on PATH printing a
+    perfectly good v2 help text while `docker compose` does not exist, because the
+    binary was never put where the docker CLI looks for plugins. Reported from an EC2
+    instance where `docker-compose` worked and every rc-repro command did not.
+
+    rc-repro deliberately does NOT fall back to it: `docker compose -p` and the plugin's
+    own project handling are what every path here is written against, and quietly using a
+    second entry point would mean two code paths for one operation. Telling someone to
+    register the binary they already have is a smaller ask than a fallback nobody tests.
+    """
+    return _first_line(["docker-compose", "version", "--short"])
+
+
 def docker_kernel_version() -> str | None:
     """Kernel of the engine host/VM (e.g. Podman machine), or None. This is the
     kernel MongoDB actually runs on - not the macOS/Windows host kernel."""

@@ -111,6 +111,47 @@ def require_docker() -> None:
     """
     if not runner.docker_available():
         raise DockerError("Docker isn't running. Start Docker Desktop and try again.")
+    # AND the compose plugin, because every path here shells out to `docker compose`
+    # and a box can have one without the other. Reported from a fresh Amazon Linux EC2
+    # instance where `docker ps` worked and `rc-repro up` died with docker's own
+    # unhelpful pair:
+    #
+    #     docker: 'compose' is not a docker command.
+    #     unknown shorthand flag: 'd' in -d
+    #
+    # `docker_available()` runs `docker info`, which says nothing about the plugin, so
+    # the engine looked fine and the failure arrived from the middle of a create. It is
+    # a preflight fault -- fix your environment -- so it is raised as one, once, with
+    # the package to install.
+    cv = runner.compose_version()
+    major = cv.split(".")[0].lstrip("v") if cv else ""
+    if not major.isdigit() or int(major) < 2:
+        if cv:
+            raise PreflightError(
+                f"`docker compose` reports {cv}, and rc-repro needs v2 or newer. "
+                "Upgrade the compose plugin, then `docker compose version`.")
+        # NOT NECESSARILY ABSENT. The same binary is both the plugin and a standalone
+        # `docker-compose`, so a box can have a working v2 on PATH while
+        # `docker compose` does not exist -- the binary was never put where the docker
+        # CLI looks. Seen on EC2, and "install the plugin" is the wrong instruction
+        # there: it is installed, just not registered.
+        standalone = runner.compose_standalone_version()
+        if standalone:
+            raise PreflightError(
+                f"`docker compose` is not available, but a standalone "
+                f"`docker-compose` {standalone} is on PATH — the binary is there and the "
+                f"docker CLI cannot see it as a plugin. rc-repro calls `docker compose`, "
+                f"so register it once:\n"
+                f"    mkdir -p ~/.docker/cli-plugins\n"
+                f"    ln -sf \"$(command -v docker-compose)\" "
+                f"~/.docker/cli-plugins/docker-compose\n"
+                f"  Then `docker compose version` should print {standalone}.")
+        raise PreflightError(
+            "`docker compose` v2 is not available — the plugin is not installed. "
+            "Everything rc-repro does with containers goes through it."
+            "\n  Amazon Linux / RHEL / Fedora: `sudo dnf install -y docker-compose-plugin`"
+            "\n  Debian / Ubuntu:              `sudo apt-get install -y docker-compose-plugin`"
+            "\n  Then `docker compose version`, and `rc-repro doctor` to check the rest.")
 
 
 #: Rocket.Chat settled at 670-770 MB and MongoDB at 124-184 MB per workspace on
@@ -1122,11 +1163,13 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
         if not edgesvc.running() or (not local and not edgesvc.has_acme()):
             info(emit, "starting the edge (one Traefik, :80 and :443 for every name)",
                  phase="tls")
-            if not edgesvc.ensure_running(
-                    acme_email="" if local else tlsspec.acme_email,
-                    acme_staging=tlsspec.acme_staging):
+            started = edgesvc.ensure_running(
+                acme_email="" if local else tlsspec.acme_email,
+                acme_staging=tlsspec.acme_staging)
+            if not started:
                 holder = edgesvc.port_holder(443)
-                because = f" — {holder} is holding :443" if holder else ""
+                because = (f" — {holder} is holding :443" if holder
+                           else (f" — {started.why}" if started.why else ""))
                 warn(emit, f"the edge did not start{because}, so {tlsspec.host} will "
                            "not answer yet. The workspace itself is unaffected; free "
                            "the port and `rc-repro edge start`.", phase="tls")

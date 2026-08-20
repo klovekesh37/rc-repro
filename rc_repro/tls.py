@@ -442,6 +442,15 @@ def acme_args(spec: TlsSpec) -> list[str]:
         if spec.acme_dns_provider:
             args.append("--certificatesresolvers.le.acme.dnschallenge.provider="
                         + spec.acme_dns_provider)
+    elif spec.acme_challenge == "http":
+        # http-01, and it exists because the other two can both be unavailable at once.
+        # Reported from an EC2 box where TLS-ALPN validation failed every time with
+        # `remote error: tls: unrecognized name` -- Let's Encrypt reached :443 and the
+        # challenge was not being answered -- and where dns-01 was impossible because the
+        # operator had the machine and not the DNS zone. With only host access and :80
+        # open, this is the one remaining option, and rc-repro could not select it.
+        args.append("--certificatesresolvers.le.acme.httpchallenge=true")
+        args.append("--certificatesresolvers.le.acme.httpchallenge.entrypoint=web")
     else:
         # TLS-ALPN-01, the same challenge the official compose.traefik.yml uses
         # (`certificatesresolvers.le.acme.tlschallenge`). It validates on 443, which
