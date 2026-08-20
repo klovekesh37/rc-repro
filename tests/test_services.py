@@ -6009,3 +6009,33 @@ def test_reclaiming_the_cluster_can_only_ever_reach_our_own(monkeypatch, tmp_pat
     res = lc.prune(confirm=True, emit=events.append)
     assert res["cluster"] is False
     assert any("left alone" in e.message for e in events), [e.message for e in events]
+
+
+def test_an_existing_cluster_is_never_planned_as_one_to_create(monkeypatch):
+    """Caught by a live sweep, in the resolver itself.
+
+    An earlier version decided `create` from whether THIS HOME's kubeconfig named a
+    reachable context. A fresh RC_REPRO_HOME facing a cluster that already exists -- a
+    wiped state directory, a second user on the box, a kubeconfig cleared by a previous
+    `prune` -- therefore planned to create one. Two consequences, the second serious:
+    `check_capacity` charged 600 MB for a control plane already running, and the failed
+    create's rollback was told the cluster was its to delete, so a create that died would
+    have taken a cluster it did not make.
+
+    `create` follows the CLUSTER now. `ensure_cluster` already re-exports the kubeconfig
+    when it finds a cluster its config does not know about, which is why the context is
+    knowable before it has been read.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(k8s, "which", lambda t: "/usr/bin/kind" if t == "kind" else "")
+    monkeypatch.setattr(k8s, "cluster_context", lambda: "")       # this home knows nothing
+    monkeypatch.setattr(k8s, "reachable", lambda ctx=None: False)
+
+    monkeypatch.setattr(k8s, "clusters", lambda: ([k8s.CLUSTER_NAME], ""))
+    plan = k8s.plan_cluster()
+    assert plan.create is False, "an existing cluster must never be planned as a create"
+    assert plan.context == k8s.CONTEXT
+
+    monkeypatch.setattr(k8s, "clusters", lambda: ([], ""))
+    assert k8s.plan_cluster().create is True, "and a missing one still is"

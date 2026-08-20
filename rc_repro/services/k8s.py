@@ -696,17 +696,23 @@ def plan_cluster() -> ClusterPlan:
     the cluster invisible -- containers holding memory that nothing in rc-repro could
     see or remove, and resolution quietly falling through to a different cluster.
     """
-    ours = cluster_context()
-    if which("kind") and CLUSTER_NAME in clusters()[0] and reachable(ours):
-        return ClusterPlan(context=ours, distribution="kind", create=False)
-    # No kind binary, but our kubeconfig may still name a cluster that is up.
-    if not which("kind") and ours and reachable(ours):
-        return ClusterPlan(context=ours, distribution=distribution(ours), create=False)
     if which("kind"):
-        # Not created yet. The context is kind's own naming convention, which is
-        # predictable enough to record before the cluster exists -- `ensure_cluster`
-        # reads the real one back from the kubeconfig afterwards.
-        return ClusterPlan(context=CONTEXT, distribution="kind", create=True)
+        # `create` is decided by whether the CLUSTER exists, never by whether this
+        # home's kubeconfig happens to know about it. An earlier version required the
+        # kubeconfig to name a reachable context, so a fresh RC_REPRO_HOME facing an
+        # existing cluster planned to CREATE one -- which charged 600 MB of capacity for
+        # a control plane already running and, far worse, told a failed create's
+        # rollback that the cluster was its to delete. `ensure_cluster` already
+        # re-exports the kubeconfig for exactly this case, so the context is knowable
+        # before it has been read.
+        return ClusterPlan(context=CONTEXT, distribution="kind",
+                           create=CLUSTER_NAME not in clusters()[0])
+    # No kind binary. Our own kubeconfig may still name a cluster that is up -- one
+    # rc-repro made before kind was uninstalled -- and that is ours to use even though
+    # we could no longer create or delete it.
+    ours = cluster_context()
+    if ours and reachable(ours):
+        return ClusterPlan(context=ours, distribution=distribution(ours), create=False)
     active = active_context()
     if active and reachable(active):
         return ClusterPlan(context=active, distribution=distribution(active),

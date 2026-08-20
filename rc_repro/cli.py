@@ -139,6 +139,37 @@ def _require_docker() -> None:
         _fail(exc)
 
 
+def _not_answering(m: runner.Metadata, exc: Exception, what: str) -> NoReturn:
+    """A REST command that could not reach or could not authenticate to a workspace.
+
+    A CONNECTION failure is NOT_READY -- exit 5, "poll again" -- and not the
+    unclassified 1. Every one of these messages already told the reader to run
+    `rc-repro ready`, while exiting the one code that tells a script not to bother
+    polling; and `services/monitor.py` raises NotReadyError for the very same
+    condition, so an unreachable workspace answered differently depending on which
+    verb you reached for. Measured: `api` against a workspace whose Rocket.Chat
+    container was still coming back from an `env` change exited 1.
+
+    Anything else -- a refused login, a 2FA challenge nothing can satisfy -- stays
+    unclassified, because it is not something waiting will fix.
+    """
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        _fail(errors.NotReadyError(
+            f"{m.name!r} is not answering yet, so {what} cannot run — wait for it with "
+            f"`rc-repro ready --name {m.name}`"))
+    # A 429 is the other "wait and it will work": Rocket.Chat rate-limits token
+    # creation per user, so two perf runs back to back -- which is exactly the
+    # `--save baseline` then `--compare baseline` pair the README prints -- have the
+    # second refused. Reported as unclassified it read like a broken workspace.
+    if "429" in str(exc) or "Too Many Requests" in str(exc):
+        _fail(errors.NotReadyError(
+            f"Rocket.Chat is rate-limiting token creation on {m.name!r}, so {what} "
+            "cannot run yet. Its limiter resets in about a minute — try again then."))
+    # No "ready?" here: the two conditions waiting actually fixes are handled above, so
+    # telling everybody else to poll sent them to a command that could not help.
+    _err(f"{what} failed: {exc}")
+
+
 def _login(meta: runner.Metadata) -> rcapi.Auth:
     """Admin login for a repro. Passes the repro's Mailpit URL (email preset)
     so rcapi can satisfy an email-2FA challenge automatically."""
@@ -1452,7 +1483,7 @@ def token(name: str = typer.Option("", "--name", "-n")) -> None:
     try:
         auth = _login(m)
     except Exception as exc:  # noqa: BLE001 - surface any auth/connection failure
-        _err(f"could not log in (is it ready? `rc-repro ready --name {m.name}`): {exc}")
+        _not_answering(m, exc, "logging in")
     typer.echo(f'-H "X-Auth-Token: {auth.token}" -H "X-User-Id: {auth.user_id}"')
 
 
@@ -1480,7 +1511,7 @@ def api(
             token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, bypass_2fa=True, workspace=m.name)
             auth = rcapi.Auth(token=token, user_id=auth.user_id)  # use the PAT as the auth token
     except Exception as exc:  # noqa: BLE001
-        _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
+        _not_answering(m, exc, "this API call")
 
     try:
         body = json.loads(data) if data else None
@@ -1518,7 +1549,7 @@ def pat(
         auth = _login(m)
         token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, token_name=label, bypass_2fa=bypass_2fa, workspace=m.name)
     except Exception as exc:  # noqa: BLE001
-        _err(f"could not create PAT (ready? `rc-repro ready --name {m.name}`): {exc}")
+        _not_answering(m, exc, "minting a token")
     typer.echo(f"# Personal Access Token for {m.name} ({m.root_url}) — bypass_2fa={bypass_2fa}")
     typer.echo(f'-H "X-Auth-Token: {token}" -H "X-User-Id: {auth.user_id}"')
 
@@ -2278,7 +2309,7 @@ def loadtest(
                                    token_name="rc-repro-loadtest", bypass_2fa=True,
                                    workspace=m.name)
     except Exception as exc:  # noqa: BLE001
-        _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
+        _not_answering(m, exc, "this API call")
 
     # Real per-user identity: log in as seeded users and hand them to k6 so VUs
     # round-robin across them. The custom scenario stays on the admin PAT —
@@ -2569,7 +2600,7 @@ def capacity(
                                    token_name="rc-repro-loadtest", bypass_2fa=True,
                                    workspace=m.name)
     except Exception as exc:  # noqa: BLE001
-        _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
+        _not_answering(m, exc, "this API call")
     users = _login_seed_users(m, users_n) if users_n > 0 else []
 
     # As in loadtest: every mutation (resource caps, rate limiter, the Prometheus
