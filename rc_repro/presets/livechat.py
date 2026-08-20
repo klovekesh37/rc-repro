@@ -163,6 +163,9 @@ def build(params: dict) -> Preset:
         files={"index.html": _widget_page()},
         mounts=[{"name": "files", "mountPath": "/usr/share/nginx/html/index.html",
                  "subPath": "index.html"}],
+        readiness={"httpGet": {"path": "/", "port": 80},
+                   "initialDelaySeconds": 2, "periodSeconds": 3,
+                   "failureThreshold": 30},
         ui={"widget-site": (_WIDGET_PORT, 80)})
     return Preset(
         name="livechat",

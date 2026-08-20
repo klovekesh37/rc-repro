@@ -72,6 +72,29 @@ def mongo_kernel_conflict(mongo_tag: str, kernel: str | None = None) -> str:
             "MongoDB 7.0.")
 
 
+#: Every check id `run_checks` can report, and the published half of
+#: `doctor --json`. A caller watches an ID; the message beside it is prose and may
+#: be reworded in any release.
+#:
+#: One id per SUBJECT, not per outcome -- `ports` covers "3000 is free" and "3000 is
+#: in use" alike, because those are two states of one question and a caller watching
+#: for the second must not have to learn a different key for it. Deriving the id
+#: from the message instead, which is the obvious shortcut, gives `port-3000-free`
+#: when it passes and `port-3000-in` when it does not: two ids for one check, and a
+#: watcher that never sees the state it was watching for.
+CHECKS: tuple[str, ...] = (
+    "preflight",                    # the report itself could not be assembled
+    "docker", "compose", "engine-kernel", "hub-auth",
+    "disk", "memory", "swap",
+    "version-lookup", "ports",
+    "edge", "edge-routes-stale", "edge-routes-unreachable",
+    "gui-accounts", "gui-admin", "gui-roles", "gui-create-policy",
+    "state-file-perms", "home-perms", "sessions-file", "identity",
+    "kubernetes", "kubernetes-tools", "kubernetes-cluster",
+    "kubernetes-storage", "kubernetes-other-clusters", "inotify",
+)
+
+
 def run_checks() -> dict:
     """Run every preflight check and return the findings.
 
@@ -80,8 +103,15 @@ def run_checks() -> dict:
      "repros": {"total": int, "running": int} | None}
     """
     rows: list[dict] = []
+    # The check a row is ABOUT, carried per block rather than repeated at each of
+    # the fifty-two call sites. Two properties follow, and both are the point: a
+    # `line()` added inside a block cannot forget its id, and every status of one
+    # check shares an id, so an agent watching `ports` sees the ok and the warn on
+    # one key. Reassigned as the report moves from subject to subject; `check=`
+    # overrides it where one block asks more than one question.
+    subject = "preflight"
 
-    def line(status: str, msg: str, elsewhere: str = "") -> None:
+    def line(status: str, msg: str, elsewhere: str = "", check: str = "") -> None:
         """`elsewhere` names a place the GUI shows this fact PERMANENTLY.
 
         The web report drops those rows (see the /api/doctor endpoint). A terminal
@@ -91,11 +121,16 @@ def run_checks() -> dict:
         Only ever set on an `ok` row -- a WARNING about the same subject is not
         something the chip beside it says, and those all still appear.
         """
-        row = {"status": status, "message": msg}
+        cid = check or subject
+        # Declared, not free-form: these are published by `doctor --json` as a
+        # contract, and a typo would be a check that silently stops being watchable.
+        assert cid in CHECKS, f"undeclared doctor check id {cid!r}"
+        row = {"check": cid, "status": status, "message": msg}
         if elsewhere:
             row["elsewhere"] = elsewhere
         rows.append(row)
 
+    subject = "docker"
     # Docker daemon (everything else that needs Docker degrades gracefully).
     # max_age=0: the dashboard poll memoises this, but somebody running `doctor`
     # has explicitly asked whether Docker is up RIGHT NOW -- answering that from a
@@ -106,6 +141,7 @@ def run_checks() -> dict:
     else:
         line("fail", "Docker daemon not running — start Docker Desktop / dockerd")
 
+    subject = "compose"
     # docker compose v2 or newer
     cv = runner.compose_version()
     cv_major = _major_version(cv)
@@ -116,6 +152,7 @@ def run_checks() -> dict:
     else:
         line("warn", "couldn't detect `docker compose` — install Compose v2 or newer")
 
+    subject = "engine-kernel"
     # Engine/VM kernel vs Mongo 8 (SERVER-121912): mongod 8.0 hard-exits on
     # kernel >= 6.19, which recent RC versions require. Common on fresh Podman /
     # FCOS machines and easy to misread as a volume/permission failure.
@@ -128,6 +165,7 @@ def run_checks() -> dict:
         elif kv:
             line("ok", f"engine kernel {kv}")
 
+    subject = "hub-auth"
     # Docker Hub auth: anonymous pulls hit Hub's rate limit (registry.rocket.chat
     # counts against Hub too), which shows up as a silent, container-less `down`.
     hub = runner.hub_logged_in()
@@ -137,6 +175,7 @@ def run_checks() -> dict:
         line("warn", "not logged in to Docker Hub — anonymous pulls can hit the rate "
                      "limit; run `docker login`. registry.rocket.chat counts against Hub too")
 
+    subject = "disk"
     # Disk headroom (RC images are ~1.5 GB each).
     try:
         free_gb = shutil.disk_usage(config.home().parent).free / 1e9
@@ -147,6 +186,7 @@ def run_checks() -> dict:
     except OSError:
         line("warn", "couldn't check disk space")
 
+    subject = "memory"
     # Memory headroom, in workspaces rather than megabytes -- "3.2 GB available"
     # does not tell you whether you can start another one, and that is the only
     # question anybody is actually asking. Added after seven concurrent stacks
@@ -170,8 +210,9 @@ def run_checks() -> dict:
                          "`rc-repro stop --name <it>` frees memory and keeps the data")
         if swap_mb == 0:
             line("warn", "No swap: memory pressure becomes an OOM kill rather than "
-                         "slowdown, and the kernel picks its own victim")
+                         "slowdown, and the kernel picks its own victim", check="swap")
 
+    subject = "version-lookup"
     # Live version lookup reachability.
     try:
         r = requests.get("https://releases.rocket.chat/8.5.1/info", timeout=5)
@@ -182,6 +223,7 @@ def run_checks() -> dict:
     except requests.RequestException:
         line("warn", "releases.rocket.chat unreachable — use `--offline` (falls back to shipped map)")
 
+    subject = "ports"
     # Ports.
     try:
         free = runner.pick_port()
@@ -192,6 +234,7 @@ def run_checks() -> dict:
     except RuntimeError as exc:   # bounded scan found nothing bindable
         line("fail", str(exc))
 
+    subject = "edge"
     # The shared edge. Silent unless one is set up, so a single-user install
     # sees no rows about a thing it does not have -- but once one exists it is
     # reported, because everything on the box depends on it (§8, shared fate):
@@ -245,6 +288,7 @@ def run_checks() -> dict:
     except Exception:  # noqa: BLE001 - a check must never break the report
         line("warn", "Edge status could not be determined")
 
+    subject = "identity"
     # Identity: who can sign in, and whether the files that decide it are sound.
     # Nothing else reports this, and an install with no admin cannot make one from
     # the GUI -- the repair is hand-editing a file most people would not think to
@@ -255,22 +299,22 @@ def run_checks() -> dict:
 
         if not usersvc.any_users():
             line("warn", "No GUI accounts — `rc-repro serve` will refuse to start on "
-                         "anything but loopback (`rc-repro users add <name>`)")
+                         "anything but loopback (`rc-repro users add <name>`)", check="gui-accounts")
         else:
             admins = usersvc.admins()
             if admins:
                 line("ok", f"{len(usersvc.list_users())} GUI account(s), "
                            f"admin: {', '.join(admins)}",
-                     elsewhere="the People page")
+                     elsewhere="the People page", check="gui-accounts")
             else:
                 line("fail", "No admin account — nobody can manage people from the "
-                             "GUI. `rc-repro users role <name> admin`")
+                             "GUI. `rc-repro users role <name> admin`", check="gui-admin")
             implicit = usersvc.implicit_admins()
             if implicit:
                 line("warn", f"admin by default (blank role column): "
                              f"{', '.join(implicit)} — that is the migration for "
                              "accounts made before roles existed, not a choice. "
-                             f"`rc-repro users role {implicit[0]} member`")
+                             f"`rc-repro users role {implicit[0]} member`", check="gui-roles")
             # Reported rather than warned about: this is the default and it is a
             # deliberate one, but "what may a member actually do on this box?" should
             # be answerable without reading source. Same reason `serve` names the
@@ -280,21 +324,21 @@ def run_checks() -> dict:
             if config.load_config().get(lcsvc.CREATE_POLICY_KEY) == "admin":
                 line("ok", "members may not set --rc-image/--reg-token/--bind "
                            "(gui.create_policy admin)",
-                     elsewhere="which fields the New workspace form offers")
+                     elsewhere="which fields the New workspace form offers", check="gui-create-policy")
             else:
                 line("ok", "members may set --rc-image/--reg-token/--bind — narrow "
                            "it with `rc-repro config set gui.create_policy admin`",
-                     elsewhere="which fields the New workspace form offers")
+                     elsewhere="which fields the New workspace form offers", check="gui-create-policy")
         for path in (usersvc.users_file(), sessionsvc.sessions_file(),
                      config.home() / "audit.log"):
             if path.exists() and (path.stat().st_mode & 0o077):
                 line("warn", f"{path} is readable by other local users "
-                             f"(mode {oct(path.stat().st_mode)[-3:]}); it should be 0600")
+                             f"(mode {oct(path.stat().st_mode)[-3:]}); it should be 0600", check="state-file-perms")
         home = config.home()
         if home.exists() and (home.stat().st_mode & 0o077):
             line("warn", f"{home} is 0{oct(home.stat().st_mode)[-3:]}, so another "
                          "local user can read the accounts and sessions inside it "
-                         "— `serve` tightens it to 0700 at startup")
+                         "— `serve` tightens it to 0700 at startup", check="home-perms")
         # A state file written by a NEWER rc-repro must not be half-understood.
         marker = "# rc-repro-state: "
         try:
@@ -305,13 +349,14 @@ def run_checks() -> dict:
                         line("fail", f"{sessionsvc.sessions_file()} was written by a "
                                      f"newer rc-repro (state v{seen}, this reads "
                                      f"v{sessionsvc.STATE_VERSION}) — upgrade rather "
-                                     "than run against it")
+                                     "than run against it", check="sessions-file")
                     break
         except OSError:
             pass
     except Exception:  # noqa: BLE001 - a check must never break the report
         line("warn", "Identity status could not be determined")
 
+    subject = "kubernetes"
     # --- Kubernetes -------------------------------------------------------
     # Severity depends on whether anything USES Kubernetes. A box with no cluster
     # is perfectly healthy if nobody wants one, and broken if a Kubernetes
@@ -334,21 +379,21 @@ def run_checks() -> dict:
             # One line, not five. Someone running only Compose repros should not
             # have their report padded with an unconfigured feature.
             line("ok", f"Kubernetes not set up ({', '.join(pre.missing_tools)} "
-                       f"not installed) — Compose workspaces are unaffected")
+                       f"not installed) — Compose workspaces are unaffected", check="kubernetes-tools")
         else:
             if pre.missing_tools:
                 line("fail", f"{len(k8s_workspaces)} Kubernetes workspace(s) exist but "
                              f"{', '.join(pre.missing_tools)} is not installed — they "
-                             "cannot be reached or torn down")
+                             "cannot be reached or torn down", check="kubernetes-tools")
             for name in pre.outdated_tools:
                 got = pre.tools[name]
                 floor = ".".join(str(n) for n in k8s.TOOLS[name])
                 line(needed, f"{name} {got.pretty} is older than {floor}, the floor "
-                             "the official Rocket.Chat guide requires")
+                             "the official Rocket.Chat guide requires", check="kubernetes-tools")
             if pre.tools_ready:
                 line("ok", "Kubernetes tools present (" + ", ".join(
                     f"{t.name} {t.pretty}" for t in pre.tools.values()
-                    if t.present) + ")")
+                    if t.present) + ")", check="kubernetes-tools")
 
             if pre.cluster_reachable:
                 where = (f", {len(pre.namespaces)} workspace namespace(s)"
@@ -359,36 +404,36 @@ def run_checks() -> dict:
                     # so `down` and `prune` will leave this cluster standing.
                     line("ok", f"Using your cluster {pre.context!r}{where} — rc-repro "
                                "creates namespaces in it and never removes the "
-                               "cluster itself")
+                               "cluster itself", check="kubernetes-cluster")
                 else:
-                    line("ok", f"Cluster {k8s.CLUSTER_NAME!r} reachable{where}")
+                    line("ok", f"Cluster {k8s.CLUSTER_NAME!r} reachable{where}", check="kubernetes-cluster")
                 if not pre.default_storage_class:
                     # The guide's own warning, and the failure is silent: a PVC
                     # stays Pending forever and nothing names storage.
                     line(needed, f"Cluster {pre.context!r} has no default "
                                  "StorageClass — a workspace's volume would stay "
-                                 "Pending with no error naming storage")
+                                 "Pending with no error naming storage", check="kubernetes-storage")
             elif pre.probe_failed:
                 # NOT "does not exist". `kind` talks to Docker, so this is what a
                 # stopped Docker looks like -- and telling someone their cluster is
                 # absent would send them to create one that is already there.
                 line(needed, f"Could not tell whether cluster {k8s.CLUSTER_NAME!r} "
-                             f"exists ({pre.probe_failed}) — kind needs Docker")
+                             f"exists ({pre.probe_failed}) — kind needs Docker", check="kubernetes-cluster")
             elif pre.context:
                 line(needed, f"Cluster {pre.context!r} is configured but its API "
-                             "server is not answering")
+                             "server is not answering", check="kubernetes-cluster")
             elif pre.can_provision:
                 line("fail" if in_use else "ok",
                      f"No cluster yet — {k8s.CLUSTER_NAME!r} is created on first use"
                      if not in_use else
                      f"Cluster {k8s.CLUSTER_NAME!r} is gone and its workspaces "
-                     "cannot be reached")
+                     "cannot be reached", check="kubernetes-cluster")
             elif pre.tools_ready:
                 # kubectl and helm but no kind and no kubeconfig: usable the moment
                 # a cluster is pointed at, and the two ways to get one are named.
                 line(needed, "No Kubernetes cluster configured — install kind so "
                              "rc-repro can create one, or point kubectl at an "
-                             "existing cluster (k3s, minikube, Docker Desktop)")
+                             "existing cluster (k3s, minikube, Docker Desktop)", check="kubernetes-cluster")
 
         # "Other" must exclude the one we just said we are USING, or the report
         # describes the same cluster twice and the second mention reads as a
@@ -400,7 +445,9 @@ def run_checks() -> dict:
             # visible before somebody wonders why `prune` left it alone.
             line("ok", f"{len(others)} other kind cluster(s) on this box "
                        f"({', '.join(others)}) — rc-repro never deletes "
-                       "a cluster it did not create")
+                       "a cluster it did not create", check="kubernetes-other-clusters")
+        for row in inotify_headroom(len(others) + 1):
+            line(row[0], row[1], check="inotify")
     except Exception:  # noqa: BLE001 - a check must never break the report
         line("warn", "Kubernetes status could not be determined")
 
@@ -420,3 +467,44 @@ def run_checks() -> dict:
             repros = None
 
     return {"checks": rows, "counts": counts, "verdict": verdict, "repros": repros}
+
+
+#: Roughly what one kind node plus the workloads on it consume. Measured, not
+#: guessed: a single-node cluster running Rocket.Chat, MongoDB, NATS and a preset
+#: sidecar sat around 40-60 instances, and the box below had five clusters' worth of
+#: history behind it.
+INOTIFY_PER_CLUSTER = 60
+
+
+def inotify_headroom(clusters: int = 1, path: str = "/proc/sys/fs/inotify/max_user_instances",
+                     in_use: int | None = None) -> list[tuple[str, str]]:
+    """Whether the kernel will let another watcher start.
+
+    This check exists because the symptom points nowhere near the cause. With
+    `fs.inotify.max_user_instances` exhausted, Traefik starts, stays up, logs
+    `Cannot start the provider *file.Provider ... too many open files`, and then
+    serves its OWN default certificate to every request -- which looks exactly like
+    a broken route or a bad certificate, and is neither. It cost three full runs to
+    find, and kind's own documentation raises these limits for multi-cluster use.
+
+    Linux-only by construction: the file does not exist elsewhere, and a missing
+    file is silence rather than a warning about a limit that does not apply.
+    """
+    try:
+        with open(path) as fh:
+            limit = int(fh.read().strip())
+    except (OSError, ValueError):
+        return []
+    need = max(1, clusters) * INOTIFY_PER_CLUSTER
+    if limit >= need * 2:
+        return [("ok", f"inotify instances: {limit} (kind and Traefik watch files; "
+                       f"~{need} needed here)")]
+    if limit >= need:
+        return [("warn", f"inotify instances: {limit}, and about {need} are needed for "
+                         f"{max(1, clusters)} cluster(s) — tight. Raise it with "
+                         f"`sudo sysctl -w fs.inotify.max_user_instances=1024`")]
+    return [("fail", f"inotify instances: only {limit}, about {need} needed for "
+                     f"{max(1, clusters)} cluster(s). Traefik will start, load NO "
+                     f"dynamic configuration and serve its own default certificate — "
+                     f"which looks like a broken route, not a kernel limit. "
+                     f"`sudo sysctl -w fs.inotify.max_user_instances=1024`")]

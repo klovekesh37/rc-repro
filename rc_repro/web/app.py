@@ -1265,7 +1265,16 @@ def create_app(allow_hosts: list[str] | None = None, *,
                      "default_deployment": deps[0]}
                     for rt, deps in topology.DEPLOYMENTS.items()
                 ],
-                "default_runtime": topology.DOCKER}
+                "default_runtime": topology.DOCKER,
+                # What a workspace will publish ON if nobody says otherwise. The
+                # dialog needs it to tell a browser on ANOTHER machine the truth:
+                # with the default 127.0.0.1 the workspace it is about to create
+                # will be reachable from the server and from nowhere else, which is
+                # not something a GUI-only user can find out any other way. Not a
+                # secret -- `up` prints it, and it is an interface, not a
+                # credential.
+                "default_bind_host": (config.load_config().get("bind_host")
+                                      or config.DEFAULT_BIND_HOST)}
 
     @app.get("/api/machine")
     def machine():
@@ -1329,8 +1338,17 @@ def create_app(allow_hosts: list[str] | None = None, *,
     def stats(name: str):
         from rc_repro.perf import resources as R
         target = lc.resolve_name(name)
-        topology.require_compose(target, "stats",
-                                 instead="Install metrics-server and use `kubectl top`.")
+        if topology.of_repro(target) == topology.KUBERNETES:
+            # `kubectl top` for the same two numbers, summed over every Rocket.Chat
+            # pod so replicas are counted the way compose counts instances. It needs
+            # metrics-server, which kind does not ship -- pod_metrics refuses and
+            # says how to install it rather than reporting a confident zero.
+            from rc_repro.services import k8s
+            meta = runner.read_meta(target)
+            context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
+            rows = k8s.pod_metrics(target, context=context)
+            return {"cpu": round(sum(r["cpu_millicores"] for r in rows) / 10.0, 1),
+                    "mem_mb": round(sum(r["mem_bytes"] for r in rows) / 1e6, 1)}
         ids = runner.container_ids(target)
         prefix = f"{config.PROJECT_PREFIX}{target}-"
         cpu = mem = 0.0
@@ -1438,11 +1456,21 @@ def create_app(allow_hosts: list[str] | None = None, *,
         # A Kubernetes workspace has no compose project, so the stream would
         # open, produce nothing, and look like a quiet workspace rather than an
         # unsupported one. Refused before the socket carries anything.
-        try:
-            topology.require_compose(target, "logs", instead="Use kubectl logs.")
-        except ReproError as exc:
-            await ws.send_json(error_body(exc)); await ws.close(); return
-        proc = open_log_process(runner.workspace(target), _clamp_tail(tail))
+        # No refusal here any more. A Kubernetes workspace streams through
+        # `kubectl logs -l app.kubernetes.io/name=rocketchat`; telling a browser
+        # user to run kubectl was advice they had no way to take.
+        #
+        # Dispatched HERE rather than inside open_log_process, so each seam stays
+        # what it says it is: that one is the single docker call, k8s.log_process is
+        # the single kubectl one.
+        if topology.of_repro(target) == topology.KUBERNETES:
+            from rc_repro.services import k8s
+            _meta = runner.read_meta(target)
+            proc = k8s.log_process(
+                target, tail=_clamp_tail(tail), follow=True,
+                context=str((_meta.extra or {}).get("context") or k8s.CONTEXT))
+        else:
+            proc = open_log_process(runner.workspace(target), _clamp_tail(tail))
 
         dropped = [0]
         offer = make_log_offer(q, dropped)

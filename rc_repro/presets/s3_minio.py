@@ -44,6 +44,54 @@ _MINIO_TAG = "RELEASE.2025-09-07T16-13-09Z"
 _MC_TAG = "RELEASE.2025-08-13T08-35-41Z"
 
 
+def _bucket_job(bucket: str, workspace: str = "__RC_REPRO_NAME__") -> str:
+    """The Kubernetes twin of the compose `minio-init` service.
+
+    It had no twin, and nothing said so. On Compose a one-shot container waits for
+    MinIO and runs `mc mb -p`; the Kubernetes adapter rendered only the MinIO
+    Deployment, so the bucket was NEVER created -- while the workspace's own notes
+    said "bucket '<name>' is created automatically; watch uploads land in it". MinIO
+    does not create buckets on demand and neither does Rocket.Chat, so every upload
+    on that runtime had nowhere to go.
+
+    A Job rather than an init container: an init container runs BEFORE its pod's main
+    container, so it would wait for a MinIO that cannot start until it finishes.
+    Same image, same idempotent `mc mb -p`, same wait loop as Compose.
+    """
+    import yaml
+
+    app = "rc-repro-minio-init"
+    labels = {"app": app, "app.kubernetes.io/managed-by": "rc-repro",
+              "rc-repro.io/component": "minio-init",
+              "rc-repro.io/repro": workspace}
+    return yaml.safe_dump({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {"name": "minio-init", "labels": labels},
+        "spec": {
+            # Retries rather than one attempt: the Job is applied at the same time as
+            # the Deployment, so its first run legitimately races MinIO starting.
+            "backoffLimit": 10,
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": {
+                    "restartPolicy": "OnFailure",
+                    "containers": [{
+                        "name": "minio-init",
+                        "image": f"docker.io/minio/mc:{_MC_TAG}",
+                        "command": [
+                            "sh", "-c",
+                            f"until mc alias set local http://minio:{_S3_PORT} "
+                            f"{_USER} {_PASSWORD}; do sleep 2; done; "
+                            f"mc mb -p local/{bucket}",
+                        ],
+                    }],
+                },
+            },
+        },
+    }, sort_keys=False)
+
+
 def build(params: dict) -> Preset:
     presigned = _common.truthy_param(params, "presigned")
     bucket = _common.str_param(params, "bucket", "rcrepro-uploads")
@@ -149,8 +197,13 @@ def build(params: dict) -> Preset:
         # the same process, and a Kubernetes label value cannot contain a comma --
         # so each Service names the workload through `rc-repro.io/ui-deployment`
         # instead of carrying a list of ports it is not allowed to spell.
+        readiness={"httpGet": {"path": "/minio/health/ready",
+                               "port": _S3_PORT},
+                   "initialDelaySeconds": 3, "periodSeconds": 3,
+                   "failureThreshold": 40},
         ui={"minio": (_S3_PORT, _S3_PORT),
             "minio-console": (_CONSOLE_PORT, _CONSOLE_PORT)})
+    bucket_job = _bucket_job(bucket)
     return Preset(
         name="s3_minio",
         description=(
@@ -169,6 +222,9 @@ def build(params: dict) -> Preset:
         },
         volumes={"minio_data": {"driver": "local"}},
         ports=list(config.PRESET_PORTS["s3_minio"]),
-        kubernetes_manifests=[kube],
+        # Both: the Deployment/Services for MinIO, and the Job that creates the
+        # bucket. Without the second, `up` succeeded, MinIO ran, and every upload had
+        # nowhere to land -- see _bucket_job.
+        kubernetes_manifests=[kube, bucket_job],
         notes=notes,
     )

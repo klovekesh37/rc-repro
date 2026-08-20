@@ -149,6 +149,23 @@ def _exec_from_file(name: str, argv: list[str], src, timeout: float | None = Non
                                          timeout=timeout)
 
 
+def _mongo_auth(name: str) -> list[str]:
+    """Credential flags for the database tools, empty unless the operator manages it.
+
+    The hand-written StatefulSet runs without authentication, so both paths existed
+    and only one was exercised until an audit ran the operator too.
+    """
+    ctx = _kube(name)
+    if not ctx:
+        return []
+    meta = runner.read_meta(name)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    if extra.get("mongo_managed_by") != "operator":
+        return []
+    from rc_repro.services import k8s
+    return k8s.mongo_tool_auth(name, context=ctx)
+
+
 def _require_mongo_tools(name: str) -> None:
     """Fail early and clearly if the Mongo image has no database tools.
 
@@ -226,6 +243,21 @@ class _Quiesced:
             # dump needs the database up and only its writers quiesced -- the same
             # distinction runner draws between `stop()` and `stop_services()`.
             k8s.scale_rocketchat(self.name, replicas=0, context=ctx)
+            # The forward is destroyed WITH the pod, deliberately and for the same
+            # reason `stop` does it: leaving it publishes a port that answers
+            # nothing. Killing it here rather than trusting it to die matters,
+            # because `ensure_port_forward` only asks whether the PROCESS is alive
+            # -- and a forward whose pod has just been deleted stays alive briefly,
+            # long enough to be reused and even to serve one request, before it
+            # exits. That is measurable: after the dump the port answered 200, and
+            # seconds later the same pid was dead and the port gave nothing.
+            meta = runner.read_meta(self.name)
+            extra = meta.extra if isinstance(meta.extra, dict) else {}
+            pid = extra.get("port_forward_pid")
+            if pid:
+                lifecycle._stop_port_forward(int(pid))
+                runner.update_meta(self.name,
+                                   lambda m: m.extra.pop("port_forward_pid", None))
         else:
             runner.stop_services(self.name, self.services)
         return self
@@ -249,6 +281,37 @@ class _Quiesced:
                  f"Rocket.Chat did not come back up on {self.name!r} - the data is "
                  f"safe, but the workspace is stopped. Start it with "
                  f"`rc-repro start --name {self.name}`.", phase="backup")
+        else:
+            # Rocket.Chat has been STARTED, which is not the same as serving, and
+            # `backup` returned on the former. Both runtimes were affected and only
+            # one recovered on its own:
+            #
+            #   Kubernetes: scaling to 0 killed the port-forward with the pod, and
+            #   scaling back up created a NEW pod that nothing forwarded to. The
+            #   workspace stayed running and permanently unreachable at its own URL
+            #   -- pod healthy, in-cluster HTTP fine, published port timing out --
+            #   and the symptom pointed at the backup, the one part that had worked.
+            #
+            #   Compose: the container comes back immediately but Rocket.Chat needs
+            #   ~30s more, so the next request was met with a connection reset. It
+            #   healed itself, which is why it went unnoticed.
+            #
+            # `wait_serving` is runtime-aware and re-establishes the forward, so one
+            # call covers both. Deliberately NOT wait_and_finalize, which `restore`
+            # uses: that also re-runs finalize and the preset's post_ready actions,
+            # and a backup has no business re-applying a workspace's configuration.
+            #
+            # It warns rather than raises: __exit__ must not mask an in-flight
+            # exception, and the DUMP is safe regardless -- only reachability is at
+            # stake, and `ready` repairs that.
+            try:
+                lifecycle.wait_serving(runner.read_meta(self.name), self.emit, 300.0)
+            except Exception as exc:  # noqa: BLE001
+                warn(self.emit,
+                     f"the dump is complete, but {self.name!r} is not serving on its "
+                     f"published port again ({exc}). Run "
+                     f"`rc-repro ready --name {self.name}` to bring it back.",
+                     phase="backup")
         return False
 
 
@@ -295,7 +358,8 @@ def _create_locked(target: str, *, out: str = "", note: str = "", live: bool = F
             info(emit, f"dumping database {database!r}", phase="backup", pct=30)
             started = time.monotonic()
             rc, err = _exec_to_file(
-                target, ["mongodump", "--archive", "--gzip", "--db", database],
+                target, ["mongodump", "--archive", "--gzip", "--db", database,
+                         *_mongo_auth(target)],
                 archive, timeout=DUMP_TIMEOUT)
         if rc != 0:
             raise DockerError(f"mongodump failed for {target!r}: {err.strip()[:600]}")
@@ -488,6 +552,27 @@ def list_backups(name: str = "") -> list[dict]:
         if name and row.get("repro") != name:
             continue
         out.append(row)
+    # Bundles OUTLIVE the workspace they came from -- they live in one directory
+    # under RC_REPRO_HOME and `down --volumes` does not touch them, deliberately,
+    # because the whole point of a backup is surviving the thing it backed up.
+    #
+    # But they are matched to a workspace by NAME, and rc-repro derives names from
+    # the version (`lovekesh-rc8-5-1`), so recreating a workspace reliably produces
+    # the same name as a destroyed one. Its old bundles then appear against the new
+    # workspace with nothing to say they predate it -- which reads as "a backup was
+    # created automatically when I made this workspace", and was reported as exactly
+    # that. Restoring one would silently load a previous workspace's data.
+    #
+    # So they are still listed -- hiding a real backup is worse -- and marked.
+    born = ""
+    if name:
+        try:
+            born = str(runner.read_meta(name).created_at or "")
+        except Exception:  # noqa: BLE001 - no workspace, nothing to compare against
+            born = ""
+    for row in out:
+        row["predates_workspace"] = bool(
+            born and row.get("created_at") and str(row["created_at"]) < born)
     return sorted(out, key=lambda r: r["mtime"], reverse=True)
 
 
@@ -618,7 +703,8 @@ def _drop_database(name: str, database: str, emit: Emit = null_emit) -> None:
     info(emit, f"dropping database {database!r} so the restore is exact",
          phase="restore", pct=40)
     rc, out = _exec_capture(
-        name, [shell, database, "--quiet", "--eval", "db.dropDatabase()"],
+        name, [shell, database, "--quiet", *_mongo_auth(name),
+               "--eval", "db.dropDatabase()"],
         timeout=PROBE_TIMEOUT)
     if rc != 0:
         # Not fatal: --drop below still clears every collection the bundle carries,
@@ -644,11 +730,20 @@ def _create_from_manifest(target: str, manifest: dict, emit: Emit) -> None:
             "--name for a different one")
     info(emit, f"creating {target!r} at Rocket.Chat {manifest.get('rc_version')} "
                f"(preset {manifest.get('preset') or 'default'})", phase="create", pct=5)
-    # An archive that recorded its axes rebuilds from them; an older one falls
-    # back to inferring them from the preset name, which is what that name meant.
+    # An archive that recorded its axes rebuilds from them; an older one falls back to
+    # inferring them from the preset name, which is what that name meant before
+    # deployment was an axis of its own.
+    #
+    # The preset comes from the manifest in BOTH branches, and it did not: the
+    # three-axis branch hardcoded "default", so every modern bundle -- they all record
+    # `deployment` -- restored with its preset thrown away. `restore --new` on an LDAP
+    # or S3 bundle produced a vanilla workspace holding LDAP or S3 data with no LDAP
+    # server and no bucket, and the line above had already ANNOUNCED "(preset ldap)".
+    # `compatibility()` then warned that the dump came from a different preset, which
+    # reads as a mismatch to be aware of rather than something rc-repro just did.
     axes = ({"runtime": str(manifest.get("runtime") or ""),
              "deployment": str(manifest.get("deployment") or ""),
-             "preset": "default"}
+             "preset": str(manifest.get("preset") or "default")}
             if manifest.get("deployment") else
             {"preset": str(manifest.get("preset") or "default")})
     req = lifecycle.CreateReq(
@@ -707,7 +802,7 @@ def _restore_locked(target: str, path: Path, manifest: dict, emit: Emit, *,
         # half-applied. New repros get ulimits.nofile=64000 from compose.py; this
         # keeps restore working on every repro created before that.
         argv = ["mongorestore", "--archive", "--gzip", "--drop",
-                "--numParallelCollections=1"]
+                "--numParallelCollections=1", *_mongo_auth(target)]
         if source_db != database:
             # Only when they genuinely differ (a repro whose MONGO_URL was
             # overridden). Passing an identity mapping on every restore would add a

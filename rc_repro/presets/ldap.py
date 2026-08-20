@@ -221,6 +221,19 @@ def _kubernetes_manifest(intent: LDAPIntent) -> str:
                             {"name": "LDAP_ADMIN_PASSWORD", "value": intent.admin_password},
                         ],
                         "ports": [{"name": "ldap", "containerPort": 389}],
+                        # slapd binds 389 only after the bootstrap LDIF is imported,
+                        # and without this the pod is Ready the instant the container
+                        # starts -- so the Service publishes an endpoint that is not
+                        # serving, and Rocket.Chat starts against an LDAP that is not
+                        # answering. That is a first-login failure nobody would
+                        # connect back to here. tcpSocket rather than httpGet: LDAP
+                        # is not HTTP, and slapd binding the port IS the milestone.
+                        "readinessProbe": {
+                            "tcpSocket": {"port": 389},
+                            "initialDelaySeconds": 5,
+                            "periodSeconds": 3,
+                            "failureThreshold": 40,
+                        },
                         "volumeMounts": [{
                             "name": "bootstrap",
                             "mountPath": _BOOTSTRAP_PATH,
@@ -271,6 +284,12 @@ def _kubernetes_manifest(intent: LDAPIntent) -> str:
                             {"name": "PHPLDAPADMIN_HTTPS", "value": "false"},
                         ],
                         "ports": [{"containerPort": 80}],
+                        "readinessProbe": {
+                            "httpGet": {"path": "/", "port": 80},
+                            "initialDelaySeconds": 3,
+                            "periodSeconds": 3,
+                            "failureThreshold": 30,
+                        },
                     }],
                 },
             },
@@ -303,6 +322,17 @@ def _kubernetes(intent: LDAPIntent) -> Preset:
             f"    Rocket.Chat users are user1..user{intent.users}, password same as name",
         ],
         topology="kubernetes",
+        # Declared here for the same reason the Compose adapter declares it, and it
+        # was missing: phpLDAPadmin is published on the FIXED host port 8082 on this
+        # runtime too (as a port-forward rather than a compose mapping), but with an
+        # empty `ports` list `check_sidecar_ports` returns immediately and
+        # `sidecar_ports` is never recorded. So a second Kubernetes LDAP workspace got
+        # no pre-flight refusal and its forward simply failed to bind 8082 -- where
+        # Compose refuses up front and names the workspace holding the port.
+        #
+        # test_preset_ports_match_registry did not catch it because it resolves
+        # presets through `presets.load`, which is the DOCKER adapter.
+        ports=list(config.PRESET_PORTS["ldap"]),
         # The scenario changes the backing service and Rocket.Chat settings; it
         # does not make the microservices deployment cease to be an Enterprise
         # topology.  Preserve that deployment-level requirement so lifecycle

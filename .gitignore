@@ -26,9 +26,28 @@ env/
 DESIGN.md
 docs/
 .docs/
-.claude/
+# `.claude/` and `.agents/` hold PERSONAL settings (settings.local.json), local
+# agent definitions and hooks -- none of which belong to anybody but their owner.
+# Their `skills/` directories are different: the rc-repro skill is a project
+# artifact, and committing it is how a fresh clone teaches an agent to drive this
+# tool correctly. So the contents are ignored and that one subdirectory is not,
+# which needs `dir/*` rather than `dir/` -- git will not descend into an excluded
+# directory to re-include something inside it.
+.claude/*
+!.claude/skills/
+# The rest of `.claude` splits cleanly into project artifacts and personal state.
+# `agents/` (the code-reviewer, live-verifier and regression-prover definitions),
+# `hooks/guard-commit.py` (which enforces two CLAUDE.md rules that have been broken
+# here before) and `settings.json` (which wires that hook) describe how to work on
+# THIS repository, so a teammate's clone should have them.
+# `settings.local.json` is one person's permission allow-list and stays out.
+!.claude/agents/
+!.claude/hooks/
+!.claude/settings.json
+.claude/settings.local.json
 .codex/
-.agents/
+.agents/*
+!.agents/skills/
 CLAUDE.md
 AGENTS.md
 GEMINI.md

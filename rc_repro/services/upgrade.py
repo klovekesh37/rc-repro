@@ -58,11 +58,20 @@ def require_running(name: str) -> runner.Metadata:
     # `down`ed)" -- advice that is wrong twice over: it was never downed, and `up`
     # would not have helped. The guard deeper in `run()` never got the chance.
     from rc_repro.services import topology
-    topology.require_compose(
-        target, "upgrade",
-        instead="Use `helm -n {t} upgrade rocketchat --set image.tag=<version>`; "
-                "the chart version may need to move too.".replace(
-                    "{t}", f"rc-repro-{target}"))
+    if topology.of_repro(target) == topology.KUBERNETES:
+        # Asked of Kubernetes, not Docker. `rc_state` reads `docker compose ps`, so a
+        # perfectly healthy workspace answered "has no containers (it was `down`ed)"
+        # -- advice wrong twice over, since it was never downed and `up` would not
+        # have helped either.
+        from rc_repro.services import k8s
+        meta = runner.read_meta(target)
+        context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
+        if k8s.workload_exists(target, context=context):
+            return meta
+        raise NotReadyError(
+            f"{target!r} is not running. Upgrades run Rocket.Chat's migrations on "
+            f"boot and the pre-upgrade backup needs MongoDB up: "
+            f"`rc-repro start --name {target}`")
     state = runner.rc_state(target)
     if state == "running":
         return runner.read_meta(target)
@@ -214,9 +223,15 @@ def _run_locked(target: str, to_version: str, *, offline: bool, force: bool,
     for line in p["warnings"]:
         warn(emit, line, phase="upgrade")
 
+    from rc_repro.services import topology
+    kube = topology.of_repro(target) == topology.KUBERNETES
+
     meta = runner.read_meta(target)
     workspace = runner.workspace(target)
-    previous_compose = (workspace / "docker-compose.yml").read_text(encoding="utf-8")
+    # A Kubernetes workspace has no compose document to keep a copy of; its previous
+    # state is the image tag, which the helm release carries.
+    previous_compose = ("" if kube
+                        else (workspace / "docker-compose.yml").read_text(encoding="utf-8"))
     previous = {"rc_version": meta.rc_version, "rc_image": meta.rc_image}
 
     bundle = ""
@@ -232,26 +247,41 @@ def _run_locked(target: str, to_version: str, *, offline: bool, force: bool,
             emit=emit)
         bundle = made["path"]
 
-    services = runner.rc_services(target)
     info(emit, f"upgrading {target!r}: {p['from_version']} -> {p['to_version']}",
          phase="upgrade", pct=25)
-    runner.stop_services(target, services)
+    if not kube:
+        services = runner.rc_services(target)
+        runner.stop_services(target, services)
+        doc = runner.read_compose(target)
+        if not _apply_image(doc, p["rc_image"], p["to_version"], p["oplog"]):
+            raise DockerError(f"{target!r} has no rocketchat service to upgrade")
 
-    doc = runner.read_compose(target)
-    if not _apply_image(doc, p["rc_image"], p["to_version"], p["oplog"]):
-        raise DockerError(f"{target!r} has no rocketchat service to upgrade")
     meta.rc_version = p["to_version"]
     meta.rc_image = p["rc_image"]
     meta.extra[UPGRADE_FROM_KEY] = p["from_version"]
     if bundle:
         meta.extra[LAST_BACKUP_KEY] = bundle
-    runner.write(target, compose.to_yaml(doc), meta)
+    if not kube:
+        # Compose has to be written BEFORE `up`, because `up` reads it. That window
+        # is inherent there, and its rollback restores the previous document.
+        runner.write(target, compose.to_yaml(doc), meta)
 
     info(emit, "pulling the new image and recreating Rocket.Chat "
                "(MongoDB and its data are untouched)", phase="boot", pct=40)
     started = time.monotonic()
     try:
-        if runner.up(target) != 0:
+        if kube:
+            # APPLY FIRST, then record. The record used to move ahead of the cluster,
+            # and when the helm call then failed the workspace was left running the
+            # OLD version while `list`, `info` and the GUI card all reported the new
+            # one -- reported from real use, after a failure that never reached helm
+            # at all (`helm list` still showed revision 1). A record that has to be
+            # corrected by hand is worse than an upgrade that simply did not happen.
+            _apply_kubernetes(target, p, emit)
+            runner.update_meta(target, lambda m: m.__dict__.update(
+                rc_version=meta.rc_version, rc_image=meta.rc_image,
+                extra=meta.extra))
+        elif runner.up(target) != 0:
             raise DockerError("`docker compose up` failed applying the new image")
         info(emit, "waiting for Rocket.Chat to run its migrations", phase="wait", pct=60)
         lifecycle.wait_and_finalize(runner.read_meta(target), emit)
@@ -260,7 +290,10 @@ def _run_locked(target: str, to_version: str, *, offline: bool, force: bool,
             warn(emit, f"upgrade failed ({exc}); rolling back to {p['from_version']}",
                  phase="upgrade")
             try:
-                _rollback(target, previous_compose, previous, bundle, emit)
+                if kube:
+                    _rollback_kubernetes(target, previous, bundle, emit)
+                else:
+                    _rollback(target, previous_compose, previous, bundle, emit)
             except Exception as rexc:  # noqa: BLE001 - the worst case, and it must be said
                 # Letting this propagate would report the ROLLBACK's error and hide
                 # why the upgrade failed -- while leaving the workspace in a state
@@ -292,6 +325,78 @@ def _run_locked(target: str, to_version: str, *, offline: bool, force: bool,
             "boot_seconds": elapsed, "backup": bundle,
             "migration_errors": errors, "warnings": p["warnings"]}
 
+
+
+def _kube_target(target: str):
+    from rc_repro.services import k8s
+    meta = runner.read_meta(target)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    return (k8s, str(extra.get("context") or k8s.CONTEXT),
+            str(extra.get("namespace") or k8s.namespace_for(target)))
+
+
+def _apply_kubernetes(target: str, p: dict, emit: Emit) -> None:
+    """`helm upgrade` to the new image, with the chart pinned for that version.
+
+    The chart moves WITH the app, which the official guide's own command does not do
+    -- it warns that it "installs the latest Rocket.Chat Helm chart". Here the chart
+    is resolved for the target release by the same floor rule `up` uses, so an
+    upgrade lands on the chart that release was matched with rather than whatever is
+    newest today.
+    """
+    k8s, context, namespace = _kube_target(target)
+    chart_version = k8s.resolve_chart_version(p["to_version"], emit)
+    info(emit, f"helm upgrade to chart {chart_version} "
+               f"(image {p['to_version']})", phase="boot", pct=45)
+    repo, _tag = k8s.split_image(p["rc_image"], p["to_version"])
+    k8s.upgrade_image(namespace=namespace, context=context,
+                      chart_version=chart_version, image_repo=repo,
+                      tag=p["to_version"], oplog=bool(p["oplog"]))
+    # The recorded values.yaml exists so a human can read what was deployed -- and
+    # after an upgrade it still said the old tag, which is precisely the kind of
+    # record that answers a question wrongly. Best-effort: the upgrade itself has
+    # already succeeded, and a stale note is not worth failing it over.
+    try:
+        _record_new_tag(target, repo, p["to_version"], chart_version)
+    except Exception as exc:  # noqa: BLE001
+        warn(emit, f"upgraded, but the recorded values.yaml still shows the old "
+                   f"image ({exc})", phase="upgrade")
+
+
+def _record_new_tag(target: str, repo: str, tag: str, chart_version: str) -> None:
+    import yaml as _yaml
+    path = runner.workspace(target) / "kubernetes" / "values.yaml"
+    if not path.exists():
+        return
+    doc = _yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    image = doc.setdefault("image", {})
+    image["repository"], image["tag"] = repo, tag
+    doc["_chart_version"] = chart_version
+    path.write_text(_yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+
+
+def _rollback_kubernetes(target: str, previous: dict, bundle: str,
+                         emit: Emit) -> None:
+    """Put the old image back, then restore the pre-upgrade data.
+
+    Same order as the Compose rollback and for the same reason: the OLD Rocket.Chat
+    has to be the one that opens the restored database, or it meets a schema its
+    migrations have already moved past.
+    """
+    k8s, context, namespace = _kube_target(target)
+    chart_version = k8s.resolve_chart_version(previous["rc_version"], emit)
+    repo, _tag = k8s.split_image(previous["rc_image"], previous["rc_version"])
+    k8s.upgrade_image(namespace=namespace, context=context,
+                      chart_version=chart_version, image_repo=repo,
+                      tag=previous["rc_version"], oplog=_ver(previous["rc_version"])
+                      is not None and _ver(previous["rc_version"]).major < 8)
+    runner.update_meta(target, lambda m: m.__dict__.update(
+        rc_version=previous["rc_version"], rc_image=previous["rc_image"]))
+    lifecycle.wait_and_finalize(runner.read_meta(target), emit)
+    if bundle:
+        backupsvc._restore_locked(
+            target, Path(bundle), backupsvc.read_manifest(Path(bundle)), emit,
+            allow_upgrade=False, force=True, created=False)
 
 def _migration_errors(name: str, tail: int = 400) -> list[str]:
     """Migration-shaped errors from the boot logs.
@@ -342,19 +447,35 @@ def rollback(name: str, *, bundle: str = "", emit: Emit = null_emit) -> dict:
     manifest = backupsvc.read_manifest(path)
     info(emit, f"rolling {target!r} back to {manifest.get('rc_version')}",
          phase="upgrade", pct=5)
+    from rc_repro.services import topology
+    kube = topology.of_repro(target) == topology.KUBERNETES
+    resolved = versions.resolve(str(manifest.get("rc_version") or ""), offline=True)
+    previous = {"rc_version": str(manifest.get("rc_version") or meta.rc_version),
+                "rc_image": str(manifest.get("rc_image") or resolved.rc_image)}
     with runner.repro_lock(target):
-        doc = runner.read_compose(target)
-        resolved = versions.resolve(str(manifest.get("rc_version") or ""), offline=True)
-        _apply_image(doc, manifest.get("rc_image") or resolved.rc_image,
-                     str(manifest.get("rc_version")), resolved.oplog)
-        meta.rc_version = str(manifest.get("rc_version") or meta.rc_version)
-        meta.rc_image = str(manifest.get("rc_image") or meta.rc_image)
-        meta.extra.pop(UPGRADE_FROM_KEY, None)
-        runner.write(target, compose.to_yaml(doc), meta)
-        if runner.up(target) != 0:
-            raise DockerError("`docker compose up` failed rolling back the image")
-        result = backupsvc._restore_locked(target, Path(path), manifest, emit,
-                                           allow_upgrade=False, force=True,
-                                           created=False)
-    return {"name": target, "rolled_back_to": meta.rc_version, "bundle": path,
+        if kube:
+            # This is the EXPLICIT `--rollback`, and it reached for a compose
+            # document a Kubernetes workspace does not have -- a bare
+            # FileNotFoundError naming a path, which is the same contract break the
+            # `env` read had. The automatic rollback-on-failure inside _run_locked
+            # was already runtime-aware; this entry point was not, and only running
+            # it live showed that. It leaves the workspace on the NEW version with
+            # the old data untouched, which is the worst of both.
+            _rollback_kubernetes(target, previous, path, emit)
+            result = {"restored": True}
+        else:
+            doc = runner.read_compose(target)
+            _apply_image(doc, previous["rc_image"], previous["rc_version"],
+                         resolved.oplog)
+            meta.rc_version = previous["rc_version"]
+            meta.rc_image = previous["rc_image"]
+            meta.extra.pop(UPGRADE_FROM_KEY, None)
+            runner.write(target, compose.to_yaml(doc), meta)
+            if runner.up(target) != 0:
+                raise DockerError("`docker compose up` failed rolling back the image")
+            result = backupsvc._restore_locked(target, Path(path), manifest, emit,
+                                               allow_upgrade=False, force=True,
+                                               created=False)
+    runner.update_meta(target, lambda m: m.extra.pop(UPGRADE_FROM_KEY, None))
+    return {"name": target, "rolled_back_to": previous["rc_version"], "bundle": path,
             "restore": result}

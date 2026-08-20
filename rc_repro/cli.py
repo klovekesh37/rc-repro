@@ -18,7 +18,7 @@ from typing import NoReturn, Optional
 import requests
 import typer
 
-from rc_repro import config, errors, presets, perf, rcapi, runner, ui, versions
+from rc_repro import config, errors, jsonout, presets, perf, rcapi, runner, ui, versions
 from rc_repro import seed as seeder
 from rc_repro.perf import report as perf_report
 from rc_repro.perf.timings import fmt_ms
@@ -75,7 +75,24 @@ def _before_any_command(
 # --- helpers ------------------------------------------------------------------
 
 
-_err = ui.die  # error-exit (red on stderr + exit 1), kept under the local name
+def _err(msg: str, exit_code: int = 1) -> NoReturn:
+    """Error-exit: a red line on stderr and a non-zero status.
+
+    In JSON mode it is an error envelope instead, because the contract is that
+    EVERY reply is one. This wrapper exists so that the forty-eight call sites
+    that predate jsonout.py -- `up`'s `--set` parsing, `config-import`'s missing
+    file, every "can't seed" -- honour it without being touched. A contract that
+    holds only on the paths somebody remembered is worse than none: a caller gets
+    clean JSON until the moment something goes wrong, which is the moment it needed
+    the JSON.
+
+    The code is the base `REPRO_ERROR` and the exit stays 1, exactly as before.
+    Saying "unclassified" is honest; picking a plausible code would tell a caller
+    to retry, or not to, on no evidence.
+    """
+    if jsonout.active():
+        jsonout.fail(errors.ReproError(msg))
+    ui.die(msg, exit_code=exit_code)
 
 
 def _fail(exc: errors.ReproError) -> NoReturn:
@@ -87,6 +104,8 @@ def _fail(exc: errors.ReproError) -> NoReturn:
     workspace that is still booting and one that is known dead looked identical.
     See errors.EXIT_CODES for the published map.
     """
+    if jsonout.active():
+        jsonout.fail(exc)
     ui.die(str(exc), exit_code=exc.exit_code)
 
 
@@ -288,6 +307,7 @@ def up(
     set_: list[str] = typer.Option(None, "--set", help="preset parameter KEY=VALUE (repeatable), e.g. --set users=5"),
     seed: bool = typer.Option(False, "--seed", help="populate with sample users/channels/messages after boot"),
     seed_profile: str = typer.Option("small", "--seed-profile", help="seed size: small | standard | large"),
+    verify_seed: bool = typer.Option(False, "--verify-seed", help="with --seed: fail if the readback disagrees with the plan"),
     pin: bool = typer.Option(False, "--pin", help="mark persistent + set as default"),
     wait: bool = typer.Option(False, "--wait", help="block until RC is serving"),
     offline: bool = typer.Option(False, "--offline", help="skip the live version lookup"),
@@ -298,6 +318,7 @@ def up(
     stats: bool = typer.Option(False, "--stats", help="with --seed: report the CPU/RAM cost of seeding"),
     domain: str = typer.Option("", "--domain", help="serve HTTPS at this hostname with a Let's Encrypt certificate. The domain must already point at this host and 443 must be reachable"),
     email: str = typer.Option("", "--email", help="contact email for Let's Encrypt. Remembered after the first use (`rc-repro config set acme.email`)"),
+    json_out: bool = typer.Option(False, "--json", help="NDJSON progress on stdout, then one final JSON envelope; prose moves to stderr"),
     https: bool = typer.Option(False, "--https", help="serve HTTPS with a local certificate instead — no domain needed (run `rc-repro trust-ca` once)"),
     env: list[str] = typer.Option(None, "--env", "-e", help="extra raw env var KEY=VALUE (repeatable). Persisted, so `up --force` keeps it; change it later with `rc-repro env`"),
     setting: list[str] = typer.Option(None, "--setting", help="Rocket.Chat SETTING Id=VALUE (repeatable) — adds the OVERWRITE_SETTING_ prefix a setting needs"),
@@ -307,6 +328,8 @@ def up(
     # runs); this wrapper just parses options, prints progress, and formats the
     # result. --seed is applied after (with the CLI's richer --stats output), so
     # `wait` is forced on when seeding, as before.
+    if json_out:
+        jsonout.activate()
     req = lcsvc.CreateReq(
         version=version, preset=preset, name=name, port=port, root_url=root_url,
         bind=bind, rc_image=rc_image, mongo=mongo, reg_token=reg_token,
@@ -318,17 +341,42 @@ def up(
         https=https, domain=domain, acme_email=email,
         env={**envsvc.parse_set(env or []), **envsvc.as_setting(setting or [])},
     )
+    # In JSON mode the progress goes out as NDJSON `rc-repro.event.v1` lines rather
+    # than as prose, and the envelope below is the LAST line -- so a caller reads to
+    # end-of-stream and parses one line, with no incremental parser and no guessing
+    # about where the machine-readable part starts.
+    writer = jsonout.EventWriter() if json_out else None
     try:
-        result = lcsvc.create_repro(req, emit=_cli_emit, stream_output=False)
+        result = lcsvc.create_repro(req, emit=(writer.emit if writer else _cli_emit),
+                                    stream_output=False)
     except errors.ReproError as exc:
         _fail(exc)
-    _render_create_result(result)
+    if not json_out:
+        _render_create_result(result)
+    seeded = None
     if seed:
-        _run_seed(runner.read_meta(result["name"]), seed_profile, stats=stats)
+        seeded = _run_seed(runner.read_meta(result["name"]), seed_profile,
+                           stats=stats, verify=verify_seed)
+    if json_out:
+        data = dict(result)
+        if seeded is not None:
+            # Folded in, not printed beside: exactly one envelope per command.
+            data["seed"] = seeded
+        jsonout.reply("up", data)
 
 
 def _run_seed(meta: runner.Metadata, profile: str,
-              users=None, channels=None, messages=None, stats: bool = False) -> None:
+              users=None, channels=None, messages=None, stats: bool = False,
+              verify: bool = False) -> dict:
+    """Seed, print the result, and RETURN the summary.
+
+    The return value is new and is why: `up --seed --json` promises exactly one
+    envelope, so the seed summary has to fold into the create's envelope rather
+    than being printed beside it. Every error path in here goes through `_err`,
+    which in JSON mode is an envelope -- the same seed failure used to leave a
+    `--json` caller with an empty stdout and exit 1.
+    """
+    quiet = jsonout.active()
     try:
         auth = _login(meta)
     except Exception as exc:  # noqa: BLE001
@@ -337,18 +385,57 @@ def _run_seed(meta: runner.Metadata, profile: str,
         plan = seeder.plan_from(profile, users, channels, messages)
     except ValueError as exc:
         _err(str(exc))
-    typer.echo(
-        f"Seeding {meta.name!r} (profile: {profile} — {plan.users} users, "
-        f"{plan.channels} channels, {plan.messages} msgs/channel)…"
-    )
+    if not quiet:
+        typer.echo(
+            f"Seeding {meta.name!r} (profile: {profile} — {plan.users} users, "
+            f"{plan.channels} channels, {plan.messages} msgs/channel)…"
+        )
     mon = perf.ResourceMonitor(meta.name).start() if stats else None
     t0 = time.monotonic()
+    tokens: dict = {}
     try:
-        s = seeder.seed(meta.root_url, auth, plan, log=lambda m: typer.echo(f"  {m}"))
+        s = seeder.seed(meta.root_url, auth, plan, tokens_out=tokens,
+                        log=(lambda m: None) if quiet else (lambda m: typer.echo(f"  {m}")))
     finally:
         resources = mon.stop() if mon else None   # stop the sampler thread even if seed raises
     total = time.monotonic() - t0
-    _print_seed_result(s, total, resources, meta)
+    if not quiet:
+        _print_seed_result(s, total, resources, meta)
+    verdict = lcsvc.check_seed(meta, auth, plan, s, tokens=tokens)
+    if not quiet:
+        _print_seed_verification(verdict)
+    # `--verify-seed` turns the report into a gate. Off by default on purpose: a
+    # check that fails a healthy workspace is one people learn to bypass, and the
+    # readback is worth having as information whether or not it refuses.
+    if verify and verdict.get("faults"):
+        _fail(errors.CreateFailedError(
+            f"seed verification failed: {len(verdict['faults'])} mismatch(es) between "
+            "the plan and the workspace (drop --verify-seed to seed anyway; the "
+            "readback is recorded in repro.json either way)"))
+    return {**s, "profile": profile, "elapsed_s": round(total, 2)}
+
+
+def _print_seed_verification(verdict: dict) -> None:
+    """The readback, in one line when it agrees and a list when it does not."""
+    if not verdict or verdict.get("ok") is None:
+        return
+    faults = verdict.get("faults") or []
+    unreadable = verdict.get("unreadable") or []
+    extra = verdict.get("extra") or []
+    if not faults and not unreadable and not extra:
+        ui.ok(f"✓ readback: {verdict['checked']} rooms match the plan")
+        return
+    for f in faults:
+        ui.warn(f"  ⚠ {f['room'] or 'users'}: wanted {f['want']}, found {f['got']}"
+                + (f" ({f['detail']})" if f.get("detail") else ""))
+    if extra:
+        ui.note(f"  · {len(extra)} room(s) hold more than this run planned — they had "
+                "content already (a re-seed, a preset, a restore). Not a fault: "
+                "seeding only ever adds.")
+    for u in unreadable:
+        # Reported apart from the faults, and never as one: a single unreadable
+        # room is a gap in the CHECK, not a defect in the workspace.
+        ui.hint(f"  · {u['what']} could not be read back ({u['why']})")
 
 
 def _run_scale(meta: runner.Metadata, spec_str: str) -> None:
@@ -426,7 +513,17 @@ def _print_seed_result(s: dict, total: float, resources, meta: runner.Metadata) 
                    f"p99 {fmt_ms(lat['p99'])}  {s.get('latency_hist', '')}")
     row("users", s["users"], d.get("users", 0.0))
     row("channels", s["channels"], d.get("channels", 0.0))
-    row("messages", s["messages"], d.get("messages", 0.0), display=f"~{s['messages']}", extra=lat_str)
+    # No tilde. It was there because the count was an estimate -- thread replies
+    # were counted optimistically and nothing read the room back. Both are fixed,
+    # so the number is now exactly what is in the workspace.
+    row("messages", s["messages"], d.get("messages", 0.0), extra=lat_str)
+    if s.get("threads"):
+        row("threads", s["threads"], 0.0)
+    if s.get("reactions"):
+        row("reactions", s["reactions"], 0.0)
+    if s.get("rooms_total"):
+        row("rooms", s["rooms_total"], d.get("channels", 0.0),
+            extra=" · ".join(f"{k} {v}" for k, v in sorted((s.get("rooms") or {}).items())))
     row("DMs", s["dms"], d.get("dms", 0.0))
     _print_resources(resources or {}, meta.name)
 
@@ -449,15 +546,28 @@ def _print_notes(meta: runner.Metadata) -> None:
 def ready(
     name: str = typer.Option("", "--name", "-n"),
     timeout: float = typer.Option(300.0, "--timeout", help="seconds to wait"),
+    json_out: bool = typer.Option(False, "--json", help="NDJSON progress on stdout, then one final JSON envelope"),
 ) -> None:
     """Block until Rocket.Chat is serving (polls /api/info)."""
+    if json_out:
+        jsonout.activate()
     _require_docker()
     m = runner.read_meta(_resolve_name(name))
-    typer.echo(f"Waiting for {m.name!r} to serve {m.root_url} ...")
+    if not json_out:
+        typer.echo(f"Waiting for {m.name!r} to serve {m.root_url} ...")
+    writer = jsonout.EventWriter() if json_out else None
     try:
-        result = lcsvc.wait_and_finalize(m, emit=_cli_emit, timeout=timeout)
+        result = lcsvc.wait_and_finalize(
+            m, emit=(writer.emit if writer else _cli_emit), timeout=timeout)
     except errors.ReproError as exc:
+        # A TIMEOUT is NotReadyError -> exit 5 ("still unknown, poll again"), which
+        # is deliberately not the exit 7 of a create that is known dead. A poller
+        # that cannot tell those apart either gives up on a slow boot or waits
+        # forever on a corpse.
         _fail(exc)
+    if json_out:
+        jsonout.reply("ready", {**result, "name": m.name, "url": m.external_url})
+        return
     ui.ok("✓ ready")
     _summary_panel(m, extra_rows=[("Booted in", _fmt_duration(result["booted_s"]))])
     ui.hint(f"  next: rc-repro logs --name {m.name} -f")
@@ -469,9 +579,21 @@ def down(
     name: str = typer.Option("", "--name", "-n"),
     volumes: bool = typer.Option(False, "--volumes", help="also delete the data volume and forget the repro"),
     yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt (for scripts/CI)"),
+    json_out: bool = typer.Option(False, "--json", help="print the result as one JSON envelope; --volumes then requires --yes"),
 ) -> None:
     """Remove a repro's containers. Keeps data (and the record) unless --volumes."""
+    if json_out:
+        jsonout.activate()
     target = _resolve_name(name)
+    if volumes and json_out and not yes:
+        # REFUSED, not silently downgraded to keeping the volume. There is nobody
+        # to prompt on this path, and the two ways out of that are "delete the data
+        # without being asked" and "quietly do something other than what was typed".
+        # Neither is acceptable for an irreversible verb, so it asks for the
+        # confirmation to be made explicit instead.
+        _fail(errors.ValidationError(
+            "--volumes deletes the data volume and the record, and --json has "
+            "nobody to prompt. Add --yes to confirm it in the command."))
     if volumes:
         # --volumes is irreversible (deletes the Mongo data + the record). On a
         # shared box the thing you most need to know first is whose it is, so the
@@ -503,6 +625,9 @@ def down(
     # a PVC, so which of the two paths kept the data is exactly what needs saying.
     # The service layer already knows; asking it beats guessing here.
     kube = (out or {}).get("runtime") == topology.KUBERNETES
+    if json_out:
+        jsonout.reply("down", {**(out or {}), "name": target, "volumes": volumes})
+        return
     what = ("namespace, PersistentVolumeClaim and record" if kube
             else "containers, data volume, and record")
     if volumes:
@@ -551,13 +676,17 @@ def monitor(
 @app.command()
 def prune(
     yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt (for scripts/CI)"),
+    orphans: bool = typer.Option(False, "--orphans",
+                                 help="also delete Kubernetes namespaces rc-repro owns "
+                                      "that no local record explains"),
 ) -> None:
     """Delete every `down` repro — INCLUDING its data volume and record. Skips pinned and running ones."""
     try:
         targets = lcsvc.prunable()
+        stray = lcsvc.orphan_namespaces() if orphans else []
     except errors.ReproError as exc:
         _fail(exc)
-    if not targets:
+    if not targets and not stray:
         typer.echo("Nothing to prune.")
         return
     if not yes:
@@ -566,9 +695,19 @@ def prune(
         for t in targets:
             owner = lcsvc.owner_of(t)
             typer.echo(f"  - {t}" + (f"   (owned by {owner})" if owner and owner != me else ""))
+        if stray:
+            # Named individually and warned about: on a shared cluster one of these
+            # may be a colleague's workspace created from their own RC_REPRO_HOME,
+            # in which case this machine having no record of it means nothing.
+            typer.echo("")
+            typer.echo("These Kubernetes namespaces are labelled rc-repro's but no "
+                       "local record explains them — their PersistentVolumeClaims go too:")
+            for ns in stray:
+                typer.echo(f"  - {ns}")
+            typer.echo("  (on a shared cluster one of these may belong to a colleague)")
         typer.confirm("Continue?", abort=True)
     try:
-        res = lcsvc.prune(confirm=True, emit=_cli_emit)
+        res = lcsvc.prune(confirm=True, orphans=orphans, emit=_cli_emit)
     except errors.ReproError as exc:
         _fail(exc)
     if res["removed"]:
@@ -638,9 +777,25 @@ def use(name: str = typer.Argument(..., help="repro to make the default")) -> No
 
 
 @app.command(name="list")
-def list_cmd() -> None:
+def list_cmd(
+    json_out: bool = typer.Option(False, "--json", help="print the result as one JSON envelope (see `--json` on `info`)"),
+) -> None:
     """List all repros with version, port, status and URL."""
-    repros = lcsvc.list_repros()
+    if json_out:
+        jsonout.activate()
+    # INSIDE the try. This call reads every repro.json and asks docker for the
+    # project states, so it is not the "obviously safe" line it looks like -- and
+    # unguarded, a ReproError here reached a --json caller as a traceback on stderr
+    # with nothing on stdout, which is the one thing the envelope exists to prevent.
+    try:
+        repros = lcsvc.list_repros()
+    except errors.ReproError as exc:
+        _fail(exc)
+    if json_out:
+        # An empty list is a SUCCESS, not the prose "No repros yet". A caller
+        # asking "what is on this box" and getting nothing has its answer.
+        jsonout.reply("list", {"repros": repros, "count": len(repros)})
+        return
     if not repros:
         typer.echo("No repros yet. Create one with `rc-repro up --version <X.Y.Z>`.")
         return
@@ -664,9 +819,24 @@ def list_cmd() -> None:
 
 
 @app.command()
-def info(name: str = typer.Option("", "--name", "-n")) -> None:
+def info(
+    name: str = typer.Option("", "--name", "-n"),
+    json_out: bool = typer.Option(False, "--json", help="print the result as one JSON envelope on stdout; prose moves to stderr"),
+) -> None:
     """Show a repro's URL, admin credentials and a curl snippet."""
+    if json_out:
+        jsonout.activate()
     target = _resolve_name(name)
+    if json_out:
+        # The full detail payload, which is what makes this the command to paste
+        # into a ticket. It carries the admin login -- a fixed sandbox credential
+        # this tool prints on every `up` and documents in the README, not a secret.
+        # Anything that IS one is masked before it gets here (lifecycle.redact_env).
+        try:
+            jsonout.reply("info", lcsvc.detail(target))
+        except errors.ReproError as exc:
+            _fail(exc)
+        return
     m = runner.read_meta(target)
     _summary_panel(m)
     ui.hint(f"  api  : rc-repro api --name {m.name} GET /api/v1/me")
@@ -1284,6 +1454,9 @@ def seed_cmd(
         help="bulk Mongo prefill for scale repros, e.g. users=50000,messages=800000@team-chat"),
     clear_scale: bool = typer.Option(
         False, "--clear-scale", help="remove data a prior --scale added, then exit"),
+    verify: bool = typer.Option(
+        False, "--verify-seed",
+        help="fail if the readback disagrees with the plan (the readback runs and is recorded either way)"),
 ) -> None:
     """Populate a repro with sample users, channels, DMs and messages.
 
@@ -1300,7 +1473,7 @@ def seed_cmd(
     if scale:
         _run_scale(m, scale)
         return
-    _run_seed(m, profile, users, channels, messages, stats=stats)
+    _run_seed(m, profile, users, channels, messages, stats=stats, verify=verify)
 
 
 @app.command(name="config-import")
@@ -1413,6 +1586,12 @@ def backups_cmd(
         typer.echo(f"  {Path(r['path']).name}")
         typer.echo(f"      {r['repro']}  RC {r['rc_version']}  "
                    f"{_human_bytes(r['bytes'])}  {r['created_at']}{label}")
+        if r.get("predates_workspace"):
+            # Bundles outlive their workspace and are matched by NAME, and rc-repro
+            # derives names from the version -- so recreating a workspace inherits
+            # the old one's backups with nothing to say they are not its own.
+            ui.warn("      ^ from an EARLIER workspace of this name, not the one "
+                    "running now — restoring it loads that workspace's data")
 
 
 @app.command(name="restore")
@@ -1534,11 +1713,30 @@ def stats(
     """Sample a repro's container CPU/RAM (peak over a window, or --watch live)."""
     _require_docker()
     m = runner.read_meta(_resolve_name(name))
-    try:
-        topology.require_compose(m.name, "stats",
-                                 instead="Install metrics-server and use `kubectl top`.")
-    except errors.ReproError as exc:
-        _fail(exc)
+    if topology.of_repro(m.name) == topology.KUBERNETES:
+        # `kubectl top`, per pod, which is the shape that means something here: a
+        # Compose repro has containers, a Kubernetes one has pods that come and go.
+        # ResourceMonitor samples docker and has nothing to sample, so this path is
+        # its own rather than a translation of it.
+        from rc_repro.services import k8s
+        context = str((m.extra or {}).get("context") or k8s.CONTEXT)
+        while True:
+            try:
+                rows = k8s.pod_metrics(m.name, context=context)
+            except errors.ReproError as exc:
+                _fail(exc)
+            typer.echo("")
+            for r in rows:
+                typer.echo(f"  {r['pod']:<44} CPU {r['cpu_millicores']:>6.0f}m"
+                           f"   RAM {r['mem_bytes'] / 1e6:>7.1f} MB")
+            if not rows:
+                ui.note("no Rocket.Chat pods are running")
+            if not watch:
+                return
+            try:
+                time.sleep(2)
+            except KeyboardInterrupt:
+                return
     if watch:
         typer.echo(f"Live stats for {m.name!r} (Ctrl-C to stop)…")
         try:
@@ -1871,6 +2069,14 @@ def loadtest(
     REST rate limiter is disabled for the run and restored after. Exits non-zero
     if a --slo rule is not met — usable as a CI gate.
     """
+    # FIRST, before `_require_docker` and before any `_err`. This was missing, and
+    # the shape of the bug is the reason the contract is tested rather than reasoned
+    # about: the success path called `jsonout.reply` directly, so stdout was a valid
+    # envelope whenever the run worked -- and every failure before it went out as
+    # prose on stderr with an EMPTY stdout. A JSON caller got a clean document right
+    # up until something went wrong.
+    if json_out:
+        jsonout.activate()
     _require_docker()
     from rc_repro import monitoring
     from rc_repro.perf import (baseline, constrain as constrain_mod, k6, mongoprof,
@@ -1944,6 +2150,18 @@ def loadtest(
         except ValueError as exc:
             _err(f"bad --slo: {exc}")
 
+    # Both front-ends ask the same question through the same function: a load test
+    # against a Kubernetes workspace would measure the port-forward, and the line
+    # below raised a bare FileNotFoundError naming a compose file that runtime does
+    # not have. See services/perf.require_compose_for_perf.
+    from rc_repro.services import perf as perfsvc
+    try:
+        perfsvc.require_compose_for_perf(_resolve_name(name), "loadtest")
+    except errors.ReproError as exc:
+        # Handled here because nothing else in this command is: `loadtest` and
+        # `capacity` have no ReproError handler of their own, so a domain error
+        # raised in the body prints a traceback instead of a red line.
+        _fail(exc)
     m = runner.read_meta(_resolve_name(name))
     doc = runner.read_compose(m.name)
     target = _loadtest_target(doc)
@@ -2226,6 +2444,8 @@ def capacity(
     """
     _require_docker()
     from rc_repro import monitoring
+    if json_out:
+        jsonout.activate()          # before any `_err`; see `loadtest`
     from rc_repro.perf import constrain as constrain_mod, k6, rcmetrics, slo as slo_mod
     if scenario not in k6.SCENARIOS or scenario in ("custom", "webhook"):
         _err("capacity supports the built-in scenarios (journey/messages/read/mixed/login/badbot)")
@@ -2242,6 +2462,14 @@ def capacity(
         except ValueError as exc:
             _err(f"bad --constrain: {exc}")
 
+    from rc_repro.services import perf as perfsvc
+    try:
+        perfsvc.require_compose_for_perf(_resolve_name(name), "capacity")
+    except errors.ReproError as exc:
+        # Handled here because nothing else in this command is: `loadtest` and
+        # `capacity` have no ReproError handler of their own, so a domain error
+        # raised in the body prints a traceback instead of a red line.
+        _fail(exc)
     m = runner.read_meta(_resolve_name(name))
     doc = runner.read_compose(m.name)
     target = _loadtest_target(doc)
@@ -2411,12 +2639,24 @@ def logs(
     """Tail a repro's logs."""
     _require_docker()
     target = _resolve_name(name)
-    try:
-        topology.require_compose(
-            target, "logs",
-            instead=f"Use `kubectl -n rc-repro-{target} logs -l app.kubernetes.io/name=rocketchat -f`.")
-    except errors.ReproError as exc:
-        _fail(exc)
+    # Logs are the first thing anyone reads when reproducing a ticket, so this
+    # dispatches rather than refusing. It used to send Kubernetes users away with a
+    # `kubectl` line -- workable in a terminal, and nothing at all in the browser,
+    # where `serve` exists precisely so a support engineer needs no shell.
+    if topology.of_repro(target) == topology.KUBERNETES:
+        from rc_repro.services import k8s
+        meta = runner.read_meta(target)
+        context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
+        proc = k8s.log_process(target, context=context, tail=tail or 200,
+                               follow=follow)
+        try:
+            for line in proc.stdout or []:
+                typer.echo(line.rstrip("\n"))
+        except KeyboardInterrupt:      # Ctrl-C on a follow is how you leave
+            pass
+        finally:
+            proc.terminate()
+        raise typer.Exit(proc.wait() or 0)
     runner.logs(target, follow=follow, tail=tail or None)
 
 
@@ -2531,10 +2771,86 @@ def chown_cmd(
 
 
 @app.command()
-def doctor() -> None:
+def capabilities() -> None:
+    """What this build can do, as JSON, for an agent or a script.
+
+    No `--json` flag, deliberately: this command IS JSON. A flag that is accepted
+    and then ignored is worse than no flag.
+
+    Every field is derived from the registered app rather than written out, because
+    a hardcoded list is right on the day it is written and wrong the first time a
+    flag moves -- which is exactly the drift a caller reads this to avoid. Answers
+    offline and with no container engine: it is asked BEFORE anybody knows whether
+    the environment works, and the question "does this box work" is `doctor`.
+    """
+    jsonout.activate()
+    jsonout.reply("capabilities", jsonout.capabilities(app))
+
+
+skill_app = typer.Typer(help="Install the agent skill that teaches a caller to drive rc-repro.")
+app.add_typer(skill_app, name="skill")
+
+
+@skill_app.command("install")
+def skill_install(
+    host: str = typer.Option("all", "--host", help="claude | agents | all"),
+    force: bool = typer.Option(False, "--force", help="overwrite a locally-edited copy"),
+    json_out: bool = typer.Option(False, "--json", help="print the result as one JSON envelope"),
+) -> None:
+    """Copy the packaged skill where an agent will find it."""
+    from rc_repro.services import skill as skillsvc
+    if json_out:
+        jsonout.activate()
+    try:
+        res = skillsvc.install(host, force=force)
+    except errors.ReproError as exc:
+        _fail(exc)
+    if json_out:
+        jsonout.reply("skill-install", res)
+        return
+    for row in res["hosts"]:
+        (ui.ok if row["action"] != "unchanged" else ui.hint)(
+            f"  {row['action']:<9} {row['path']}")
+    ui.hint(f"  version {res['version']}")
+
+
+@skill_app.command("status")
+def skill_status(
+    json_out: bool = typer.Option(False, "--json", help="print the result as one JSON envelope"),
+) -> None:
+    """Whether the installed skill matches this build."""
+    from rc_repro.services import skill as skillsvc
+    if json_out:
+        jsonout.activate()
+    st = skillsvc.state()
+    if json_out:
+        jsonout.reply("skill-status", st)
+        return
+    for host, row in sorted(st["hosts"].items()):
+        mark = {"current": ui.ok, "absent": ui.hint}.get(row["status"], ui.warn)
+        mark(f"  {host:<8} {row['status']:<9} {row['path']}")
+    if not st["current"]:
+        ui.hint("  `rc-repro skill install` writes the copy this build ships.")
+
+
+@app.command()
+def doctor(
+    json_out: bool = typer.Option(False, "--json", help="print the report as one JSON envelope; exits 3 on any failing check"),
+) -> None:
     """Preflight: check Docker, Compose, disk, connectivity and ports."""
     from rc_repro.services import doctor as doctorsvc
+    if json_out:
+        jsonout.activate()
     report = doctorsvc.run_checks()
+    if json_out:
+        jsonout.reply("doctor", report)
+        # PreflightError's own code, not a bare 1: "this box is not ready" is a
+        # different answer from "rc-repro broke", and a CI step branching on the
+        # exit needs to tell them apart. The human path keeps its exit 1, because
+        # changing it would move the ground under every existing script.
+        if report["verdict"] == "fail":
+            raise typer.Exit(errors.PreflightError.exit_code)
+        return
     marks = {
         "ok": ("\u2713", typer.colors.GREEN),
         "warn": ("\u26a0", typer.colors.YELLOW),

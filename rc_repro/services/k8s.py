@@ -20,6 +20,7 @@ one that says "cannot reach it" -- `doctor` exists to answer quickly.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -32,7 +33,7 @@ from pathlib import Path
 
 from rc_repro import config, runner
 from rc_repro.errors import (ConflictError, CreateFailedError, DockerError,
-                            NotFoundError, PreflightError)
+                            NotFoundError, NotReadyError, PreflightError)
 from rc_repro.services.events import Emit, info, null_emit, warn
 
 #: The cluster rc-repro creates and owns. One cluster with a namespace per
@@ -946,7 +947,8 @@ def split_image(rc_image: str, rc_version: str) -> tuple[str, str]:
 def values_for(*, rc_version: str, rc_image: str, microservices: bool,
                replicas: int = 1, root_url: str = "", oplog: bool = False,
                mongo_url: str = "", oplog_url: str = "",
-               mongo_secret: str = "", preset_env=None) -> dict:
+               mongo_secret: str = "", reg_token_secret: str = "",
+               preset_env=None) -> dict:
     """Chart values for one workspace.
 
     MongoDB is ALWAYS external, never the chart's bundled subchart. PR #3's reason
@@ -995,6 +997,13 @@ def values_for(*, rc_version: str, rc_image: str, microservices: bool,
     # overridden by one -- the same precedence compose.py gives it ("Preset env wins
     # over base defaults").
     env.extend({"name": str(k), "value": str(v)} for k, v in (preset_env or {}).items())
+    if reg_token_secret:
+        # By REFERENCE, so the token is never a value in this document. The chart
+        # renders extraEnv verbatim, so valueFrom survives -- verified against the
+        # published chart rather than assumed.
+        env.append({"name": "REG_TOKEN",
+                    "valueFrom": {"secretKeyRef": {"name": reg_token_secret,
+                                                   "key": REG_TOKEN_KEY}}})
     values: dict = {
         # pullPolicy and the NATS cluster name are the guide's own values.yaml.
         # IfNotPresent also matters here specifically: a repro box re-creates
@@ -1083,6 +1092,42 @@ def install(*, namespace: str, context: str, values: dict,
     if res.returncode != 0:
         raise CreateFailedError("helm install failed: "
                                 + why(res))
+
+
+def upgrade_image(*, namespace: str, context: str, chart_version: str,
+                  image_repo: str, tag: str, oplog: bool) -> None:
+    """Move a release to a new Rocket.Chat image, the way the official guide does.
+
+    The guide says: change `image.tag` in your values and run `helm upgrade`. This is
+    that, with two differences it explicitly warns about or implies.
+
+    First, the chart version IS pinned. The guide's own note says its command "does
+    not pin a chart version, so it installs the latest Rocket.Chat Helm chart" --
+    which for a tool whose entire purpose is reproducing a customer's exact version
+    would quietly deploy different software than the one asked for.
+
+    Second, `--reuse-values` rather than a re-rendered values file: everything else
+    about the workspace -- the admin env, microservices, replica count, whether
+    MongoDB comes from a Secret or a URL, a preset's settings -- was decided at
+    create time, and rebuilding that set from scratch risks silently dropping a
+    piece of it. The one value that must NOT be carried over is the oplog URL:
+    Rocket.Chat 8 dropped oplog tailing and chart 7.0.0 removed the key, so it is
+    explicitly cleared when the target no longer wants it.
+    """
+    argv = ["helm", "upgrade", RELEASE, CHART, "--kube-context", context,
+            "-n", namespace, "--version", chart_version, "--reuse-values",
+            "--set", f"image.repository={image_repo}",
+            "--set", f"image.tag={tag}"]
+    if not oplog:
+        argv += ["--set", "externalMongodbOplogUrl=null"]
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True,
+                             timeout=INSTALL_TIMEOUT, check=False,
+                             env=owned_env() if is_ours(context) else None)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DockerError(f"helm upgrade failed: {exc}") from exc
+    if res.returncode != 0:
+        raise DockerError("helm upgrade failed: " + why(res))
 
 
 def delete_namespace(name: str, *, context: str, volumes: bool = False,
@@ -1455,7 +1500,8 @@ def record_rendered(name: str, *, values: dict, manifests: dict) -> list[str]:
 def create_workspace(*, name: str, resolved, host_port: int, microservices: bool,
                      replicas: int = 1, owner: str = "", root_url: str = "",
                      bind_host: str = "", use_operator: bool = False,
-                     preset=None, emit: Emit = null_emit) -> dict:
+                     reg_token: str = "", preset=None,
+                     emit: Emit = null_emit) -> dict:
     """Build a Kubernetes workspace, and return what repro.json needs.
 
     A PARALLEL path to lifecycle's compose one rather than a refactor of it, which
@@ -1552,11 +1598,16 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
         apply(mongo_url_secret_manifest(name, mongo_url=mongo_url,
                                         oplog_url=oplog_url, owner=owner),
               namespace=namespace, context=context)
+        if reg_token:
+            info(emit, "installing the registration token Secret", phase="boot")
+            apply(reg_token_secret_manifest(name, token=reg_token, owner=owner),
+                  namespace=namespace, context=context)
         values = values_for(rc_version=resolved.rc_version,
                             rc_image=resolved.rc_image,
                             microservices=microservices, replicas=replicas,
                             root_url=root_url, oplog=resolved.oplog,
                             mongo_secret=MONGO_URL_SECRET,
+                            reg_token_secret=(REG_TOKEN_SECRET if reg_token else ""),
                             preset_env=getattr(preset, "env", None))
         values.update(container_security_context(chart_version))
         info(emit, f"installing {CHART} as {RELEASE}", phase="boot", pct=60)
@@ -1617,13 +1668,50 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
             "mongo_managed_by": managed_by, "mongo_image": image}
 
 
+#: The workloads whose readiness `ready` is entitled to speak for: the ones the
+#: official chart gives a real readinessProbe. `account`, `authorization` and
+#: `presence` are deliberately NOT here -- the chart ships them with no probe at all,
+#: so their pod-Ready is set the moment the container starts and attests nothing.
+#: Waiting on it would add delay and buy no confidence.
+READY_SELECTOR = ("app.kubernetes.io/name in "
+                  "(rocketchat,rocketchat-ddp-streamer)")
+
+
 def workspace_ready(name: str, *, context: str) -> bool:
-    """Whether the Rocket.Chat pod reports itself Ready."""
+    """Whether every probed Rocket.Chat workload reports itself Ready.
+
+    This used to read `items[0].status.containerStatuses[0].ready`, which over-claimed
+    twice, and an audit caught both:
+
+      * `items[0]` is ONE pod. With `--replicas 3` the workspace was called ready on
+        the strength of the first pod alone.
+      * Only the monolith container was consulted. On microservices, `ddp-streamer`
+        carries the WebSocket -- the realtime half of Rocket.Chat -- and it was
+        observed Running-but-not-Ready on a workspace `ready` had already reported as
+        serving. A caller told "ready" could open the URL and find messages not
+        arriving, which is the one failure this tool exists to reproduce, not cause.
+
+    A Pending pod has no containerStatuses at all, so counting pods and comparing is
+    what keeps "no statuses yet" from passing as "nothing failed".
+    """
     res = run(["kubectl", "--context", context, "-n", namespace_for(name),
-               "get", "pod", "-l", "app.kubernetes.io/name=rocketchat", "-o",
-               "jsonpath={.items[0].status.containerStatuses[0].ready}"],
+               "get", "pod", "-l", READY_SELECTOR, "-o", "json"],
               own=is_ours(context))
-    return (res.stdout or "").strip() == "true"
+    if res.returncode != 0:
+        return False
+    try:
+        pods = json.loads(res.stdout or "{}").get("items") or []
+    except ValueError:
+        return False
+    if not pods:
+        return False
+    for pod in pods:
+        statuses = (pod.get("status") or {}).get("containerStatuses") or []
+        if not statuses:                      # Pending/ContainerCreating
+            return False
+        if not all(c.get("ready") for c in statuses):
+            return False
+    return True
 
 
 def forward_alive(pid: int | None) -> bool:
@@ -1655,6 +1743,283 @@ def ensure_port_forward(name: str, *, namespace: str, context: str, host_port: i
         return int(pid)
     return port_forward(name, namespace=namespace, context=context,
                         host_port=host_port, bind_host=bind_host, emit=emit)
+
+
+#: Rocket.Chat's APPLICATION pods -- every replica of the monolith, and on
+#: microservices the account, authorization, ddp-streamer and presence deployments
+#: too. `-l` rather than a pod name so this follows a rollout.
+#:
+#: This was `app.kubernetes.io/name=rocketchat`, which is the MONOLITH deployment
+#: alone. On microservices that silently omitted the four services that make the
+#: deployment interesting -- ddp-streamer above all, since it carries the WebSocket,
+#: so a realtime problem produced logs with nothing about realtime in them. Compose
+#: has no service filter at all and shows everything, so the narrow selector was also
+#: the two runtimes disagreeing.
+#:
+#: Selected by RELEASE with nats excluded, rather than by listing the four names: a
+#: microservice the chart adds later is then included automatically, which a hardcoded
+#: list would quietly miss. nats is the message bus, not Rocket.Chat, and its output
+#: would drown the logs somebody opened to read Rocket.Chat's.
+LOG_SELECTOR = (f"app.kubernetes.io/instance={RELEASE},"
+                "app.kubernetes.io/name!=nats")
+
+#: The MONOLITH Rocket.Chat deployment alone, and its container. Anything asking a
+#: question about "Rocket.Chat itself" -- readiness, its environment -- wants this and
+#: not the broad log selector: that one matches ddp-streamer and presence too, so
+#: `items[0]` under it could answer with a microservice's environment instead of
+#: Rocket.Chat's.
+APP_SELECTOR = "app.kubernetes.io/name=rocketchat"
+LOG_CONTAINER = "rocketchat"
+
+
+def _pod_count(name: str, *, context: str, selector: str = LOG_SELECTOR) -> int:
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "pods", "-l", selector, "-o", "name"],
+              own=is_ours(context))
+    if res.returncode != 0:
+        return 1
+    return len([ln for ln in (res.stdout or "").splitlines() if ln.strip()])
+
+
+def log_process(name: str, *, context: str, tail: int = 200, follow: bool = True,
+                selector: str = LOG_SELECTOR) -> subprocess.Popen:
+    """Stream Rocket.Chat's logs out of the cluster, shaped like the Compose one.
+
+    A named function for the same reason `open_log_process` is one: it is the single
+    kubectl call the log path makes, so a test can stand here without a cluster.
+
+    `--prefix` matters more here than on Compose: with microservices or several
+    replicas the lines come from different pods and are otherwise indistinguishable,
+    which is exactly when someone is reading them. `--max-log-requests` is raised
+    because kubectl refuses to follow more than five pods by default and a
+    microservices workspace has more than five.
+    """
+    # No `-c`: the pods now selected have DIFFERENT container names (rocketchat,
+    # ddp-streamer, presence...), so naming one would fail on the others. Each pod
+    # here has a single container, so kubectl's default is the right one.
+    argv = ["kubectl", "--context", context, "-n", namespace_for(name), "logs",
+            "-l", selector, "--tail", str(int(tail)),
+            "--max-log-requests", "20"]
+    # `--prefix` ONLY when there is more than one pod to tell apart. It was
+    # unconditional and that was wrong: Rocket.Chat pretty-prints its own log lines
+    # in columns, and stamping "[pod/rocketchat-rocketchat-<hash>/rocketchat] " onto
+    # the front of every one of them destroys exactly the formatting somebody opened
+    # the logs to read. With a single pod the prefix names the only thing it could
+    # be, so it is pure noise; with several it is the only way to tell them apart.
+    if _pod_count(name, context=context, selector=selector) > 1:
+        argv.append("--prefix")
+    if follow:
+        argv.append("-f")
+    return subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            env=owned_env() if is_ours(context) else None)
+
+
+def container_env(name: str, *, context: str,
+                  selector: str = APP_SELECTOR) -> dict[str, str]:
+    """Rocket.Chat's EFFECTIVE environment, read out of the running container.
+
+    Compose answers this from the generated compose file. There is no such document
+    here, and the helm values are only what rc-repro asked for -- the chart adds its
+    own, so the values are not the answer to "what is Rocket.Chat actually running
+    with". The container is, so it is asked directly.
+    """
+    pod = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "pod", "-l", selector, "-o",
+               "jsonpath={.items[0].metadata.name}"], own=is_ours(context))
+    target = (pod.stdout or "").strip()
+    if not target:
+        raise NotReadyError(
+            f"no Rocket.Chat pod in {namespace_for(name)} to read the environment "
+            f"from — is {name!r} running? (`rc-repro start --name {name}`)")
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "exec", target, "-c", LOG_CONTAINER, "--", "env"],
+              timeout=APPLY_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        raise NotReadyError(f"could not read the environment from {target}: "
+                            + why(res))
+    out: dict[str, str] = {}
+    for line in (res.stdout or "").splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            out[key.strip()] = value
+    return out
+
+
+def _parse_quantity(text: str) -> float:
+    """A Kubernetes CPU or memory quantity as a plain number.
+
+    CPU comes as millicores ("142m") or cores ("1"); memory as Ki/Mi/Gi. Returned as
+    millicores and BYTES respectively, so the caller does the same arithmetic it does
+    for Compose.
+    """
+    t = text.strip()
+    if t.endswith("m"):
+        return float(t[:-1] or 0)
+    for suffix, mult in (("Ki", 1024), ("Mi", 1024 ** 2), ("Gi", 1024 ** 3),
+                         ("K", 1000), ("M", 1000 ** 2), ("G", 1000 ** 3)):
+        if t.endswith(suffix):
+            return float(t[:-len(suffix)] or 0) * mult
+    try:
+        return float(t)
+    except ValueError:
+        return 0.0
+
+
+def pod_metrics(name: str, *, context: str,
+                selector: str = LOG_SELECTOR) -> list[dict]:
+    """Per-pod CPU and memory, via `kubectl top`.
+
+    Every Rocket.Chat application pod, which on microservices means the four services
+    as well as the monolith deployment -- the same set Compose sums when it adds up
+    `rocketchat`, `rocketchat-1`, `rocketchat-2`. Scoped to the monolith alone it
+    would report two pods out of six and call it the workspace's resource use, which
+    is the quietly-wrong number this function exists to avoid.
+
+    Needs metrics-server, which kind does NOT ship. When it is absent the refusal
+    says so and how to install it, rather than reporting zero -- a resource figure
+    that is quietly wrong is worse than one that is missing, which is the same
+    reasoning `stats` already applies to a container it cannot find.
+    """
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "top", "pods", "-l", selector, "--no-headers"],
+              timeout=APPLY_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        blob = (res.stderr or "") + (res.stdout or "")
+        if "metrics" in blob.lower() or "not available" in blob.lower():
+            # Both commands, because the second is not optional on kind: its
+            # kubelet serves a self-signed certificate that metrics-server refuses
+            # by default, so the install succeeds and never reports a metric. The
+            # first version of this message mixed the helm flag into the kubectl
+            # route, which is syntax that does not apply to what it just told the
+            # user to run.
+            raise NotReadyError(
+                "this cluster has no metrics-server, so there is nothing to read "
+                "CPU and memory from. Install it with:\n"
+                "  kubectl apply -f https://github.com/kubernetes-sigs/"
+                "metrics-server/releases/latest/download/components.yaml\n"
+                "and on kind, let it accept the kubelet's self-signed certificate:\n"
+                "  kubectl -n kube-system patch deploy metrics-server --type=json "
+                "-p '[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0"
+                "/args/-\",\"value\":\"--kubelet-insecure-tls\"}]'")
+        raise NotReadyError("could not read pod metrics: " + why(res))
+    rows = []
+    for line in (res.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            rows.append({"pod": parts[0],
+                         "cpu_millicores": _parse_quantity(parts[1]),
+                         "mem_bytes": _parse_quantity(parts[2])})
+    return rows
+
+
+def pod_rows(name: str, *, context: str) -> list[dict]:
+    """Every pod in this workspace's namespace, in the shape the panel's containers
+    tab already renders: [{service, state, status, health, restarts, started}].
+
+    A pod is not a container, but the question is the one Compose's list answers --
+    what is running, and is any of it unhappy -- so the tab renders the same three
+    columns rather than growing a second Kubernetes-only view. ALL pods, not just
+    Rocket.Chat's: the Compose tab lists Mongo and every sidecar too, and the pod
+    that is wrong is usually not the one you went looking for.
+
+    A waiting REASON outranks the phase in the status column. "Pending" says only
+    that something has not happened; `ImagePullBackOff`, `CrashLoopBackOff` and
+    `CreateContainerConfigError` say what, and that is the answer to "why is this
+    workspace not up" -- which the GUI previously had no way to show at all, because
+    this block was empty and the tab said "No containers -- this repro is down."
+    under a workspace that was running.
+    """
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "pods", "-o", "json"], own=is_ours(context))
+    if res.returncode != 0:
+        # An unreachable cluster is the panel's "docker is unavailable": an empty
+        # list, never a raise. detail() is on the path of every panel open, and a
+        # workspace whose cluster is asleep still has to render.
+        return []
+    try:
+        doc = json.loads(res.stdout or "{}")
+    except ValueError:
+        return []
+    rows = []
+    for item in doc.get("items") or []:
+        meta = item.get("metadata") or {}
+        st = item.get("status") or {}
+        # initContainerStatuses too: the MongoDB fix-permission and init containers
+        # are exactly where a Kubernetes workspace gets stuck, and a pod whose init
+        # container is in CrashLoopBackOff reports phase Pending and an EMPTY
+        # containerStatuses -- so reading only the main list showed "0/0 ready" and
+        # named nothing.
+        cs = list(st.get("initContainerStatuses") or []) + list(st.get("containerStatuses") or [])
+        main = list(st.get("containerStatuses") or [])
+        ready = sum(1 for c in main if c.get("ready"))
+        restarts = sum(int(c.get("restartCount") or 0) for c in cs)
+        reason = ""
+        for c in cs:
+            state = c.get("state") or {}
+            waiting = state.get("waiting") or {}
+            terminated = state.get("terminated") or {}
+            # A terminated init container that SUCCEEDED is not a reason -- that is
+            # the normal end of an init container, and reporting "Completed" as the
+            # pod's status hid a Rocket.Chat container that was crash-looping
+            # behind it.
+            if terminated.get("reason") == "Completed":
+                continue
+            reason = str(waiting.get("reason") or terminated.get("reason") or "")
+            if reason:
+                break
+        phase = str(st.get("phase") or "")
+        status = reason or f"{ready}/{len(main)} ready"
+        if restarts:
+            status += f" · {restarts} restart" + ("s" if restarts != 1 else "")
+        rows.append({"service": str(meta.get("name") or ""),
+                     "state": phase.lower(), "status": status,
+                     "health": "healthy" if main and ready == len(main) else "",
+                     "restarts": restarts,
+                     "started": str(st.get("startTime") or "")})
+    # Named order, so the tab does not reshuffle itself between two panel opens.
+    rows.sort(key=lambda r: r["service"])
+    return rows
+
+
+#: Waiting-state reasons a pod will never recover from on its own. Taken from PR #3,
+#: whose note is the important part: `ImagePullBackOff` alone is NOT terminal -- a slow
+#: or rate-limited registry looks identical while it is still making progress -- so it
+#: is the REASON that discriminates, not the phase.
+TERMINAL_POD_REASONS = (
+    "ErrImagePull", "ImagePullBackOff", "InvalidImageName",
+    "CreateContainerConfigError", "CreateContainerError", "RunContainerError",
+)
+
+
+def terminal_pod_failure(name: str, *, context: str) -> tuple[str, str, str] | None:
+    """The first pod condition that cannot succeed, as (pod, reason, message).
+
+    Without this, a create waits out its whole timeout on something already decided:
+    a mistyped version, an image the registry does not have, an unreachable registry.
+    Ten minutes of "waiting for Rocket.Chat" for an answer Kubernetes had in seconds,
+    and the eventual failure names the timeout rather than the cause.
+
+    Returns None when nothing is terminal, so the caller keeps waiting -- the default
+    has to be patience, or a slow pull becomes a failed create.
+    """
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "pods", "-o", "json"], own=is_ours(context))
+    if res.returncode != 0:
+        return None
+    try:
+        items = json.loads(res.stdout or "{}").get("items") or []
+    except ValueError:
+        return None
+    for item in items:
+        pod = item.get("metadata", {}).get("name", "")
+        for status in (item.get("status", {}).get("containerStatuses") or []) + \
+                      (item.get("status", {}).get("initContainerStatuses") or []):
+            waiting = (status.get("state") or {}).get("waiting") or {}
+            reason = str(waiting.get("reason") or "")
+            if reason in TERMINAL_POD_REASONS:
+                return pod, reason, str(waiting.get("message") or "").strip()
+    return None
 
 
 def workload_exists(name: str, *, context: str) -> bool:
@@ -1955,6 +2320,30 @@ spec:
 MONGO_URL_SECRET = "rocketchat-mongodb-url"
 
 
+#: The EE registration token travels in its own Opaque Secret, referenced from the
+#: container env by `valueFrom`. NEVER in helm values or `extraEnv` as a literal:
+#: values are readable with `helm get values` by anyone who can reach the release, and
+#: rc-repro also writes them to `repros/<n>/kubernetes/values.yaml` for a human to
+#: read -- which is exactly the exposure the MongoDB password was moved out of. The
+#: manifest goes to `kubectl apply -f -` on stdin so the token never appears in argv
+#: either, where `ps` would show it to every user on the box.
+REG_TOKEN_SECRET = "rc-repro-reg-token"
+REG_TOKEN_KEY = "token"
+
+
+def reg_token_secret_manifest(name: str, *, token: str, owner: str = "") -> str:
+    """An Opaque Secret holding the cloud registration token."""
+    import yaml as _yaml
+    body = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {"name": REG_TOKEN_SECRET, "labels": _labels(name, owner)},
+        "type": "Opaque",
+        "stringData": {REG_TOKEN_KEY: token},
+    }
+    return _yaml.safe_dump(body, sort_keys=False)
+
+
 def mongo_url_secret_manifest(name: str, *, mongo_url: str, oplog_url: str,
                               owner: str = "") -> str:
     """A Secret holding the connection strings, for `existingMongodbSecret`.
@@ -1977,6 +2366,41 @@ stringData:
   mongo-uri: {mongo_url}
   mongo-oplog-uri: {oplog_url}
 """
+
+
+def mongo_tool_auth(name: str, *, context: str) -> list[str]:
+    """`mongodump`/`mongorestore` flags for an operator-managed MongoDB.
+
+    The operator enables SCRAM, so an unauthenticated `mongodump` fails with
+    "Command listCollections requires authentication" -- which is exactly what it did:
+    backup was broken on the operator path, the path the official guide recommends,
+    while working perfectly on the hand-written StatefulSet that has no auth. The
+    audit found it because it ran both.
+
+    The password is read back out of the Secret rather than kept anywhere: it is
+    generated at create time and deliberately never written to disk, which is a
+    property worth keeping (`repros/<n>/kubernetes/` is checked for exactly this).
+
+    Empty list when there is no operator, so the StatefulSet path is unchanged.
+    """
+    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
+               "get", "secret", "mongodb-rocketchat-password",
+               "-o", "jsonpath={.data.password}"], own=is_ours(context))
+    encoded = (res.stdout or "").strip()
+    if res.returncode != 0 or not encoded:
+        return []
+    try:
+        password = base64.b64decode(encoded).decode("utf-8").strip()
+    except (ValueError, UnicodeDecodeError):
+        return []
+    if not password:
+        return []
+    # authenticationDatabase is MONGO_APP_DB, not `admin`: the app user is DEFINED
+    # in the application database, and authenticating against admin looks for a user
+    # that was never created there. The same mistake, on authSource, is recorded in
+    # operator_mongo_url's docstring.
+    return ["--username", MONGO_APP_USER, "--password", password,
+            "--authenticationDatabase", MONGO_APP_DB]
 
 
 def operator_mongo_url(namespace: str, password: str, *, oplog: bool = False) -> str:
@@ -2375,6 +2799,25 @@ def stop_workspace(name: str, *, context: str, emit: Emit = null_emit,
              "--overwrite", "namespace", namespace,
              f"{SCALE_ANNOTATION}={json.dumps(before)}"], own=is_ours(context))
     moved = scale_workspace(name, replicas=0, context=context, emit=emit)
+    # An operator-managed MongoDB CANNOT be scaled to zero: the operator reconciles
+    # its StatefulSet straight back, and the Community operator has no way to pause
+    # reconciliation. So its pods are expected to survive `stop`, and two things
+    # follow that an audit caught this doing wrong.
+    #
+    # First, the wait below must not require them to go, or every stop and restart on
+    # the operator path burns POD_GONE_TRIES * POD_GONE_INTERVAL seconds waiting for
+    # something that will never happen, then continues anyway.
+    #
+    # Second and worse, `stop` documents itself as giving the memory back. On this
+    # path it gives back Rocket.Chat's and not MongoDB's, and said nothing -- so the
+    # user who ran `stop` to free the box was told it had worked. Say it instead.
+    survivors = mongo_pods_the_operator_keeps(name, context=context)
+    if survivors:
+        warn(emit, f"MongoDB stays up: it is operator-managed, and the operator "
+                   f"recreates it as fast as it is scaled down (there is no way to "
+                   f"pause its reconciliation). Rocket.Chat's memory is freed, "
+                   f"MongoDB's is not — `rc-repro down --name {name} --volumes` is "
+                   f"what reclaims it.", phase="done")
     # WAIT for the pods to actually go, rather than returning on the API call.
     # `restart` is stop-then-start, so returning early scales back up while the old
     # pods are still Terminating -- and the readiness check then finds one of THOSE,
@@ -2385,11 +2828,28 @@ def stop_workspace(name: str, *, context: str, emit: Emit = null_emit,
     for _ in range(POD_GONE_TRIES):
         res = run(["kubectl", "--context", context, "-n", namespace, "get", "pods",
                    "-o", "name"], own=is_ours(context))
-        if not (res.stdout or "").strip():
+        left = [p for p in (res.stdout or "").split() if p.strip()]
+        if not [p for p in left if p not in survivors]:
             break
         sleep(POD_GONE_INTERVAL)
     info(emit, f"scaled {moved} workload(s) to zero", phase="done")
     return moved
+
+
+def mongo_pods_the_operator_keeps(name: str, *, context: str) -> set[str]:
+    """Pod names (as `pod/<n>`) that an operator-managed MongoDB will not give up.
+
+    Empty for the hand-written StatefulSet, which scales to zero like anything else.
+    """
+    namespace = namespace_for(name)
+    res = run(["kubectl", "--context", context, "-n", namespace,
+               "get", "mongodbcommunity", "-o", "name"], own=is_ours(context))
+    if res.returncode != 0 or not (res.stdout or "").strip():
+        return set()
+    pods = run(["kubectl", "--context", context, "-n", namespace, "get", "pods",
+                "-l", f"app={MONGO_SERVICE}-svc", "-o", "name"],
+               own=is_ours(context))
+    return {p for p in (pods.stdout or "").split() if p.strip()}
 
 
 def start_workspace(name: str, *, context: str, emit: Emit = null_emit) -> int:
@@ -2400,16 +2860,28 @@ def start_workspace(name: str, *, context: str, emit: Emit = null_emit) -> int:
     have given it.
     """
     namespace = namespace_for(name)
-    # The annotation key contains a `/`, which jsonpath treats as a path separator
-    # unless it is escaped -- so the escape is built outside the f-string, where
-    # Python 3.11 allows a backslash at all.
-    key = SCALE_ANNOTATION.replace("/", "\\/")
+    # Read as JSON and pick the key in Python, rather than through jsonpath.
+    #
+    # jsonpath was how this went wrong: the key is `rc-repro.io/replicas-before-stop`
+    # and the code escaped the SLASH while leaving the DOT in `rc-repro.io`
+    # unescaped -- so jsonpath read `rc-repro` and `io/...` as separate path segments,
+    # matched nothing, and returned empty. Measured against a live cluster: the
+    # slash-escaped form returns "" while the dot-escaped form returns the
+    # annotation. Every stop/start therefore restored the DEFAULT of 1, silently
+    # turning a `--replicas 2` workspace into a one-replica one, and the annotation
+    # written to prevent exactly that was never once read back.
+    #
+    # No escaping at all is a rule that cannot be got subtly wrong.
     res = run(["kubectl", "--context", context, "-n", namespace, "get", "namespace",
-               namespace, "-o", "jsonpath={.metadata.annotations." + key + "}"],
-              own=is_ours(context))
+               namespace, "-o", "json"], own=is_ours(context))
+    before = {}
     try:
-        before = json.loads((res.stdout or "").strip() or "{}")
+        annotations = (json.loads(res.stdout or "{}").get("metadata", {})
+                       .get("annotations") or {})
+        before = json.loads(annotations.get(SCALE_ANNOTATION) or "{}")
     except ValueError:
+        before = {}
+    if not isinstance(before, dict):
         before = {}
     targets = _scalables(namespace, context)
     if not targets:

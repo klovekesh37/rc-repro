@@ -271,6 +271,45 @@ def test_s3_minio_preset_shape():
     assert p.depends_on == ["minio"]
 
 
+def test_s3_minio_creates_its_bucket_on_both_runtimes():
+    """MinIO running is not the same as the bucket existing.
+
+    The test above asserts `minio-init` is in `services`, which is the COMPOSE half.
+    The Kubernetes adapter rendered only the MinIO Deployment and its Services, so on
+    that runtime the bucket was never created -- while the workspace's own notes said
+    "bucket '<name>' is created automatically; watch uploads land in it". Neither MinIO
+    nor Rocket.Chat creates a bucket on demand, so every upload had nowhere to go, and
+    `up` reported success. Found by an audit that looked in the namespace and saw a
+    minio Deployment with no init workload beside it.
+    """
+    import yaml
+
+    from rc_repro.services import topology
+
+    # Compose: the one-shot service, running the idempotent mc mb.
+    d = presets.resolve("s3_minio", topology.DOCKER, {"bucket": "tickets"})
+    init = d.services["minio-init"]
+    assert "mc mb -p local/tickets" in " ".join(init["entrypoint"])
+
+    # Kubernetes: the same thing, as a Job.
+    k = presets.resolve("s3_minio", topology.KUBERNETES, {"bucket": "tickets"})
+    docs = [doc for m in k.kubernetes_manifests for doc in yaml.safe_load_all(m) if doc]
+    jobs = [doc for doc in docs if doc.get("kind") == "Job"]
+    assert jobs, ("nothing creates the bucket on Kubernetes: "
+                  f"rendered {[doc['kind'] for doc in docs]}")
+    spec = jobs[0]["spec"]["template"]["spec"]
+    cmd = " ".join(spec["containers"][0]["command"])
+    assert "mc mb -p local/tickets" in cmd, cmd
+    assert "until mc alias set" in cmd, \
+        "it must wait for MinIO; the Job is applied alongside the Deployment"
+    # A Job, not an init container: an init container runs before its pod's main
+    # container, so it would wait for a MinIO that cannot start until it finishes.
+    assert spec["restartPolicy"] == "OnFailure"
+    assert jobs[0]["spec"]["backoffLimit"] >= 1, "the first attempt races MinIO starting"
+    assert (jobs[0]["metadata"]["labels"]["app.kubernetes.io/managed-by"]
+            == "rc-repro"), "teardown and ownership select on this"
+
+
 def test_s3_minio_presigned_mode_and_bucket():
     p = presets.load("s3_minio", {"presigned": "true", "bucket": "tickets"})
     assert p.env["OVERWRITE_SETTING_FileUpload_S3_Proxy_Uploads"] == "false"
@@ -661,6 +700,29 @@ def test_preset_ports_match_registry():
     assert presets.load("default").ports == []
 
 
+def test_preset_ports_match_registry_on_every_runtime():
+    """The registry ports are per PRESET, not per runtime, so both adapters declare them.
+
+    The test above resolves through `presets.load`, which is the DOCKER adapter -- so a
+    Kubernetes adapter that forgot `ports=` was invisible to the very invariant written
+    to catch a missing port. The ldap adapter had, and an audit found it: phpLDAPadmin
+    is published on the same fixed 8082 there (a port-forward rather than a compose
+    mapping), but with an empty list `check_sidecar_ports` returns immediately and
+    `sidecar_ports` is never recorded. A second Kubernetes workspace on that preset
+    therefore got no refusal and its forward silently failed to bind, where Compose
+    refuses up front and names the workspace already holding the port.
+    """
+    from rc_repro.services import topology
+
+    for name, expected in config.PRESET_PORTS.items():
+        for runtime in (topology.DOCKER, topology.KUBERNETES):
+            p = presets.resolve(name, runtime, {})
+            assert p.ports == list(expected), (
+                f"{name} on {runtime} declares {p.ports}, registry says "
+                f"{list(expected)} — port allocation and the collision pre-flight "
+                f"both read this list, and skip entirely when it is empty")
+
+
 def test_used_ports_includes_sidecars_and_monitoring(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     meta = runner.Metadata(
@@ -845,7 +907,13 @@ def test_seed_returns_durations_and_latency(monkeypatch):
     # drive the seed body with a mock poster; no server needed.
     from unittest.mock import MagicMock
     from rc_repro import seed, rcapi
-    resp = MagicMock(ok=True); resp.json.return_value = {"message": {"_id": "m"}}
+    # The mock has to answer a room CREATE as well as a message post: messages go
+    # by `rid` now, because a discussion's name is a server-generated slug and
+    # `#name` cannot reach one.
+    resp = MagicMock(ok=True)
+    resp.json.return_value = {"message": {"_id": "m"}, "channel": {"_id": "r1"},
+                              "group": {"_id": "r1"}, "room": {"_id": "r1"},
+                              "team": {"_id": "t1", "roomId": "r1"}}
     post = MagicMock(return_value=resp)
     plan = seed.plan_from("small", users=2, channels=1, messages=3)
     monkeypatch.setattr(rcapi, "login", lambda *a, **k: (_ for _ in ()).throw(Exception("no server")))
@@ -1468,9 +1536,12 @@ def test_status_breakdown_non_zero_only():
 
 def test_seed_profile_and_overrides():
     p = seed.plan_from("standard")
-    assert (p.users, p.channels, p.messages, p.rich) == (20, 8, 20, True)
+    assert (p.users, p.channels, p.messages, p.rich) == (20, 5, 20, True)
     p2 = seed.plan_from("standard", users=3, messages=1)
-    assert p2.users == 3 and p2.messages == 1 and p2.channels == 8  # override + inherit
+    assert p2.users == 3 and p2.messages == 1 and p2.channels == 5  # override + inherit
+    # An override reshapes the MANIFEST, not just the counts: three users means
+    # every room's membership is drawn from three names.
+    assert all(set(r.members) <= {"alice", "bob", "carol"} for r in p2.rooms)
 
 
 def test_seed_usernames_avoid_userN_collision():
@@ -1530,7 +1601,7 @@ def test_seed_does_not_count_failed_dms():
     def post(path, _headers, _payload):
         return _Resp(not path.endswith("im.create"))
 
-    plan = seed.Plan(users=3, channels=1, messages=1, dms=3, rich=False)
+    plan = seed.plan_from("small", users=3, channels=1, messages=1)
     out = seed._seed_body("http://x", {"h": "1"}, plan, post, lambda _m: None)
     # was 3: post() returns None only on a TRANSPORT error, so a 400 still counted
     # and the number reached the benchmark report as workload never created.
@@ -1789,6 +1860,38 @@ def test_detail_redacts_secret_env_values():
                      ("DEPLOY_METHOD", "docker")):
         assert lcsvc.redact_env(key, val) == val, key
     assert lcsvc.redact_env("REG_TOKEN", "") == ""      # empty stays empty
+
+
+def test_a_credential_inside_a_url_is_redacted_even_though_the_key_is_innocent():
+    """The key-name rule was not enough, and the gap opened the moment `env` started
+    reading the RUNNING CONTAINER on Kubernetes.
+
+    `MONGO_URL` matches no secret hint and, on the operator path, holds
+    `mongodb://rocketchat:<real SCRAM password>@...` -- resolved out of a Secret when
+    the container's environment is read. So the env tab, whose entire reason for
+    masking is that a debugging aid must not hand over credentials, handed the
+    database password to every member+ who opened it.
+
+    Only the userinfo goes. The host, database, replicaSet and authSource in the rest
+    of that string are what somebody is reading it FOR.
+    """
+    from rc_repro.services import lifecycle as lcsvc
+    url = ("mongodb://rocketchat:SuP3rS3cret@mongodb-0.mongodb-svc.rc-repro-k.svc"
+           ".cluster.local:27017/rocketchat?replicaSet=mongodb&authSource=rocketchat")
+    shown = lcsvc.redact_env("MONGO_URL", url)
+    assert "SuP3rS3cret" not in shown
+    assert lcsvc.REDACTED in shown
+    # ...and it is still a readable connection string.
+    for keep in ("mongodb://", "rocketchat:", "mongodb-svc", "replicaSet=mongodb",
+                 "authSource=rocketchat", ":27017"):
+        assert keep in shown, keep
+    # The oplog URL is the same shape and was the same leak.
+    assert "SuP3rS3cret" not in lcsvc.redact_env(
+        "MONGO_OPLOG_URL", "mongodb://rocketchat:SuP3rS3cret@mongodb-0:27017/local")
+    # A URL with no credentials in it is left completely alone.
+    plain = "mongodb://mongodb-0.mongodb:27017/rocketchat?replicaSet=rs0"
+    assert lcsvc.redact_env("MONGO_URL", plain) == plain
+    assert lcsvc.redact_env("ROOT_URL", "http://localhost:3000") == "http://localhost:3000"
 
 
 def test_k6_keeps_secrets_out_of_the_argv(tmp_path, monkeypatch):
@@ -2552,6 +2655,11 @@ def test_a_compose_only_command_refuses_cleanly_rather_than_traceback(monkeypatc
 
     This is the shape the whole taxonomy exists to prevent, so it is pinned at the
     process boundary where a script would see it.
+
+    It is driven through `env --set` now rather than `stats`, because `stats` gained
+    a Kubernetes path and no longer refuses. The property being pinned is the
+    refusal's SHAPE, not which command happens to raise it, so it follows whichever
+    command still does.
     """
     from typer.testing import CliRunner
 
@@ -2566,11 +2674,11 @@ def test_a_compose_only_command_refuses_cleanly_rather_than_traceback(monkeypatc
     runner_mod.write("k", "services: {}\n", m)
     monkeypatch.setattr(runner_mod, "docker_available", lambda **_k: True)
 
-    res = CliRunner().invoke(cli.app, ["stats", "--name", "k", "--for", "1"])
+    res = CliRunner().invoke(cli.app, ["env", "--name", "k", "--set", "A=b"])
     assert res.exit_code == 2, f"a compose-only refusal exited {res.exit_code}, expected 2"
     assert res.exception is None or isinstance(res.exception, SystemExit), (
         "the error escaped as an exception instead of being rendered")
-    assert "kubectl top" in res.output, "the alternative is stated to the user"
+    assert "helm" in res.output, "the alternative is stated to the user"
     assert "Traceback" not in res.output
 
 
@@ -2796,3 +2904,399 @@ def test_the_realm_lands_as_a_file_not_a_directory():
     mount = dep["spec"]["template"]["spec"]["containers"][0]["volumeMounts"][0]
     assert mount["subPath"] == "rcrepro-realm.json", mount
     assert mount["mountPath"].endswith("/import/rcrepro-realm.json"), mount
+
+
+def test_every_scenario_workload_declares_when_it_is_ready():
+    """The audit's root cause, in one assertion.
+
+    Without a readiness probe a pod is Ready the instant its container starts --
+    about forty seconds before Keycloak serves HTTP. Everything downstream then
+    trusts a signal that has not been earned: the Service publishes a "ready"
+    endpoint, the port-forward attaches to a backend that is not listening, and
+    post_ready fetches the IdP descriptor from a port with nothing behind it.
+
+    The operational audit caught exactly that -- SAML came up with an empty
+    SAML_Custom_Default_cert and both post_ready actions failed, on a workspace that
+    reported itself running.
+    """
+    import yaml
+
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    for name in ("ldap", "saml", "oidc", "email", "s3_minio", "livechat"):
+        # resolve(..., KUBERNETES): `ldap` is a Scenario whose two adapters return
+        # DIFFERENT Presets, so `load` gives the Compose one with no manifests at all.
+        kube = presets.resolve(name, topology.KUBERNETES, {})
+        docs = [d for d in yaml.safe_load_all(kube.kubernetes_manifests[0]) if d]
+        deployments = [d for d in docs if d["kind"] == "Deployment"]
+        assert deployments, name
+        for dep in deployments:
+            container = dep["spec"]["template"]["spec"]["containers"][0]
+            probe = container.get("readinessProbe")
+            assert probe, f"{name}/{dep['metadata']['name']} has no readinessProbe"
+            # It must test the thing that actually serves. httpGet where the
+            # workload speaks HTTP; LDAP does not, so slapd gets a tcpSocket check --
+            # which is meaningful there because slapd binds 389 only after its
+            # bootstrap import finishes.
+            assert "httpGet" in probe or "tcpSocket" in probe, f"{name}: {probe}"
+            # Long enough for an image pull plus a slow boot; the cost of being wrong
+            # is a workspace that looks healthy and is not configured.
+            assert probe.get("failureThreshold", 3) >= 30, f"{name}: {probe}"
+
+
+def test_a_service_exposes_every_port_its_workload_listens_on():
+    """Reported from a live workspace: Rocket.Chat could not send mail.
+
+        SMTP_Host=mailpit  SMTP_Port=1025      (what RC was told)
+        containerPort 8025, 1025               (what Mailpit listened on)
+        Service ports: 8025                    (what was reachable)
+
+    On Compose, container-to-container traffic reaches ANY port directly, so
+    `mailpit:1025` just works. A Kubernetes Service forwards only its DECLARED
+    ports -- so publishing the web UI and nothing else produced a workspace whose
+    Mailpit answered the browser and refused Rocket.Chat, which is where the mail
+    has to come from. Both UIs worked, which is exactly why it was not noticed.
+
+    The Service speaks CONTAINER ports, as Compose's network does; the `ui-port`
+    label is what says which host port publishes one.
+    """
+    import yaml
+
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    def services(name):
+        docs = yaml.safe_load_all(
+            presets.resolve(name, topology.KUBERNETES, {}).kubernetes_manifests[0])
+        return {d["metadata"]["name"]: d for d in docs if d and d["kind"] == "Service"}
+
+    mailpit = services("email")["mailpit"]
+    ports = {p["port"] for p in mailpit["spec"]["ports"]}
+    assert ports == {8025, 1025}, f"SMTP must be reachable in-cluster: {ports}"
+    # The published one first: the forwarder reads .spec.ports[0].
+    assert mailpit["spec"]["ports"][0]["port"] == 8025, mailpit["spec"]["ports"]
+
+    # MinIO serves API and console from one process; both are published, so the
+    # second gets its own Service naming the workload it belongs to.
+    minio = services("s3_minio")
+    assert {p["port"] for p in minio["minio"]["spec"]["ports"]} == {9000, 9001}
+    assert minio["minio-console"]["metadata"]["labels"][
+        "rc-repro.io/ui-deployment"] == "minio"
+
+
+def test_every_port_a_preset_configures_rocket_chat_to_use_is_reachable():
+    """The general rule the Mailpit bug broke: if a preset points Rocket.Chat at
+    `<host>:<port>`, a Service must actually carry that port.
+
+    Asserted against the settings themselves rather than a hand-written list, so a
+    preset that gains a new backing port cannot quietly skip its Service.
+    """
+    import re
+
+    import yaml
+
+    from rc_repro import presets
+    from rc_repro.services import topology
+
+    for name in ("email", "s3_minio", "ldap", "oidc"):
+        kube = presets.resolve(name, topology.KUBERNETES, {})
+        svc_ports = {}
+        for doc in yaml.safe_load_all(kube.kubernetes_manifests[0]):
+            if doc and doc["kind"] == "Service":
+                svc_ports[doc["metadata"]["name"]] = {
+                    p["port"] for p in doc["spec"]["ports"]}
+
+        # Settings of the form Host=<service> paired with Port=<n>.
+        env = kube.env or {}
+        hosts = {k.rsplit("_", 1)[0]: v for k, v in env.items() if k.endswith("_Host")}
+        for prefix, host in hosts.items():
+            port_val = env.get(f"{prefix}_Port")
+            if not port_val or host not in svc_ports:
+                continue
+            port = int(re.sub(r"\D", "", str(port_val)) or 0)
+            assert port in svc_ports[host], (
+                f"{name}: Rocket.Chat is pointed at {host}:{port} but the {host} "
+                f"Service exposes {sorted(svc_ports[host])}")
+
+
+# --- the seed manifest --------------------------------------------------------
+#
+# A plan used to be four numbers and everything else was `random`. It is a MANIFEST
+# now -- every room named, every membership decided, every message counted before
+# the first HTTP call -- and these hold that line, because the readback below is
+# only meaningful if the plan is something a workspace can be compared against.
+
+def test_the_seed_manifest_is_the_same_every_time():
+    """Two runs of one profile must produce the same workspace. Without it, a
+    customer's ticket and the reproduction of it cannot be compared, and nothing can
+    be read back and checked -- a plan of counts has nothing to check against."""
+    a, b = seed.plan_from("standard"), seed.plan_from("standard")
+    assert a.rooms == b.rooms
+    assert [r.members for r in a.rooms] == [r.members for r in b.rooms]
+    assert a.total_messages == b.total_messages
+
+
+def test_every_profile_contains_every_kind_of_room():
+    """Support tickets are rarely about a public channel. They are about a
+    discussion inside a private team channel, or a thread nobody else can see -- so
+    `small` carries one of each rather than being a scaled-down `standard`."""
+    for profile in ("small", "standard", "large"):
+        kinds = set(seed.plan_from(profile).by_kind())
+        for kind in (seed.CHANNEL, seed.PRIVATE, seed.TEAM, seed.TEAM_CHANNEL,
+                     seed.TEAM_CHANNEL_PRIVATE, seed.DISCUSSION, seed.DM,
+                     seed.GENERAL):
+            assert kind in kinds, f"{profile} has no {kind}"
+    # And both team visibilities appear as soon as there are two teams.
+    assert seed.TEAM_PRIVATE in seed.plan_from("standard").by_kind()
+
+
+def test_a_discussion_hangs_off_a_room_that_exists_first():
+    """Creation order is part of the manifest: a team before its channels, a parent
+    before its discussions. Nothing sorts this list later, because sorting it would
+    break seeding."""
+    plan = seed.plan_from("standard")
+    seen: set[str] = set()
+    for room in plan.rooms:
+        if room.parent:
+            assert room.parent in seen, f"{room.name} is created before {room.parent}"
+        seen.add(room.name)
+
+
+def test_dm_pairs_do_not_repeat_while_there_are_pairs_left():
+    """`random.sample` drew with replacement across DMs, so the same pair could come
+    up twice -- and the second `im.create` returns the SAME room, so a plan asking
+    for five DM rooms could quietly produce four."""
+    for n in (5, 6, 20):
+        names = [seed.username(i) for i in range(n)]
+        # The published bound: `gap == n / 2` on an even count folds back onto
+        # pairs an earlier gap already produced, so it is (n-1)//2 bands, not n//2.
+        pairs = [frozenset(seed.dm_pair(names, i)) for i in range(n * ((n - 1) // 2))]
+        assert len(set(pairs)) == len(pairs), f"a pair repeated with {n} users"
+        assert all(len(p) == 2 for p in pairs), "a pair must never be a user with itself"
+    # And every profile stays inside it.
+    for profile in ("small", "standard", "large"):
+        plan = seed.plan_from(profile)
+        dms = [r for r in plan.rooms if r.kind == seed.DM]
+        assert len({frozenset(r.members) for r in dms}) == len(dms), profile
+
+
+def test_a_planned_thread_is_counted_as_a_message_in_its_room():
+    """A threaded reply IS a message in the room -- `channels.messages` returns it
+    with a `tmid` -- so a plan that omits it cannot match what the server reports,
+    and every room would verify as short by the number of its threads."""
+    plan = seed.plan_from("small")
+    room = next(r for r in plan.rooms if r.kind == seed.CHANNEL)
+    assert room.threads == tuple(range(0, room.messages, seed.THREAD_EVERY))
+    assert room.total_messages == room.messages + len(room.threads)
+
+
+def test_two_teams_do_not_fight_over_one_channel_name():
+    """A channel name is unique workspace-wide, so two teams both wanting `planning`
+    would collide and the second team would come out empty."""
+    plan = seed.plan_from("large")
+    names = [r.name for r in plan.rooms]
+    assert len(names) == len(set(names))
+    team_channels = [r.name for r in plan.rooms if r.kind.startswith("team-channel")]
+    assert all("-" in n for n in team_channels)
+
+
+def test_a_thread_reply_is_posted_the_only_way_that_creates_a_thread():
+    """The defect this exists for: `chat.postMessage` with a `tmid` answers 400, so
+    every reply this module attempted was silently lost and no thread was ever
+    created -- while the `rich` profiles advertised threads and reactions and
+    delivered reactions.
+
+    Asserted on the CALL SHAPE, because that is what was wrong: the server said no
+    and the seeder counted it as a message it had failed to post, so nothing
+    downstream noticed for as long as the feature existed.
+    """
+    calls: list[tuple[str, dict]] = []
+
+    class _Resp:
+        ok, status_code = True, 200
+
+        @staticmethod
+        def json():
+            return {"message": {"_id": "m1"}, "channel": {"_id": "r1"},
+                    "group": {"_id": "r1"}, "room": {"_id": "r1"},
+                    "team": {"_id": "t1", "roomId": "r1"}}
+
+    def post(path, _headers, payload):
+        calls.append((path, payload))
+        return _Resp()
+
+    plan = seed.plan_from("small", users=2, channels=1, messages=5)
+    seed._seed_body("http://x", {"h": "1"}, plan, post, lambda _m: None)
+    threaded = [p for path, p in calls
+                if path.endswith("chat.sendMessage") and (p.get("message") or {}).get("tmid")]
+    assert threaded, "no threaded reply was posted at all"
+    assert all("rid" in p["message"] for p in threaded), "a thread reply needs its room"
+    assert not [p for path, p in calls if path.endswith("chat.postMessage")], \
+        "chat.postMessage cannot create a thread and is not used for messages any more"
+
+
+# --- the seed readback --------------------------------------------------------
+
+def _facts(plan, **over):
+    """Readback facts for a plan where everything is exactly as asked."""
+    rooms = []
+    for spec in plan.rooms:
+        rooms.append(seed.RoomFacts(spec=spec, found=True, rid=f"r-{spec.name}",
+                                    messages=spec.total_messages, replies=spec.replies,
+                                    reacted=spec.reacted, threads=len(spec.threads)))
+    out = {"rooms": rooms, "planned_users": [seed.username(i) for i in range(plan.users)],
+           "users_unreadable": ""}
+    out["users_found"] = list(out["planned_users"])
+    out.update(over)
+    return out
+
+
+def test_a_clean_seed_verifies_clean():
+    plan = seed.plan_from("small")
+    verdict = seed.verify(plan, _facts(plan))
+    assert verdict["ok"] is True
+    assert verdict["faults"] == [] and verdict["extra"] == []
+    assert verdict["checked"] == len(plan.rooms)
+
+
+def test_more_content_than_planned_is_not_a_fault():
+    """Seeding only ever ADDS, so a room holding more than this run planned cannot
+    be evidence that this run lost anything: it had content already, which is what a
+    second `rc-repro seed`, a preset that posts on boot, or a restored backup all
+    look like.
+
+    Gating on exact equality is precisely what made an earlier version of this idea
+    refuse a workspace that was working, and a check that fails when nothing is
+    wrong is one people learn to bypass.
+    """
+    plan = seed.plan_from("small")
+    facts = _facts(plan)
+    facts["rooms"][0].messages += 40
+    verdict = seed.verify(plan, facts)
+    assert verdict["ok"] is True, verdict["faults"]
+    assert len(verdict["extra"]) == 1
+    assert verdict["extra"][0]["room"] == plan.rooms[0].name
+
+
+def test_fewer_messages_than_planned_is_a_fault():
+    plan = seed.plan_from("small")
+    facts = _facts(plan)
+    facts["rooms"][0].messages -= 1
+    verdict = seed.verify(plan, facts)
+    assert verdict["ok"] is False
+    assert verdict["faults"][0]["kind"] == "messages"
+    assert verdict["faults"][0]["got"] == plan.rooms[0].total_messages - 1
+
+
+def test_a_room_that_could_not_be_read_is_a_gap_in_the_check_not_a_fault():
+    """One 500 on a listing must not fail an otherwise perfect seed. The version of
+    this that required `not unavailable` for a pass did exactly that."""
+    plan = seed.plan_from("small")
+    facts = _facts(plan)
+    facts["rooms"][1].unreadable = "HTTP 500"
+    verdict = seed.verify(plan, facts)
+    assert verdict["ok"] is True
+    assert verdict["unreadable"] == [{"what": plan.rooms[1].name, "why": "HTTP 500"}]
+
+
+def test_a_room_that_is_absent_is_a_fault_even_though_the_lookup_failed():
+    """Rocket.Chat answers a lookup for a deleted room with HTTP 400 and
+    `error-room-not-found`. That is an ANSWER, not a failure to ask -- and filing it
+    under "could not read" made a workspace with a missing room verify clean. Found
+    live, by deleting one and watching the check pass.
+    """
+    plan = seed.plan_from("small")
+    facts = _facts(plan)
+    facts["rooms"][0].found = False
+    facts["rooms"][0].unreadable = ""       # what ABSENT leaves behind
+    verdict = seed.verify(plan, facts)
+    assert verdict["ok"] is False
+    assert verdict["faults"][0]["kind"] == "missing"
+
+
+def test_a_team_channel_that_is_not_in_its_team_is_a_fault():
+    """A channel can exist and not be in the team, which looks identical from
+    `channels.info` -- and is the whole difference between a team workspace and a
+    workspace with similarly-named channels."""
+    plan = seed.plan_from("small")
+    facts = _facts(plan)
+    room = next(f for f in facts["rooms"] if f.spec.kind == seed.TEAM_CHANNEL)
+    room.in_team = False
+    verdict = seed.verify(plan, facts)
+    assert any(f["kind"] == "team" for f in verdict["faults"])
+
+
+def test_reactions_are_planned_rather_than_decided_while_posting():
+    """They were the one part of a `rich` profile that worked, which made them the
+    part with no evidence: `i % 3 == 0` lived in the posting loop, so nothing could
+    say how many there should be and nothing checked how many there were."""
+    rich = seed.plan_from("standard")
+    room = next(r for r in rich.rooms if r.kind == seed.CHANNEL)
+    assert room.reactions == tuple(range(0, room.messages, seed.REACT_EVERY))
+    assert room.reacted == len(room.reactions)
+    # `small` asks for none, and plans none.
+    assert all(r.reactions == () for r in seed.plan_from("small").rooms)
+
+
+def test_the_seeder_reacts_exactly_where_the_manifest_says(monkeypatch):
+    calls: list[tuple[str, dict]] = []
+
+    class _Resp:
+        ok, status_code = True, 200
+
+        @staticmethod
+        def json():
+            return {"message": {"_id": "m1"}, "channel": {"_id": "r1"},
+                    "group": {"_id": "r1"}, "room": {"_id": "r1"},
+                    "team": {"_id": "t1", "roomId": "r1"}}
+
+    def post(path, _headers, payload):
+        calls.append((path, payload))
+        return _Resp()
+
+    # `general` is LOOKED UP rather than created (every workspace ships it), and the
+    # lookup is a GET rather than the injected `post` -- so without this the one room
+    # every user is in gets no rid and no messages, and the totals are quietly short.
+    monkeypatch.setattr(seed.requests, "get", lambda *a, **k: _Resp())
+    plan = seed.plan_from("standard", users=2, channels=1, messages=6)
+    seed._seed_body("http://x", {"h": "1"}, plan, post, lambda _m: None)
+    reacts = [p for path, p in calls if path.endswith("chat.react")]
+    assert reacts, "a rich profile that reacts nowhere"
+    assert all("messageId" in p and "emoji" in p for p in reacts)
+    # One per planned index per room, and not one per message.
+    assert len(reacts) == sum(r.reacted for r in plan.rooms)
+
+
+def test_fewer_reactions_than_planned_is_a_fault():
+    plan = seed.plan_from("standard")
+    facts = _facts(plan)
+    facts["rooms"][0].reacted -= 1
+    verdict = seed.verify(plan, facts)
+    assert verdict["ok"] is False
+    assert verdict["faults"][0]["kind"] == "reactions"
+
+
+def test_a_discussion_that_lost_its_anchor_is_a_fault():
+    """The `pmid` variant was dead code for a while: discussions were created before
+    their parents had posted anything, so the branch could never fire and every
+    discussion came out attached to the room instead. Nothing noticed.
+
+    It is caught by the message count rather than by a check of its own, and that is
+    deliberate: a discussion opened from a message arrives holding ANCHOR_MESSAGES it
+    did not post, so a `pmid` that stops being sent makes the room come back exactly
+    that much short -- which is a fault, named by room.
+    """
+    plan = seed.plan_from("standard")
+    anchored = next(r for r in plan.rooms
+                    if r.kind == seed.DISCUSSION and r.from_message >= 0)
+    plain = next(r for r in plan.rooms
+                 if r.kind == seed.DISCUSSION and r.from_message < 0)
+    assert anchored.total_messages - plain.total_messages == seed.ANCHOR_MESSAGES
+
+    facts = _facts(plan)
+    lost = next(f for f in facts["rooms"] if f.spec is anchored)
+    lost.messages -= seed.ANCHOR_MESSAGES          # what an un-anchored one looks like
+    verdict = seed.verify(plan, facts)
+    assert verdict["ok"] is False
+    assert verdict["faults"][0]["room"] == anchored.name

@@ -617,6 +617,10 @@ form textarea { font-family: var(--mono); font-size: .8rem; resize: vertical; }
 .adv summary:hover { color: var(--ink); }
 form menu { display: flex; justify-content: flex-end; gap: .5rem; padding: 0; margin: 1.1rem 0 0; }
 .hint { color: var(--muted); font-size: .82rem; margin: .1rem 0 .4rem; }
+/* A server message quoted verbatim, where the newlines in it carry meaning: the
+   metrics-server install is two commands, the helm upgrade is one long one. Without
+   this they collapse into a paragraph and the command cannot be copied out of it. */
+.hint.pre, .empty.pre { white-space: pre-wrap; text-align: left; font-size: .8rem; }
 .log { background: #05070b; color: #c9d1d9; font-family: var(--mono); font-size: .8rem; line-height: 1.45;
   padding: .8rem; border-radius: var(--r-sm); max-height: 52vh; overflow: auto; white-space: pre-wrap; word-break: break-word;
   border: 1px solid var(--line); }

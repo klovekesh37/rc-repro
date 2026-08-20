@@ -11,9 +11,32 @@ from typing import NoReturn
 
 import typer
 
+#: JSON mode: every human-facing line in this module moves to stderr, for the life
+#: of the process. This is the seam the module docstring above has always promised.
+#:
+#: Redirected, not suppressed. stdout has to be a valid JSON document -- `rc-repro
+#: info --json > case.json` is the whole point -- and a person who runs the same
+#: command at a terminal should still see what happened. Two streams answer both;
+#: silence would answer only the first.
+#:
+#: It lives HERE rather than as a flag threaded through each command, because the
+#: prose is written by helpers several frames below the flag: a panel printed by
+#: `_render_create_result` cannot see the `--json` that a command signature took.
+_JSON = False
+
+
+def json_mode(on: bool = True) -> None:
+    global _JSON
+    _JSON = on
+
+
+def _echo(msg: str, **kw) -> None:
+    """typer.secho, on stderr whenever stdout belongs to a machine."""
+    typer.secho(msg, err=kw.pop("err", False) or _JSON, **kw)
+
 
 def ok(msg: str) -> None:
-    typer.secho(msg, fg=typer.colors.GREEN)
+    _echo(msg, fg=typer.colors.GREEN)
 
 
 def warn(msg: str, *, err: bool = False) -> None:
@@ -23,7 +46,7 @@ def warn(msg: str, *, err: bool = False) -> None:
     exit -- `rc-repro serve > /dev/null` must still show why nothing started.
     Default stays stdout so no existing caller moves stream.
     """
-    typer.secho(msg, fg=typer.colors.YELLOW, err=err)
+    _echo(msg, fg=typer.colors.YELLOW, err=err)
 
 
 def fail(msg: str) -> None:
@@ -32,7 +55,7 @@ def fail(msg: str) -> None:
 
 def note(msg: str) -> None:
     """Preset tips / supplementary info (cyan)."""
-    typer.secho(msg, fg=typer.colors.CYAN)
+    _echo(msg, fg=typer.colors.CYAN)
 
 
 def die(msg: str, exit_code: int = 1) -> NoReturn:
@@ -48,7 +71,7 @@ def die(msg: str, exit_code: int = 1) -> NoReturn:
 
 def hint(msg: str) -> None:
     """A dim next-step line under a panel."""
-    typer.secho(msg, fg=typer.colors.BRIGHT_BLACK)
+    _echo(msg, fg=typer.colors.BRIGHT_BLACK)
 
 
 def rule(n: int, color: str = typer.colors.BRIGHT_BLACK) -> str:
@@ -66,10 +89,11 @@ def box(title: str, lines: list[str], width: int,
     b = lambda s: typer.style(s, fg=border)  # noqa: E731
     side = b("|")
     dashes = "-" * max(1, width - len(title) - 1)
-    typer.echo(b("+- ") + typer.style(title, fg=title_color, bold=True) + b(" " + dashes + "+"))
+    out = lambda s: typer.echo(s, err=_JSON)  # noqa: E731
+    out(b("+- ") + typer.style(title, fg=title_color, bold=True) + b(" " + dashes + "+"))
     for ln in lines:
-        typer.echo(f"{side} {ln.ljust(width)} {side}")
-    typer.echo(b("+" + "-" * (width + 2) + "+"))
+        out(f"{side} {ln.ljust(width)} {side}")
+    out(b("+" + "-" * (width + 2) + "+"))
 
 
 def panel(title: str, rows: list[tuple[str, str]], color: str = typer.colors.GREEN) -> None:
@@ -85,7 +109,8 @@ def panel(title: str, rows: list[tuple[str, str]], color: str = typer.colors.GRE
     width = max([len(title) + 2] + [len(c) for c in cells])
     bar = lambda s: typer.style(s, fg=color)  # noqa: E731
     side = bar("|")
-    typer.echo(bar("+- " + title + " " + "-" * (width - len(title) + 1) + "+"))
+    out = lambda s: typer.echo(s, err=_JSON)  # noqa: E731
+    out(bar("+- " + title + " " + "-" * (width - len(title) + 1) + "+"))
     for c in cells:
-        typer.echo(f"{side}  {c.ljust(width)}  {side}")
-    typer.echo(bar("+" + "-" * (width + 4) + "+"))
+        out(f"{side}  {c.ljust(width)}  {side}")
+    out(bar("+" + "-" * (width + 4) + "+"))

@@ -79,6 +79,35 @@ def _login_seed_users(root_url: str, count: int) -> list[dict]:
     return users
 
 
+def require_compose_for_perf(name: str, operation: str) -> None:
+    """Refuse a load test or capacity search on a Kubernetes workspace, and say why.
+
+    Not merely "unimplemented". The number would be WRONG in a way that reads as a
+    result: a Kubernetes workspace is reached through `kubectl port-forward`, which
+    is a single userspace relay -- it saturates, serialises and drops connections far
+    below what Rocket.Chat itself would, so every figure the run produced would be a
+    measurement of the forward. A plausible wrong number is the one failure mode this
+    tool cannot afford in a report a support engineer sends to a customer.
+    """
+    from rc_repro.services import topology
+    target = lifecycle.resolve_name(name)
+    if topology.of_repro(target) != topology.KUBERNETES:
+        return
+    version = ""
+    try:
+        version = runner.read_meta(target).rc_version
+    except Exception:  # noqa: BLE001 - the refusal matters more than the example
+        pass
+    raise ValidationError(
+        f"{operation} is Compose-only. A Kubernetes workspace is reached through a "
+        "`kubectl port-forward`, which is a single userspace relay: it saturates and "
+        "drops connections long before Rocket.Chat does, so every number this "
+        "produced would be measuring the forward. Run it against a Compose "
+        f"workspace on the same version instead — `rc-repro up --version "
+        f"{version or '<version>'} --name perf` — where the client talks to the "
+        "container directly.")
+
+
 def run_loadtest(req: LoadtestReq, emit: Emit = null_emit) -> dict:
     from rc_repro import monitoring, perf
     from rc_repro.perf import (constrain as constrain_mod, k6, mongoprof, rcmetrics,
@@ -90,6 +119,13 @@ def run_loadtest(req: LoadtestReq, emit: Emit = null_emit) -> dict:
     if req.vus < 1:
         raise ValidationError("vus must be >= 1")
 
+    # Refused here rather than at the top, so a bad --scenario is still named before
+    # a bad --name: the request's own shape is cheaper to check and is what the
+    # caller most likely got wrong. But BEFORE read_compose, which raised a bare
+    # FileNotFoundError naming a compose file a Kubernetes workspace does not have --
+    # outside the ReproError contract, so the GUI answered 500 to a request that is
+    # merely unsupported. The same defect the env tab had, in a second place.
+    require_compose_for_perf(req.name, "loadtest")
     m = runner.read_meta(lifecycle.resolve_name(req.name))
     doc = runner.read_compose(m.name)
     target = _loadtest_target(doc)
@@ -248,6 +284,7 @@ def run_capacity(req: CapacityReq, emit: Emit = null_emit) -> dict:
     if req.start < 1 or req.max_vus < req.start:
         raise ValidationError("start must be >= 1 and max >= start")
 
+    require_compose_for_perf(req.name, "capacity")   # see run_loadtest for the why
     m = runner.read_meta(lifecycle.resolve_name(req.name))
     doc = runner.read_compose(m.name)
     target = _loadtest_target(doc)

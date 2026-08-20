@@ -245,33 +245,82 @@ def test_detail_and_stats_endpoints(monkeypatch):
     assert r.status_code == 200 and j["cpu"] == 120.0 and j["mem_mb"] > 900
 
 
-def test_stats_refuses_a_workspace_that_has_no_compose_project(monkeypatch, tmp_path):
-    """The topology socket, proven through real HTTP rather than as a function call.
+def test_stats_answers_a_kubernetes_workspace_over_http(monkeypatch, tmp_path):
+    """`stats` refused this runtime and now answers it, in the same shape.
 
-    `stats` shells out to `docker stats` against a compose project. A workspace on
-    another runtime has none, so the route must refuse with 400 and say what to use
-    instead -- rather than running `docker stats` on nothing and answering 200 with
-    a plausible-looking zero, which is the failure that would be believed.
+    The refusal was right while there was nothing behind it -- running `docker stats`
+    on nothing and returning a plausible zero is the failure that would be believed.
+    It is `kubectl top` now, summed over every Rocket.Chat pod so replicas count the
+    way compose instances do, and the payload keys are unchanged because the GUI
+    renders from them.
+
+    Docker must not be reached for it: that was the original defect.
     """
     from rc_repro import runner as R
-    from rc_repro.services import topology
+    from rc_repro.services import k8s, topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     m = R.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
                    mongo_tag="8.0", mongo_flavor="official", preset="default",
                    root_url="u", host_port=3010, version_source="t")
     topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
     R.write("k", "services: {}\n", m)
 
     monkeypatch.setattr(lc, "resolve_name", lambda n: n)
     monkeypatch.setattr(lc.runner, "container_ids",
-                        lambda n: pytest.fail("docker was reached for a non-compose workspace"))
+                        lambda n: pytest.fail("docker was reached for a Kubernetes "
+                                              "workspace"))
+    monkeypatch.setattr(k8s, "pod_metrics", lambda name, *, context: [
+        {"pod": "rocketchat-a", "cpu_millicores": 150.0, "mem_bytes": 400e6},
+        {"pod": "rocketchat-b", "cpu_millicores": 50.0, "mem_bytes": 200e6}])
+
     r = client().get("/api/repros/k/stats", headers=H)
-    assert r.status_code == 400, f"expected a refusal, got {r.status_code}"
+    assert r.status_code == 200, r.text
     body = r.json()
-    assert "kubectl top" in body.get("error", ""), "the alternative is stated"
-    assert body.get("kind") == "ValidationError"
-    assert body.get("code") == "VALIDATION_FAILED", "the STABLE identifier, not the class name"
+    assert set(body) == {"cpu", "mem_mb"}, "the GUI renders from these keys"
+    assert body["mem_mb"] == 600.0, "every Rocket.Chat pod counts, not just the first"
+    assert body["cpu"] == 20.0, "millicores rendered on the same scale as docker's %"
+
+
+def test_reading_env_over_http_answers_for_a_kubernetes_workspace(
+        monkeypatch, tmp_path):
+    """This route raised a bare FileNotFoundError, so `serve` answered 500.
+
+    A path in a stack trace, for a request that was merely unsupported, while
+    `stats` on the same workspace answered cleanly. It then refused with 400, and now
+    answers -- read out of the running container, which shows variables the chart
+    contributes that no document rc-repro writes would ever list.
+
+    Asserted through real HTTP because 500 versus 400 versus 200 is the whole
+    history of this endpoint.
+    """
+    import json as _json
+    from dataclasses import asdict
+
+    from rc_repro import runner as R
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = R.Metadata(name="k", project="p", rc_version="8.6.1", rc_image="i",
+                   mongo_tag="8.0", mongo_flavor="official", preset="default",
+                   root_url="u", host_port=3010, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra["context"] = k8s.CONTEXT
+    ws = R.workspace("k")
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "repro.json").write_text(_json.dumps(asdict(m)), encoding="utf-8")
+    assert not (ws / "docker-compose.yml").exists()
+
+    monkeypatch.setattr(lc, "resolve_name", lambda n, actor="": n)
+    monkeypatch.setattr(k8s, "container_env", lambda name, *, context: {
+        "ROOT_URL": "http://localhost:3010", "ADMIN_PASS": "admin123"})
+
+    r = client().get("/api/repros/k/env", headers=H)
+    assert r.status_code == 200, r.text
+    keys = {row["key"]: row["value"] for row in r.json()["env"]}
+    assert keys["ROOT_URL"] == "http://localhost:3010"
+    assert keys["ADMIN_PASS"] != "admin123", "credentials are masked over HTTP too"
 
 
 def test_an_error_payload_carries_the_stable_code_not_just_the_class_name(monkeypatch):
@@ -1071,6 +1120,21 @@ def test_settings_says_whether_an_email_is_remembered_without_leaking_it(monkeyp
     r = c.get("/api/settings", headers=H)
     assert r.json()["acme_email_remembered"] is True
     assert "ops@rocket.chat" not in r.text, "the address itself must never be returned"
+
+
+def test_settings_reports_the_boxs_default_bind_host(monkeypatch, tmp_path):
+    """The create dialog cannot tell a browser on ANOTHER machine the truth without
+    it: with the default 127.0.0.1 the workspace it is about to make will answer on
+    the server and nowhere else, which a GUI-only user has no other way to find out.
+
+    An interface, not a credential -- `up` prints it on every create.
+    """
+    from rc_repro import config as cfgmod
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    c = client()
+    assert c.get("/api/settings", headers=H).json()["default_bind_host"] == "127.0.0.1"
+    cfgmod.update_config(lambda cfg: cfg.__setitem__("bind_host", "0.0.0.0"))
+    assert c.get("/api/settings", headers=H).json()["default_bind_host"] == "0.0.0.0"
 
 
 def test_settings_needs_a_session():

@@ -21,9 +21,9 @@ from pathlib import Path
 
 from rc_repro import compose, config, presets, rcapi, runner, versions
 from rc_repro import seed as seeder
-from rc_repro.errors import (ConflictError, DockerError, NotFoundError,
-                             NotReadyError, PreflightError, ReproError,
-                             ValidationError)
+from rc_repro.errors import (ConflictError, CreateFailedError, DockerError,
+                            NotFoundError, NotReadyError, PreflightError,
+                            ReproError, ValidationError)
 from rc_repro.services import audit as auditsvc
 from rc_repro.services import edge as edgesvc
 from rc_repro.services import diagnose, postready, topology
@@ -239,6 +239,56 @@ def _kube_overhead_mb(req: "CreateReq") -> int:
     return need
 
 
+#: What the container ENGINE must have before a Kubernetes workspace is worth
+#: starting: a control plane, the MongoDB operator or a StatefulSet, and on
+#: microservices six more Rocket.Chat processes. Taken from PR #3, whose measured
+#: floor these are; the value of them is not the numbers but WHERE they are read
+#: from -- `docker info`, i.e. the VM, not `/proc/meminfo`.
+ENGINE_FLOOR_CPUS = 4
+ENGINE_FLOOR_MEMORY_GIB = 6.0
+
+
+def _check_engine_floor(req: "CreateReq", emit: Emit = null_emit) -> None:
+    """Refuse a Kubernetes create the container engine is too small for.
+
+    Compose is left alone: it runs two containers and works on a 2 GB VM, so a floor
+    there would refuse creates that succeed today.
+
+    Silent when the engine cannot be asked. An unreadable `docker info` is not
+    evidence of a small VM, and a refusal on no evidence is the failure mode this
+    whole family of checks has to avoid -- `up` already refuses for real capacity,
+    and a second refusal nobody can explain is how people learn to pass --force by
+    reflex.
+    """
+    from rc_repro.services import topology
+    if topology.normalize(getattr(req, "runtime", "")) != topology.KUBERNETES:
+        return
+    cap = runner.docker_capacity()
+    if cap is None:
+        return
+    cpus, mem_bytes = cap
+    gib = mem_bytes / (1024 ** 3)
+    short = []
+    if cpus and cpus < ENGINE_FLOOR_CPUS:
+        short.append(f"{cpus:.0f} CPUs (needs {ENGINE_FLOOR_CPUS})")
+    if gib and gib < ENGINE_FLOOR_MEMORY_GIB:
+        short.append(f"{gib:.1f} GiB of memory (needs {ENGINE_FLOOR_MEMORY_GIB})")
+    if not short:
+        return
+    if getattr(req, "force", False):
+        warn(emit, "the container engine is below the Kubernetes floor — "
+                   + " and ".join(short) + ". Continuing because --force was given.",
+             phase="preflight")
+        return
+    raise PreflightError(
+        "the container engine has " + " and ".join(short) + ". A Kubernetes "
+        "workspace needs a control plane, MongoDB and the chart, and below this it "
+        "does not fail cleanly -- pods stay Pending with nothing naming memory. "
+        "Raise the VM (Docker Desktop: Settings -> Resources; Podman: "
+        "`podman machine set --cpus 4 --memory 6144`), or use --runtime docker. "
+        "--force overrides this.")
+
+
 def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_emit) -> None:
     """Refuse to create a workspace the host cannot hold.
 
@@ -259,6 +309,13 @@ def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_em
     reads until after the machine is down. Overridable with --force, and the
     message says what to stop instead.
     """
+    # The ENGINE's floor first, and it is a different question from the host's
+    # headroom. On Linux the engine is the host and the two agree; on macOS and on
+    # Podman the container VM has its own allocation, so a laptop with 32 GB and a
+    # 4 GB VM passes every check below and then cannot run a Kubernetes workspace at
+    # all -- the failure arriving later as pods that never schedule, which names
+    # nothing a reader can act on.
+    _check_engine_floor(req, emit)
     mem = runner.host_memory()
     if mem is None:                     # not Linux: skip rather than guess
         return
@@ -288,6 +345,24 @@ def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_em
     swap_note = ("\n  This host has NO SWAP, so there is no buffer at all: memory "
                  "pressure becomes an OOM kill rather than slowdown."
                  if swap_mb == 0 else "")
+    if getattr(req, "force", False):
+        # The docstring above has always said "Overridable with --force" and the
+        # refusal below has always told the user to pass it -- and nothing here ever
+        # read req.force, so the advertised way out did not exist. Following the
+        # message produced the identical refusal, and on `up` --force ALSO means
+        # "overwrite this repro", so obeying the advice risked destroying a workspace
+        # while still being blocked. Same shape as the --https guard that was shipped
+        # and dead: prose that describes behaviour nothing implements.
+        #
+        # It warns rather than passing silently, because this is the guard that
+        # exists after an OOM took out a 10 GB host: overriding it has to stay
+        # visible, especially on a shared server where the kernel picks the victim.
+        warn(emit, f"--force: creating anyway, though this workspace wants about "
+                   f"{need} MB and only {max(0, headroom)} MB is free to use."
+                   f"{swap_note} If the host runs out, the OOM killer chooses what "
+                   f"dies — which may be a colleague's workspace, not this one.",
+             phase="create")
+        return
     raise PreflightError(
         f"not enough memory: this workspace needs about {need} MB and only "
         f"{max(0, headroom)} MB is free to use "
@@ -925,6 +1000,11 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
     # one thing: a workspace older than the key. See services/topology.py.
     topology.stamp(meta.extra, req.runtime or topology.DOCKER)
     meta.extra[config.EXTRA_DEPLOYMENT] = req.deployment or topology.MONOLITH
+    # Recorded so a reader can be told the truth about reaching this workspace from
+    # another machine. It was only ever written INTO the compose port mappings, which
+    # meant every caller that wanted to know had to parse the generated file --
+    # Kubernetes has recorded it in the metadata since its first workspace.
+    meta.extra["bind_host"] = bind_host
     if pre.post_ready:
         meta.extra["post_ready"] = pre.post_ready
     if pre.notes:
@@ -1227,6 +1307,62 @@ def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: fl
 
 # --- seed (inline, used by create --seed) -------------------------------------
 
+def check_seed(meta: runner.Metadata, auth, plan, result: dict,
+               emit: Emit = null_emit, tokens: dict | None = None) -> dict:
+    """Read the seeded workspace back, compare it with the manifest, and record it.
+
+    Both front-ends call this, because both had the same hole: the seed summary was
+    what the seeder ASKED for, and nothing anywhere checked it. `messages: ~62` --
+    the tilde was the tool admitting it did not know.
+
+    REPORTS, it does not refuse. A mismatch is written into the result and warned
+    about; whether that ends the command is the caller's decision and the default is
+    that it does not. The version of this idea that shipped elsewhere gated on exact
+    equality over a seeder that was losing every thread reply, so `up --seed` failed
+    on a healthy workspace -- and a check that fails when nothing is wrong is one
+    people learn to bypass.
+
+    The verification is persisted into `repro.json` either way. A seeded workspace
+    that says what it contains, and whether that was confirmed, is the difference
+    between a reproduction and a pile of plausible content.
+    """
+    try:
+        facts = seeder.readback(meta.root_url, auth, plan, tokens=tokens)
+        verdict = seeder.verify(plan, facts)
+    except Exception as exc:  # noqa: BLE001 - a check must never break the seed
+        warn(emit, f"could not read the seed back: {exc}", phase="seed")
+        return {"ok": None, "faults": [], "unreadable": [], "checked": 0, "rooms": []}
+    result["verification"] = {k: verdict[k] for k in
+                              ("ok", "faults", "extra", "unreadable", "checked")}
+    result["readback"] = verdict["rooms"]
+    if verdict["faults"]:
+        warn(emit, f"seed readback found {len(verdict['faults'])} mismatch(es): "
+                   + "; ".join(f"{f['room'] or 'users'} wanted {f['want']}, found {f['got']}"
+                               for f in verdict["faults"][:3]), phase="seed")
+    elif verdict["extra"]:
+        info(emit, f"readback: {len(verdict['extra'])} room(s) hold more than this run "
+                   "planned — they had content already (a re-seed, a preset, a restore)",
+             phase="seed")
+    elif verdict["unreadable"]:
+        warn(emit, f"{len(verdict['unreadable'])} room(s) could not be read back — "
+                   "not counted as a fault", phase="seed")
+    else:
+        info(emit, f"readback: {verdict['checked']} rooms match the plan", phase="seed")
+    try:
+        runner.update_meta(meta.name, lambda m: m.extra.update({"seed": {
+            "profile": plan.profile,
+            "planned": result.get("planned", {}),
+            "actual": {k: result.get(k) for k in
+                       ("users", "rooms", "rooms_total", "messages", "threads", "dms")},
+            "verification": result["verification"],
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }}))
+    except Exception:  # noqa: BLE001 - a record is not worth failing a good seed
+        pass
+    return verdict
+
+
+
 def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit) -> dict:
     from rc_repro import perf
     try:
@@ -1240,13 +1376,16 @@ def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit
     info(emit, f"seeding (profile {profile})", phase="seed")
     mon = perf.ResourceMonitor(meta.name).start() if stats else None
     t0 = time.monotonic()
+    tokens: dict = {}
     try:
-        s = seeder.seed(meta.root_url, auth, plan, log=lambda m: info(emit, m.strip(), phase="seed"))
+        s = seeder.seed(meta.root_url, auth, plan, tokens_out=tokens,
+                        log=lambda m: info(emit, m.strip(), phase="seed"))
     finally:
         resources = mon.stop() if mon else None
     s["total_s"] = time.monotonic() - t0
     if resources is not None:
         s["resources_keys"] = sorted(resources)
+    check_seed(meta, auth, plan, s, emit, tokens=tokens)
     return s
 
 
@@ -1258,6 +1397,12 @@ def _summary(meta: runner.Metadata) -> dict:
         "mongo_flavor": meta.mongo_flavor, "preset": meta.preset, "root_url": meta.root_url,
         "host_port": meta.host_port, "login": {"user": config.ADMIN_USERNAME, "password": config.ADMIN_PASSWORD},
         "pinned": meta.pinned, "notes": list(meta.extra.get("notes", []) if isinstance(meta.extra, dict) else []),
+        # Which runtime, and how Rocket.Chat is arranged inside it. `list_repros`
+        # has carried the runtime all along and the DETAIL payload had neither, so
+        # the panel rendered every workspace as though it were Compose -- and
+        # offered actions the Kubernetes path can only refuse.
+        "runtime": topology.of_meta(meta),
+        "deployment": topology.axes_of_meta(meta).get("deployment", ""),
     }
     n = meta.extra.get("instances") if isinstance(meta.extra, dict) else None
     if n:
@@ -1416,10 +1561,31 @@ _SECRET_KEY_HINTS = ("password", "pass", "secret", "token", "_key", "apikey",
 REDACTED = "********"
 
 
+#: A credential embedded in a URL: `scheme://user:password@host`. Matched on the
+#: VALUE, because the key that carries it says nothing -- `MONGO_URL`, `MONGO_URI`
+#: and `MONGO_OPLOG_URL` name no secret and hold one.
+_URL_USERINFO = re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^/\s:@]+):([^/\s@]+)@")
+
+
 def redact_env(key: str, value: str) -> str:
-    """Mask an env value whose KEY names a credential; pass anything else through."""
+    """Mask an env value that carries a credential; pass anything else through.
+
+    Two rules, because one was not enough. The KEY names a credential
+    (`*password*`, `*token*`, `*secret*`, ...) -- that catches REG_TOKEN, the LDAP
+    bind password and MinIO's secret key.
+
+    Or the VALUE carries one inside a URL. `MONGO_URL` matches no hint and on the
+    Kubernetes operator path holds `mongodb://rocketchat:<real SCRAM password>@...`,
+    resolved out of a Secret the moment the container's environment is read -- so the
+    env tab, which exists so that a debugging aid does not hand over credentials,
+    handed over the database password to every member. Only the userinfo goes: the
+    host, database and replicaSet in the rest of that string are exactly what a
+    reader is looking at it for.
+    """
     low = key.lower()
-    return REDACTED if value and any(h in low for h in _SECRET_KEY_HINTS) else value
+    if value and any(h in low for h in _SECRET_KEY_HINTS):
+        return REDACTED
+    return _URL_USERINFO.sub(rf"\1:{REDACTED}@", value or "")
 
 
 def _env_rows(doc: dict, overrides: dict | None = None) -> list[dict]:
@@ -1443,6 +1609,61 @@ def _env_rows(doc: dict, overrides: dict | None = None) -> list[dict]:
             for k, v in pairs]
 
 
+def _bind_host_of(m: runner.Metadata) -> str:
+    """The address this workspace publishes its ports ON, for the panel's
+    remote-access notice. "" means genuinely unknown.
+
+    Recorded in the metadata at create time. Read back out of the generated compose
+    file for workspaces made before it was recorded, so a workspace that already
+    exists gets the accurate notice rather than the hedged one -- the fact was always
+    on disk, just not where a reader could ask for it.
+    """
+    extra = m.extra if isinstance(m.extra, dict) else {}
+    recorded = str(extra.get("bind_host") or "")
+    if recorded:
+        return recorded
+    if topology.of_meta(m) == topology.KUBERNETES:
+        # Kubernetes has recorded it from the first workspace it ever made, so an
+        # absence here is not "older than the key" -- there is nothing to recover.
+        return ""
+    try:
+        doc = runner.read_compose(m.name)
+    except Exception:  # noqa: BLE001 - no file, or half-written; unknown is fine
+        return ""
+    svcs = doc.get("services", {}) if isinstance(doc, dict) else {}
+    rc = svcs.get("rocketchat") or svcs.get("rocketchat-1") or {}
+    for port in rc.get("ports") or []:
+        parts = str(port).split(":")
+        if len(parts) >= 3 and parts[0]:
+            return parts[0]
+    return ""
+
+
+def _since(iso: str) -> str:
+    """An ISO timestamp -> docker's phrasing for how long ago it was ("2 hours").
+
+    The panel's Uptime cell is filled from docker's own `Status` string on Compose;
+    on Kubernetes the same cell has to be built from a pod's startTime, and it has to
+    read the SAME way. Two vocabularies in one column is how a reader stops trusting
+    the column.
+    """
+    if not iso:
+        return ""
+    try:
+        then = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    secs = (datetime.now(timezone.utc) - then).total_seconds()
+    if secs < 0:
+        return ""
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        n = int(secs // size)
+        if n:
+            return f"{n} {unit}" + ("s" if n != 1 else "")
+    n = int(secs)
+    return f"{n} second" + ("s" if n != 1 else "")
+
+
 def detail(name: str) -> dict:
     """Rich detail for the GUI panel: summary + state/uptime/health + links +
     containers + the RC service's env vars."""
@@ -1461,10 +1682,57 @@ def detail(name: str) -> dict:
     d["owner"] = d["created_by"]
     d["made_by"] = _x.get("created_by", "")
     d["owner_history"] = list(_x.get("owner_history") or [])
+    # Which address this workspace's ports are bound to. The panel needs it to say
+    # anything true about reaching the workspace from ANOTHER machine: every link
+    # below is built from `localhost`, which for a browser on a different box than
+    # `serve` names that browser's own machine. Reported, never acted on -- ROOT_URL
+    # is what Rocket.Chat itself advertises and is deliberately left alone.
+    d["bind_host"] = _bind_host_of(m)
     # The panel keys its HTTPS row and its "Check TLS" action off these. list_repros()
     # carried them and detail() did not, so the feature was invisible in the panel.
     d["public_url"] = m.public_url
     d["tls"] = m.extra.get("tls", "") if isinstance(m.extra, dict) else ""
+    # ASKED FIRST, before docker is asked anything. A Kubernetes workspace's state
+    # does not depend on the local daemon, and the branch below reads the workspace's
+    # compose file -- which this runtime does not have, so a box whose docker was
+    # merely asleep answered the panel with a FileNotFoundError, i.e. 500, for a
+    # workspace that was running perfectly well in the cluster.
+    if topology.of_meta(m) == topology.KUBERNETES:
+        from rc_repro.services import k8s
+        context = str(_x.get("context") or k8s.CONTEXT)
+        d["state"] = kubernetes_state(target, m)
+        # Pods, in the containers tab's own three columns. This block used to be
+        # deliberately empty on the reasoning that invented rows would be a
+        # plausible wrong answer -- true, but these are not invented, and the empty
+        # list was itself a wrong answer: the tab reads it as "no containers" and
+        # printed "this repro is down" under a running workspace, with no way at all
+        # to see an ImagePullBackOff from the browser.
+        d["containers"] = ([] if d["state"] == "down"
+                           else k8s.pod_rows(target, context=context))
+        # Uptime from the earliest RUNNING pod, which is as close as this runtime
+        # gets to the workspace's own uptime. Left empty when nothing is running,
+        # because "—" is the honest cell for a stopped workspace.
+        started = sorted(r["started"] for r in d["containers"]
+                         if r["state"] == "running" and r["started"])
+        d["uptime"] = _since(started[0]) if started else ""
+        # Health stays empty on purpose: the kv falls back to the state, which here
+        # already distinguishes starting/running/stopped. A per-pod answer is in the
+        # containers tab, where it belongs.
+        d["health"] = ""
+        # LINKS ARE NOT COMPOSE-SHAPED, and leaving them out of this branch cost the
+        # panel every address a scenario publishes. A preset's UI answers on the SAME
+        # host port under both runtimes -- Compose binds it, Kubernetes port-forwards
+        # it to the same number deliberately (k8s.scenario_ui_forwards) -- so one
+        # list is right for both. Without it, phpLDAPadmin, Keycloak, MinIO, Mailpit
+        # and Grafana were unreachable from the GUI on Kubernetes while the CLI
+        # printed all of them.
+        d["links"] = repro_links(m)
+        # Named rather than reconstructed. Every message that mentions it builds it
+        # from `namespace_for`, and a browser rebuilding the same string from the
+        # workspace name is a second implementation of a naming rule.
+        d["namespace"] = str(_x.get("namespace") or "")
+        return d
+
     # `container_details` returns [] both for "no containers" AND for "docker could
     # not be asked", so deriving state from it alone asserted `down` whenever the
     # daemon was unreachable — while list_repros() reported "?" for the same repro.
@@ -1475,15 +1743,6 @@ def detail(name: str) -> dict:
         d["links"] = repro_links(m)
         d["env"] = _env_rows(runner.read_compose(target), m.extra.get("env")
                              if isinstance(m.extra, dict) else None)
-        return d
-    if topology.of_meta(m) == topology.KUBERNETES:
-        # Same reason as `list_repros`. The panel's containers/env/health blocks are
-        # compose-shaped and stay empty rather than being faked: an empty list is a
-        # readable absence, and invented rows would be a plausible wrong answer.
-        d["state"] = kubernetes_state(target, m)
-        d["containers"] = []
-        d["uptime"] = ""
-        d["health"] = ""
         return d
     containers = runner.container_details(target)
     rc = [c for c in containers if c["service"] == "rocketchat" or c["service"].startswith("rocketchat-")]
@@ -1761,15 +2020,60 @@ def prunable() -> list[str]:
     if states is None:
         raise DockerError("couldn't query docker compose projects - not pruning (is Docker healthy?)")
     me = auditsvc.actor()
-    return [m.name for m in runner.list_meta()
-            if not m.pinned and m.project not in states
-            and may_destroy(m.name, me)[0]]
+    out: list[str] = []
+    for m in runner.list_meta():
+        if m.pinned or not may_destroy(m.name, me)[0]:
+            continue
+        if topology.of_meta(m) == topology.KUBERNETES:
+            # ASK KUBERNETES, not Docker. "Is it down" was decided by whether a
+            # compose PROJECT was running, and a Kubernetes workspace never has one
+            # -- so every Kubernetes workspace looked down, including a healthy one
+            # serving traffic. `prune` then offered to delete N "down" repros with a
+            # live workspace among them, and its compose teardown could not remove
+            # any of them anyway.
+            from rc_repro.services import k8s
+            context = str((m.extra or {}).get("context") or k8s.CONTEXT)
+            if k8s.workload_exists(m.name, context=context):
+                continue
+            out.append(m.name)
+            continue
+        if m.project not in states:
+            out.append(m.name)
+    return out
 
 
-def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
+
+def orphan_namespaces(context: str = "") -> list[str]:
+    """Namespaces labelled ours that NO local record can explain.
+
+    A workspace whose `repro.json` is gone -- an interrupted create, a wiped
+    RC_REPRO_HOME, a workspace made under a different one -- leaves its namespace,
+    its pods and its PersistentVolumeClaim running with nothing able to remove them:
+    every rc-repro command starts from the state directory, so the workspace is
+    simply invisible. One was found holding 8Gi and five CrashLoopBackOff pods with
+    no way to reach it short of `kubectl delete namespace` by hand.
+
+    Reported, never swept automatically. On a shared cluster an unrecorded namespace
+    may be a COLLEAGUE's workspace created from their own home, so deleting it
+    because this machine has no record of it would destroy their work. `prune
+    --orphans` is the opt-in.
+    """
+    from rc_repro.services import k8s
+    ctx = context or k8s.CONTEXT
+    try:
+        found = k8s.workspace_namespaces(ctx)
+    except Exception:  # noqa: BLE001 - no cluster is not an error here
+        return []
+    known = {k8s.namespace_for(m.name) for m in runner.list_meta()}
+    return sorted(ns for ns in found
+                  if ns not in known and ns != k8s.OPERATOR_NAMESPACE)
+
+def prune(*, confirm: bool = False, orphans: bool = False,
+          emit: Emit = null_emit) -> dict:
     targets = prunable()
-    if not targets:
-        return {"targets": [], "removed": []}
+    stray = orphan_namespaces() if orphans else []
+    if not targets and not stray:
+        return {"targets": [], "removed": [], "orphans": []}
     if not confirm:
         raise ValidationError(f"prune deletes {len(targets)} down repro(s) incl. data - pass confirm=true")
     auditsvc.record("prune", ",".join(targets))
@@ -1781,6 +2085,30 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         # waited on -- it is no longer idle, so it no longer qualifies for pruning.
         try:
             with runner.repro_lock(name, timeout=5.0):
+                if topology.of_repro(name) == topology.KUBERNETES:
+                    # The same dispatch `teardown` makes, for the same reason: this
+                    # called `docker compose down` on a workspace that has no compose
+                    # project, which always failed -- so a Kubernetes workspace could
+                    # be listed for pruning and never actually pruned, and its
+                    # namespace and PersistentVolumeClaim stayed on the cluster.
+                    from rc_repro.services import k8s
+                    meta = runner.read_meta(name)
+                    context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
+                    for ui_pid in (meta.extra or {}).get("scenario_forwards", {}).values():
+                        try:
+                            _stop_port_forward(int(ui_pid))
+                        except (TypeError, ValueError):
+                            pass
+                    pid = (meta.extra or {}).get("port_forward_pid")
+                    if pid:
+                        _stop_port_forward(int(pid))
+                    k8s.delete_namespace(name, context=context, volumes=True,
+                                         emit=emit)
+                    runner.remove(name)
+                    _clear_default_if(name)
+                    removed.append(name)
+                    info(emit, f"pruned {name!r}", phase="done")
+                    continue
                 # Detach BEFORE `down`: compose cannot remove a network that still
                 # has an active endpoint, and the attached edge is one.
                 edgesvc.detach(name)
@@ -1798,7 +2126,20 @@ def prune(*, confirm: bool = False, emit: Emit = null_emit) -> dict:
         _clear_default_if(name)
         removed.append(name)
         info(emit, f"pruned {name!r}", phase="done")
-    return {"targets": targets, "removed": removed}
+    swept = []
+    if stray:
+        from rc_repro.services import k8s
+        for ns in stray:
+            res = k8s.run(["kubectl", "--context", k8s.CONTEXT, "delete", "namespace",
+                           ns, "--wait=false"], timeout=k8s.APPLY_TIMEOUT,
+                          own=k8s.is_ours(k8s.CONTEXT))
+            if res.returncode == 0:
+                swept.append(ns)
+                info(emit, f"removed orphaned namespace {ns}", phase="done")
+            else:
+                warn(emit, f"could not remove orphaned namespace {ns}: "
+                           f"{(res.stderr or '').strip()[:120]}", phase="done")
+    return {"targets": targets, "removed": removed, "orphans": swept}
 
 
 #: What `up` accepts on Compose and cannot honour on Kubernetes, with the reason.
@@ -1822,8 +2163,6 @@ _KUBERNETES_UNSUPPORTED: tuple[tuple[str, str], ...] = (
     ("https", "HTTPS needs an ingress controller and cert-manager, not the Traefik "
               "edge Compose uses"),
     ("domain", "a public domain needs the ingress that HTTPS needs"),
-    ("reg_token", "the EE registration token is injected through the preset "
-                  "environment, which this runtime does not apply yet"),
     ("fresh", "--fresh means DELETE this workspace's data, and the Kubernetes path "
               "keeps the PersistentVolumeClaim — use `rc-repro down --name <n> "
               "--volumes` first, which does delete it"),
@@ -1921,6 +2260,7 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     # Same resolution order Compose uses: the flag, then the box-level config, then
     # loopback. This was dropped entirely on the Kubernetes path.
     cfg = config.load_config()
+    reg_token = req.reg_token or cfg.get("reg_token") or ""
     bind_host = req.bind or cfg.get("bind_host") or config.DEFAULT_BIND_HOST
     root = f"http://localhost:{host_port}"
     microservices = req.deployment == topology.MICROSERVICES
@@ -1928,11 +2268,51 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     # so what was applied and what is printed cannot disagree.
     preset_for_notes = presets.resolve(req.preset or "default", topology.KUBERNETES,
                                        req.params or {})
+    # A WRITE-AHEAD RECORD, before a single cluster resource exists.
+    #
+    # `create_workspace` below builds the namespace, MongoDB, the chart release, the
+    # scenario's manifests and the port-forward -- minutes of work -- and only after
+    # it returned was anything written down. Kill the process in that window (a
+    # `serve` shutdown with a create job still running does exactly this) and the
+    # workspace is left fully running with NO record: invisible to `list`, `info`
+    # and `down`, and unreachable by every command, because all of them start from
+    # the state directory. Two such orphans were found holding several GB between
+    # them, removable only with `kubectl delete namespace` by hand.
+    #
+    # Compose never had this: it writes the record at the top and starts containers
+    # afterwards, so an interrupted create leaves something to clean up with. This
+    # makes the runtimes agree. The namespace name is deterministic, so it can be
+    # recorded before it exists; everything learned later is merged in below.
+    provisional = runner.Metadata(
+        name=repro_name, project=k8s.namespace_for(repro_name),
+        rc_version=resolved.rc_version, rc_image=resolved.rc_image,
+        mongo_tag=resolved.mongo_tag, mongo_flavor=resolved.mongo_flavor,
+        preset=req.preset, root_url=root, host_port=host_port,
+        version_source=resolved.source, pinned=req.pin,
+        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    topology.stamp(provisional.extra, topology.KUBERNETES)
+    provisional.extra[config.EXTRA_DEPLOYMENT] = req.deployment or topology.MICROSERVICES
+    provisional.extra["namespace"] = k8s.namespace_for(repro_name)
+    provisional.extra["context"] = k8s.CONTEXT
+    provisional.extra["incomplete"] = True
+    if req.actor:
+        provisional.extra["created_by"] = req.actor
+    _ws = runner.workspace(repro_name)
+    _ws.mkdir(parents=True, exist_ok=True)
+    runner.atomic_write(_ws / "repro.json", json.dumps(asdict(provisional), indent=2))
+
     out = k8s.create_workspace(
         name=repro_name, resolved=resolved, host_port=host_port,
         microservices=microservices, replicas=req.replicas or 1,
         owner=req.actor, bind_host=bind_host,
         use_operator=req.mongo_operator,
+        # Through a Secret referenced by `valueFrom`, never as a values literal:
+        # `helm get values` is readable by anyone who can reach the release, and
+        # rc-repro writes the values to disk for a human to read. This refusal used
+        # to say the token "is injected through the preset environment, which this
+        # runtime does not apply yet" -- preset env has been applied here for some
+        # time, so the reason had outlived itself while the flag stayed refused.
+        reg_token=reg_token,
         # Resolved through the KUBERNETES adapter, so a scenario yields native
         # manifests here and a compose service on the other runtime -- one intent,
         # two renderings. `_refuse_unsupported_on_kubernetes` has already proved
@@ -2017,8 +2397,16 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         f"{repro_name}` installs one Prometheus + Grafana in "
         f"{k8s.OPERATOR_NAMESPACE} for the whole cluster, and `--off` leaves it up "
         "while any other workspace still wants it.",
-        "logs, stats and backup have no Kubernetes path yet — each refuses and "
-        "names the kubectl command that does the job.",
+        # This used to say "logs, stats and backup have no Kubernetes path yet". Two
+        # of the three were right and backup was not: it has run on this runtime
+        # since it learned to exec through `kubectl` instead of compose, and an audit
+        # found the note still telling users otherwise. A workspace's own notes are
+        # where someone checks what they can do with it, so a stale one costs them a
+        # capability they already have.
+        "`logs`, `stats`, `env`, `upgrade`, `backup`, `restore`, `seed`, `monitor`, "
+        "`api`, `pat` and `token` all work here. `stats` needs metrics-server in the "
+        "cluster and says so if it is missing; `env --set` still refuses and hands "
+        "over the `helm upgrade` that changes a value.",
     ]
     # A preset's own notes, which the Compose path already surfaces via
     # `meta.extra["notes"] = pre.notes`. This path builds its own list, so without
@@ -2166,6 +2554,17 @@ def _wait_serving_kubernetes(meta: runner.Metadata, emit: Emit,
                      phase="ready", pct=100)
                 return {"ready": True, "url": meta.root_url}
             extra = dict(extra, port_forward_pid=pid)
+        # Stop waiting for something Kubernetes has already decided cannot happen.
+        # A mistyped version or an unreachable registry used to cost the full timeout
+        # and then report the timeout rather than the cause.
+        doomed = k8s.terminal_pod_failure(meta.name, context=context)
+        if doomed:
+            pod, reason, message = doomed
+            raise CreateFailedError(
+                f"{meta.name!r} cannot start: pod {pod} is {reason}"
+                + (f" — {message}" if message else "")
+                + f". Nothing will change by waiting. `kubectl -n {namespace} "
+                  f"describe pod {pod}` has the detail.")
         now = _time.monotonic()
         if now - last > 15:
             last = now

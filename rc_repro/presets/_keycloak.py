@@ -67,6 +67,24 @@ def manifests(realm: str, host_port: int, http_port: int | None = None,
                     "args": ["start-dev", "--import-realm"],
                     "env": env,
                     "ports": [{"containerPort": container_port}],
+                    # WITHOUT THIS the pod is Ready the instant the container
+                    # starts -- about forty seconds before Keycloak serves HTTP.
+                    # Everything downstream then waits on a signal that means
+                    # nothing: the Service gets a "ready" endpoint, the port-forward
+                    # attaches to a backend that is not listening, and post_ready
+                    # fetches the IdP descriptor from a port with nothing behind it.
+                    # The operational audit caught precisely that -- SAML came up
+                    # with an empty cert and both post_ready actions failed.
+                    "readinessProbe": {
+                        "httpGet": {"path": "/realms/master",
+                                    "port": container_port},
+                        "initialDelaySeconds": 10,
+                        "periodSeconds": 5,
+                        # Realm import plus an image pull on a cold node; generous
+                        # because the cost of being wrong is a workspace that looks
+                        # healthy and is not configured.
+                        "failureThreshold": 60,
+                    },
                     # subPath, so the ConfigMap lands as a FILE next to Keycloak's
                     # own import directory rather than replacing the directory.
                     "volumeMounts": [{
