@@ -53,9 +53,19 @@ def fail(msg: str) -> None:
     typer.secho(msg, fg=typer.colors.RED, err=True)
 
 
-def note(msg: str) -> None:
-    """Preset tips / supplementary info (cyan)."""
-    _echo(msg, fg=typer.colors.CYAN)
+def note(msg: str, *, bold: bool = False) -> None:
+    """Preset tips / supplementary info (cyan). `bold` for a section heading."""
+    _echo(msg, fg=typer.colors.CYAN, bold=bold)
+
+
+def line(msg: str = "") -> None:
+    """A plain content line, routed like every other human-facing line in here.
+
+    `typer.echo` at a call site puts prose on stdout unconditionally, which in --json
+    mode is the stream a caller is parsing. Content that belongs to a panel or a
+    section goes through this instead, so the json_mode() seam covers all of it.
+    """
+    _echo(msg)
 
 
 def die(msg: str, exit_code: int = 1) -> NoReturn:

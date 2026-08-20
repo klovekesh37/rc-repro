@@ -420,16 +420,34 @@ def test_set_state_explains_a_downed_repro(monkeypatch):
     assert "no containers to start" in str(exc.value)
 
 
-def test_summary_carries_preset_notes():
-    # These are what the GUI renders from the create job's result and the CLI
-    # prints in a box after `up` -- the Keycloak realm, the /etc/hosts line, etc.
+def test_summary_carries_preset_notes_derived_and_not_the_frozen_copy():
+    """These are what the GUI renders from the create job's result and the CLI prints
+    after `up` -- the Keycloak realm, the /etc/hosts line.
+
+    DERIVED from the preset on every read, not read back out of the record. A note
+    written into `repro.json` at create time keeps its wording for the life of the
+    workspace, which is how a Kubernetes workspace went on telling people `backup`
+    had no path on that runtime for three releases after it grew one -- the fix
+    reached new workspaces and no existing one. So the stale copy in this record is
+    deliberately not what the preset says, and it is the preset's that has to come
+    out.
+    """
+    from rc_repro import presets
+
     m = lc.runner.Metadata(
         name="x", project="rcrepro-x", rc_version="8.5.1", rc_image="i",
         mongo_tag="8.0", mongo_flavor="official", preset="oidc",
         root_url="http://localhost:3000", host_port=3000, version_source="map",
-        extra={"notes": ["Add this to /etc/hosts:", "    127.0.0.1  keycloak"]})
-    assert lc._summary(m)["notes"] == ["Add this to /etc/hosts:",
-                                      "    127.0.0.1  keycloak"]
+        extra={"notes": ["a sentence some older release wrote down"]})
+    s = lc._summary(m)
+    assert s["notes"] == lc.flatten_notes([lc.note_group(
+        "Scenario · oidc", kind="scenario", body=presets.load("oidc").notes)])
+    assert "a sentence some older release wrote down" not in s["notes"]
+    # The grouped form is what the panel renders, and the scenario has to be MARKED
+    # as one -- the panel feeds that group back into its links card rather than
+    # giving it a card of its own.
+    assert [g["kind"] for g in s["note_groups"]] == ["scenario"]
+    assert any("/etc/hosts" in n for n in s["notes"])
 
 
 def test_compose_major_version_parsing():
@@ -2411,7 +2429,10 @@ def test_a_cluster_rc_repro_did_not_create_is_marked_external(monkeypatch):
     the cluster itself is never its to remove."""
     from rc_repro.services import k8s
 
-    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    # No kind: the bring-your-own path, where the cluster kubectl points at is
+    # adopted. With kind INSTALLED rc-repro creates its own instead of adopting
+    # anyone's, so that is not the setup this rule is about.
+    monkeypatch.setattr(k8s, "which", lambda t: "" if t == "kind" else f"/usr/bin/{t}")
     monkeypatch.setattr(k8s, "run", _fake_run({
         "get clusters": (0, "somebody-elses\n"),
         "config current-context": (0, "kind-somebody-elses\n"),
@@ -2424,8 +2445,10 @@ def test_a_cluster_rc_repro_did_not_create_is_marked_external(monkeypatch):
     assert pre.cluster_exists is False, "ours is not among them"
     assert pre.provider == k8s.PROVIDER_EXTERNAL
     assert pre.context == "kind-somebody-elses"
+    assert pre.will_create is False, "a cluster rc-repro cannot make is never one it creates"
 
     # And ours, when it IS there, is the one rc-repro may manage fully.
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
     monkeypatch.setattr(k8s, "run", _fake_run({
         "get clusters": (0, f"{k8s.CLUSTER_NAME}\n"),
         "/readyz": (0, "ok"),
@@ -2465,8 +2488,8 @@ def test_the_cluster_in_use_is_not_also_listed_as_another_cluster(monkeypatch, t
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
     monkeypatch.setattr(k8s, "run", _fake_run({
-        "get clusters": (0, "kind\n"),
-        "config current-context": (0, "kind-kind\n"),
+        "get clusters": (0, f"{k8s.CLUSTER_NAME}\nsomebody-elses\n"),
+        "config current-context": (0, f"{k8s.CONTEXT}\n"),
         "/readyz": (0, "ok"),
         "get storageclass": (0, '{"items": [{"metadata": {"name": "standard",'
                                 ' "annotations": {"storageclass.kubernetes.io/'
@@ -2475,9 +2498,79 @@ def test_the_cluster_in_use_is_not_also_listed_as_another_cluster(monkeypatch, t
         "version": (0, "v9.9.9"),
     }))
     msgs = [r["message"] for r in doctor.run_checks()["checks"]]
-    assert any("Using your cluster 'kind-kind'" in m for m in msgs), msgs
-    assert not any("other kind cluster" in m for m in msgs), \
+    assert any(f"Cluster {k8s.CLUSTER_NAME!r} reachable" in m for m in msgs), msgs
+    others = [m for m in msgs if "other kind cluster" in m]
+    assert len(others) == 1 and "somebody-elses" in others[0], others
+    assert k8s.CLUSTER_NAME not in others[0], \
         "the cluster in use was counted again as an 'other' one"
+
+
+def test_the_kubeconfig_note_matches_which_cluster_the_workspace_is_in(monkeypatch):
+    """The note said `export KUBECONFIG=<rc-repro's own>` on every Kubernetes
+    workspace. On a cluster rc-repro ADOPTED that is wrong three ways -- it created no
+    cluster, that file does not describe yours, and your kubectl already pointed at the
+    right one -- so pasting step 1 broke the shell it was pasted into. rc-repro only
+    keeps its own kubeconfig for the cluster it created (`own=is_ours(context)`), and
+    the note has to say the same thing the code does."""
+    from rc_repro import runner
+    from rc_repro.services import k8s, lifecycle as lc
+
+    def note_text(context):
+        meta = runner.Metadata(
+            name="w", project=k8s.namespace_for("w"), rc_version="8.5.1",
+            rc_image="registry.rocket.chat/rocketchat/rocket.chat:8.5.1",
+            mongo_tag="8.0", mongo_flavor="community", preset="default",
+            root_url="http://localhost:3000", host_port=3000,
+            version_source="shipped")
+        meta.extra.update({"runtime": "kubernetes", "namespace": k8s.namespace_for("w"),
+                           "context": context, "deployment": "monolith"})
+        return "\n".join(lc.flatten_notes(lc.note_groups_of(meta)))
+
+    ours = note_text(k8s.CONTEXT)
+    assert "export KUBECONFIG=" in ours, ours
+    assert str(k8s.owned_kubeconfig()) in ours
+
+    adopted = note_text("default")
+    assert "export KUBECONFIG=" not in adopted, \
+        "told the user to export a kubeconfig that does not describe their cluster"
+    assert str(k8s.owned_kubeconfig()) not in adopted
+    assert "'default'" in adopted, adopted
+
+
+def test_doctor_names_the_cluster_up_would_actually_use(monkeypatch, tmp_path):
+    """A box with BOTH kind and k3s. `doctor` resolved the cluster itself -- kind's
+    if one existed, else whatever kubectl pointed at -- and `up` asked
+    `plan_cluster`, which creates rc-repro's own whenever kind is installed. With
+    kind present but no cluster yet and k3s running, the two disagreed: the report
+    said "Using your cluster 'default' (k3s)" and `up` went and built a kind
+    cluster. A preflight whose whole job is predicting a boot cannot be a second
+    opinion about it."""
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "which", lambda t: f"/usr/bin/{t}")
+    monkeypatch.setattr(k8s, "run", _fake_run({
+        "get clusters": (0, "\n"),            # kind installed, no cluster yet
+        "config current-context": (0, "default\n"),   # ...but k3s is up and active
+        "/readyz": (0, "ok"),
+        "get storageclass": (0, '{"items": []}'),
+        "get namespace": (0, ""),
+        "version": (0, "v9.9.9"),
+    }))
+
+    plan = k8s.plan_cluster()
+    pre = k8s.preflight()
+    assert pre.context == plan.context, "doctor and up must name the same cluster"
+    assert pre.will_create is plan.create
+
+    msgs = [r["message"] for r in doctor.run_checks()["checks"]]
+    assert not any("Using your cluster 'default'" in m for m in msgs), \
+        "reported a cluster that up would not touch"
+    assert any(f"No cluster yet — {k8s.CLUSTER_NAME!r} is created on first use" in m
+               for m in msgs), msgs
+    # ...and the one being set aside is still named, or the next question is why
+    # rc-repro is building a second cluster next to a working one.
+    assert any("will NOT be used" in m and "'default'" in m for m in msgs), msgs
 
 
 def test_missing_storage_is_a_refusal_because_nothing_would_ever_log_it():
@@ -2551,9 +2644,17 @@ def test_a_missing_ingress_controller_only_blocks_a_request_that_needs_one():
     assert k8s.ingress_blocker(have, wants_domain=True) == ""
 
 
-def test_doctor_says_nothing_about_ingress(monkeypatch, tmp_path):
-    """Deliberate omission, asserted so it stays deliberate. `doctor` does not know
-    whether you are about to ask for `--domain`, and most workspaces never do."""
+def test_doctor_never_warns_about_ingress(monkeypatch, tmp_path):
+    """This used to assert `doctor` did not MENTION ingress at all, on the reasoning that
+    it cannot know whether you are about to ask for `--domain` and most workspaces never
+    do. That reasoning was about not nagging, and it still holds -- but silence turned out
+    to be the wrong way to keep it: on a cluster that already has an ingress controller
+    (k3s ships Traefik) the report left a reader unable to see the one thing that
+    distinguishes their cluster from a kind one.
+
+    So it is reported as a FACT and never as a warning. Severity still belongs to whatever
+    needs it, which is `ingress_blocker` refusing a `--domain` that cannot be served.
+    """
     from rc_repro.services import doctor, k8s
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
@@ -2568,8 +2669,16 @@ def test_doctor_says_nothing_about_ingress(monkeypatch, tmp_path):
         "get namespace": (0, ""),
         "version": (0, "v9.9.9"),
     }))
-    msgs = [r["message"] for r in doctor.run_checks()["checks"]]
-    assert not any("ingress" in m.lower() for m in msgs), msgs
+    rows = doctor.run_checks()["checks"]
+    ingress = [r for r in rows if "ingress" in r["message"].lower()]
+    assert len(ingress) == 1, [r["message"] for r in ingress]
+    assert ingress[0]["status"] == "ok", "an absent ingress controller is not a fault"
+    assert ingress[0]["check"] == "kubernetes-ingress"
+    assert "port-forward" in ingress[0]["message"], \
+        "and it says why its absence does not matter"
+    # Nothing anywhere in the report escalates over it.
+    assert not any(r["status"] in ("warn", "fail") and "ingress" in r["message"].lower()
+                   for r in rows)
 
 
 def test_rc_repro_never_rewrites_the_users_kubeconfig(monkeypatch, tmp_path):
@@ -2655,55 +2764,74 @@ def test_a_kubernetes_workspace_is_not_charged_as_a_compose_one(monkeypatch, tmp
     assert lc._kube_overhead_mb(mono) == lc.CLUSTER_MB + lc.KUBE_CHART_MB
 
 
-def test_the_control_plane_is_charged_once_not_per_workspace(monkeypatch, tmp_path):
-    """It is shared. Billing it to the second and third workspace would refuse
-    creates the host could hold -- and a capacity check that is wrong in the safe
-    direction still stops people using the tool, which is how they learn to pass
-    --force by reflex."""
-    from rc_repro.services import k8s, topology
+def test_the_control_plane_is_charged_only_when_one_is_about_to_be_built(monkeypatch, tmp_path):
+    """It is shared, so billing it to the second and third workspace would refuse creates
+    the host could hold -- and a capacity check that is wrong in the safe direction still
+    stops people using the tool, which is how they learn to pass --force by reflex.
+
+    The charge now turns on whether this create will BUILD a control plane, which is the
+    only case where its memory is new.
+    """
+    from rc_repro.services import topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     req = lc.CreateReq(version="8.6.1", runtime="k8s", deployment=topology.MONOLITH)
 
-    monkeypatch.setattr(k8s, "preflight",
-                        lambda *a, **k: k8s.Preflight(cluster_exists=False))
-    assert lc._kube_overhead_mb(req) == lc.CLUSTER_MB + lc.KUBE_CHART_MB, "first one pays"
-
-    monkeypatch.setattr(k8s, "preflight",
-                        lambda *a, **k: k8s.Preflight(cluster_exists=True))
-    assert lc._kube_overhead_mb(req) == lc.KUBE_CHART_MB, \
+    assert lc._kube_overhead_mb(req, provisioning=True) == lc.CLUSTER_MB + lc.KUBE_CHART_MB, \
+        "the create that builds the cluster pays for it"
+    assert lc._kube_overhead_mb(req, provisioning=False) == lc.KUBE_CHART_MB, \
         "the rest share the cluster but still pay for their own chart"
 
 
-def test_somebody_elses_reachable_cluster_does_not_pay_for_ours(monkeypatch, tmp_path):
-    """The charge is on OUR cluster existing, not on "a cluster is reachable".
+def test_a_cluster_that_is_already_running_is_not_charged_for(monkeypatch, tmp_path):
+    """INVERTED, deliberately, and the old reasoning is worth recording.
 
-    Keyed on `cluster_reachable` it billed zero on this box -- whose only cluster
-    belongs to someone else -- because rc-repro would still have to create its own
-    alongside it, and the 573 MiB would be spent after the check said there was room.
+    This charge used to be keyed on whether rc-repro's OWN kind cluster existed, on the
+    argument that "somebody else's cluster being up does not mean the control plane is
+    already paid for" -- true while rc-repro always created its own alongside, and wrong
+    the moment it can use one that is already running, where the 600 MB is spent whatever
+    this create does. Charging it anyway refuses creates the box can hold, on a box whose
+    only cluster is the one about to be adopted.
     """
     from rc_repro.services import k8s, topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    req = lc.CreateReq(version="8.6.1", runtime="k8s", deployment=topology.MONOLITH)
-    monkeypatch.setattr(k8s, "preflight", lambda *a, **k: k8s.Preflight(
-        cluster_exists=False, cluster_reachable=True,      # theirs is up
-        context="kind-somebody-else", provider=k8s.PROVIDER_EXTERNAL))
-    assert lc._kube_overhead_mb(req) == lc.CLUSTER_MB + lc.KUBE_CHART_MB, \
-        "another cluster being up does not pay for the one we still have to create"
+    req = lc.CreateReq(version="8.6.1", runtime="kubernetes", deployment=topology.MONOLITH)
+    # A k3s cluster that is up: nothing to build, so nothing to charge.
+    monkeypatch.setattr(k8s, "plan_cluster", lambda: k8s.ClusterPlan(
+        context="default", distribution="k3s", create=False))
+    assert lc._will_provision(req) is False
+    assert lc._kube_overhead_mb(req, lc._will_provision(req)) == lc.KUBE_CHART_MB
+
+    # And with kind and no cluster yet, the control plane is real and is charged.
+    monkeypatch.setattr(k8s, "plan_cluster", lambda: k8s.ClusterPlan(
+        context=k8s.CONTEXT, distribution="kind", create=True))
+    assert lc._will_provision(req) is True
+    assert lc._kube_overhead_mb(req, lc._will_provision(req)) == \
+        lc.CLUSTER_MB + lc.KUBE_CHART_MB
 
 
-def test_an_unprobeable_cluster_is_charged_for_rather_than_assumed_free(monkeypatch, tmp_path):
-    """If the cluster cannot be probed, the safe assumption is that it is not there.
-    Assuming it exists would let the create through and spend the memory anyway."""
-    from rc_repro.services import k8s
+def test_no_cluster_and_no_kind_charges_nothing_because_the_create_refuses(monkeypatch, tmp_path):
+    """The old rule was "an unprobeable cluster is charged for", on the reasoning that
+    assuming it exists would let the create through and spend the memory anyway.
+
+    There is nothing to be safe about any more: the only thing `plan_cluster` raises for
+    is having no cluster AND no way to make one, and that create is refused before a byte
+    is written. Charging for a control plane that will never be built would refuse for
+    memory a create was never going to spend.
+    """
+    from rc_repro.services import k8s, topology
+    from rc_repro.errors import PreflightError
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    def boom(*_a, **_k):
-        raise OSError("kubectl exploded")
-    monkeypatch.setattr(k8s, "preflight", boom)
-    req = lc.CreateReq(version="8.6.1", runtime="k8s")
-    assert lc._kube_overhead_mb(req) >= lc.CLUSTER_MB
+    def refuse():
+        raise PreflightError("kind is not installed, ...")
+    monkeypatch.setattr(k8s, "plan_cluster", refuse)
+    # MONOLITH explicitly: an empty deployment means "that runtime's default", which for
+    # Kubernetes is microservices and carries its own 800 MB.
+    req = lc.CreateReq(version="8.6.1", runtime="k8s", deployment=topology.MONOLITH)
+    assert lc._will_provision(req) is False
+    assert lc._kube_overhead_mb(req, lc._will_provision(req)) == lc.KUBE_CHART_MB
 
 
 def test_the_kubernetes_overhead_actually_reaches_the_refusal(monkeypatch, tmp_path):
@@ -2715,8 +2843,11 @@ def test_the_kubernetes_overhead_actually_reaches_the_refusal(monkeypatch, tmp_p
     from rc_repro.services import k8s
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
-    monkeypatch.setattr(k8s, "preflight",
-                        lambda *a, **k: k8s.Preflight(cluster_exists=False))
+    # A kind box with no cluster yet, so the control plane is part of the bill. STATED
+    # rather than probed: `check_capacity` now asks which cluster it would use, and a
+    # unit test must not depend on whether one happens to be running on the machine.
+    monkeypatch.setattr(k8s, "plan_cluster", lambda: k8s.ClusterPlan(
+        context=k8s.CONTEXT, distribution="kind", create=True))
     # A host with room for exactly one Compose workspace and no more.
     need_k8s = (lc.WORKSPACE_MB + lc.CLUSTER_MB + lc.KUBE_CHART_MB
                 + lc.MICROSERVICES_MB)
@@ -4266,6 +4397,9 @@ def test_detaching_monitoring_leaves_it_up_for_the_workspaces_still_using_it(
                         lambda ctx: ["rc-repro-a", "rc-repro-b"])
     monkeypatch.setattr(k8s, "monitoring_wanted",
                         lambda ns, *, context: ns == "rc-repro-b")
+    # The stack IS installed here: "who else wants it" is only a question once
+    # something exists to keep, and `remove_monitoring` now returns early otherwise.
+    monkeypatch.setattr(k8s, "release_installed", lambda *a, **k: True)
     calls = []
 
     def fake_run(argv, **kw):
@@ -4377,11 +4511,35 @@ def test_the_notes_say_the_operator_is_shared_when_it_is_used():
     guide's `kubectl -n <ns> get pods` finds no operator and concludes it was never
     installed.
     """
-    import inspect
+    # Asserted against the groups a real record produces rather than against the
+    # source of the function that builds them: the notes are derived on every read
+    # now, so the record is the input and the rendered groups are the output, and
+    # only the second of those is what anybody sees.
+    def groups_for(managed_by):
+        m = lc.runner.Metadata(
+            name="k", project="rc-repro-k", rc_version="8.5.1", rc_image="i",
+            mongo_tag="8.0", mongo_flavor="official", preset="default",
+            root_url="http://localhost:3000", host_port=3000, version_source="map",
+            extra={"runtime": "kubernetes", "deployment": "microservices",
+                   "namespace": "rc-repro-k", "context": "kind-rc-repro-local",
+                   "release": "rocketchat", "mongo_managed_by": managed_by,
+                   "mongo_image": "mongo:8.0"})
+        return {g["title"]: g for g in lc.note_groups_of(m)}
 
-    src = inspect.getsource(lc._create_kubernetes)
-    assert "SHARED" in src and "official guide" in src
-    assert "monitoring is shared the same way" in src
+    op = groups_for("operator")
+    shared = op["The MongoDB operator is shared"]
+    assert "official guide" in " ".join(shared["body"])
+    # And it says where to look, not just that it is elsewhere.
+    assert any("get mongodbcommunity" in c for c in shared["commands"])
+    assert ("Managed by", "the official operator") in [tuple(r) for r in op["MongoDB"]["rows"]]
+    # Monitoring deviates the same way and for the same reason, on both paths.
+    assert "shared by the cluster, not installed per" in " ".join(op["Monitoring"]["body"])
+    # A plain StatefulSet has no operator to explain, and says so where the guide
+    # would have led someone to expect authentication.
+    sts = groups_for("statefulset")
+    assert "The MongoDB operator is shared" not in sts
+    assert ("Authentication", "none") in [tuple(r) for r in sts["MongoDB"]["rows"]]
+    assert "official guide" in " ".join(sts["MongoDB"]["body"])
 
 
 def test_the_oplog_user_can_actually_read_the_oplog(monkeypatch):
@@ -5227,6 +5385,9 @@ def test_a_kubernetes_create_is_refused_when_the_ENGINE_is_too_small(monkeypatch
     Podman, and the capacity check only ever asked the host. A laptop with 32 GB and
     a 4 GB VM passed everything and then could not run a Kubernetes workspace -- the
     failure arriving minutes later as pods stuck Pending, which names nothing."""
+    from rc_repro.services import k8s
+    monkeypatch.setattr(k8s, "plan_cluster", lambda: k8s.ClusterPlan(
+        context=k8s.CONTEXT, distribution="kind", create=True))
     monkeypatch.setattr(lc.runner, "docker_capacity", lambda: (2.0, 3 * 1024 ** 3))
     with pytest.raises(errors.PreflightError) as caught:
         lc.check_capacity(lc.CreateReq(version="8.5.1", runtime="kubernetes"))
@@ -5249,6 +5410,9 @@ def test_an_unreadable_engine_is_not_evidence_of_a_small_one(monkeypatch):
 
 def test_force_downgrades_the_engine_floor_to_a_warning(monkeypatch):
     events = []
+    from rc_repro.services import k8s
+    monkeypatch.setattr(k8s, "plan_cluster", lambda: k8s.ClusterPlan(
+        context=k8s.CONTEXT, distribution="kind", create=True))
     monkeypatch.setattr(lc.runner, "docker_capacity", lambda: (1.0, 1 * 1024 ** 3))
     monkeypatch.setattr(lc.runner, "host_memory", lambda: (16000, 12000, 0))
     lc.check_capacity(lc.CreateReq(version="8.5.1", runtime="kubernetes", force=True),
@@ -5297,3 +5461,656 @@ def test_no_copy_anywhere_is_not_current(tmp_path, monkeypatch):
     monkeypatch.chdir(empty)
     st = skill.state()
     assert st["current"] is False, "nothing installed is not the same as up to date"
+
+
+def test_the_flat_notes_are_derived_from_the_groups_not_maintained_beside_them():
+    """A workspace's notes now exist in two renderings -- grouped cards in the GUI,
+    a flat list of lines in the terminal and in every record written before groups
+    existed. Two hand-written copies is how the two come to disagree, so the groups
+    are the source and the flat list is computed from them.
+
+    What the flattening has to preserve is the notes pattern the panel already
+    parses: an INDENTED line is a copyable box, a line naming a place is a link row,
+    anything else is prose. So a group's rows come out as an aligned indented block
+    (a table where it is read as text), its commands come out indented (a code box),
+    and its prose comes out flush (prose).
+    """
+    g = lc.note_group("Kubernetes", rows=[("Cluster", "kind-x"), ("Namespace", "rc-y")])
+    assert g == {"title": "Kubernetes", "kind": "", "body": [], "commands": [],
+                 "rows": [["Cluster", "kind-x"], ["Namespace", "rc-y"]]}
+
+    lines = lc.flatten_notes([
+        g,
+        lc.note_group("Port forward", body=["It dies with the pod. Start it again:"],
+                      commands=["kubectl -n rc-y port-forward deployment/rc 3001:3000"]),
+    ])
+    assert lines == [
+        "Kubernetes:",
+        "    Cluster    kind-x",      # padded to the widest key, so the column lines up
+        "    Namespace  rc-y",
+        "Port forward:",
+        "It dies with the pod. Start it again:",
+        "    kubectl -n rc-y port-forward deployment/rc 3001:3000",
+    ], lines
+    # The two shapes that matter to the parser, stated as such: indentation is what
+    # makes a line copyable, and prose must not be indented or it becomes a command.
+    assert lines[1].startswith("    ") and lines[-1].startswith("    ")
+    assert not lines[4].startswith(" ")
+
+
+def test_an_empty_group_contributes_no_stray_heading():
+    """A group is built unconditionally and filled conditionally -- the operator note
+    only exists on one MongoDB path -- so an empty one must vanish rather than leave a
+    bare `Monitoring:` above nothing."""
+    assert lc.flatten_notes([lc.note_group("Monitoring")]) == ["Monitoring:"]
+    assert lc.flatten_notes([]) == []
+    assert lc.flatten_notes([lc.note_group("", body=["a bare line"])]) == ["a bare line"]
+
+
+def _k8s_meta(**extra):
+    """A Kubernetes workspace record, as `repro.json` holds one."""
+    base = {"runtime": "kubernetes", "deployment": "microservices",
+            "namespace": "rc-repro-old", "context": "kind-rc-repro-local",
+            "release": "rocketchat", "bind_host": "127.0.0.1",
+            "mongo_managed_by": "statefulset", "mongo_image": "mongo:8.0"}
+    base.update(extra)
+    return lc.runner.Metadata(
+        name="old", project="rc-repro-old", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="default",
+        root_url="http://localhost:3000", host_port=3000, version_source="map",
+        extra=base)
+
+
+def test_a_workspace_made_before_groups_existed_still_renders_as_groups():
+    """The grouped notes were built at create time and written into `repro.json`, so
+    they only ever reached workspaces created after the release that added them. Every
+    existing workspace kept the flat eleven-bullet dump in `info` and in the GUI panel
+    for life, and the only way to see the new shape was to destroy the workspace and
+    build another -- which for a repro of a customer's issue is the one thing you
+    cannot do.
+
+    Notes are a pure function of the record (namespace, context, release, bind host,
+    preset), so they are derived on every read. This record is exactly what an older
+    release wrote: a flat list and no groups at all.
+    """
+    m = _k8s_meta()
+    m.extra["notes"] = [
+        "microservices on kind-rc-repro-local - about 9 pods, namespace rc-repro-old",
+        "reachable on this box at http://localhost:3000",
+    ]
+    s = lc._summary(m)
+    titles = [g["title"] for g in s["note_groups"]]
+    assert titles[:2] == ["Kubernetes", "MongoDB"]
+    # The three steps read in the order somebody has to perform them.
+    assert titles[2:5] == ["1 · Point kubectl and helm at this cluster",
+                           "2 · Open the way in",
+                           "3 · Look at what is inside"], titles
+    # The facts that were welded into a sentence are rows now, for this record too.
+    rows = dict((k, v) for k, v in s["note_groups"][0]["rows"])
+    assert rows == {"Cluster": "kind-rc-repro-local", "Namespace": "rc-repro-old",
+                    "Arrangement": "microservices", "Pods": "about 9"}
+    # And the flat list the CLI prints is the derived one, not the sentence above.
+    assert s["notes"] == lc.flatten_notes(s["note_groups"])
+    assert not any("about 9 pods, namespace" in n for n in s["notes"])
+
+
+def test_the_url_is_not_repeated_as_a_note_when_the_bind_is_loopback():
+    """"reachable on this box at http://localhost:3000" was the fourth copy of that
+    string on one screen -- the summary panel prints it, the panel's identity line
+    carries it, the links table lists it -- and the browser had to de-duplicate the
+    note against the link row to stop it appearing twice.
+
+    What is not said anywhere else is what a NON-loopback bind means, and that is the
+    only case the group appears in.
+    """
+    quiet = [g["title"] for g in lc.note_groups_of(_k8s_meta())]
+    assert "Reachable from other machines" not in quiet
+    assert not any("reachable on this box" in n
+                   for n in lc.flatten_notes(lc.note_groups_of(_k8s_meta())))
+
+    public = lc.note_groups_of(_k8s_meta(bind_host="0.0.0.0"))
+    warned = {g["title"]: g for g in public}["Reachable from other machines"]
+    assert "0.0.0.0" in " ".join(warned["body"])
+    assert "admin123" in " ".join(warned["body"])          # what it exposes
+    # The port-forward has to come back the same way it was published, or the
+    # workspace is unreachable from the machines the note just warned about.
+    forward = {g["title"]: g for g in public}["2 · Open the way in"]
+    assert "--address 0.0.0.0" in forward["commands"][0]
+
+
+def test_a_compose_workspaces_add_ons_are_groups_too():
+    """The edge lines and the monitoring block were appended to one flat list, so a
+    monitored workspace behind HTTPS had five unrelated bullets in a row. Same words,
+    three sections -- and derived, so an older record gets them as well.
+    """
+    m = lc.runner.Metadata(
+        name="c", project="rcrepro-c", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="default",
+        root_url="http://localhost:3000", host_port=3000, version_source="map",
+        public_url="https://c.example.test",
+        extra={"edge": True, "tls": "local", "monitoring": True})
+    groups = {g["title"]: g for g in lc.note_groups_of(m)}
+    assert list(groups) == ["HTTPS", "Monitoring"]
+    assert "https://c.example.test" in " ".join(groups["HTTPS"]["body"])
+    assert any("Grafana" in n for n in groups["Monitoring"]["body"])
+    # A plain workspace has nothing to add and gets no empty sections.
+    m.extra = {}
+    m.public_url = ""
+    assert lc.note_groups_of(m) == []
+
+
+def test_a_command_in_the_notes_is_never_wrapped_where_it_would_be_pasted(capsys):
+    """`_print_notes` wrapped every line to the box it drew, commands included. A
+    port-forward came out as `... port-forward deployment/rocketchat-` on one line and
+    `  rocketchat 3000:3000` on the next, so the one thing anyone does with that line
+    -- select it and paste it -- produced a broken command. The box is gone and an
+    indented line overflows the width instead.
+
+    Driven from a RECORDED flat note, which is both what an older workspace holds and
+    the shape the derived groups render commands in.
+    """
+    from rc_repro import cli
+
+    forward = ("kubectl -n rc-repro-a-fairly-long-workspace-name port-forward "
+               "deployment/rocketchat-rocketchat 3000:3000")
+    assert len(forward) > 88          # wider than anything `_print_notes` renders
+    m = lc.runner.Metadata(
+        name="c", project="rcrepro-c", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="default",
+        root_url="http://localhost:3000", host_port=3000, version_source="map",
+        extra={"notes": ["bring the forward back with:", "    " + forward,
+                         "`stats` needs metrics-server in the cluster " * 3]})
+    cli._print_notes(m)
+    out = capsys.readouterr().out.split("\n")
+    assert [ln for ln in out if forward in ln], "the command has to survive as one line"
+    assert not any(ln.rstrip().endswith("rocketchat-") for ln in out)
+    # Prose is still wrapped, and a hyphenated word is not broken across the wrap.
+    assert not any(ln.rstrip().endswith("metrics-") for ln in out)
+    prose = [ln for ln in out if ln[:5] == "    " + ln[4:5].strip()]
+    assert prose and max(len(ln) for ln in prose) <= 88
+
+
+def test_the_terminal_prints_the_same_sections_the_panel_draws(capsys):
+    """One definition, two renderings. The CLI used to print a flat list inside a box
+    while the browser drew cards, and the two could only be compared by eye.
+    """
+    from rc_repro import cli
+
+    m = _k8s_meta()
+    cli._print_notes(m)
+    out = capsys.readouterr().out
+    for group in lc.note_groups_of(m):
+        # `_ascii` first: the terminal renderer replaces the middle dot in a step
+        # heading, because a box-drawing or typographic glyph is not width-1 everywhere.
+        title = cli._ascii(group["title"])
+        assert any(ln.strip() == title for ln in out.split("\n")), title
+        for k, v in group["rows"]:
+            assert any(k in ln and str(v) in ln for ln in out.split("\n")), k
+        for c in group["commands"]:
+            assert c in out
+
+
+def _kube_probe_stubs(monkeypatch, *, kind: bool, our_cluster: bool, active: str,
+                      reachable: bool = True):
+    """The four facts `plan_cluster` reads, stated instead of probed."""
+    from rc_repro.services import k8s
+    monkeypatch.setattr(k8s, "which", lambda t: "/usr/bin/kind" if (t == "kind" and kind) else "")
+    monkeypatch.setattr(k8s, "clusters",
+                        lambda: ([k8s.CLUSTER_NAME] if our_cluster else [], ""))
+    monkeypatch.setattr(k8s, "cluster_context",
+                        lambda: k8s.CONTEXT if our_cluster else "")
+    monkeypatch.setattr(k8s, "active_context", lambda: active)
+    monkeypatch.setattr(k8s, "reachable", lambda ctx=None: reachable)
+    monkeypatch.setattr(k8s, "distribution", lambda ctx: "k3s")
+
+
+def test_the_only_difference_between_kind_and_k3s_is_whether_a_cluster_is_built(monkeypatch):
+    """`up --runtime kubernetes` could only ever use a cluster rc-repro built itself:
+    `create_workspace` opened with `ensure_cluster()`, which refuses when `kind` is
+    absent. So on a box running k3s -- an ordinary way to have Kubernetes -- `doctor`
+    said "Using your cluster 'default'" and `up` refused to use it, two commands in one
+    tool contradicting each other.
+
+    Provisioning is the ONE step that differs. Everything after it already took
+    `context=`, which is why adopting a cluster is a resolver and not a runtime.
+    """
+    from rc_repro.errors import PreflightError
+    from rc_repro.services import k8s
+
+    # kind, with its cluster already up: ours, and nothing to build. Today's behaviour.
+    _kube_probe_stubs(monkeypatch, kind=True, our_cluster=True, active="default")
+    plan = k8s.plan_cluster()
+    assert (plan.context, plan.distribution, plan.create) == (k8s.CONTEXT, "kind", False)
+
+    # kind, no cluster yet: build ours. Today's behaviour, and the k3s box is IGNORED --
+    # "no change to kind" is the stronger promise, so an existing cluster elsewhere never
+    # takes the choice away from a box that can make its own.
+    _kube_probe_stubs(monkeypatch, kind=True, our_cluster=False, active="default")
+    plan = k8s.plan_cluster()
+    assert (plan.context, plan.distribution, plan.create) == (k8s.CONTEXT, "kind", True)
+
+    # No kind: skip provisioning and use what kubectl points at.
+    _kube_probe_stubs(monkeypatch, kind=False, our_cluster=False, active="default")
+    plan = k8s.plan_cluster()
+    assert (plan.context, plan.distribution, plan.create) == ("default", "k3s", False)
+
+    # No kind and nothing reachable: refuse, and the message is now true.
+    _kube_probe_stubs(monkeypatch, kind=False, our_cluster=False, active="")
+    try:
+        k8s.plan_cluster()
+    except PreflightError as exc:
+        assert "not pointed at one either" in str(exc), str(exc)
+    else:
+        raise AssertionError("a box with no cluster and no kind must be refused")
+
+
+def test_a_cluster_rc_repro_made_is_found_by_asking_it_not_by_asking_kind(monkeypatch):
+    """`cluster_exists` was `CLUSTER_NAME in clusters()`, and that probe needs the kind
+    BINARY. So uninstalling kind while its cluster was still running made the cluster
+    invisible -- node containers holding memory that nothing in rc-repro could see or
+    remove, and resolution quietly falling through to a different cluster.
+    """
+    from rc_repro.services import k8s
+
+    # kind gone, but our kubeconfig still names a cluster that answers.
+    _kube_probe_stubs(monkeypatch, kind=False, our_cluster=True, active="default")
+    plan = k8s.plan_cluster()
+    assert plan.context == k8s.CONTEXT, "our own cluster is still the one to use"
+    assert plan.create is False
+
+
+def test_the_distribution_is_read_from_the_node_not_guessed_from_a_name(monkeypatch):
+    """A label for messages, never a branch: `k3s --disable traefik` is a real setup, so
+    what a cluster CAN do is probed and what it IS is only named. Signals are the ones
+    verified against live clusters.
+    """
+    import subprocess as sp
+
+    from rc_repro.services import k8s
+
+    def answer(text):
+        return lambda argv, timeout=None, own=False: sp.CompletedProcess(argv, 0, text, "")
+
+    monkeypatch.setattr(k8s, "run", answer("k3s://docker-01 v1.36.3+k3s1 k3s docker-01"))
+    assert k8s.distribution("default") == "k3s"
+    monkeypatch.setattr(k8s, "run", answer(
+        "kind://docker/rc-repro-local/rc-repro-local-control-plane v1.36.1  x"))
+    assert k8s.distribution("kind-rc-repro-local") == "kind"
+    monkeypatch.setattr(k8s, "run", answer("aws:///eu-west-1a/i-0abc v1.31.0-eks-1234 m5"))
+    assert k8s.distribution("arn:aws:eks:x") == "eks", \
+        "a cloud providerID is the most reliable 'not a disposable cluster' signal"
+    monkeypatch.setattr(k8s, "run", answer(" v1.29.0  somenode"))
+    assert k8s.distribution("x") == "unknown", "unknown is a fine answer"
+    monkeypatch.setattr(k8s, "run",
+                        lambda argv, timeout=None, own=False: sp.CompletedProcess(argv, 1, "", "no"))
+    assert k8s.distribution("x") == "unknown", "an unreachable cluster is not a failure here"
+
+
+def test_a_create_refused_for_want_of_a_cluster_leaves_no_record(monkeypatch, tmp_path):
+    """Measured on a box with k3s and no kind: the refusal left an `incomplete`
+    repro.json, `list` showed it as a workspace, and `used_ports()` went on reserving its
+    port -- so a create that could never have succeeded held :3142 until somebody ran
+    `down --volumes`.
+
+    The write-ahead record is not the problem and must not be weakened: it exists because
+    an interrupted create once left a workspace running and unrecorded. The order was.
+    Choosing the cluster only probes, so it belongs above the write.
+    """
+    from rc_repro.errors import PreflightError
+
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "check_capacity", lambda *a, **k: None)
+    # Only functions that predate this change, so the test drives the OLD code too: no
+    # kind and nothing for kubectl to point at is the box that gets refused.
+    monkeypatch.setattr(k8s, "which", lambda _t: "")
+    monkeypatch.setattr(k8s, "cluster_context", lambda: "")
+    monkeypatch.setattr(k8s, "active_context", lambda: "")
+    req = lc.CreateReq(version="8.5.1", runtime="kubernetes", name="ghost", offline=True)
+    try:
+        lc._create_kubernetes(req)
+    except PreflightError:
+        pass
+    else:
+        raise AssertionError("it must refuse")
+    assert not (tmp_path / "repros" / "ghost").exists(), \
+        "a refusal wrote a record for a workspace that was never created"
+    assert lc.runner.used_ports() == set(), "and it reserved that workspace's port"
+
+
+def test_doctor_reports_what_a_cluster_provides_the_same_way_on_every_distribution(
+        monkeypatch, tmp_path):
+    """The difference between kind and k3s is three capabilities -- ingress, load
+    balancer, metrics -- and nothing in the report said so. A reader on a context called
+    `default` was not even told it was k3s, and found out that `stats` works there by
+    running it.
+
+    All three are `ok` rows on purpose. A capability is a FACT; severity belongs to
+    whatever needs it, and an absent ingress controller cannot affect a workspace reached
+    by port-forward -- `ingress_blocker` is what refuses when something asks for a
+    hostname. A doctor that warns about a feature you are not using teaches people to
+    ignore its warnings.
+    """
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    def report_for(pre):
+        monkeypatch.setattr(k8s, "preflight", lambda *a, **k: pre)
+        monkeypatch.setattr(k8s, "which", lambda t: "/usr/bin/" + t)
+        rows = doctor.run_checks()["checks"]
+        return {r["check"]: r for r in rows if r["check"].startswith("kubernetes")}
+
+    tools = {n: k8s.Tool(name=n, path="/usr/bin/" + n, version=(9, 9))
+             for n in ("kubectl", "helm", "kind")}
+    k3s = report_for(k8s.Preflight(
+        tools=tools, cluster_reachable=True, context="default",
+        provider=k8s.PROVIDER_EXTERNAL, distribution="k3s", node_count=1,
+        architectures=["amd64"], default_storage_class="local-path",
+        ingress_classes=["traefik"], metrics=True,
+        loadbalancer="traefik has 172.16.0.2"))
+    assert "k3s, 1 node, amd64" in k3s["kubernetes-cluster"]["message"]
+    assert "traefik" in k3s["kubernetes-ingress"]["message"]
+    assert "172.16.0.2" in k3s["kubernetes-loadbalancer"]["message"]
+    assert "`rc-repro stats` works here" in k3s["kubernetes-metrics"]["message"]
+    assert all(k3s[c]["status"] == "ok" for c in
+               ("kubernetes-ingress", "kubernetes-loadbalancer", "kubernetes-metrics"))
+
+    kind = report_for(k8s.Preflight(
+        tools=tools, cluster_reachable=True, cluster_exists=True, context=k8s.CONTEXT,
+        provider=k8s.PROVIDER_KIND, distribution="kind", node_count=1,
+        architectures=["amd64"], default_storage_class="standard"))
+    assert "kind, 1 node, amd64" in kind["kubernetes-cluster"]["message"]
+    # The same three subjects, answered the other way and still not a warning.
+    assert "none installed" in kind["kubernetes-ingress"]["message"]
+    assert "not confirmed" in kind["kubernetes-loadbalancer"]["message"]
+    assert "refuses" in kind["kubernetes-metrics"]["message"]
+    assert all(kind[c]["status"] == "ok" for c in
+               ("kubernetes-ingress", "kubernetes-loadbalancer", "kubernetes-metrics"))
+    # Storage is reported when it is THERE too, not only when it is missing.
+    assert "standard (default)" in kind["kubernetes-storage"]["message"]
+
+
+def test_the_mongodb_operator_goes_with_the_last_workspace_but_not_before(monkeypatch):
+    """`--volumes` means delete everything, and an operator left running afterwards is
+    the wrong answer -- but three things about it are shared, and the ORDER is what makes
+    removing it safe rather than destructive.
+
+    The reference count is not bureaucracy: with a second workspace still holding a
+    `MongoDBCommunity`, removing the operator leaves its finalizer with nothing to clear
+    it, so a later `down --volumes` on THAT workspace hangs in Terminating forever. It is
+    the identical failure `remove_monitoring` recorded for a GrafanaFolder.
+    """
+    import subprocess as sp
+
+    from rc_repro.services import k8s
+
+    calls = []
+
+    def fake(mongodbs, installed=True, rc=0):
+        def run(argv, timeout=None, own=False):
+            calls.append(" ".join(argv))
+            j = " ".join(argv)
+            if "helm list" in j:
+                return sp.CompletedProcess(argv, 0,
+                                           k8s.OPERATOR_RELEASE if installed else "", "")
+            if "get mongodbcommunity" in j:
+                return sp.CompletedProcess(argv, 0, "\n".join(mongodbs), "")
+            return sp.CompletedProcess(argv, rc, "", "boom" if rc else "")
+        return run
+
+    # Nothing left that needs it: the operator goes.
+    calls.clear()
+    monkeypatch.setattr(k8s, "run", fake([]))
+    assert k8s.remove_operator(context="default") is True
+    assert any("helm uninstall " + k8s.OPERATOR_RELEASE in c for c in calls), calls
+    # The CRD is never touched: deleting it would delete every MongoDBCommunity in the
+    # cluster, i.e. every other workspace's database.
+    assert not any("delete crd" in c for c in calls), calls
+    # Nor the namespace, which is shared with the monitoring stack.
+    assert not any("delete namespace" in c for c in calls), calls
+
+    # Another workspace still has one: left alone, and it says whose.
+    calls.clear()
+    events = []
+    monkeypatch.setattr(k8s, "run", fake(["rc-repro-other"]))
+    assert k8s.remove_operator(context="default", emit=events.append) is False
+    assert not any("helm uninstall" in c for c in calls), calls
+    assert any("still used by other" in e.message for e in events), \
+        [e.message for e in events]
+
+    # A cluster that never had it is not an error and says nothing.
+    calls.clear()
+    monkeypatch.setattr(k8s, "run", fake([], installed=False))
+    assert k8s.remove_operator(context="default") is False
+    assert not any("helm uninstall" in c for c in calls), calls
+
+
+def test_removing_the_operator_never_fails_a_teardown(monkeypatch):
+    """The workspace is already gone by the time this runs, and the next
+    `--mongo-operator` is an `upgrade --install` that repairs it. A teardown that reports
+    failure for wreckage it cannot help would leave a user believing their workspace is
+    still there."""
+    import subprocess as sp
+
+    from rc_repro.services import k8s
+
+    def run(argv, timeout=None, own=False):
+        j = " ".join(argv)
+        if "helm list" in j:
+            return sp.CompletedProcess(argv, 0, k8s.OPERATOR_RELEASE, "")
+        if "get mongodbcommunity" in j:
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "uninstall exploded")
+
+    monkeypatch.setattr(k8s, "run", run)
+    events = []
+    assert k8s.remove_operator(context="default", emit=events.append) is False
+    assert any("could not be uninstalled" in e.message for e in events)
+
+
+def test_down_volumes_takes_the_monitoring_stack_with_it(monkeypatch, tmp_path):
+    """Reported from a live k3s box: after `down --volumes` the monitoring stack was
+    still running -- ten pods and ~840 MB, wanted by nobody, because the workspace that
+    asked for it had been destroyed.
+
+    `remove_monitoring` could always do this. It was only ever called by `monitor --off`,
+    so the teardown walked past the most expensive thing rc-repro installs. On Compose
+    there was nothing to fix: the stack is part of the workspace's own compose project
+    and goes down with it.
+    """
+    import json as _json
+
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    (tmp_path / "repros" / "mon").mkdir(parents=True)
+    (tmp_path / "repros" / "mon" / "repro.json").write_text(_json.dumps({
+        "name": "mon", "project": "p", "rc_version": "8.5.1", "rc_image": "i",
+        "mongo_tag": "8.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3001", "host_port": 3001, "version_source": "x",
+        "extra": {"runtime": "kubernetes", "namespace": "rc-repro-mon",
+                  "context": "default", "monitoring": True,
+                  "grafana_pid": 4242}}))
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    monkeypatch.setattr(k8s, "delete_namespace", lambda *a, **k: True)
+    called = {}
+    monkeypatch.setattr(k8s, "remove_operator",
+                        lambda **kw: called.setdefault("operator", kw) is None)
+    monkeypatch.setattr(k8s, "remove_monitoring",
+                        lambda **kw: called.setdefault("monitoring", kw) is None)
+
+    stopped = []
+    monkeypatch.setattr(lc, "_stop_port_forward", stopped.append)
+    lc.teardown("mon", volumes=True, confirm=True)
+    assert "monitoring" in called, "the monitoring stack was left running"
+    # And the Grafana forward, which targets a deployment in `rc-repro-system` and so
+    # SURVIVES the workspace: it went on holding :5050 after the workspace was destroyed,
+    # and the next `up --monitor` was refused for a port held by a corpse.
+    assert 4242 in stopped, "the Grafana port-forward was left holding its host port"
+    # The namespace being destroyed must not be counted as still wanting it: the count
+    # reads a label on the namespace, and a namespace still Terminating is still listed
+    # and still labelled.
+    assert called["monitoring"]["excluding"] == "rc-repro-mon"
+    assert called["operator"]["excluding"] == "rc-repro-mon"
+
+    # A plain `down` keeps the namespace and the data, so the workspace can come back and
+    # the stack it wants must stay with it.
+    called.clear()
+    (tmp_path / "repros" / "mon").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repros" / "mon" / "repro.json").write_text(_json.dumps({
+        "name": "mon", "project": "p", "rc_version": "8.5.1", "rc_image": "i",
+        "mongo_tag": "8.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3001", "host_port": 3001, "version_source": "x",
+        "extra": {"runtime": "kubernetes", "namespace": "rc-repro-mon",
+                  "context": "default", "monitoring": True}}))
+    stopped.clear()
+    lc.teardown("mon", volumes=False, confirm=True)
+    assert called == {}, "a plain `down` must leave both alone — the workspace comes back"
+    assert 4242 not in stopped, \
+        "and Grafana stays reachable for a workspace that is coming back"
+    assert topology.KUBERNETES  # the branch under test is the Kubernetes one
+
+
+def test_the_workspace_being_destroyed_does_not_vote_to_keep_the_stack(monkeypatch):
+    """The reference count reads a label on the workspace namespace, and
+    `workspace_namespaces` does not filter by phase -- a namespace still Terminating is
+    still listed and still labelled. Without excluding it, a teardown asking "does
+    anyone else still want this?" is answered yes by the workspace it is deleting.
+    """
+    import subprocess as sp
+
+    from rc_repro.services import k8s
+
+    def run(argv, timeout=None, own=False):
+        j = " ".join(argv)
+        if "helm list" in j:
+            return sp.CompletedProcess(argv, 0, k8s.MONITORING_RELEASE, "")
+        if "get namespace" in j and "-l" in j:
+            return sp.CompletedProcess(argv, 0, "namespace/rc-repro-going\n", "")
+        if "get namespace rc-repro-going" in j or "jsonpath" in j and "monitoring" in j:
+            return sp.CompletedProcess(argv, 0, "true", "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", run)
+    events = []
+    # Not excluded: the dying workspace keeps its own stack alive forever.
+    assert k8s.remove_monitoring(context="default", emit=events.append) is False
+    assert any("still used by going" in e.message for e in events)
+    # Excluded: nothing else wants it, so it goes.
+    events.clear()
+    assert k8s.remove_monitoring(context="default", excluding="rc-repro-going",
+                                 emit=events.append) is True
+
+
+def test_detaching_monitoring_that_was_never_attached_says_nothing_alarming(monkeypatch):
+    """Measured live: `monitor --off` on a workspace whose attach had failed ran the
+    uninstall anyway, helm answered "Release not loaded: monitoring: release: not found",
+    and the fallback announced that "the monitoring stack needed its finalizers cleared by
+    hand" -- a frightening sentence about wreckage that did not exist.
+
+    Nothing installed is nothing to report, which is also what `remove_operator` already
+    did; the two are symmetric now.
+    """
+    import subprocess as sp
+
+    from rc_repro.services import k8s
+
+    calls = []
+
+    def run(argv, timeout=None, own=False):
+        calls.append(" ".join(argv))
+        # `helm list -q` answers with no releases: nothing is installed here.
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(k8s, "run", run)
+    events = []
+    assert k8s.remove_monitoring(context="default", emit=events.append) is False
+    assert not any("uninstall" in c for c in calls), calls
+    assert not any("finalizer" in e.message for e in events), [e.message for e in events]
+
+
+def test_prune_gives_back_the_cluster_it_created(monkeypatch, tmp_path):
+    """Measured live: with every workspace gone, `prune` said "Nothing to prune" and left
+    rc-repro's own kind control plane running -- 514 MiB holding nothing. Both the README
+    and the agent skill said `prune` reclaims it; `delete_cluster` had exactly one caller,
+    a failed create's rollback, so the documented promise was never kept and the memory
+    the tool tells you to worry about was the memory it left behind.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "prunable", lambda: [])
+    monkeypatch.setattr(lc, "orphan_namespaces", lambda *a, **k: [])
+    deleted = []
+    monkeypatch.setattr(k8s, "delete_cluster",
+                        lambda **kw: deleted.append(kw) is None or True)
+
+    res = lc.prune(confirm=True)
+    assert res["cluster"] is True, "the cluster was left running with nothing in it"
+    assert deleted, "delete_cluster was never called"
+
+    # And after a prune that DID remove workspaces, the same offer applies.
+    deleted.clear()
+    monkeypatch.setattr(lc, "prunable", lambda: [])
+    res = lc.prune(confirm=True, orphans=False)
+    assert res["cluster"] is True
+
+
+def test_reclaiming_the_cluster_can_only_ever_reach_our_own(monkeypatch, tmp_path):
+    """The teardown asymmetry the runtime split is built on: what rc-repro created it may
+    destroy, what you supplied it only borrows a namespace in. `delete_cluster` takes no
+    parameter, needs the `kind` binary, and refuses while a workspace namespace remains --
+    so an adopted k3s cannot be reached from a prune at all. And a refusal is not a failed
+    prune: the workspaces are already gone, which is what was asked for.
+    """
+    from rc_repro.errors import ConflictError
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "prunable", lambda: [])
+    monkeypatch.setattr(lc, "orphan_namespaces", lambda *a, **k: [])
+
+    # No kind binary: there is nothing of ours to give back.
+    monkeypatch.setattr(k8s, "which", lambda _t: "")
+    assert k8s.cluster_reclaimable() is False
+
+    # A cluster that still holds a workspace refuses, and the prune still succeeds.
+    def refuse(**_kw):
+        raise ConflictError("cluster rc-repro-local still holds 1 workspace namespace(s)")
+    monkeypatch.setattr(k8s, "delete_cluster", refuse)
+    events = []
+    res = lc.prune(confirm=True, emit=events.append)
+    assert res["cluster"] is False
+    assert any("left alone" in e.message for e in events), [e.message for e in events]
+
+
+def test_an_existing_cluster_is_never_planned_as_one_to_create(monkeypatch):
+    """Caught by a live sweep, in the resolver itself.
+
+    An earlier version decided `create` from whether THIS HOME's kubeconfig named a
+    reachable context. A fresh RC_REPRO_HOME facing a cluster that already exists -- a
+    wiped state directory, a second user on the box, a kubeconfig cleared by a previous
+    `prune` -- therefore planned to create one. Two consequences, the second serious:
+    `check_capacity` charged 600 MB for a control plane already running, and the failed
+    create's rollback was told the cluster was its to delete, so a create that died would
+    have taken a cluster it did not make.
+
+    `create` follows the CLUSTER now. `ensure_cluster` already re-exports the kubeconfig
+    when it finds a cluster its config does not know about, which is why the context is
+    knowable before it has been read.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(k8s, "which", lambda t: "/usr/bin/kind" if t == "kind" else "")
+    monkeypatch.setattr(k8s, "cluster_context", lambda: "")       # this home knows nothing
+    monkeypatch.setattr(k8s, "reachable", lambda ctx=None: False)
+
+    monkeypatch.setattr(k8s, "clusters", lambda: ([k8s.CLUSTER_NAME], ""))
+    plan = k8s.plan_cluster()
+    assert plan.create is False, "an existing cluster must never be planned as a create"
+    assert plan.context == k8s.CONTEXT
+
+    monkeypatch.setattr(k8s, "clusters", lambda: ([], ""))
+    assert k8s.plan_cluster().create is True, "and a missing one still is"

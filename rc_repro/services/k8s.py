@@ -151,12 +151,26 @@ class Preflight:
     ingress_classes: list[str] = field(default_factory=list)
     other_clusters: list[str] = field(default_factory=list)
     namespaces: list[str] = field(default_factory=list)
+    #: What this cluster IS, and what it can do. The name is for the wording of a
+    #: message and never for a branch -- what it CAN do is each of the fields below,
+    #: because `k3s --disable traefik` is a real setup and minikube's ingress is an
+    #: addon that ships off.
+    distribution: str = ""
+    node_count: int = 0
+    architectures: list[str] = field(default_factory=list)
+    metrics: bool = False
+    #: Evidence that a LoadBalancer works here, or "" -- see loadbalancer_address().
+    loadbalancer: str = ""
     #: The context actually probed, and how that cluster came to exist. On a box
     #: with no kind this is whatever `kubectl` is already pointed at -- the
     #: bring-your-own-cluster case, where rc-repro manages namespaces and never
     #: the cluster.
     context: str = ""
     provider: str = ""
+    #: Whether this call would BRING THE CLUSTER INTO EXISTENCE. Reported rather
+    #: than inferred from `cluster_reachable`, because "not answering" and "not made
+    #: yet" are different sentences and send a reader to different places.
+    will_create: bool = False
     #: Why the cluster question could not be ANSWERED, as opposed to answered no.
     #: `kind get clusters` fails when Docker is down, and returns nothing when there
     #: are simply no clusters -- both give an empty list. Reporting the first as
@@ -166,15 +180,23 @@ class Preflight:
 
     @property
     def tools_ready(self) -> bool:
-        """Whether Kubernetes can be USED. Provisioning is a separate question."""
-        return all(self.tools[n].present and self.tools[n].new_enough
-                   for n in CORE_TOOLS if n in self.tools)
+        """Whether Kubernetes can be USED. Provisioning is a separate question.
+
+        Keyed on CORE_TOOLS rather than on what happens to be in `self.tools`, because
+        `all()` over nothing is True: a Preflight carrying no tool information at all
+        claimed every tool was ready, which is "I have no idea" reported as "yes".
+        """
+        return all(n in self.tools and self.tools[n].present
+                   and self.tools[n].new_enough for n in CORE_TOOLS)
 
     @property
     def can_provision(self) -> bool:
-        """Whether rc-repro can CREATE a cluster, as opposed to use one."""
-        return all(self.tools[n].present and self.tools[n].new_enough
-                   for n in PROVISION_TOOLS if n in self.tools)
+        """Whether rc-repro can CREATE a cluster, as opposed to use one.
+
+        Same reasoning as `tools_ready`: no information is not a yes.
+        """
+        return all(n in self.tools and self.tools[n].present
+                   and self.tools[n].new_enough for n in PROVISION_TOOLS)
 
     @property
     def missing_tools(self) -> list[str]:
@@ -373,6 +395,59 @@ def storage_classes(context: str = CONTEXT) -> tuple[list[str], str]:
     return names, default
 
 
+def metrics_available(context: str = CONTEXT) -> bool:
+    """Whether `kubectl top` can answer here, i.e. metrics-server is installed.
+
+    Asked rather than assumed per distribution: kind ships none, k3s ships one, and
+    minikube has it as an addon that is off by default -- and any of the three can be
+    changed by the person running the cluster. `stats` already discovers this by trying;
+    this is the same question asked before anybody needs the answer, so `doctor` can say
+    it instead of `stats` being the way you find out.
+    """
+    return run(["kubectl", "--context", context, "top", "nodes", "--no-headers"],
+               own=is_ours(context)).returncode == 0
+
+
+def loadbalancer_address(context: str = CONTEXT) -> str:
+    """An address some LoadBalancer Service actually got, or "".
+
+    EVIDENCE, not a capability claim: "no address" means either no controller or nobody
+    asked for one, and those cannot be told apart from outside. Reported as what it is,
+    because a cluster that has given a Service a real address has demonstrably got a
+    load balancer -- which on k3s is ServiceLB and on kind is nothing at all.
+    """
+    res = run(["kubectl", "--context", context, "get", "svc", "-A", "-o",
+               "jsonpath={range .items[?(@.spec.type=='LoadBalancer')]}"
+               "{.metadata.name}={.status.loadBalancer.ingress[0].ip}"
+               "{.status.loadBalancer.ingress[0].hostname} {end}"],
+              own=is_ours(context))
+    if res.returncode != 0:
+        return ""
+    for pair in (res.stdout or "").split():
+        name, _, addr = pair.partition("=")
+        if addr:
+            return f"{name} has {addr}"
+    return ""
+
+
+def nodes_summary(context: str = CONTEXT) -> tuple[int, list[str]]:
+    """(how many nodes, which architectures). Both matter, for different reasons.
+
+    Node COUNT decides whether a node-local default StorageClass can bite: `local-path`
+    on kind and k3s alike is `WaitForFirstConsumer`, so on more than one node a MongoDB
+    pod rescheduled elsewhere cannot rebind its volume. ARCHITECTURE matters because on
+    kind and k3s the node is this machine and on a managed cluster it need not be --
+    `bitnamilegacy/mongodb`, which every Rocket.Chat below 8 pairs with, is amd64-only.
+    """
+    res = run(["kubectl", "--context", context, "get", "nodes", "-o",
+               "jsonpath={range .items[*]}{.status.nodeInfo.architecture} {end}"],
+              own=is_ours(context))
+    if res.returncode != 0:
+        return 0, []
+    arches = (res.stdout or "").split()
+    return len(arches), sorted(set(arches))
+
+
 def ingress_classes(context: str = CONTEXT) -> list[str]:
     """Ingress controllers installed in this cluster.
 
@@ -441,15 +516,29 @@ def preflight(context: str = "") -> Preflight:
     if not out.tools["kubectl"].present:
         return out
 
+    # THE SAME FUNCTION `up` USES, and that is the whole point of the call. An
+    # earlier version resolved the context itself -- `kind` cluster if one existed,
+    # else whatever `kubectl` pointed at -- which agreed with `plan_cluster` on every
+    # box that had only one of the two and disagreed on the box that had both: with
+    # `kind` installed but no cluster yet and k3s running, `doctor` reported "Using
+    # your cluster 'default' (k3s)" while `up` went and created a kind cluster. A
+    # preflight whose job is to predict a boot must not be a second opinion about it.
     if context:
         out.context = context
-    elif out.cluster_exists:
-        out.context = CONTEXT
     else:
-        out.context = active_context()
+        try:
+            plan = plan_cluster()
+        except PreflightError:
+            plan = None
+        if plan:
+            out.context = plan.context
+            out.will_create = plan.create
     out.provider = PROVIDER_KIND if out.context == CONTEXT else PROVIDER_EXTERNAL
 
-    if not out.context:
+    if not out.context or out.will_create:
+        # Nothing to probe: the cluster this create would use does not exist yet, and
+        # asking the OTHER cluster for its storage classes would describe a machine
+        # rc-repro is not about to use.
         return out
     out.cluster_reachable = reachable(out.context)
     if not out.cluster_reachable:
@@ -457,6 +546,10 @@ def preflight(context: str = "") -> Preflight:
     out.storage_classes, out.default_storage_class = storage_classes(out.context)
     out.ingress_classes = ingress_classes(out.context)
     out.namespaces = workspace_namespaces(out.context)
+    out.distribution = distribution(out.context)
+    out.node_count, out.architectures = nodes_summary(out.context)
+    out.metrics = metrics_available(out.context)
+    out.loadbalancer = loadbalancer_address(out.context)
     return out
 
 
@@ -539,6 +632,116 @@ def cluster_context() -> str:
     return found or CONTEXT
 
 
+#: What `distribution` a cluster is, for the one thing a name may decide: the wording
+#: of a message. Never a branch -- `k3s --disable traefik` is a real setup, minikube
+#: ships ingress as an addon that is off, and kind gains one when rc-repro installs it,
+#: so what a cluster CAN do is probed (see Preflight) and what it IS is only labelled.
+#:
+#: Signals in order of reliability, each verified against a live cluster: `providerID`
+#: (`kind://docker/…`, `k3s://docker-01`), then the kubelet's version suffix (`+k3s`,
+#: `+rke2`), then node labels. A managed cluster's `providerID` names its cloud, which
+#: is the most reliable "this is not a disposable cluster" signal there is.
+_PROVIDER_ID_PREFIX = (("kind://", "kind"), ("k3s://", "k3s"), ("aws://", "eks"),
+                       ("gce://", "gke"), ("azure://", "aks"))
+_KUBELET_SUFFIX = (("+k3s", "k3s"), ("+rke2", "rke2"))
+
+
+def distribution(context: str) -> str:
+    """What kind of Kubernetes this is, as a label. "unknown" is a fine answer.
+
+    Asks the first node, because every signal lives there and one node is enough to
+    identify a distribution. Never raises: an unreachable cluster is "unknown", and a
+    label nobody branches on is not worth a failure.
+    """
+    res = run(["kubectl", "--context", context, "get", "nodes", "-o",
+               "jsonpath={.items[0].spec.providerID} {.items[0].status.nodeInfo."
+               "kubeletVersion} {.items[0].metadata.labels."
+               "node\\.kubernetes\\.io/instance-type} {.items[0].metadata.name}"],
+              own=is_ours(context))
+    if res.returncode != 0:
+        return "unknown"
+    parts = (res.stdout or "").split()
+    blob = " ".join(parts)
+    for prefix, name in _PROVIDER_ID_PREFIX:
+        if prefix in blob:
+            return name
+    for suffix, name in _KUBELET_SUFFIX:
+        if suffix in blob:
+            return name
+    if "minikube" in blob:
+        return "minikube"
+    if "docker-desktop" in blob:
+        return "docker-desktop"
+    return "unknown"
+
+
+@dataclass
+class ClusterPlan:
+    """Which cluster this create will use, decided before anything is written.
+
+    The whole Kubernetes/k3s difference is ONE STEP: provisioning. With `kind` here,
+    rc-repro creates its own cluster exactly as it always has; without it, that step
+    is skipped and the cluster `kubectl` already points at is used instead. Every step
+    afterwards is the same code, because every function below takes `context=`.
+
+    `create` is the only thing any caller needs to know beyond the context: it decides
+    what a failed create may roll back (never a cluster we did not make), and whether
+    `check_capacity` should charge for a control plane that does not exist yet.
+    """
+    context: str
+    distribution: str = ""
+    create: bool = False          # this call will bring the cluster into existence
+
+
+def plan_cluster() -> ClusterPlan:
+    """Choose the cluster, probing only -- nothing here writes to the machine.
+
+    Separate from `ensure_cluster` on purpose, and the reason is a measured defect: the
+    write-ahead `repro.json` is written before `create_workspace` runs, so a create that
+    refuses for want of a cluster left an `incomplete` record that `list` showed as a
+    workspace and whose port `used_ports()` reserved. A pure probe can run BEFORE that
+    write, so the refusal costs nothing.
+
+    Order, and it is short because it is not a precedence contest:
+
+      1. a cluster rc-repro created, if it still answers  -- ask the cluster, not `kind`
+      2. `kind` present                                   -- create ours, as today
+      3. whatever `kubectl` points at, if it answers       -- k3s, minikube, anything
+      4. refuse
+
+    Step 1 asks the owned kubeconfig rather than `kind get clusters` deliberately: that
+    probe needs the kind BINARY, so uninstalling kind while its cluster still ran made
+    the cluster invisible -- containers holding memory that nothing in rc-repro could
+    see or remove, and resolution quietly falling through to a different cluster.
+    """
+    if which("kind"):
+        # `create` is decided by whether the CLUSTER exists, never by whether this
+        # home's kubeconfig happens to know about it. An earlier version required the
+        # kubeconfig to name a reachable context, so a fresh RC_REPRO_HOME facing an
+        # existing cluster planned to CREATE one -- which charged 600 MB of capacity for
+        # a control plane already running and, far worse, told a failed create's
+        # rollback that the cluster was its to delete. `ensure_cluster` already
+        # re-exports the kubeconfig for exactly this case, so the context is knowable
+        # before it has been read.
+        return ClusterPlan(context=CONTEXT, distribution="kind",
+                           create=CLUSTER_NAME not in clusters()[0])
+    # No kind binary. Our own kubeconfig may still name a cluster that is up -- one
+    # rc-repro made before kind was uninstalled -- and that is ours to use even though
+    # we could no longer create or delete it.
+    ours = cluster_context()
+    if ours and reachable(ours):
+        return ClusterPlan(context=ours, distribution=distribution(ours), create=False)
+    active = active_context()
+    if active and reachable(active):
+        return ClusterPlan(context=active, distribution=distribution(active),
+                           create=False)
+    raise PreflightError(
+        "kind is not installed, so rc-repro cannot create a cluster, and `kubectl` is "
+        + ("not pointed at one either" if not active else
+           f"pointed at {active!r}, which is not answering")
+        + ". Install kind, or point kubectl at a cluster you already have.")
+
+
 def ensure_cluster(emit: Emit = null_emit) -> str:
     """Create rc-repro's cluster if it is not there, and return its context.
 
@@ -601,6 +804,20 @@ def ensure_cluster(emit: Emit = null_emit) -> str:
             f"{CLUSTER_NAME}` and try again.")
     info(emit, f"cluster {CLUSTER_NAME} ready at {context}", phase="provision")
     return context
+
+
+def cluster_reclaimable() -> bool:
+    """Whether rc-repro's own cluster exists and holds nothing of ours.
+
+    Mirrors `delete_cluster`'s own guard so a caller can ASK before offering to reclaim,
+    rather than finding out by being refused. A cluster that exists but does not answer
+    counts: `kind delete` talks to Docker, not to the API server, and a control plane
+    nobody can reach is the clearest case of memory doing nothing.
+    """
+    if not which("kind") or CLUSTER_NAME not in clusters()[0]:
+        return False
+    ctx = cluster_context()
+    return not reachable(ctx) or not workspace_namespaces(ctx)
 
 
 def delete_cluster(*, force: bool = False, emit: Emit = null_emit) -> bool:
@@ -1500,7 +1717,7 @@ def record_rendered(name: str, *, values: dict, manifests: dict) -> list[str]:
 def create_workspace(*, name: str, resolved, host_port: int, microservices: bool,
                      replicas: int = 1, owner: str = "", root_url: str = "",
                      bind_host: str = "", use_operator: bool = False,
-                     reg_token: str = "", preset=None,
+                     reg_token: str = "", preset=None, plan: ClusterPlan | None = None,
                      emit: Emit = null_emit) -> dict:
     """Build a Kubernetes workspace, and return what repro.json needs.
 
@@ -1514,8 +1731,19 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
     initiated BEFORE the chart goes in, because Rocket.Chat needs change streams
     and would otherwise sit at not-ready with nothing in its logs naming MongoDB.
     """
-    had_cluster = CLUSTER_NAME in clusters()[0]
-    context = ensure_cluster(emit=emit)
+    # The plan was made before the caller wrote its record, so the refusal for "no
+    # cluster and no kind" has already happened by here. Provisioning is the ONE step
+    # that differs between a kind box and a k3s box; everything below is the same code.
+    plan = plan or plan_cluster()
+    context = ensure_cluster(emit=emit) if plan.create else plan.context
+    if not plan.create:
+        info(emit, f"using your {plan.distribution} cluster {context!r} — rc-repro "
+                   "creates a namespace in it and never removes the cluster",
+             phase="provision", pct=5)
+    # Only a cluster THIS call created may be rolled back. `plan.create` carries that;
+    # it is not inferred from the cluster's name, which is what made a hand-made
+    # `rc-repro-local` look like ours.
+    had_cluster = not plan.create
     ensure_repo(emit=emit)
     chart_version = resolve_chart_version(resolved.rc_version, emit=emit)
     info(emit, f"chart {chart_version} for Rocket.Chat {resolved.rc_version}",
@@ -1975,6 +2203,20 @@ def pod_rows(name: str, *, context: str) -> list[dict]:
         rows.append({"service": str(meta.get("name") or ""),
                      "state": phase.lower(), "status": status,
                      "health": "healthy" if main and ready == len(main) else "",
+                     # WHICH POD IS ROCKET.CHAT ITSELF, decided by the label the
+                     # APP_SELECTOR above already names -- not by a substring of the
+                     # pod name, which is a naming rule the browser would then hold a
+                     # second copy of. The panel needs it to report Rocket.Chat's own
+                     # restart count on a runtime where nine pods have one each.
+                     "app": (meta.get("labels") or {}).get(
+                         "app.kubernetes.io/name") == "rocketchat",
+                     # Decided HERE, next to the list that defines it, because the
+                     # browser needs the answer and must not keep a second copy of
+                     # the policy: `ContainerCreating` and `PodInitializing` are
+                     # waiting reasons too, and a panel that treated every reason as
+                     # a failure would report a booting workspace as broken. The
+                     # create path spends the same list -- see terminal_pod_failure.
+                     "blocked": reason in TERMINAL_POD_REASONS,
                      "restarts": restarts,
                      "started": str(st.get("startTime") or "")})
     # Named order, so the tab does not reshuffle itself between two panel opens.
@@ -2453,6 +2695,86 @@ def ensure_operator(*, context: str, emit: Emit = null_emit) -> None:
         raise CreateFailedError("could not install the MongoDB operator: " + why(res))
 
 
+def mongodb_resources(context: str) -> list[str]:
+    """Namespaces that still hold a `MongoDBCommunity`, i.e. still need the operator.
+
+    Empty when the CRD is not installed at all, which is the answer, not an error --
+    `--ignore-not-found` keeps a cluster that never had the operator from looking like
+    a failure.
+    """
+    res = run(["kubectl", "--context", context, "get", "mongodbcommunity", "-A",
+               "--ignore-not-found", "-o",
+               "jsonpath={range .items[*]}{.metadata.namespace}{\"\\n\"}{end}"],
+              timeout=APPLY_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        return []
+    return sorted({ns for ns in (res.stdout or "").split() if ns})
+
+
+def release_installed(release: str, namespace: str, context: str) -> bool:
+    """Whether a helm release is in this cluster. Used before uninstalling one, so
+    "there was nothing there" is reported as nothing rather than as a failure."""
+    res = run(["helm", "list", "--kube-context", context, "-n", namespace, "-q"],
+              timeout=APPLY_TIMEOUT, own=is_ours(context))
+    return release in (res.stdout or "").split()
+
+
+def operator_installed(context: str) -> bool:
+    """Whether the shared MongoDB operator release is in this cluster."""
+    return release_installed(OPERATOR_RELEASE, OPERATOR_NAMESPACE, context)
+
+
+def remove_operator(*, context: str, excluding: str = "",
+                    emit: Emit = null_emit) -> bool:
+    """Uninstall the shared MongoDB operator once nothing is using it any more.
+
+    `down --volumes` means delete everything, so leaving an operator running afterwards
+    is the wrong answer -- but three things about it are shared, and the ORDER is what
+    makes removing it safe rather than destructive.
+
+    **The custom resources go first, and they already have.** This is called after the
+    workspace's namespace is deleted, which takes its `MongoDBCommunity` with it while
+    the operator is still alive to clear the finalizer. Removing the operator first
+    deadlocks on a resource nothing is left to finalise, and the namespace then sits in
+    Terminating forever -- the identical failure `remove_monitoring` records for a
+    GrafanaFolder, observed there on the first real uninstall.
+
+    **The reference count is a real check, not bureaucracy.** With a second workspace
+    still holding a `MongoDBCommunity`, removing the operator leaves its finalizer with
+    nothing to clear it, so a later `down --volumes` on THAT workspace hangs. In the
+    normal one-workspace case the check passes immediately and the operator goes.
+
+    **The CRD stays.** `helm uninstall` does not remove it anyway, and deleting it would
+    delete every `MongoDBCommunity` in the cluster -- every other workspace's database,
+    instantly. It is inert without the operator and the next `--mongo-operator` reuses
+    it. Same for the namespace: `rc-repro-system` is shared with the monitoring stack.
+    """
+    if not operator_installed(context):
+        return False
+    # `excluding` for the same reason `remove_monitoring` takes it: the workspace being
+    # destroyed must not be counted as still needing the operator. Its MongoDBCommunity
+    # is normally gone by the time the namespace finishes, but "normally" is a race, and
+    # losing it leaves the operator running with nothing at all using it.
+    still = [ns for ns in mongodb_resources(context) if ns != excluding]
+    if still:
+        info(emit, "leaving the MongoDB operator up — still used by "
+                   + ", ".join(n.removeprefix(NAMESPACE_PREFIX) for n in still),
+             phase="teardown")
+        return False
+    info(emit, f"uninstalling the MongoDB operator from {OPERATOR_NAMESPACE} — "
+               "nothing is using it now", phase="teardown")
+    res = run(["helm", "uninstall", OPERATOR_RELEASE, "--kube-context", context,
+               "-n", OPERATOR_NAMESPACE, "--wait", "--timeout", "5m"],
+              timeout=INSTALL_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        # Not an error worth failing a teardown for: the workspace is already gone and
+        # the next `--mongo-operator` runs `upgrade --install`, which repairs it.
+        warn(emit, "the MongoDB operator could not be uninstalled and is still "
+                   f"running in {OPERATOR_NAMESPACE}: " + why(res), phase="teardown")
+        return False
+    return True
+
+
 def wait_for_mongodb(*, namespace: str, context: str, emit: Emit = null_emit,
                      sleep=time.sleep) -> None:
     """Wait for the operator to report the MongoDBCommunity Running.
@@ -2606,15 +2928,30 @@ def wait_for_grafana(*, context: str, emit: Emit = null_emit,
          phase="monitor")
 
 
-def remove_monitoring(*, context: str, emit: Emit = null_emit) -> bool:
+def remove_monitoring(*, context: str, excluding: str = "",
+                     emit: Emit = null_emit) -> bool:
     """Uninstall the shared stack. Returns False if another workspace still wants it.
 
     Shared, so `--off` on one workspace must not blind the others. This is the whole
     behavioural difference from Compose, where the stack belongs to a project and
     detaching it is unambiguous.
+
+    `excluding` is the namespace of a workspace being DESTROYED, and it exists because
+    the count reads a label on the namespace while `workspace_namespaces` does not
+    filter by phase: a namespace still Terminating is still listed and still labelled,
+    so a teardown asking "does anyone else want this?" would be told yes by the
+    workspace it is in the middle of deleting.
     """
+    # Nothing installed is nothing to report. Without this, `monitor --off` on a
+    # workspace that never had monitoring ran the uninstall anyway, helm answered
+    # "Release not loaded: monitoring: release: not found", and the fallback path
+    # announced that "the monitoring stack needed its finalizers cleared by hand" --
+    # a frightening sentence about wreckage that did not exist. Measured on a live
+    # detach after an attach that had failed.
+    if not release_installed(MONITORING_RELEASE, MONITORING_NAMESPACE, context):
+        return False
     others = [n for n in workspace_namespaces(context)
-              if monitoring_wanted(n, context=context)]
+              if n != excluding and monitoring_wanted(n, context=context)]
     if others:
         info(emit, "leaving the monitoring stack up — still used by "
                    + ", ".join(sorted(n.removeprefix(NAMESPACE_PREFIX) for n in others)),

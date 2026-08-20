@@ -122,6 +122,7 @@ ROUTE_ROLES: dict[tuple[str, str], str] = {
     ("POST", "/api/backups/compatibility"): _READ,   # a question, not a change
     ("GET", "/api/doctor"): _READ,
     ("GET", "/api/edge"): _READ,
+    ("GET", "/api/kubernetes"): _READ,
     ("GET", "/api/machine"): _READ,
     ("GET", "/api/presets"): _READ,
     ("GET", "/api/settings"): _READ,
@@ -1190,6 +1191,28 @@ def create_app(allow_hosts: list[str] | None = None, *,
     def list_repros():
         return {"repros": lc.list_repros()}
 
+    @app.get("/api/kubernetes")
+    def kubernetes_status():
+        """Which Kubernetes this box has, and what it provides.
+
+        Its own endpoint for exactly the reason `/api/edge` is one: this shells out to
+        kubectl several times, and `/api/health` is the cheap unauthenticated call every
+        tab makes every four seconds. Read once when the page loads and again on Refresh.
+
+        The same facts `doctor` reports, from the same probe, so the footer and the
+        report cannot disagree about which cluster you are on.
+        """
+        from rc_repro.services import k8s
+
+        try:
+            pre = k8s.preflight()
+        except Exception:  # noqa: BLE001 - a badge must never be the thing that breaks
+            return {"usable": False, "reachable": False}
+        return {"usable": pre.tools_ready, "reachable": pre.cluster_reachable,
+                "context": pre.context, "distribution": pre.distribution,
+                "can_provision": pre.can_provision, "nodes": pre.node_count,
+                "workspaces": len(pre.namespaces)}
+
     @app.get("/api/edge")
     def edge_status():
         """The shared Traefik, and whether each name it serves is actually
@@ -1262,7 +1285,17 @@ def create_app(allow_hosts: list[str] | None = None, *,
                 # field the API rejects, which is exactly what happened there.
                 "runtimes": [
                     {"name": rt, "deployments": list(deps),
-                     "default_deployment": deps[0]}
+                     "default_deployment": deps[0],
+                     # What it costs and what it builds, from the same constants
+                     # `check_capacity` spends -- a card quoting one number while
+                     # the preflight reserves another is a card the refusal
+                     # contradicts. Per deployment, because microservices is not
+                     # a monolith with a label.
+                     "cost": {dep: lc.runtime_cost(rt, dep) for dep in deps},
+                     # And what this runtime cannot honour, from the registry the
+                     # create path enforces. The list has shrunk twice; a copy
+                     # written into the form would still be refusing `--reg-token`.
+                     "unsupported": lc.unsupported_fields(rt)}
                     for rt, deps in topology.DEPLOYMENTS.items()
                 ],
                 "default_runtime": topology.DOCKER,

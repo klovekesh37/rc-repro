@@ -90,8 +90,19 @@ def page(browser):
 
 @pytest.fixture
 def serve(tmp_path, monkeypatch):
-    """A server factory bound to an isolated home."""
+    """A server factory bound to an isolated home.
+
+    The Kubernetes probe is stubbed for the whole file. Every page load fetches
+    /api/kubernetes for the footer, and `preflight()` shells out to kubectl half a dozen
+    times -- so on a developer machine that happens to have a cluster, ninety browser
+    tests would each spend seconds probing it, and NOTHING in the suite is allowed to
+    depend on a live cluster. The two tests that care about the footer's contents set
+    the value in the page instead.
+    """
+    from rc_repro.services import k8s
+
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "preflight", lambda *a, **k: k8s.Preflight())
 
     def _start(**kw):
         return _Server(create_app(allow_hosts=["127.0.0.1"], **kw), _free_port())
@@ -291,13 +302,16 @@ def _fake_detail(name="t1234", state="running", **over):
         # panel. test_fake_detail_matches_the_real_payload below now compares the two
         # so the next drift fails here instead of in production.
         "env": [{"key": "ROOT_URL", "value": "http://localhost:3001", "override": False}],
-        "links": [], "notes": [], "restarts": 0, "monitoring": False,
+        "links": [], "notes": [], "note_groups": [], "restarts": 0, "monitoring": False,
         "tls": "", "is_default": False, "created_by": "alice", "owner": "alice",
         "made_by": "alice", "owner_history": [], "workspace": "/tmp/ws", "default": False,
         "grafana_url": "", "diag": {},
         # The three axes the panel now reads: which runtime it is, how it is
         # arranged, and what address it publishes on.
         "runtime": "docker", "deployment": "monolith", "bind_host": "127.0.0.1",
+        # None until something seeds it. The action pane's first suggestion turns on
+        # this, so the fake has to carry the key whichever way it is set.
+        "seed": None,
         "pinned": False,
         # Kubernetes-only, "" on Compose: the fixture is the UNION of what both
         # branches of detail() return, so one fixture covers either runtime.
@@ -488,8 +502,8 @@ def test_the_doctor_dialog_renders_its_checks(serve, page, monkeypatch):
 
     with serve() as s:
         _sign_in(page, s.url)
-        page.wait_for_selector("#docker-badge")
-        page.click("#docker-badge")
+        page.wait_for_selector("#doctor-badge")
+        page.click("#doctor-badge")
         page.wait_for_selector("#doctor-dialog[open]")
         page.wait_for_function(
             "() => !document.querySelector('#doctor-body').textContent.includes('Checking')")
@@ -1552,47 +1566,77 @@ def test_the_create_dialog_offers_a_runtime_and_follows_it(serve, page, monkeypa
         page.click("#btn-new")
         page.wait_for_selector("#create-dialog[open]")
 
-        # Compose is the default and its arrangement list is Compose's.
-        assert page.locator("#runtime-select").input_value() == "docker"
-        deployments = page.locator("#deployment-select option").all_inner_texts()
-        assert any("monolith" in d for d in deployments), deployments
-        assert any("multi-instance" in d for d in deployments), deployments
-        assert not any("microservices" in d for d in deployments), deployments
-        assert page.locator("#mongo-operator-row").is_hidden()
+        # The runtime is a pair of CARDS now, not a select: it decides what the
+        # other twenty-odd fields mean, and the two facts that decide it -- what it
+        # costs and what it cannot do -- have nowhere to live inside an <option>.
+        # The assertions below are the same ones; only the widget moved.
+        def fork(name):
+            return page.locator(f"#runtime-forks button:has-text('{name}')")
 
-        page.select_option("#runtime-select", "kubernetes")
-        deployments = page.locator("#deployment-select option").all_inner_texts()
-        assert any("microservices" in d for d in deployments), deployments
+        def arrangement():
+            return page.locator("#deployment-seg button[aria-pressed='true']").inner_text()
+
+        def arrangements():
+            return page.locator("#deployment-seg button").all_inner_texts()
+
+        # Compose is the default and its arrangement list is Compose's.
+        assert page.locator("#runtime-value").input_value() == "docker"
+        assert fork("Docker Compose").get_attribute("aria-pressed") == "true"
+        assert any("monolith" in d for d in arrangements()), arrangements()
+        assert any("multi-instance" in d for d in arrangements()), arrangements()
+        assert not any("microservices" in d for d in arrangements()), arrangements()
+        assert page.locator("#mongo-operator").count() == 0
+        # A card carries what a select could not: what this runtime BUILDS.
+        assert "containers" in fork("Docker Compose").inner_text()
+        assert "pods" in fork("Kubernetes").inner_text()
+
+        fork("Kubernetes").click()
+        assert any("microservices" in d for d in arrangements()), arrangements()
         # The RUNTIME'S default, not the one Compose had selected: `--runtime k8s`
         # on the CLI defaults to microservices, and the two must not disagree.
-        assert page.locator("#deployment-select").input_value() == "microservices"
-        assert not any("multi-instance" in d for d in deployments), deployments
+        assert arrangement() == "microservices"
+        assert not any("multi-instance" in d for d in arrangements()), arrangements()
         # Kubernetes-only control appears; HTTPS, which the service layer refuses
         # on this runtime, goes away.
-        assert page.locator("#mongo-operator-row").is_visible()
+        assert page.locator("#mongo-operator").count() == 1
         # `hidden` rather than is_visible: the HTTPS block lives inside the
         # Advanced disclosure, so is_visible() would be answering about the
         # twisty, not about the runtime.
         assert page.eval_on_selector("#create-https-block", "e => e.hidden") is True
-        assert "Kubernetes" in page.locator("#runtime-hint").inner_text() or \
-            page.locator("#runtime-hint").inner_text() != ""
+        # And the form says what it took away, from the server's own registry --
+        # not a list written in JS, which would still be refusing --reg-token.
+        assert page.eval_on_selector("#adv-gone", "e => e.hidden") is False
+        # textContent, not inner_text: this line lives inside the same closed
+        # <details> as the HTTPS block, and inner_text answers "" for anything a
+        # closed twisty is hiding -- which would pass whatever the text said.
+        assert "HTTPS" in page.eval_on_selector("#adv-gone", "e => e.textContent")
+        # `fresh` is one OPTION of the existing-name select, not the whole control:
+        # reuse and force work on both runtimes.
+        opts = page.eval_on_selector_all(
+            "select[name=existing] option", "es => es.map(e => e.textContent)")
+        assert not any("DELETE" in o for o in opts), opts
+        assert any("Reuse" in o for o in opts), opts
 
         # An arrangement the user PICKS must stick. Wiring the runtime handler to
-        # this select too made every choice snap back to the runtime default:
+        # this control too made every choice snap back to the runtime default:
         # picking monolith on Kubernetes created a microservices workspace, and the
         # dialog looked correct throughout. Found by clicking, not by a test.
-        page.select_option("#deployment-select", "monolith")
-        assert page.locator("#deployment-select").input_value() == "monolith"
+        page.locator("#deployment-seg button:has-text('monolith')").click()
+        assert arrangement() == "monolith"
         assert page.locator("#replicas-row").is_hidden(), \
             "replicas mean nothing on a monolith"
-        page.select_option("#deployment-select", "microservices")
-        assert page.locator("#deployment-select").input_value() == "microservices"
+        page.locator("#deployment-seg button:has-text('microservices')").click()
+        assert arrangement() == "microservices"
 
         # Back to Compose and HTTPS returns -- the hiding is a consequence of the
-        # choice, not a one-way door.
-        page.select_option("#runtime-select", "docker")
+        # choice, not a one-way door. So does the option that deletes data.
+        fork("Docker Compose").click()
         assert page.eval_on_selector("#create-https-block", "e => e.hidden") is False
-        assert page.locator("#mongo-operator-row").is_hidden()
+        assert page.locator("#mongo-operator").count() == 0
+        assert page.eval_on_selector("#adv-gone", "e => e.hidden") is True
+        opts = page.eval_on_selector_all(
+            "select[name=existing] option", "es => es.map(e => e.textContent)")
+        assert any("DELETE" in o for o in opts), opts
 
 
 def test_creating_a_kubernetes_workspace_sends_the_axes(serve, page, monkeypatch):
@@ -1612,8 +1656,8 @@ def test_creating_a_kubernetes_workspace_sends_the_axes(serve, page, monkeypatch
         page.click("#btn-new")
         page.wait_for_selector("#create-dialog[open]")
         page.fill("input[name=version]", "8.5.1")
-        page.select_option("#runtime-select", "kubernetes")
-        page.select_option("#deployment-select", "microservices")
+        page.locator("#runtime-forks button:has-text('Kubernetes')").click()
+        page.locator("#deployment-seg button:has-text('microservices')").click()
         page.check("input[name=mongo_operator]")
         page.click("#create-submit")
         for _ in range(40):
@@ -2043,4 +2087,1103 @@ def test_the_seed_job_shows_what_it_made_and_whether_it_was_confirmed(
         assert "match the plan" in body, body[-400:]
         assert "283 messages" in body and "48 in threads" in body
         assert "channel 5" in body and "discussion 3" in body
+        assert page.errors == [], page.errors
+
+
+def test_the_create_dialog_says_what_it_builds_and_what_the_box_has_left(
+        serve, page, monkeypatch):
+    """A card carries what a `<select>` could not: what this runtime BUILDS.
+
+    It used to quote a memory estimate as well, and that came out: the figure
+    depends on the preset, the arrangement and whatever else is running, so it was a
+    guess dressed as a fact -- while the line beside it answers "will it fit" from
+    the box itself, which is the question and is measured. `up` already REFUSES
+    without headroom, so that belongs at the moment of choosing rather than in the
+    failure afterwards.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#btn-new")
+        page.click("#btn-new")
+        page.wait_for_selector("#create-dialog[open]")
+        page.wait_for_function(
+            "() => document.querySelector('#create-room').textContent.includes('free')",
+            timeout=15000)
+        assert "room for about" in page.locator("#create-room").inner_text()
+
+        compose = page.locator("#runtime-forks button").first.inner_text()
+        kube = page.locator("#runtime-forks button").nth(1).inner_text()
+        assert "2 containers" in compose, compose
+        # Microservices is not a monolith with a label, and the card says so.
+        assert "9 pods" in kube, kube
+        # And no invented weight on either.
+        for card in (compose, kube):
+            assert "GB" not in card and "MB" not in card, card
+        assert page.errors == [], page.errors
+
+
+def test_the_runtime_card_names_the_cluster_that_will_actually_be_used(
+        page, serve, monkeypatch):
+    """The card read the literal "Kubernetes (kind)". That was true while kind was the
+    only way to have a cluster and became wrong the moment rc-repro could adopt one:
+    on a box with no kind and a running k3s it named a cluster the create would not
+    touch -- the same defect `doctor` had, in the other front-end. So the label comes
+    from the probe, in `plan_cluster`'s branch order."""
+    from rc_repro.services import k8s, users as usersvc
+
+    usersvc.add("alice", PASSWORD, role="admin")
+
+    # A cluster rc-repro did NOT create and cannot create: no kind binary, so
+    # `can_provision` is false and the adopted distribution is what matters.
+    adopted = k8s.Preflight(tools={
+        "kubectl": k8s.Tool(name="kubectl", path="/usr/bin/kubectl",
+                            version=(1, 30, 0), raw="v1.30.0"),
+        "helm": k8s.Tool(name="helm", path="/usr/bin/helm",
+                         version=(3, 14, 0), raw="v3.14.0"),
+    })
+    adopted.context = "default"
+    adopted.distribution = "k3s"
+    adopted.cluster_reachable = True
+    monkeypatch.setattr(k8s, "preflight", lambda *a, **k: adopted)
+
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#btn-new")
+        # The footer proves the probe reached the page before the dialog is opened.
+        page.wait_for_function(
+            "() => document.querySelector('#sb-engines')"
+            ".textContent.includes('k3s')", timeout=15000)
+        page.click("#btn-new")
+        page.wait_for_selector("#create-dialog[open]")
+        page.wait_for_selector("#runtime-forks button")
+        kube = page.locator("#runtime-forks button").nth(1).inner_text()
+        assert "Kubernetes (k3s)" in kube, kube
+        assert "kind" not in kube, "named a cluster the create would not use"
+        assert page.errors == [], page.errors
+
+
+def test_the_arrangement_says_what_it_builds(serve, page, monkeypatch):
+    """The note under the segmented control describes the ARRANGEMENT, which is the
+    choice directly above it. It used to describe the runtime and repeat "HTTPS is
+    not available here" -- the same fact the absence line in Advanced now states
+    from the server's registry, and only one of the two would have been updated when
+    that changes."""
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#btn-new")
+        page.click("#btn-new")
+        page.wait_for_selector("#create-dialog[open]")
+        assert "One Rocket.Chat process" in page.locator("#runtime-hint").inner_text()
+        page.locator("#runtime-forks button:has-text('Kubernetes')").click()
+        note = page.locator("#runtime-hint").inner_text()
+        assert "ddp-streamer" in note, note
+        assert "HTTPS" not in note, "the refusal is stated once, in Advanced"
+        page.locator("#deployment-seg button:has-text('monolith')").click()
+        assert "One Rocket.Chat process" in page.locator("#runtime-hint").inner_text()
+        assert page.errors == [], page.errors
+
+
+def test_the_three_panes_survive_a_narrow_window(serve, page, monkeypatch, tmp_path):
+    """532px of the layout was fixed -- a 288px rail and a 244px action pane -- and
+    nothing was responsive: the @media rules still named `.layout`, the class the
+    workbench redesign replaced with `.panes`, so they had matched nothing since.
+
+    Measured before the fix, at 900px tall with a workspace open: 236px of stage at
+    768, 108px at 640, and at 480 the page scrolled sideways with 42px of stage.
+
+    The stage is also `position: sticky`, which in ONE column rides up over the row
+    above -- the rail ended up underneath the panel and its rows could not be
+    clicked at all. That reset lived in the dead rule and went with it.
+    """
+    import json as _json
+
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    (tmp_path / "repros" / "t1234").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repros" / "t1234" / "repro.json").write_text(_json.dumps({
+        "name": "t1234", "project": "p", "rc_version": "7.4.1", "rc_image": "i",
+        "mongo_tag": "7.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3001", "host_port": 3001,
+        "version_source": "x", "extra": {}}))
+
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        for width in (1440, 1024, 768, 640, 480, 380):
+            page.set_viewport_size({"width": width, "height": 900})
+            page.wait_for_timeout(150)
+            m = page.evaluate("""() => {
+              const r = document.querySelector('.rail').getBoundingClientRect();
+              const d = document.querySelector('#detail').getBoundingClientRect();
+              return {over: document.documentElement.scrollWidth
+                             > document.documentElement.clientWidth,
+                      stage: Math.round(d.width),
+                      overlap: Math.round(Math.min(r.bottom, d.bottom)
+                                          - Math.max(r.top, d.top))
+                               > 2 && Math.round(Math.min(r.right, d.right)
+                                          - Math.max(r.left, d.left)) > 2};
+            }""")
+            assert not m["over"], f"the page scrolls sideways at {width}px"
+            assert m["stage"] >= 320, f"the stage is {m['stage']}px at {width}px"
+            assert not m["overlap"], f"the rail and the stage overlap at {width}px"
+        assert page.errors == [], page.errors
+
+
+def test_a_note_that_ends_in_a_name_is_not_glued_to_the_next_one(serve, page, monkeypatch):
+    """The notes pattern has three shapes, and this is the third one's rule: prose
+    lines are joined into a paragraph only when the previous line was WRAPPED — they
+    were written for an 80-column terminal, not as separate points.
+
+    "Ends in any lowercase word" was too broad, and the Kubernetes notes proved it:
+    "monolith on kind-rc-repro-local — about 5 pods, namespace rc-repro-x" is a
+    complete point that happens to end in an identifier, and it was being glued to
+    the MongoDB note after it — two unrelated facts in one bullet, in the notes a
+    reader consults to find out what their workspace actually is.
+
+    Both sides are pinned here, because narrowing the rule could easily have broken
+    the wrapping it exists for -- `oidc`'s real notes must still join, which is the
+    test directly after this one.
+    """
+    kube_notes = [
+        "monolith on kind-rc-repro-local — about 5 pods, namespace rc-repro-x",
+        "MongoDB 8.0 as a plain StatefulSet — mongo:8.0, NO authentication.",
+        "reachable on this box at http://localhost:3000",
+    ]
+    _stub_lifecycle(monkeypatch, _fake_detail(state="stopped", notes=kube_notes))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        paras = page.eval_on_selector_all(
+            "#d-body .note-p", "es => es.map(e => e.textContent.trim())")
+        assert len(paras) == 3, paras
+        assert paras[0].endswith("rc-repro-x"), paras[0]
+        assert "StatefulSet" not in paras[0], "two notes were glued into one bullet"
+        assert page.errors == [], page.errors
+
+
+def test_a_genuinely_wrapped_note_still_joins_the_line_after_it(serve, page, monkeypatch):
+    """The other side of the same rule, and the reason narrowing it was risky:
+    `oidc`'s real notes trail off in "…can reach Keycloak at the", which is what
+    wrapping actually looks like, and those two lines are one point."""
+    from rc_repro import presets as presets_mod
+
+    oidc = list(presets_mod.load("oidc").notes or [])
+    assert oidc[0].rstrip().endswith("the"), \
+        "the fixture for this assertion is oidc's real wrapped line"
+    _stub_lifecycle(monkeypatch, _fake_detail(state="stopped", preset="oidc", notes=oidc))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body")
+        joined = page.eval_on_selector_all(
+            "#d-body .note-p", "es => es.map(e => e.textContent)")
+        assert any("host entry" in t and "/etc/hosts" in t for t in joined), \
+            f"the wrapped oidc line stopped joining: {joined}"
+        assert page.errors == [], page.errors
+
+
+def test_a_long_line_in_a_note_scrolls_instead_of_being_clipped_away(
+        serve, page, monkeypatch):
+    """A Kubernetes workspace's notes carry `export KUBECONFIG=<absolute path>`, and
+    it did not fit: `.note-cmd` came out 1147px inside an 824px panel, and
+    `.panelcard`'s `overflow-x: hidden` silently CLIPPED the rest — so the reader was
+    told to paste a path whose end they could not see.
+
+    `white-space: pre` has to stay (a pasted line's spacing is load-bearing and
+    another test asserts it), so the fix is `min-width: 0` on the flex/grid items:
+    without it they refuse to shrink below their content and the `overflow-x: auto`
+    that was already there never engages.
+    """
+    long_path = "/tmp/pytest-of-someone/a-very-long-isolated-home-0/clients/kubernetes/config"
+    notes = ["rc-repro keeps its own kubeconfig; a bare kubectl will not see this:",
+             f"    export KUBECONFIG={long_path}"]
+    _stub_lifecycle(monkeypatch, _fake_detail(state="stopped", notes=notes))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .note-cmd")
+        m = page.evaluate("""() => {
+          const card = document.querySelector('#d-body .panelcard');
+          const box = document.querySelector('#d-body .note-cmd');
+          const code = box.querySelector('code');
+          return {cardOver: card.scrollWidth > card.clientWidth + 2,
+                  boxOver: box.scrollWidth > box.clientWidth + 2,
+                  codeScrolls: code.scrollWidth > code.clientWidth,
+                  overflowX: getComputedStyle(code).overflowX,
+                  ws: getComputedStyle(code).whiteSpace};
+        }""")
+        assert not m["cardOver"], "the card still overflows, so the panel clips it"
+        assert not m["boxOver"], "the code box still pushes past its own bounds"
+        assert m["codeScrolls"] and m["overflowX"] == "auto", \
+            "the long line has to scroll inside its box"
+        assert m["ws"] == "pre", "a pasted line's spacing must survive"
+        assert page.errors == [], page.errors
+
+
+def test_a_grouped_note_gets_its_own_card_with_a_fact_table_and_a_copy_button(
+        serve, page, monkeypatch):
+    """A Kubernetes workspace had ten things to say and said them as one bulleted
+    dump: the cluster, the namespace and the arrangement welded into a sentence; the
+    `kubectl port-forward` you actually have to paste sitting mid-paragraph as prose;
+    the ldap preset's phpLDAPadmin credentials one bullet among the rest.
+
+    They are three different kinds of content and each now gets the shape it needs --
+    facts as a table, prose as prose, commands as a code block with Copy -- one card
+    per group. What this asserts is that all three arrive: a `.notetable` row for a
+    fact, the group's own title, and a copyable block for a command.
+    """
+    groups = [
+        {"title": "Kubernetes",
+         "rows": [["Cluster", "kind-rc-repro-local"], ["Namespace", "rc-repro-t1234"],
+                  ["Arrangement", "microservices"]],
+         "body": [], "commands": []},
+        {"title": "Port forward",
+         "rows": [],
+         "body": ["The port-forward dies with the pod. Start it again:"],
+         "commands": ["kubectl -n rc-repro-t1234 port-forward deployment/rc 3001:3000"]},
+    ]
+    _stub_lifecycle(monkeypatch, _kube_detail(note_groups=groups,
+                                              notes=["Kubernetes:", "    Cluster  x"]))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .notetable")
+        m = page.evaluate("""() => {
+          const cards = [...document.querySelectorAll('#d-body .panelcard')];
+          const titled = t => cards.find(c => (c.querySelector('.section-label')
+                                               || {}).textContent === t);
+          const kube = titled('Kubernetes'), fwd = titled('Port forward');
+          const rows = kube ? [...kube.querySelectorAll('.notetable tr')].map(
+            r => [r.querySelector('th').textContent, r.querySelector('td').textContent])
+            : null;
+          return {rows,
+                  fwdCmd: fwd ? (fwd.querySelector('.note-cmd code') || {}).textContent : null,
+                  fwdCopy: !!(fwd && fwd.querySelector('.note-cmd .cp')),
+                  fwdProse: fwd ? fwd.textContent.includes('dies with the pod') : false,
+                  // the facts must NOT also be a bullet in the old flat dump
+                  flatDump: cards.some(c => c.textContent.includes('Cluster  x'))};
+        }""")
+        assert m["rows"] == [["Cluster", "kind-rc-repro-local"],
+                             ["Namespace", "rc-repro-t1234"],
+                             ["Arrangement", "microservices"]], m["rows"]
+        assert m["fwdCmd"] == \
+            "kubectl -n rc-repro-t1234 port-forward deployment/rc 3001:3000"
+        assert m["fwdCopy"], "a command you have to paste needs its Copy button"
+        assert m["fwdProse"], "the group's own prose has to survive next to it"
+        assert not m["flatDump"], \
+            "the flat notes are still rendered too, so every fact appears twice"
+        assert page.errors == [], page.errors
+
+
+def test_the_overview_says_which_runtime_the_workspace_runs_on(
+        serve, page, monkeypatch):
+    """Both runtimes rendered an identical Overview. A support engineer handed a link
+    could see the version, the scenario and the health of a workspace with no way to
+    tell whether it was Compose or Kubernetes -- which decides what half the actions
+    in the pane will even do.
+
+    It takes Port's cell: the port is already in the identity line under the name and
+    in the URL box below, and the grid is deliberately exactly six so it fills two rows
+    of three with no hole.
+    """
+    _stub_lifecycle(monkeypatch, _kube_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .kv-grid")
+        cells = page.evaluate("""() => [...document.querySelectorAll(
+          '#d-body .kv-grid .kv')].map(c => [
+            c.querySelector('.k').textContent, c.querySelector('.v').textContent])""")
+        keys = [k for k, _ in cells]
+        assert "Runs on" in keys, keys
+        assert dict(cells)["Runs on"] == "Kubernetes · microservices"
+        assert len(cells) == 6, "the grid is six cells so two rows of three fill"
+        assert page.errors == [], page.errors
+
+
+def test_the_panel_is_not_a_two_hundred_pixel_window_on_a_narrow_screen(
+        serve, page, monkeypatch):
+    """"Everything collapses when I resize the browser."
+
+    The shell is viewport-locked by design -- `body.shell` is 100vh with
+    `overflow: hidden` and each pane scrolls inside it, which is right when the three
+    sit side by side. Stacked into one column it gave each of them a third of the
+    screen: the workspace panel came out a ~200px window showing four of its six
+    cells, with every notes card below the cut and reachable only by scrolling a box
+    nothing marked as a box. The status bar stayed pinned to the viewport too, so it
+    was drawn ACROSS the middle of the panel.
+
+    In one column the page scrolls instead: the panes stack in normal flow, each as
+    tall as its content, and the status bar is last. The rail stays capped, because
+    it is a picker and not content.
+    """
+    groups = [{"title": f"Group {i}", "kind": "", "rows": [],
+               "body": [f"Something worth reading, number {i}."], "commands": []}
+              for i in range(8)]
+    _stub_lifecycle(monkeypatch, _kube_detail(note_groups=groups))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .panelcard")
+        page.set_viewport_size({"width": 520, "height": 900})
+        page.wait_for_timeout(300)
+        m = page.evaluate("""() => {
+          const stage = document.querySelector('.stage');
+          const cards = [...document.querySelectorAll('#d-body .panelcard')];
+          const last = cards[cards.length - 1].getBoundingClientRect();
+          const sb = document.querySelector('.statusbar').getBoundingClientRect();
+          const grid = document.querySelectorAll('#d-body .kv-grid .kv').length;
+          return {pageScrolls: document.documentElement.scrollHeight > window.innerHeight,
+                  sideways: document.body.scrollWidth > window.innerWidth + 2,
+                  // nothing hidden inside an internal scroller
+                  stageHidden: stage.scrollHeight - stage.clientHeight,
+                  lastBottom: last.bottom, sbTop: sb.top, cells: grid,
+                  cards: cards.length};
+        }""")
+        assert m["pageScrolls"], "the page has to scroll; the panel does not fit 900px"
+        assert not m["sideways"], "and it must not scroll sideways"
+        assert m["stageHidden"] <= 2, \
+            f"{m['stageHidden']}px of the panel is hidden inside the stage's own scroller"
+        assert m["cells"] == 6, f"only {m['cells']} of the six Overview cells rendered"
+        assert m["cards"] >= 9, f"only {m['cards']} cards rendered of the 8 groups + scenario"
+        assert m["lastBottom"] <= m["sbTop"] + 2, \
+            "the status bar is drawn over the panel instead of below it"
+        # Five uppercase tabs want 402px. With the shell's `overflow: hidden` gone
+        # they would push the whole page sideways, so the strip scrolls itself --
+        # which also makes BACKUPS reachable, and it was not.
+        page.set_viewport_size({"width": 380, "height": 900})
+        page.wait_for_timeout(200)
+        t = page.evaluate("""() => {
+          const strip = document.querySelector('.tabs');
+          const tabs = [...strip.querySelectorAll('.tab')];
+          const last = tabs[tabs.length - 1];
+          strip.scrollLeft = strip.scrollWidth;
+          const r = last.getBoundingClientRect(), s = strip.getBoundingClientRect();
+          return {label: last.textContent, scrolls: strip.scrollWidth > strip.clientWidth,
+                  reachable: r.right <= s.right + 2 && r.left >= s.left - 2,
+                  sideways: document.documentElement.scrollWidth
+                            > document.documentElement.clientWidth};
+        }""")
+        assert not t["sideways"], "the tab strip pushes the page sideways at 380px"
+        assert t["scrolls"], "the strip should be scrollable, not squeezed"
+        assert t["reachable"], f"{t['label']} cannot be scrolled into view"
+        assert page.errors == [], page.errors
+
+
+def test_a_place_a_group_names_is_the_link_row_and_not_a_second_row(
+        serve, page, monkeypatch):
+    """The monitoring notes name Grafana and Prometheus, and both are already link
+    rows in the panel -- with the password, which is the part the link row does not
+    know. While every note lived in one card, that card merged the two; splitting the
+    notes into cards put the same two urls on screen twice, once as rows and again as
+    prose one card below, which is the exact duplication the merge was written for.
+
+    So the merge is across every group, not just the card that owns the prose.
+    """
+    groups = [
+        {"title": "Monitoring", "rows": [],
+         "body": ["Grafana:    http://localhost:5050  (admin/admin; anonymous view enabled)",
+                  "Dashboards auto-provisioned: Rocket.Chat Metrics, MongoDB."],
+         "commands": []},
+    ]
+    d = _kube_detail(note_groups=groups, notes=[], links=[
+        {"label": "Rocket.Chat", "url": "http://localhost:3001", "kind": "rc"},
+        {"label": "Grafana", "url": "http://localhost:5050", "kind": "monitor"}])
+    _stub_lifecycle(monkeypatch, d)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .linkrow")
+        m = page.evaluate("""() => {
+          const body = document.querySelector('#d-body');
+          const rows = [...body.querySelectorAll('.linkrow')].map(r => r.textContent);
+          return {
+            grafanaRows: rows.filter(t => t.includes('localhost:5050')).length,
+            // the password the note carries has to survive the merge
+            creds: rows.some(t => t.includes('admin/admin')),
+            // and what the note said BESIDES a place is still there
+            rest: body.textContent.includes('auto-provisioned'),
+          };
+        }""")
+        assert m["grafanaRows"] == 1, "Grafana is on screen twice"
+        assert m["creds"], "the merge dropped the credential the note carried"
+        assert m["rest"], "the rest of the group's prose was dropped with it"
+        assert page.errors == [], page.errors
+
+
+def test_a_healthy_workspace_gets_no_triage_block_at_all(serve, page, monkeypatch):
+    """The quiet state is ABSENCE, not a green box saying everything is fine. A panel
+    that always carries a status block trains people to stop reading it, and the facts
+    below it already say the workspace is healthy.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .kv-grid")
+        assert page.locator("#detail .triage").count() == 0
+        assert page.errors == [], page.errors
+
+
+def test_the_panel_leads_with_what_is_wrong_and_what_to_do(serve, page, monkeypatch):
+    """The panel is opened when something looks wrong, and it opened with six facts
+    that never change. The one thing on it that said anything was wrong -- the restart
+    banner -- was under them, i.e. under the fold on a 900px window, and it named no
+    action: it said "check the Logs tab" and left you to find the tab.
+
+    It leads with it now, above the TABS rather than inside Overview, because what is
+    wrong with a workspace is not a property of the tab you happen to be on -- it was
+    invisible from Logs, which is exactly where you go when something is wrong.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail(restarts=4, health="unhealthy"))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#detail .triage .tri")
+        m = page.evaluate("""() => {
+          const tri = document.querySelector('#detail .triage');
+          const tabs = document.querySelector('#detail .tabs');
+          return {
+            title: tri.querySelector('.tri-t b').textContent,
+            why: tri.querySelector('.tri-t span').textContent,
+            acts: [...tri.querySelectorAll('.tri-a button')].map(b => b.textContent),
+            // 4 == DOCUMENT_POSITION_FOLLOWING: the block precedes the tab strip
+            beforeTabs: !!(tri.compareDocumentPosition(tabs) & 4),
+            // and one problem, not two: a restart loop and its failing healthcheck
+            // are the same fault reported twice
+            count: document.querySelectorAll('#detail .triage .tri').length,
+          };
+        }""")
+        assert m["title"] == "Rocket.Chat has restarted 4×", m["title"]
+        assert "memory pressure" in m["why"]
+        assert m["acts"][:1] == ["Open the logs"], m["acts"]
+        assert m["beforeTabs"], "the triage block is below the tab strip"
+        assert m["count"] == 1, "a restart loop and its healthcheck are one problem"
+        # And the action IS the tab, not a sentence telling you to go and find it.
+        page.click("#detail .triage .tri-a button")
+        page.wait_for_selector("button.tab.active:has-text('Logs')")
+        assert page.errors == [], page.errors
+
+
+def test_a_down_workspace_is_told_what_it_still_holds(serve, page, monkeypatch):
+    """"down" is not a fault, and the panel said nothing about it at all: the reader
+    had to infer from a greyed action pane that the port and the data volume are still
+    reserved and that bringing it up reuses both.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail(state="down", health="", uptime=""))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#detail .triage .tri")
+        why = page.text_content("#detail .triage .tri-t span")
+        assert ":3001" in why and "data volume" in why, why
+        assert page.text_content("#detail .triage .tri-a button") == "Bring it up"
+        assert page.errors == [], page.errors
+
+
+def test_a_pod_that_cannot_start_is_named_in_the_panel(serve, page, monkeypatch):
+    """An ImagePullBackOff was reachable only by opening the Containers tab and
+    reading a table. It is the answer to "why is this workspace not up", so it is on
+    the panel -- named, with its reason.
+
+    `blocked` is decided in services/k8s.py, beside the list of reasons a pod never
+    recovers from: `ContainerCreating` is a waiting reason too, and a browser holding
+    its own copy of that policy would report a booting workspace as broken.
+    """
+    d = _kube_detail(containers=[
+        {"service": "rocketchat-0", "state": "pending", "status": "ImagePullBackOff",
+         "health": "", "blocked": True, "restarts": 0, "started": ""},
+        {"service": "mongodb-0", "state": "pending", "status": "ContainerCreating",
+         "health": "", "blocked": False, "restarts": 0, "started": ""}])
+    _stub_lifecycle(monkeypatch, d)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#detail .triage .tri")
+        title = page.text_content("#detail .triage .tri-t b")
+        why = page.text_content("#detail .triage .tri-t span")
+        assert title == "One pod cannot start", title
+        assert "rocketchat-0 — ImagePullBackOff" in why, why
+        assert "mongodb-0" not in why, "a pod that is merely starting is not a fault"
+        page.click("#detail .triage .tri-a button")
+        page.wait_for_selector("#d-body .dtable")
+        assert page.errors == [], page.errors
+
+
+def _stub_list(monkeypatch, rows):
+    """Several workspaces in the rail, with the panel answering for whichever is asked."""
+    from rc_repro.services import lifecycle as lc
+    by_name = {r["name"]: r for r in rows}
+    monkeypatch.setattr(lc, "list_repros", lambda: [dict(r) for r in rows])
+    monkeypatch.setattr(lc, "detail", lambda name: dict(by_name[name]))
+    monkeypatch.setattr(lc, "resolve_name", lambda name: name)
+    return rows
+
+
+def test_the_rail_groups_by_what_each_workspace_wants_from_you(serve, page, monkeypatch):
+    """A flat alphabetical list is fine with two workspaces and is the wrong shape for
+    the shared box this tool is run on, which carries eight to twelve. "Which one is
+    unhappy" was a question you answered by reading every row, and the unhappy one
+    could be anywhere in the list.
+
+    "Wants you" is deliberately not "not running": a stopped workspace is doing exactly
+    what it was told and a restart-looping one is not, so putting them together would
+    make the group mean nothing.
+    """
+    _stub_list(monkeypatch, [
+        _fake_detail(name="aa-loop", state="restarting", restarts=4),
+        _fake_detail(name="bb-sick", state="running", health="unhealthy"),
+        _fake_detail(name="cc-fine", state="running"),
+        _fake_detail(name="dd-stopped", state="stopped", uptime="", health=""),
+        _fake_detail(name="ee-down", state="down", uptime="", health=""),
+    ])
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros .rgrp")
+        m = page.evaluate("""() => {
+          const out = [];
+          let g = null;
+          for (const c of document.querySelector('#repros').children) {
+            if (c.classList.contains('rgrp')) {
+              g = {title: c.querySelector('.rgrp-t').textContent,
+                   count: c.querySelector('.rgrp-n').textContent, rows: []};
+              out.push(g);
+            } else if (g) g.rows.push(c.querySelector('.nm').textContent);
+          }
+          return out;
+        }""")
+        assert [g["title"] for g in m] == ["Wants you", "Running", "Not running"], m
+        assert [g["count"] for g in m] == ["2", "1", "2"], m
+        assert m[0]["rows"] == ["aa-loop", "bb-sick"], m[0]
+        assert m[1]["rows"] == ["cc-fine"], m[1]
+        assert m[2]["rows"] == ["dd-stopped", "ee-down"], m[2]
+        assert page.errors == [], page.errors
+
+
+def test_one_state_gets_no_group_headings(serve, page, monkeypatch):
+    """A heading over a list that is entirely one state is a label for the thing it is
+    inside, and the rail head's pill already says "3 running". The rule is conditional,
+    so both halves of it are asserted: three running workspaces get no headings, and the
+    moment one of them is in another state all three headings appear.
+    """
+    _stub_list(monkeypatch, [_fake_detail(name=f"ws-{i}") for i in range(3)])
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros .wrow")
+        assert page.locator("#repros .rgrp").count() == 0
+        assert page.locator("#repros .wrow").count() == 3
+        # The rule itself, both ways round, without waiting out a four-second poll.
+        titles = page.evaluate("""() => [
+          railGroups([{state: 'running'}, {state: 'running'}]).map(g => g[0]),
+          railGroups([{state: 'running'}, {state: 'stopped'}]).map(g => g[0]),
+        ]""")
+        assert titles[0] == ["", "", ""], titles[0]
+        assert titles[1] == ["Wants you", "Running", "Not running"], titles[1]
+        assert page.errors == [], page.errors
+
+
+def test_a_long_workspace_name_does_not_push_the_rail_sideways(serve, page, monkeypatch):
+    """`.rows` was left on the implicit `auto` grid track, which is at least as wide as
+    its widest item's MIN-content. That was survivable while a row could wrap, and it
+    made the rail scroll sideways -- clipping the state and the group counts off the
+    right edge -- the moment anything in a row could not.
+
+    A guard, not a regression test: the row wraps again, so the track is no longer what
+    stops it. The narrow strip is where a name cannot wrap, and that is asserted here
+    too, because that is the layout the rule now protects.
+    """
+    long_name = "a-really-long-workspace-name-for-ticket-4821"
+    _stub_list(monkeypatch, [
+        _fake_detail(name=long_name, preset="ldap"),
+        _fake_detail(name="dana-upgrade", uptime="4 minutes", monitoring=True),
+    ])
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros .wrow")
+        for width in (1440, 430):
+            page.set_viewport_size({"width": width, "height": 900})
+            page.wait_for_timeout(200)
+            m = page.evaluate("""() => {
+              const rows = document.querySelector('#repros');
+              return {sideways: rows.scrollWidth > rows.clientWidth + 1,
+                      inside: [...rows.querySelectorAll('.wrow')].every(
+                        (r) => r.scrollWidth <= r.clientWidth + 1),
+                      title: rows.querySelector('.wrow').title};
+            }""")
+            # At 430 the strip scrolls BY DESIGN -- it is a horizontal picker -- so what
+            # is asserted there is that no individual chip overflows its own box.
+            if width > 760:
+                assert not m["sideways"], f"the rail scrolls sideways at {width}px"
+            assert m["inside"], f"a row is wider than its own box at {width}px"
+            assert m["title"] == long_name, "the full name has to stay reachable"
+        # The wide row keeps every part: the port and the owner are what people search a
+        # shared box's rail by, and one line could not hold them.
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.wait_for_timeout(200)
+        meta = page.locator(".wrow", has_text="dana-upgrade").locator(".meta").inner_text()
+        assert ":3001" in meta and "alice" in meta and "monitored" in meta, meta
+        assert page.errors == [], page.errors
+
+
+def _pane(page):
+    return page.evaluate("""() => ({
+      // The label and nothing else: a reason written under each suggestion was a
+      // sentence to read before you could act on it.
+      next: [...document.querySelectorAll('#actpane .apn')].map(
+        (b) => [b.querySelector('b').textContent, b.textContent]),
+      rest: [...document.querySelectorAll('#actpane .aplist button')].map(
+        (b) => [b.textContent, b.disabled]),
+      groups: [...document.querySelectorAll('#actpane .apgroup')].map((g) => g.textContent),
+      note: (document.querySelector('#actpane .apnote') || {}).textContent || "",
+    })""")
+
+
+def test_the_action_pane_leads_with_what_this_state_admits(serve, page, monkeypatch):
+    """Eleven equally-weighted items under four headings is a taxonomy, and a taxonomy
+    is what you need when you do not know what you are looking for. The question people
+    arrive at this pane with is "what do I do with this workspace now", and a heading
+    called "Keep or move it" does not answer it -- nor could a 30px row with a label
+    carry the reason anything was worth doing.
+
+    Two at most, chosen by a rule over facts about THIS workspace, and nothing appears
+    twice: a promoted item leaves the list below.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#actpane .apn")
+        m = _pane(page)
+        assert [n[0] for n in m["next"]] == ["Add sample data", "Send an API call"], m["next"]
+        assert m["next"][0][1] == "Add sample data", "the card is the label, nothing else"
+        assert m["groups"][:2] == ["Next, probably", "Everything else"], m["groups"]
+        labels = [r[0] for r in m["rest"]]
+        assert "Add sample data" not in labels and "Send an API call" not in labels, labels
+        # and the suggestion is the same action, not a second way of describing it
+        page.click("#actpane .apn")
+        page.wait_for_selector("#seed-dialog[open]")
+        assert page.errors == [], page.errors
+
+
+def test_a_seeded_workspace_is_not_told_to_seed_itself(serve, page, monkeypatch):
+    """Seeding only ever ADDS, so "add sample data" on a workspace that is already full
+    is a wrong guess -- and a wrong guess about what to do next is worse than not
+    guessing. The ladder moves on to the next thing its state admits.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail(
+        seed={"profile": "standard", "at": "2026-08-19T09:00:00+00:00", "ok": True}))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#actpane .apn")
+        m = _pane(page)
+        assert [n[0] for n in m["next"]] == ["Send an API call", "Back up now"], m["next"]
+        assert "Add sample data" in [r[0] for r in m["rest"]]
+        assert page.errors == [], page.errors
+
+
+def test_nothing_is_suggested_for_a_workspace_that_is_not_running(serve, page, monkeypatch):
+    """What a down workspace's state admits is "start it", which the panel's own action
+    row and the triage block above it both offer. Suggesting "add sample data" against a
+    workspace that cannot answer would be an invitation to a red toast.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail(state="down", uptime="", health=""))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#actpane .aplist")
+        m = _pane(page)
+        assert m["next"] == [], m["next"]
+        # The heading says what the list is when nothing has been picked out of it.
+        assert m["groups"][:1] == ["What you can do with it"], m["groups"]
+        assert "need the workspace running" in m["note"]
+        # Everything that needs it running is offered but refused in place, rather than
+        # being hidden -- it will be available again the moment it is up.
+        rest = dict(m["rest"])
+        assert rest["Add sample data"] is True, "it would only answer with a red toast"
+        assert rest["Use for CLI commands"] is False, "that one does not need it running"
+        assert page.errors == [], page.errors
+
+
+def test_the_pane_never_offers_what_this_runtime_refuses(serve, page, monkeypatch):
+    """Dropped entirely, not disabled. A greyed button invites "why can't I?" about a
+    thing that will never be available on this runtime -- both would be measuring the
+    `kubectl port-forward` rather than Rocket.Chat -- and the pane says so once, in
+    prose, instead of eleven times in grey.
+    """
+    _stub_lifecycle(monkeypatch, _kube_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#actpane .aplist")
+        m = _pane(page)
+        labels = [r[0] for r in m["rest"]] + [n[0] for n in m["next"]]
+        assert "Run a load test" not in labels, labels
+        assert "Find capacity" not in labels, labels
+        assert "Check the certificate" not in labels, labels
+        assert "Compose-only" in page.text_content("#actpane")
+        assert page.errors == [], page.errors
+
+
+def test_the_top_links_become_one_menu_on_a_narrow_screen(serve, page, monkeypatch):
+    """Four links, a theme toggle and an account name wrapped onto a second row of
+    chrome below 760px -- on a 430px screen that is a quarter of the height spent
+    before anything has been said about a workspace.
+
+    The same four buttons move into a popover; there is no second copy of them, because
+    two sets of the same controls is two things to keep in step and they drift.
+    """
+    _stub_lifecycle(monkeypatch)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.set_viewport_size({"width": 430, "height": 780})
+        page.wait_for_timeout(200)
+        assert page.locator("#nav-toggle").is_visible(), "no way to reach the links"
+        assert not page.locator("#btn-jobs").is_visible(), "they are still on the bar"
+        # One set of buttons, not two.
+        assert page.locator("#btn-jobs").count() == 1
+        page.click("#nav-toggle")
+        page.wait_for_selector("#btn-jobs", state="visible")
+        assert page.get_attribute("#nav-toggle", "aria-expanded") == "true"
+        page.click("#btn-jobs")
+        page.wait_for_function(
+            "() => document.querySelector('#btn-jobs').hasAttribute('aria-current')")
+        # and choosing one puts the menu away
+        assert not page.locator("#btn-jobs").is_visible()
+        # Back on a wide screen they are links again, with no hamburger.
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.wait_for_timeout(200)
+        assert page.locator("#btn-jobs").is_visible()
+        assert not page.locator("#nav-toggle").is_visible()
+        assert page.errors == [], page.errors
+
+
+def test_the_narrow_layout_is_a_picker_a_panel_and_a_bar(serve, page, monkeypatch):
+    """Below 760px the layout was merely survivable: it stacked and nothing overlapped,
+    but nothing was designed for it. The rail was a capped vertical strip spending 38vh
+    of a phone on a list of four names, and the action pane was eleven items in a
+    wrapping grid at the bottom of the document -- which pushed the danger zone off the
+    end of a panel that can be several screens tall.
+
+    Three changes: the rail is a one-row chip picker, the state actions are a bar that
+    stays put while the panel scrolls, and the rest of the pane is one tap away.
+    """
+    _stub_list(monkeypatch, [_fake_detail(name=f"ws-{i}") for i in range(6)])
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros .wrow")
+        page.set_viewport_size({"width": 430, "height": 780})
+        page.click("#repros >> text=ws-2")
+        page.wait_for_selector("#d-body .kv-grid")
+        page.wait_for_timeout(250)
+        m = page.evaluate("""() => {
+          const rows = document.querySelector('#repros');
+          const chips = [...rows.querySelectorAll('.wrow')];
+          return {
+            sideways: document.body.scrollWidth > window.innerWidth + 2,
+            // one row of chips, not six stacked rows
+            railHeight: Math.round(rows.getBoundingClientRect().height),
+            oneRow: new Set(chips.map((c) => Math.round(
+              c.getBoundingClientRect().top))).size === 1,
+            railScrolls: rows.scrollWidth > rows.clientWidth + 2,
+            sticky: getComputedStyle(document.querySelector('#detail .d-actions')).position,
+            pane: getComputedStyle(document.querySelector('#actpane')).display,
+            toggle: getComputedStyle(document.querySelector('.panetoggle')).display,
+          };
+        }""")
+        assert not m["sideways"], "the page scrolls sideways"
+        assert m["oneRow"], "the chips are not on one row"
+        assert m["railHeight"] <= 60, f"the picker is {m['railHeight']}px tall"
+        assert m["railScrolls"], "six chips at 430px have to scroll, not wrap"
+        assert m["sticky"] == "sticky", "the action bar scrolls away with the panel"
+        assert m["pane"] == "none", "the whole pane is still open at the bottom"
+        assert m["toggle"] != "none", "and there is no way to get it back"
+        # PINNED, not merely on screen. This assertion used to pass for the wrong
+        # reason: the panel was short enough that the bar's natural position happened
+        # to be visible, so it said nothing about stickiness -- and stickiness was in
+        # fact not working at all, because `bottom` holds an element that would fall
+        # BELOW the scrollport and does not drag one down from above.
+        pin = page.evaluate("""() => {
+          const b = document.querySelector('#detail .d-actions').getBoundingClientRect();
+          const panel = document.querySelector('#detail').getBoundingClientRect();
+          return {gap: Math.round(window.innerHeight - b.bottom),
+                  taller: panel.height > window.innerHeight};
+        }""")
+        assert pin["taller"], "the panel has to be taller than the screen to pin anything"
+        assert pin["gap"] <= 2, f"the bar sits {pin['gap']}px above the bottom, not pinned"
+        # And it is still there with the panel scrolled to its end.
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(200)
+        assert page.evaluate("""() => {
+          const b = document.querySelector('#detail .d-actions').getBoundingClientRect();
+          return b.bottom > 0 && b.top < window.innerHeight;
+        }"""), "the action bar left the screen"
+        page.click("#detail .panetoggle")
+        page.wait_for_selector("#actpane .apdanger", state="visible")
+        assert page.errors == [], page.errors
+
+
+def test_a_kubernetes_log_line_is_split_by_pod_like_a_compose_one(serve, page, monkeypatch):
+    """kubectl streams these workspaces' logs with `--prefix`, so every line arrives as
+    `[pod/<pod>/<container>] the actual line`. The viewer knew only Compose's
+    `service-1  | line`, so on the runtime where it matters most -- nine pods logging at
+    once on microservices -- the SERVICE column was empty, the service filter had nothing
+    to offer, and 55 characters of pod name sat in front of every message.
+
+    Worse when the line was JSON: the message was taken from the parsed object, so the
+    prefix was dropped entirely and nine pods' logs interleaved with no way to tell which
+    said what.
+
+    Lines below are verbatim from a live microservices workspace.
+    """
+    _stub_lifecycle(monkeypatch, _kube_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        parsed = page.evaluate("""() => [
+          parseLogLine('[pod/rocketchat-presence-7ffb7dc6f7-7v88f/presence-service] NetworkBroker started successfully.'),
+          parseLogLine('[pod/rocketchat-rocketchat-579c867b87-mclgv/rocketchat] {"level":50,"time":1755600000000,"msg":"You have not provided a mail URL."}'),
+          parseLogLine('rocketchat-1  | {"level":30,"time":1755600000000,"msg":"started"}'),
+        ]""")
+        # The CONTAINER, not the pod: a pod name carries a replicaset hash that changes
+        # on every rollout, and the container is the same word Compose calls a service.
+        assert parsed[0]["service"] == "presence", parsed[0]
+        assert parsed[0]["msg"] == "NetworkBroker started successfully.", parsed[0]
+        assert parsed[0]["pod"] == "rocketchat-presence-7ffb7dc6f7-7v88f", parsed[0]
+        # JSON still parses, and the pod is no longer lost with the prefix.
+        assert parsed[1]["service"] == "rocketchat", parsed[1]
+        assert parsed[1]["level"] == "error", parsed[1]
+        assert parsed[1]["msg"] == "You have not provided a mail URL.", parsed[1]
+        assert parsed[1]["pod"] == "rocketchat-rocketchat-579c867b87-mclgv", parsed[1]
+        # And the Compose shape is untouched.
+        assert parsed[2]["service"] == "rocketchat", parsed[2]
+        assert parsed[2]["msg"] == "started", parsed[2]
+        # The rendered row puts it in the service cell, with the pod on the tooltip --
+        # which is what tells two replicas of one service apart.
+        cell = page.evaluate("""() => {
+          const r = logRow(parseLogLine(
+            '[pod/rocketchat-ddp-streamer-768f896d7-2r7w7/ddp-streamer] hello'));
+          const s = r.querySelector('.ls');
+          return [s.textContent, s.title, r.querySelector('.lm').textContent];
+        }""")
+        assert cell == ["ddp-streamer", "rocketchat-ddp-streamer-768f896d7-2r7w7", "hello"], cell
+        assert page.errors == [], page.errors
+
+
+def test_a_note_paragraph_is_as_wide_as_the_card_it_is_in(serve, page, monkeypatch):
+    """The prose in a note card was capped at 74ch. A measure like that is the right
+    idea for a page of running text and the wrong one inside a card: it made the
+    paragraph 647px wide in an 832px card at 1440, and the SAME 647px in a 1344px card
+    at 1920 -- half the box -- while the code block directly under it ran the full
+    width. Text stopping at half the box with a border drawn round the whole of it
+    reads as a broken layout, not as a measure.
+    """
+    groups = [{"title": "1 · Point kubectl and helm at this cluster", "rows": [],
+               "body": ["rc-repro keeps its own kubeconfig so creating a cluster cannot "
+                        "move the context you were using. A bare `kubectl` will not see "
+                        "this workspace until it is pointed here, and every command "
+                        "below assumes it:"],
+               "commands": ["export KUBECONFIG=/home/you/.rc-repro/clients/kubernetes/config"]}]
+    _stub_lifecycle(monkeypatch, _kube_detail(note_groups=groups))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#d-body .note-cmd")
+        for width in (1440, 1920):
+            page.set_viewport_size({"width": width, "height": 1000})
+            page.wait_for_timeout(200)
+            m = page.evaluate("""() => {
+              const card = [...document.querySelectorAll('#d-body .panelcard')].find(
+                (c) => c.textContent.includes('own kubeconfig'));
+              const w = (sel) => Math.round(
+                card.querySelector(sel).getBoundingClientRect().width);
+              return {para: w('.note-p'), cmd: w('.note-cmd'),
+                      card: Math.round(card.clientWidth)};
+            }""")
+            # The paragraph and the thing under it share one edge. Comparing them to each
+            # other rather than to a number is what makes this hold at every width.
+            assert abs(m["para"] - m["cmd"]) <= 2, (
+                f"at {width}px the paragraph is {m['para']}px and the code block "
+                f"{m['cmd']}px in a {m['card']}px card")
+        assert page.errors == [], page.errors
+
+
+def test_a_sidecar_that_keeps_restarting_is_a_fault_on_kubernetes(serve, page, monkeypatch):
+    """The restart rule read `d.restarts`, and the Kubernetes branch of detail() never
+    set it -- so both the restart cell and the triage rule were dead on the runtime where
+    a crash-looping workspace is the common failure. Found on a live microservices
+    workspace whose `ddp-streamer` pod had restarted three times while the panel called
+    it healthy.
+
+    Two halves. `restarts` is now Rocket.Chat's OWN pod, by the label the server selects
+    on -- nine pods here have a count each and "RC restarts: 3" must not be a sidecar's.
+    And a sidecar that keeps restarting gets its own entry, because Rocket.Chat depends
+    on it and the fault is the same one a layer along.
+    """
+    d = _kube_detail(restarts=0, containers=[
+        {"service": "rocketchat-rocketchat-579c867b87-mwq4w", "state": "running",
+         "status": "1/1 ready", "health": "healthy", "app": True, "restarts": 0},
+        {"service": "rocketchat-ddp-streamer-768f896d7-rpcw9", "state": "running",
+         "status": "1/1 ready · 3 restarts", "health": "healthy", "app": False,
+         "restarts": 3},
+        # One restart is what a slow first boot looks like, on either runtime.
+        {"service": "rocketchat-presence-7ffb7dc6f7-m25vt", "state": "running",
+         "status": "1/1 ready · 1 restart", "health": "healthy", "app": False,
+         "restarts": 1}])
+    _stub_lifecycle(monkeypatch, d)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#detail .triage .tri")
+        m = page.evaluate("""() => [...document.querySelectorAll('#detail .triage .tri')].map(
+          (t) => [t.querySelector('.tri-t b').textContent,
+                  t.querySelector('.tri-t span').textContent])""")
+        assert len(m) == 1, m
+        assert m[0][0] == "rocketchat-ddp-streamer-768f896d7-rpcw9 keeps restarting", m
+        assert "restarted 3×" in m[0][1], m[0][1]
+        assert "presence" not in m[0][1], "one restart is a slow boot, not a fault"
+        page.click("#detail .triage .tri-a button")
+        page.wait_for_selector("#d-body .dtable")
+        assert page.errors == [], page.errors
+
+
+def test_the_restart_count_on_kubernetes_is_rocket_chats_own_pod(monkeypatch, tmp_path):
+    """`app` is decided in services/k8s.py from the label APP_SELECTOR already names,
+    never from a substring of the pod name -- the browser would then hold a second copy
+    of a naming rule, and on microservices every pod's name starts with the release.
+    """
+    import json as _json
+
+    from rc_repro import runner
+    from rc_repro.services import k8s as k8ssvc
+    from rc_repro.services import lifecycle as lcsvc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    (tmp_path / "repros" / "kub").mkdir(parents=True)
+    (tmp_path / "repros" / "kub" / "repro.json").write_text(_json.dumps({
+        "name": "kub", "project": "p", "rc_version": "8.5.1", "rc_image": "i",
+        "mongo_tag": "8.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3131", "host_port": 3131, "version_source": "x",
+        "extra": {"runtime": "kubernetes", "namespace": "rc-repro-kub",
+                  "release": "rocketchat"}}))
+    monkeypatch.setattr(runner, "docker_available", lambda **_k: False)
+    monkeypatch.setattr(lcsvc, "kubernetes_state", lambda name, meta: "running")
+    monkeypatch.setattr(k8ssvc, "pod_rows", lambda name, **kw: [
+        {"service": "rocketchat-ddp-streamer-x", "state": "running", "status": "",
+         "health": "", "app": False, "restarts": 3, "started": ""},
+        {"service": "rocketchat-rocketchat-y", "state": "running", "status": "",
+         "health": "healthy", "app": True, "restarts": 1, "started": ""}])
+    # Rocket.Chat's own, not the worst in the namespace.
+    assert lcsvc.detail("kub")["restarts"] == 1
+
+
+def test_the_header_is_the_doctor_button_and_the_footer_names_both_engines(
+        serve, page, monkeypatch):
+    """The header said "docker: up". That was the whole environment when Docker was the
+    only runtime; it is one engine of two now, and it made the one control that answers
+    "is this box usable" look like a status label.
+
+    So the header says what it DOES and the footer says what each engine is doing --
+    because a workspace can run in either and the answer for one says nothing about the
+    other.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#doctor-badge")
+        assert page.text_content("#doctor-badge").strip() == "doctor"
+        # The footer names both, whatever the cluster answer turns out to be here.
+        page.wait_for_function(
+            "() => !document.querySelector('#sb-engines').textContent.includes('k8s: ?')")
+        footer = page.text_content("#sb-engines")
+        assert footer.startswith("docker: "), footer
+        # "not set up" is what an empty Preflight means, and it is a real state: a box
+        # with no kubectl. The cluster-shaped wording is asserted below.
+        assert "k8s: not set up" in footer, footer
+        # And it is still the way to the report.
+        page.click("#doctor-badge")
+        page.wait_for_selector("#doctor-dialog[open]")
+        assert page.errors == [], page.errors
+
+
+def test_the_doctor_chip_goes_red_only_when_nothing_can_run_a_workspace(
+        serve, page, monkeypatch):
+    """Docker being down is not a broken box on a machine whose Kubernetes is up, and
+    colouring the chip red there would be crying wolf at somebody whose k3s works. Red
+    means nothing here can run a workspace at all."""
+    _stub_lifecycle(monkeypatch, _fake_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#doctor-badge")
+        classes = page.evaluate("""() => {
+          const badge = document.querySelector('#doctor-badge');
+          const out = {};
+          DOCKER_OK = false; KUBE = {usable: true, reachable: true,
+                                     distribution: 'k3s', context: 'default'};
+          paintEngines();
+          out.dockerDownKubeUp = badge.className;
+          out.footer = document.querySelector('#sb-engines').textContent;
+          DOCKER_OK = false; KUBE = {usable: false, reachable: false};
+          paintEngines();
+          out.bothDown = badge.className;
+          DOCKER_OK = true; KUBE = null;
+          paintEngines();
+          out.dockerOnly = badge.className;
+          return out;
+        }""")
+        assert "up" in classes["dockerDownKubeUp"], \
+            "a working k3s is not a broken box just because Docker is off"
+        assert "k3s default" in classes["footer"], classes["footer"]
+        assert "down" in classes["bothDown"], "nothing can run: that is red"
+        assert "up" in classes["dockerOnly"]
         assert page.errors == [], page.errors

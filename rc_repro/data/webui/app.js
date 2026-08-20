@@ -184,8 +184,7 @@ async function loadRepros() {
     } catch (_) { /* signed out; api() has already redirected */ }
     // The top bar too: "+ New repro" and "Prune down" are member+, so a readonly
     // session should not be offered them at all.
-    for (const [sel, ok] of [["#btn-new", canWrite()], ["#btn-prune", canWrite()],
-                             ["#btn-bench", canWrite()]]) {
+    for (const [sel, ok] of [["#btn-new", canWrite()], ["#btn-prune", canWrite()]]) {
       const b = $(sel); if (b) b.hidden = !ok;
     }
     // Only worth offering once somebody else's workspaces can appear.
@@ -199,14 +198,47 @@ async function loadRepros() {
     who.textContent = ME + (MY_ROLE && MY_ROLE !== "admin" ? ` · ${MY_ROLE}` : "");
     who.hidden = !ME;
     DOCKER_OK = !!health.docker;
-    const dockerTxt = "docker: " + (health.docker ? "up" : "down");
-    const badge = $("#docker-badge");
-    badge.textContent = dockerTxt; badge.className = "chip " + (health.docker ? "up" : "down");
-    $("#sb-docker").textContent = dockerTxt;
+    paintEngines();
     if (SELECTED && !ALL_REPROS.find((r) => r.name === SELECTED)) closeDetail();
     render();
     refreshHome();
   } catch (e) { toast(e.message); }
+}
+
+// ---- the two engines --------------------------------------------------------
+// `KUBE` is fetched on its own, NOT on the four-second poll: `preflight()` shells out
+// to kubectl several times, and /api/health is the cheap unauthenticated call every
+// open tab makes. Same reasoning as the edge badge, and the same facts `doctor`
+// reports, from the same probe -- so the footer and the report cannot disagree about
+// which cluster you are on.
+let KUBE = null;
+
+async function refreshKube() {
+  try { KUBE = await api("/api/kubernetes"); }
+  catch (_) { KUBE = null; }                    // no permission, or no gui extra
+  paintEngines();
+}
+
+// The footer says what each ENGINE is doing; the header button says what it does.
+// "docker: up" in the header was the whole environment when Docker was the only
+// runtime -- it is one engine of two now, and a workspace can run in either.
+function paintEngines() {
+  const k = KUBE || {};
+  const kube = !k.usable ? "not set up"
+    : k.reachable ? `${k.distribution || "cluster"} ${k.context || ""}`.trim()
+    : k.can_provision ? "no cluster yet" : "no cluster";
+  const el = $("#sb-engines");
+  if (el) el.textContent = `docker: ${DOCKER_OK ? "up" : "down"} · k8s: ${kube}`;
+  // Red only when NOTHING can run a workspace. Docker being down is not a broken box
+  // on a machine whose Kubernetes is up, and saying so would be crying wolf at
+  // somebody whose k3s is working perfectly.
+  const badge = $("#doctor-badge");
+  if (badge) {
+    const dead = !DOCKER_OK && !(k.usable && k.reachable);
+    badge.className = "chip " + (dead ? "down" : "up");
+    badge.title = dead ? "Nothing here can run a workspace — run the environment check"
+                       : "Run the environment check";
+  }
 }
 
 // ---- the edge ---------------------------------------------------------------
@@ -303,15 +335,64 @@ function render() {
 
   if (!ALL_REPROS.length) grid.append(el("p", { class: "empty" }, "No workspaces yet. Start with “+ New workspace”."));
   else if (!list.length) grid.append(el("p", { class: "empty" }, "Nothing matches this filter."));
-  for (const r of list) grid.append(card(r));
+
+  // GROUPED BY WHAT IT WANTS FROM YOU. A flat list is fine with two workspaces and
+  // is the wrong shape for a shared box running eight to twelve: "which one is
+  // unhappy" was a question you answered by reading every row, and the unhappy one
+  // could be anywhere in an alphabetical list.
+  //
+  // With docker unreachable every state is "?" -- there is nothing to distinguish, so
+  // grouping would sort them into one bucket with a heading that says nothing.
+  for (const [title, tone, rows] of unknown ? [["", "", list]] : railGroups(list)) {
+    if (!rows.length) continue;
+    // The heading is suppressed when there is only one group: with everything in one
+    // state the rail-head pill above already says which, and a heading over the whole
+    // list is a label for the thing it is inside.
+    if (title && !unknown) {
+      grid.append(el("div", { class: "rgrp" },
+        el("span", { class: "rdot " + tone }),
+        el("span", { class: "rgrp-t" }, title),
+        el("span", { class: "rgrp-n" }, String(rows.length))));
+    }
+    for (const r of rows) grid.append(card(r));
+  }
 }
 
+// Three buckets, in the order you need them. "Wants you" is not "not running": a
+// stopped workspace is doing exactly what it was told, and a restart-looping one is
+// not, so they cannot share a group without the group meaning nothing.
+const RAIL_ORDER = [["Wants you", "warn"], ["Running", "ok"], ["Not running", "off"]];
+function wantsYou(r) {
+  // States nothing is going to fix on its own.
+  if (["restarting", "dead", "paused"].includes(r.state)) return true;
+  // Running, answering, and failing the healthcheck it sets for itself.
+  if (r.state === "running" && healthClass(r) === "bad") return true;
+  // Its https name resolves and answers 502, which looks like a broken workspace
+  // rather than a broken route -- so the rail has to be the thing that says so.
+  const route = ((EDGE && EDGE.routes) || []).find((x) => x.name === r.name);
+  return !!(route && route.reachable === false);
+}
+function railGroups(list) {
+  const buckets = [[], [], []];
+  for (const r of list) {
+    buckets[wantsYou(r) ? 0 : r.state === "running" ? 1 : 2].push(r);
+  }
+  const live = buckets.filter((b) => b.length).length;
+  return RAIL_ORDER.map(([title, tone], i) =>
+    [live > 1 ? title : "", tone, buckets[i]]);
+}
+
+// A row, not a card. The old card was 130px tall and carried six buttons; six
+// workspaces meant 36 buttons on screen and 4.5 of them visible. This is 52px, has no
+// buttons at all, and shows the whole name -- which is the thing anyone is actually
+// scanning for. Everything you can DO lives in the stage, next to the workspace it
+// acts on.
+//
+// One line was tried and reverted. It fits more rows, and it pays for them with the
+// port, the owner and the scenario -- which is what people search a rail BY on a
+// shared box. The grouping above is what "which one is unhappy" needed; the row did
+// not have to shrink as well.
 function card(r) {
-  // A row, not a card. The old one was 130px tall and carried six buttons; six
-  // workspaces meant 36 buttons on screen and 4.5 of them visible. This is 52px,
-  // has no buttons at all, and shows the whole name -- which is the thing anyone
-  // is actually scanning for. Everything you can DO lives in the stage, next to
-  // the workspace it acts on.
   const busy = pendingOn(r.name);
   const state = busy ? "working" : stateClass(r.state || "?");
   const row = el("button", {
@@ -334,11 +415,26 @@ function card(r) {
   if (r.runtime && r.runtime !== "docker") bits.push(r.runtime === "kubernetes" ? "k8s" : r.runtime);
   if (r.monitoring) bits.push("monitored");
   row.append(r1, el("span", { class: "meta" }, bits.join(" · ")));
+  // The third line stays even under a group heading that names the same state: the
+  // heading is a boundary you scroll past, this is on the row you are looking at --
+  // and for the group that wants you it says WHY, which the heading cannot.
   row.append(el("span", { class: "r3" },
     el("span", { class: "wstate " + (busy ? "working" : stateClass(r.state)) },
       busy ? (BUSY_VERB[busy] || busy) : (r.state === "?" ? "state unknown" : r.state)),
-    el("span", { class: "wage" }, r.uptime || "")));
+    el("span", { class: "wage" }, railWhy(r) || r.uptime || "")));
   return row;
+}
+
+// What the state word does not say, on the rows where there is something: the reason
+// this row is in the group that wants you. Empty everywhere else, where the age it
+// replaces is the more useful thing.
+function railWhy(r) {
+  if (!wantsYou(r)) return "";
+  const route = ((EDGE && EDGE.routes) || []).find((x) => x.name === r.name);
+  const bits = [];
+  if (r.state === "running" && healthClass(r) === "bad") bits.push(r.health || "unhealthy");
+  if (route && route.reachable === false) bits.push("https 502");
+  return bits.join(" · ");
 }
 
 const PENDING = new Map();
@@ -393,6 +489,22 @@ async function runAction(name, label, fn) {
 // The grouping is not decoration, it is the teaching: "put data in it" explains
 // what Seed does to somebody who never read the CLI's help. That only works if
 // they can SEE it, which is why this is a pane and not a menu.
+// The suggestion ladder, stated in order. Only ever the FIRST TWO that qualify, and
+// every reason is a fact about THIS workspace rather than a guess about intent --
+// guessing "next" wrongly is worse than not guessing, which is why nothing here reads
+// a name, an age or a preset.
+//
+// Nothing is suggested for a workspace that is not running: what its state admits is
+// "start it", which the panel's own action row and the triage block above both offer.
+const NEXT_LADDER = [
+  ["seed", (d) => !d.seed,
+   "It has no sample data yet — no users, rooms or messages beyond the admin account."],
+  ["call", () => true,
+   "Send a REST request to this workspace and read the response here."],
+  ["backup", (d) => !!d.seed,
+   "It has data now, and a backup can be restored into a new workspace."],
+];
+
 function renderActionPane(d, busyLabel) {
   const pane = $("#actpane");
   pane.innerHTML = "";
@@ -403,54 +515,72 @@ function renderActionPane(d, busyLabel) {
     return;
   }
   const running = d.state === "running";
-  // A fourth element: false means "this runtime refuses it". The load test and the
-  // capacity search are Compose-only and the server says so with a 400 -- rendering
-  // them on a Kubernetes workspace could only produce a red toast, which is the same
-  // reason the logs and env tabs are kept off a readonly panel. Not "unimplemented":
-  // both would be measuring the `kubectl port-forward` rather than Rocket.Chat.
+  // `on: false` means "this runtime refuses it". The load test and the capacity search
+  // are Compose-only and the server says so with a 400 -- rendering them on a
+  // Kubernetes workspace could only produce a red toast, which is the same reason the
+  // logs and env tabs are kept off a readonly panel. Not "unimplemented": both would
+  // be measuring the `kubectl port-forward` rather than Rocket.Chat.
   // See services/perf.require_compose_for_perf.
   const kube = d.runtime === "kubernetes";
-  const groups = [
-    ["Put data in it", [
-      ["Add sample data", () => openSeed(d.name), running],
-      ["Import settings", () => openImport(d.name), running],
-    ]],
-    ["Measure it", [
-      ["Run a load test", () => openPerf(d.name, d.monitoring), running, !kube],
-      ["Find capacity", () => openCap(d.name), running, !kube],
-      // Named for the thing rather than for one of its parts: it attaches
-      // Prometheus, Grafana, Loki and the exporters, and "stream to Grafana"
-      // described the last hop of it.
-      [d.monitoring ? "Detach monitoring" : "Attach monitoring",
-       () => doMonitor(d.name, !!d.monitoring), running],
-    ]],
-    ["Connect to it", [
-      ["PAT and Token", () => doPat(d.name), running],
-      ["Send an API call", () => openCall(d.name), running],
-    ]],
-    ["Keep or move it", [
-      ["Back up now", () => doBackup(d.name), running],
-      ["Upgrade version", () => openUpgrade(d.name, d.rc_version), running],
-      // Greyed on Compose, GONE on Kubernetes: TLS is a runtime property there, so a
-      // Compose workspace can gain HTTPS later and this becomes available -- while
-      // `up --https` is refused outright on Kubernetes, so it never can.
-      ["Check the certificate", () => doTlsStatus(d.name), running && !!d.public_url,
-       !kube],
-      ["Use for CLI commands", () => doDefault(d.name), !d.is_default],
-    ]],
-  ];
-  for (const [title, rawItems] of groups) {
-    // Dropped entirely, not disabled: a greyed button invites "why can't I?" about
-    // a thing that will never be available on this runtime, which is the same
-    // reasoning the create dialog gives for HIDING the privileged fields.
-    const items = rawItems.filter(([, , , supported]) => supported !== false);
-    const usable = items.filter(([, , ok]) => ok !== false || running);
-    if (!usable.length) continue;
-    pane.append(el("div", { class: "apgroup" }, title));
+  // ONE FLAT LIST, in the order the four headings used to impose. Four titled groups
+  // over eleven items is a taxonomy, and a taxonomy is what you need when you do not
+  // know what you are looking for -- but the question people arrive with is "what do I
+  // do with this workspace now", and a heading called "Keep or move it" does not answer
+  // it. The two that DO are lifted out above, with the reason they were chosen.
+  const items = [
+    { id: "seed", label: "Add sample data", fn: () => openSeed(d.name), ok: running },
+    { id: "import", label: "Import settings", fn: () => openImport(d.name), ok: running },
+    { id: "call", label: "Send an API call", fn: () => openCall(d.name), ok: running },
+    { id: "pat", label: "PAT and Token", fn: () => doPat(d.name), ok: running },
+    { id: "backup", label: "Back up now", fn: () => doBackup(d.name), ok: running },
+    { id: "upgrade", label: "Upgrade version",
+      fn: () => openUpgrade(d.name, d.rc_version), ok: running },
+    // Named for the thing rather than for one of its parts: it attaches Prometheus,
+    // Grafana, Loki and the exporters, and "stream to Grafana" described the last hop.
+    { id: "monitor", label: d.monitoring ? "Detach monitoring" : "Attach monitoring",
+      fn: () => doMonitor(d.name, !!d.monitoring), ok: running },
+    { id: "loadtest", label: "Run a load test",
+      fn: () => openPerf(d.name, d.monitoring), ok: running, on: !kube },
+    { id: "capacity", label: "Find capacity", fn: () => openCap(d.name), ok: running,
+      on: !kube },
+    // Greyed on Compose, GONE on Kubernetes: TLS is a runtime property there, so a
+    // Compose workspace can gain HTTPS later and this becomes available -- while
+    // `up --https` is refused outright on Kubernetes, so it never can.
+    { id: "tls", label: "Check the certificate", fn: () => doTlsStatus(d.name),
+      ok: running && !!d.public_url, on: !kube },
+    { id: "default", label: "Use for CLI commands", fn: () => doDefault(d.name),
+      ok: !d.is_default },
+  ].filter((it) => it.on !== false);
+
+  const byId = new Map(items.map((it) => [it.id, it]));
+  const next = [];
+  if (running && !busyLabel) {
+    for (const [id, when, why] of NEXT_LADDER) {
+      if (next.length === 2) break;
+      const it = byId.get(id);
+      if (it && it.ok && when(d)) next.push([it, why]);
+    }
+  }
+  if (next.length) {
+    pane.append(el("div", { class: "apgroup" }, "Next, probably"));
+    const box = el("div", { class: "apnext" });
+    // The label, and nothing else. The reason each one was chosen was a sentence under
+    // it, and a sentence under a suggestion is a thing to read before you can act: the
+    // heading already says these are suggestions, and the item says what it does.
+    for (const [it] of next) {
+      box.append(el("button", { class: "apn", onclick: it.fn }, el("b", {}, it.label)));
+    }
+    pane.append(box);
+  }
+
+  const rest = items.filter((it) => !next.some(([n]) => n === it.id || n.id === it.id));
+  if (rest.length) {
+    pane.append(el("div", { class: "apgroup" },
+      next.length ? "Everything else" : "What you can do with it"));
     const listEl = el("div", { class: "aplist" });
-    for (const [label, fn, ok] of items) {
-      const b = el("button", { onclick: fn }, label);
-      if (!ok || busyLabel) b.disabled = true;
+    for (const it of rest) {
+      const b = el("button", { onclick: it.fn }, it.label);
+      if (!it.ok || busyLabel) b.disabled = true;
       listEl.append(b);
     }
     pane.append(listEl);
@@ -703,11 +833,71 @@ async function openScenarios() {
 }
 
 
+// One grouped note, as a card. Three kinds of content and each gets the treatment
+// it needs rather than all three arriving as bullets:
+//
+//   rows      facts. A key/value table -- "Cluster: kind-x" was three facts welded
+//             into a sentence, and a sentence is the wrong shape for a lookup.
+//   body      what a reader needs to KNOW. Still read through the notes pattern's
+//             three shapes, so a place line is still a link row and an indented
+//             line is still a copyable box.
+//   commands  what a reader has to PASTE. Its own block with a Copy button, never
+//             prose -- these were buried mid-paragraph.
+function noteGroupCard(g, items, shown) {
+  const rows = g.rows || [], cmds = g.commands || [];
+  // A place this workspace's link table ALREADY lists is not a second place: the
+  // monitoring notes name Grafana and Prometheus, and both are link rows, so without
+  // this the same two urls appear once as rows and again as prose one card below.
+  const body = (items || []).filter((i) => !(shown && shown.has(i)));
+  if (!rows.length && !body.length && !cmds.length) return null;
+  const card = el("div", { class: "panelcard" });
+  if (g.title) {
+    card.append(el("div", { class: "panelcard-h" },
+      el("span", { class: "section-label flat" }, g.title)));
+  }
+  if (rows.length) {
+    const t = el("table", { class: "notetable" });
+    for (const [k, v] of rows) {
+      t.append(el("tr", {}, el("th", {}, k), el("td", {}, String(v))));
+    }
+    card.append(t);
+  }
+  if (body.length || cmds.length) {
+    const box = el("div", { class: "panelcard-b notes" });
+    // The body went through the SAME parser the ungrouped notes use, so the three
+    // shapes hold inside a group and nothing about that pattern is re-decided here.
+    if (body.length) renderNoteItems(box, body);
+    for (const c of cmds) {
+      box.append(el("div", { class: "note-cmd" },
+        el("code", {}, c),
+        el("button", { class: "cp", onclick: () => copy(c) }, "Copy")));
+    }
+    card.append(box);
+  }
+  return card;
+}
+
+// Every note this workspace has, parsed once, group by group. Parsed HERE rather
+// than inside each card because the link rows are enriched from these: a note naming
+// a place the links already list is the rest of what is known about that one row, not
+// a second row -- and the notes it can come from are no longer all in one group.
+function noteItemsByGroup(d) {
+  const groups = d.note_groups || [];
+  // A workspace whose record has no groups keeps its whole story in the scenario
+  // card, exactly as before groups existed.
+  if (!groups.length) {
+    return [{ g: { kind: "scenario" }, items: parseNotes(d.notes || []) }];
+  }
+  return groups.map((g) => ({ g, items: parseNotes(g.body || []) }));
+}
+
+
+
 // The Scenario card: what this workspace adds beyond a plain Rocket.Chat, where
 // those things are, and what you have to do to use them — in one block instead of
 // a "Where things are" list and a "Using this scenario" list that never referred
 // to each other.
-function scenarioCard(d) {
+function scenarioCard(d, parsed, shown) {
   const card = el("div", { class: "panelcard" });
   // Title it by what is actually IN it. A plain workspace with monitoring
   // attached has links and notes but no scenario, and calling that block
@@ -734,7 +924,12 @@ function scenarioCard(d) {
   // dc=com / admin" before the scenario would work, which is not true of anything.
   // The discriminator is the sentence that INTRODUCES the line, and it is already in
   // the note above it: a hosts entry is the only setup step any preset has.
-  const items = parseNotes(d.notes);
+  // Grouped or not, this card's prose is the SCENARIO's prose. Ungrouped that is
+  // the whole flat list; grouped it is the one group marked as the scenario, and the
+  // rest are cards of their own below. Reading d.notes in the grouped case would put
+  // every Kubernetes fact through here a second time.
+  const own = parsed.find((x) => x.g.kind === "scenario");
+  const items = own ? own.items : [];
   const introduced = (item) => {
     const before = items[items.indexOf(item) - 1];
     const text = before && before.kind === "prose" ? (before.lines || []).join(" ") : "";
@@ -761,8 +956,12 @@ function scenarioCard(d) {
   // once as rows and once as prose.
   const key = (u) => String(u || "").replace(/\/+$/, "");
   const byUrl = new Map();
-  for (const it of items) if (it.kind === "place") byUrl.set(key(it.url), it);
-  const shown = new Set();
+  // Across EVERY group, not just this card's own prose. Monitoring's Grafana line
+  // lives in the Monitoring group now, and it is still the same row as the Grafana
+  // link -- password included, which is the part the link row does not know.
+  for (const { items: its } of parsed) {
+    for (const it of its) if (it.kind === "place") byUrl.set(key(it.url), it);
+  }
   for (const l of d.links || []) {
     const note = byUrl.get(key(l.url));
     if (note) shown.add(note);
@@ -812,6 +1011,142 @@ function closeDetail() {
   render();
 }
 function switchTab(t) { dstate.tab = t; renderDetail(); }
+
+// ---- triage: what is wrong, and what to do about it -------------------------
+//
+// The panel is opened when something LOOKS wrong, and it used to open with six
+// facts that never change. The one thing on it that said anything was wrong -- the
+// restart banner -- was under them, which on a 900px window is under the fold. This
+// goes first, and it answers the two questions in the order they get asked: what is
+// wrong, and what do I do about it.
+//
+// Every entry is a rule over what the payload already carries, never a guess about
+// intent. Guessing "next" wrongly is worse than not guessing, so nothing here is
+// inferred from a workspace's name, its age or its preset.
+//
+// The quiet state is ABSENCE. A healthy workspace gets no block at all rather than a
+// green one saying so -- a box that is always on screen stops being read, and the six
+// facts below it already say everything is fine.
+function triageOf(d) {
+  const out = [];
+  const push = (title, why, actions) => out.push({ title, why, actions: actions.filter(Boolean) });
+  // Logs are member+ on the server (they carry an LDAP bind password), so offering
+  // the button to a readonly reader would offer them a 403.
+  const logs = canWrite() && ["Open the logs", () => switchTab("logs"), true];
+  const pods = ["See the pods", () => switchTab("containers")];
+
+  // The STATE comes first and comes alone. The health of a workspace that is not
+  // running is not a second problem, it is the same problem said twice.
+  if (d.state === "?") {
+    push("Docker is not answering",
+         "Nothing here can report its state, start or stop until it is back.",
+         [["Check this box", openDoctor, true]]);
+    return out;
+  }
+  if (d.state === "down") {
+    push("This workspace is not running",
+         `Its record and its data volume are still here, and :${d.host_port} stays `
+         + "reserved for it. Bringing it up reuses both.",
+         [canWrite() && ["Bring it up", () => doBringUp(d.name), true]]);
+    return out;
+  }
+  if (d.state === "stopped") {
+    push("This workspace is stopped",
+         d.runtime === "kubernetes"
+           ? "Its release is scaled to zero. The data and the namespace are intact."
+           : "Its containers exist and are not running. The data volume is intact.",
+         [canWrite() && ["Start it", () => doState(d.name, "start"), true]]);
+    return out;
+  }
+
+  // Restarting, or a restart count that is climbing. Two restarts is the line
+  // because one is what a slow first boot looks like.
+  const n = d.restarts || 0;
+  if (d.state === "restarting" || n >= 2) {
+    // The free-memory sentence only when the number is actually known -- the home
+    // stage fetches it, and inventing one would be worse than leaving it out.
+    const free = HOME.cap && HOME.cap.known
+      ? ` This box has ${fmtGb(Math.max(0, (HOME.cap.available_mb || 0)
+                                          - (HOME.cap.reserve_mb || 0)))} free.` : "";
+    push(n ? `Rocket.Chat has restarted ${n}×` : "Rocket.Chat is restarting",
+         "That is usually memory pressure — the kernel kills it and Docker starts it "
+         + "again — or an error during boot, which the logs name." + free,
+         [logs, ["Check this box", openDoctor]]);
+  } else if (healthClass(d) === "bad") {
+    // Running, answering, and reporting itself unhealthy: its healthcheck is what
+    // knows why, and the logs are where it says so.
+    push("It is failing its healthcheck",
+         "The container is up but Rocket.Chat is not answering the check it sets "
+         + "for itself, so anything talking to it will see errors.",
+         [logs]);
+  }
+
+  // A pod OTHER than Rocket.Chat's that keeps restarting. The rule above counts
+  // Rocket.Chat's own restarts and nothing counted the rest, so on microservices a
+  // ddp-streamer or presence pod could crash-loop all day with the panel calling the
+  // workspace healthy -- and it is the same fault, one layer along. `app` is the
+  // server's answer to "which pod is Rocket.Chat", from the label it selects on.
+  const flapping = (d.containers || []).filter((c) => !c.app && (c.restarts || 0) >= 2);
+  if (flapping.length) {
+    const one = flapping.length === 1;
+    push(one ? `${flapping[0].service} keeps restarting`
+             : `${flapping.length} pods keep restarting`,
+         (one ? `It has restarted ${flapping[0].restarts}×`
+              : flapping.slice(0, 3).map((c) => `${c.service} — ${c.restarts}×`).join(" · "))
+         + ". Rocket.Chat depends on these, so it will be failing in ways its own logs "
+         + "only half explain.",
+         [pods]);
+  }
+
+  // Pods that cannot start, named. `blocked` is decided server-side by the module
+  // that owns the list of reasons a pod never recovers from (services/k8s.py); the
+  // browser reads the flag rather than keeping a second copy of the policy, which is
+  // how the create dialog's refusal list came to be wrong.
+  const stuck = (d.containers || []).filter((c) => c.blocked);
+  if (stuck.length) {
+    push(stuck.length === 1 ? "One pod cannot start"
+                            : `${stuck.length} pods cannot start`,
+         stuck.slice(0, 3).map((c) => `${c.service} — ${c.status}`).join(" · ")
+         + ". Kubernetes will keep retrying and will not get further on its own.",
+         [pods]);
+  }
+
+  // The https name resolves and answers 502, which looks like a broken workspace
+  // rather than a broken route -- so it has to be said next to the workspace.
+  const route = ((EDGE && EDGE.routes) || []).find((r) => r.name === d.name);
+  if (route && route.reachable === false) {
+    push("The edge cannot reach this workspace",
+         `${d.public_url || "Its https name"} answers 502. The route exists; the `
+         + "edge is not on this workspace's network.",
+         [["Look at the edge", openEdge, true]]);
+  }
+  return out;
+}
+
+function triageBlock(d) {
+  const items = triageOf(d);
+  if (!items.length) return null;
+  // Amber, not red. The rule in app.css is that red means "about to destroy
+  // something" -- a crash-looping workspace wants you, it does not threaten you, and
+  // spending red here leaves nothing louder for the Down button.
+  const box = el("div", { class: "triage" });
+  for (const t of items) {
+    const card = el("div", { class: "tri" });
+    card.append(el("span", { class: "tri-i" }, "▲"));
+    card.append(el("div", { class: "tri-t" },
+      el("b", {}, t.title), el("span", {}, t.why)));
+    if (t.actions.length) {
+      const row = el("div", { class: "tri-a" });
+      for (const [label, fn, primary] of t.actions) {
+        row.append(el("button", { class: "btn small" + (primary ? " solid" : ""),
+                                  onclick: fn }, label));
+      }
+      card.append(row);
+    }
+    box.append(card);
+  }
+  return box;
+}
 
 function renderDetail() {
   const d = dstate.detail; if (!d) return;
@@ -876,8 +1211,25 @@ function renderDetail() {
     actions.append(dBtn("Stop", () => doState(d.name, "stop")));
     actions.append(dBtn("Restart", () => doState(d.name, "restart")));
   }
+  // Rendered always and shown only by the narrow layout, where the action pane is not
+  // a column. It scrolls the pane into view as well as revealing it: the pane follows
+  // the stage in the document, so revealing it silently would put it below a panel
+  // that can be several screens tall.
+  if (canWrite()) {
+    actions.append(el("button", { class: "btn small panetoggle", onclick: () => {
+      const open = !document.body.classList.contains("pane-open");
+      document.body.classList.toggle("pane-open", open);
+      if (open) $("#actpane").scrollIntoView({ block: "start", behavior: "smooth" });
+    } }, "Actions ⌄"));
+  }
   renderActionPane(d, busyLabel);
-  panel.append(head, sub, tabs, actions, el("div", { class: "d-body", id: "d-body" }));
+  // Above the TABS, not inside Overview: what is wrong with the workspace is not a
+  // property of the tab you happen to be on, and it was invisible from Logs --
+  // which is precisely where you go when something is wrong.
+  panel.append(head, sub);
+  const tri = triageBlock(d);
+  if (tri) panel.append(tri);
+  panel.append(tabs, actions, el("div", { class: "d-body", id: "d-body" }));
   renderTab();
 }
 
@@ -893,32 +1245,51 @@ function renderTab() {
   body.innerHTML = "";
   if (dstate.tab === "overview") {
     const kv = (k, v, cls = "") => el("div", { class: "kv" }, el("div", { class: "k" }, k), el("div", { class: "v " + cls }, v));
-    // Exactly six, exactly like v4: three columns, two full rows, no hole. The
-    // owner, the port and the scenario moved into the identity line above, which
-    // is where they read as a sentence rather than as three more boxes.
+    // Exactly six, three columns, two full rows, no hole -- a seventh cell leaves an
+    // empty third, which is why the conditional restart count below adds a ROW rather
+    // than sitting between two of these.
+    //
+    // Rows were tried here and reverted: they read as a form rather than as a set of
+    // readings, and the values lost the size that makes health and uptime findable
+    // without looking for them. The facts a cell had nowhere to put -- "failing its
+    // healthcheck", "restarted 4x" -- are said by the triage block above instead,
+    // which is where a reader is looking when either of them is true.
+    //
+    // WHERE IT RUNS earns a cell. It decides what every other command will do to this
+    // workspace -- which ones refuse, where the data lives, how to reach it -- and the
+    // panel stated it nowhere. `Port` gave up its place: it is already in the identity
+    // line under the title AND in the URL box below, so it was the one fact on this
+    // grid stated three times, while the runtime was stated nowhere.
+    const where = d.runtime === "kubernetes" ? "Kubernetes" : "Compose";
     const grid = el("div", { class: "kv-grid" },
       kv("RC Version", d.rc_version), kv("MongoDB", d.mongo_tag),
+      kv("Runs on", d.deployment ? `${where} · ${d.deployment}` : where),
       kv("Uptime", d.uptime || "—", d.uptime ? "green" : ""),
-      kv("Port", ":" + d.host_port), kv("Scenario", d.preset || "default"),
+      kv("Scenario", d.preset || "default"),
       // healthClass() knows unhealthy/starting/healthy; the kv only understood the
       // literal string "healthy", so a container reporting "running" rendered plain.
       kv("Health", d.health || d.state || "—", HEALTH_TONE[healthClass(d)] || ""));
-
-    // Where its https name is actually served from. Without this the panel shows
-    // a workspace with no TLS port and no Traefik, which now looks like HTTPS is
-    // simply missing rather than handled one layer up.
-    // A climbing restart count separates "slow to boot" from "crash-looping".
+    // A climbing restart count separates "slow to boot" from "crash-looping". No
+    // banner under it any more: that is the triage block, above the tabs.
     if (typeof d.restarts === "number" && d.restarts > 0) {
       grid.append(kv("RC restarts", String(d.restarts), d.restarts >= 2 ? "bad" : "warn"));
     }
     body.append(grid);
-    if (d.state === "restarting" || (d.restarts || 0) >= 2) {
-      body.append(el("p", { class: "banner bad" },
-        `Rocket.Chat has restarted ${d.restarts || 0}× — usually resource pressure `
-        + `(free some repros, or raise Docker's CPU/RAM) or a boot error. Check the Logs tab.`));
+    // Parsed once and shared: the links card merges a note that names a place it
+    // already lists, and records which notes it took, so no group below repeats one.
+    const parsed = noteItemsByGroup(d);
+    const shown = new Set();
+    const ownNotes = parsed.find((x) => x.g.kind === "scenario");
+    if ((d.links && d.links.length) || (ownNotes && ownNotes.items.length)) {
+      body.append(scenarioCard(d, parsed, shown));
     }
-    if ((d.links && d.links.length) || (d.notes && d.notes.length)) {
-      body.append(scenarioCard(d));
+    // Everything else the workspace has to say, one card per group. A workspace made
+    // before groups existed has none of these and its whole story stays in the card
+    // above, unchanged.
+    for (const { g, items } of parsed) {
+      if (g.kind === "scenario") continue;          // rendered by the card above
+      const card = noteGroupCard(g, items, shown);
+      if (card) body.append(card);
     }
     if (d.state === "running") {
       const card = el("div", { class: "panelcard" },
@@ -1348,10 +1719,29 @@ function queueLog(e) {
   if (!logv.frame) logv.frame = requestAnimationFrame(flushLogs);
 }
 
+// kubectl's `--prefix`: `[pod/<pod>/<container>] the actual line`. On a microservices
+// workspace every line arrives like this from nine pods at once, and this function knew
+// only Compose's `service-1  | line` -- so the SERVICE column was empty on the runtime
+// where it matters most, the filter had nothing to offer, and 55 characters of pod name
+// sat in front of every message pushing the content out of alignment. When the line was
+// JSON the prefix was silently dropped instead, which is worse: nine pods' logs
+// interleaved with no way to tell which said what.
+const K8S_PREFIX = /^\[pod\/([^/\]]+)\/([^/\]]+)\]\s?/;
+
 function parseLogLine(line) {
-  const bar = line.indexOf("|");
-  let service = "", content = line;
-  if (bar > 0 && bar < 40) { service = line.slice(0, bar).trim().replace(/-\d+$/, ""); content = line.slice(bar + 1).trim(); }
+  let service = "", content = line, pod = "";
+  const k = K8S_PREFIX.exec(line);
+  if (k) {
+    pod = k[1];
+    // The CONTAINER, not the pod: a pod name carries a replicaset hash that changes on
+    // every rollout, and the container is the same word Compose calls a service --
+    // `rocketchat`, `ddp-streamer`, `presence`. The chart suffixes half of them with
+    // `-service`, which is noise in a 92px column where every row has it.
+    service = k[2].replace(/-service$/, "");
+    content = line.slice(k[0].length);
+  }
+  const bar = content.indexOf("|");
+  if (!k && bar > 0 && bar < 40) { service = content.slice(0, bar).trim().replace(/-\d+$/, ""); content = content.slice(bar + 1).trim(); }
   let level = "info", msg = content, ts = "";
   const b = content.indexOf("{");
   if (b >= 0) {
@@ -1366,7 +1756,7 @@ function parseLogLine(line) {
       if (o.name) msg = `[${o.name}] ${msg}`;
     } catch (_) { /* not JSON — keep raw */ }
   }
-  return { service, level, msg, ts, raw: line };
+  return { service, level, msg, ts, pod, raw: line };
 }
 function passes(e) {
   return LEVELS.indexOf(e.level) >= LEVELS.indexOf(logv.min)
@@ -1374,10 +1764,14 @@ function passes(e) {
     && (!logv.q || e.msg.toLowerCase().includes(logv.q));
 }
 function logRow(e) {
+  // The pod on the service cell's tooltip: two replicas of one service are the same
+  // word in this column, and which of the two said it is occasionally the whole
+  // question. Not in the column itself -- a replicaset hash is 20 characters of noise
+  // on every row to answer a question nobody asks most of the time.
   return el("div", { class: "logrow lv-" + e.level },
     el("span", { class: "lt" }, e.ts || ""),
     el("span", { class: "ll lv-" + e.level }, e.level.toUpperCase()),
-    el("span", { class: "ls" }, e.service || ""),
+    el("span", { class: "ls", title: e.pod || "" }, e.service || ""),
     el("span", { class: "lm" }, e.msg));
 }
 // The service filter's options, rebuilt from whatever services the buffer has seen.
@@ -1983,6 +2377,13 @@ function renderCreateResult(r) {
 // notes as plain text -- a preset that says "pass --reg-token" or "`loadtest
 // --live`" is naming something you type, and leaving the backticks on screen is
 // showing the reader the markup instead of the meaning.
+//: Words a finished sentence does not end on. A note ending in one of these was
+//: wrapped for an 80-column terminal and continues on the next line; a note ending
+//: in anything else -- a name, a number, a url, punctuation -- is a complete point.
+const WRAPPED_TAIL = new RegExp("\\b(?:a|an|the|and|or|but|of|to|in|on|at|by|for|from|"
+  + "with|is|are|was|were|be|been|being|that|which|who|as|its|their|your|our|this|"
+  + "these|those|into|than|then|so|if|when|while|it|not|no|any|each|per|via)$");
+
 const TOKEN_RE = /`([^`]+)`|\bhttps?:\/\/[^\s)]+/;
 
 function linkify(line) {
@@ -2063,13 +2464,23 @@ function parseNotes(notes) {
       continue;
     }
     // A column-0 line continues the one above ONLY if that one broke mid-sentence,
-    // and the reliable signal is what it ENDS with. Ending punctuation is not
-    // enough on its own: livechat has two separate points that each end in a url,
-    // and one that starts with a lowercase username. A line that trails off in a
-    // plain lowercase word ("…can reach Keycloak at the") was wrapped; one ending
-    // in a url, a path, a number or punctuation was finished.
+    // and the reliable signal is what it ENDS with. Ending punctuation is not enough
+    // on its own: livechat has two separate points that each end in a url, and one
+    // that starts with a lowercase username.
+    //
+    // "Ends in any lowercase word" was too broad, and the Kubernetes notes are what
+    // proved it: "monolith on kind-rc-repro-local — about 5 pods, namespace
+    // rc-repro-knotes" is a COMPLETE point that happens to end in an identifier, and
+    // it was being glued to the MongoDB note that followed it — two facts in one
+    // bullet, in the notes a reader consults to find out what their workspace is.
+    //
+    // So the test is narrower: a line was wrapped only if it trails off in a short
+    // FUNCTION word, which is a thing no finished sentence ends with. `oidc`'s
+    // "…can reach Keycloak at the" still joins the line after it; a namespace name
+    // no longer does. Indented continuations (the 2-space ones `email` and `saml`
+    // use) never needed this test and still do not — they are handled above.
     const tail = prev.trim();
-    const wrapped = para && /[a-z][a-z'’]*$/.test(tail) && !/\/\S*$/.test(tail);
+    const wrapped = para && WRAPPED_TAIL.test(tail) && !/\/\S*$/.test(tail);
     if (!para || !(indented || wrapped)) {
       para = { kind: "prose", lines: [] };
       items.push(para);
@@ -2107,6 +2518,11 @@ function placeRow(p) {
 
 function renderNoteItems(box, items) {
   let group = null;                       // consecutive places are one table
+  // A marker says "this is one point of several". A card holding ONE paragraph is not
+  // several, and the dot in front of it reads as a list with one item -- which is
+  // what every grouped note card became when the groups arrived and each took one
+  // paragraph with it.
+  const listed = items.filter((i) => i.kind === "prose").length > 1;
   for (const it of items) {
     if (it.kind !== "place") group = null;
     if (it.kind === "cmd") {
@@ -2117,7 +2533,7 @@ function renderNoteItems(box, items) {
       if (!group) { group = el("div", { class: "linkrows one" }); box.append(group); }
       group.append(placeRow(it));
     } else {
-      const para = el("p", { class: "note-p" });
+      const para = el("p", { class: "note-p" + (listed ? "" : " solo") });
       it.lines.forEach((l, i) => { if (i) para.append(" "); para.append(linkify(l)); });
       box.append(para);
     }
@@ -2292,16 +2708,6 @@ function renderCapResult(r) {
   pre.append(box, t); pre.scrollTop = pre.scrollHeight;
 }
 
-// ---- benchmark dialog -------------------------------------------------------
-function openBench() { $("#bench-dialog").showModal(); }
-async function submitBench() {
-  const f = $("#bench-form");
-  if (!f.versions.value.trim()) { toast("enter at least two versions"); return; }
-  $("#bench-dialog").close();
-  try { const { job_id } = await api("/api/benchmark", { method: "POST", body: JSON.stringify({ versions: f.versions.value.trim(), seed_profile: f.seed_profile.value }) });
-    streamJob(job_id, "Benchmark", renderBenchResult); }
-  catch (e) { toast(e.message); }
-}
 function renderBenchResult(r) {
   const pre = $("#job-log");
   const t = el("table", { class: "dtable" }, el("tr", {}, el("th", {}, "version"), el("th", {}, "boot"), el("th", {}, "seed"), el("th", {}, "msg/s"), el("th", {}, "p95"), el("th", {}, "RC mem"), el("th", {}, "flag")));
@@ -2632,15 +3038,21 @@ async function openCreate(preset) {
     }
     if (Array.isArray(s.runtimes) && s.runtimes.length) {
       RUNTIMES = s.runtimes;
-      const rsel = $("#runtime-select");
-      const want = rsel.value || s.default_runtime;
-      rsel.innerHTML = "";
-      for (const r of RUNTIMES) {
-        rsel.append(el("option", { value: r.name }, RUNTIME_LABEL[r.name] || r.name));
-      }
-      rsel.value = RUNTIMES.some((r) => r.name === want) ? want : RUNTIMES[0].name;
+      const cur = $("#runtime-value");
+      const want = cur.value || s.default_runtime;
+      cur.value = RUNTIMES.some((r) => r.name === want) ? want : RUNTIMES[0].name;
     }
   } catch (_) { ACME_EMAIL_REMEMBERED = false; MAY_SET_PRIVILEGED = false; }
+  // What the box has left, next to the choice that spends it. `up` already REFUSES
+  // without headroom, so the cost belongs at the moment of choosing rather than in
+  // the failure afterwards -- and this is the same number the refusal uses.
+  $("#create-room").textContent = "";
+  api("/api/machine").then((cap) => {
+    if (!cap || !cap.known) return;
+    const free = Math.max(0, (cap.available_mb || 0) - (cap.reserve_mb || 0));
+    $("#create-room").textContent =
+      `${fmtGb(free)} free · room for about ${cap.room} more`;
+  }).catch(() => {});
   renderRuntimeAxes();
   syncHttpsFields();
   const sel = $("#preset-select");
@@ -2701,7 +3113,24 @@ function syncBindHint() {
 // the dialog ends up offering a combination the service layer refuses.
 let RUNTIMES = [];
 
-const RUNTIME_LABEL = { docker: "Docker Compose", kubernetes: "Kubernetes (kind)" };
+const RUNTIME_LABEL = { docker: "Docker Compose", kubernetes: "Kubernetes" };
+
+// WHICH Kubernetes, from the server's probe rather than from a word written here.
+// The label was the literal "Kubernetes (kind)", which was true while kind was the
+// only way to have a cluster and became a lie the moment rc-repro could adopt one:
+// on a box with no kind and a running k3s, the card named a cluster that would not
+// be touched -- the same defect `doctor` had, in the other front-end.
+//
+// The branch order is `plan_cluster`'s, so the card cannot promise a different
+// cluster than the create will use: kind present wins even when something else is
+// running, because rc-repro makes its own.
+function runtimeLabel(name) {
+  if (name !== "kubernetes") return RUNTIME_LABEL[name] || name;
+  const k = KUBE || {};
+  if (k.can_provision) return "Kubernetes (kind)";
+  if (k.usable && k.reachable && k.distribution) return `Kubernetes (${k.distribution})`;
+  return "Kubernetes";
+}
 const DEPLOYMENT_LABEL = {
   monolith: "monolith — one Rocket.Chat",
   "multi-instance": "multi-instance — several behind a load balancer",
@@ -2710,10 +3139,16 @@ const DEPLOYMENT_LABEL = {
 // What CHANGES when you pick one, said where the choice is made. Not decoration:
 // the runtime decides which other commands will work on this workspace for the
 // rest of its life, and that is not recoverable from the word "Kubernetes".
-const RUNTIME_HINT = {
-  docker: "",
-  kubernetes: "Its own kind cluster, one namespace per workspace. HTTPS is not "
-    + "available here yet; everything else works.",
+// What the ARRANGEMENT builds, since that is the choice directly above it. What
+// the runtime cannot do is said once, by the absence line in Advanced, which is
+// generated from the server's refusal registry -- so this no longer repeats "HTTPS
+// is not available here", which was the same fact in two places and only one of
+// them would have been updated when it changes.
+const DEPLOYMENT_NOTE = {
+  monolith: "One Rocket.Chat process.",
+  "multi-instance": "Several Rocket.Chat containers behind a load balancer.",
+  microservices: "Rocket.Chat plus presence, ddp-streamer, account, authorization "
+    + "and stream-hub, each its own deployment.",
 };
 
 // TWO functions, not one, and the split is load-bearing. Changing the RUNTIME
@@ -2722,37 +3157,149 @@ const RUNTIME_HINT = {
 // events made every arrangement choice snap straight back to the runtime's
 // default -- picking `monolith` on Kubernetes recorded `microservices`, and the
 // dialog looked right the whole time. Found by clicking it, not by a test.
-function renderRuntimeAxes() {
-  const rt = $("#runtime-select").value;
-  const spec = RUNTIMES.find((r) => r.name === rt);
-  const dsel = $("#deployment-select");
-  dsel.innerHTML = "";
-  for (const d of (spec ? spec.deployments : [])) {
-    dsel.append(el("option", { value: d }, DEPLOYMENT_LABEL[d] || d));
-  }
-  // The RUNTIME'S default, rather than carrying the previous runtime's over. Both
-  // offer `monolith`, so preserving looked considerate and produced a real
-  // divergence: `--runtime k8s` on the CLI defaults to microservices, and the
-  // dialog would have handed you monolith because that is what Compose had
-  // selected a moment earlier. The value sitting there was never a choice.
-  dsel.value = spec ? spec.default_deployment : "";
-  $("#runtime-hint").textContent = RUNTIME_HINT[rt] || "";
+// What a card says, beyond its name. Everything measurable comes from the server
+// (`/api/settings` -> runtimes[].cost, built from the same constants check_capacity
+// spends), so a card cannot quote a figure the preflight will contradict. Only the
+// one-line "what this is for" is written here, because it is a judgement rather
+// than a measurement.
+const RUNTIME_PITCH = {
+  docker: "Every command works, including HTTPS and load tests.",
+  kubernetes: "Helm, real pods, microservices. SCRAM auth available.",
+};
 
-  const kube = rt === "kubernetes";
-  $("#mongo-operator-row").hidden = !kube;
-  // HTTPS is refused by the service layer on Kubernetes -- there is no ingress yet.
-  // Hidden rather than disabled: a greyed-out control invites "why can't I?", and
-  // the hint above already says so in a sentence.
-  const https = $("#create-https-block");
-  if (https) https.hidden = kube;
+function fmtGb(mb) {
+  return mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${mb} MB`;
+}
+
+// The runtime fork. Rendered rather than written into the markup because the list
+// of runtimes comes from the server -- the same table the CLI resolves against, so
+// the dialog cannot offer a combination the service layer refuses.
+function renderRuntimeAxes() {
+  const rt = $("#runtime-value").value || (RUNTIMES[0] && RUNTIMES[0].name) || "docker";
+  const forks = $("#runtime-forks");
+  forks.innerHTML = "";
+  for (const spec of RUNTIMES) {
+    const chosen = spec.name === rt;
+    const cost = (spec.cost || {})[spec.default_deployment] || {};
+    const card = el("button", {
+      type: "button", class: "fork", "aria-pressed": String(chosen),
+      onclick: () => pickRuntime(spec.name),
+    },
+      el("span", { class: "fork-n" }, el("span", { class: "fork-dot" }),
+         runtimeLabel(spec.name)),
+      // What it BUILDS, not what it might weigh. The memory figure was an
+      // estimate dressed as a fact -- it depends on the preset, the arrangement
+      // and what else is running -- and the free-space line in this same header
+      // answers "will it fit" from the box itself, which is the question.
+      el("div", { class: "fork-cost" }, cost.shape || ""),
+      el("div", { class: "fork-can" }, RUNTIME_PITCH[spec.name] || ""));
+    forks.append(card);
+  }
+  const spec = RUNTIMES.find((r) => r.name === rt);
+
+  // Arrangement: a segmented control INSIDE this section, because it is dependent
+  // on the runtime rather than a peer of it. Two peer dropdowns claimed to be
+  // independent and the code then had to fight that -- it produced two live bugs,
+  // the arrangement snapping back to the runtime default being one of them.
+  const seg = $("#deployment-seg");
+  seg.innerHTML = "";
+  const deployments = spec ? spec.deployments : [];
+  // A value outside this runtime's list can never stand. Choosing the runtime's
+  // default when the runtime CHANGES is `pickRuntime`'s job, not this function's --
+  // see the comment there for why "keep it if it is still legal" is wrong.
+  if (!deployments.includes($("#deployment-value").value)) {
+    $("#deployment-value").value = spec ? spec.default_deployment : "";
+  }
+  for (const d of deployments) {
+    seg.append(el("button", {
+      type: "button", "aria-pressed": String($("#deployment-value").value === d),
+      onclick: () => pickDeployment(d),
+    }, d));
+  }
+  $("#runtime-hint").textContent =
+    DEPLOYMENT_NOTE[$("#deployment-value").value] || "";
+
+  // The one control a runtime ADDS rather than removes, and it belongs here in
+  // "where it runs" rather than in Advanced: it decides whether this workspace's
+  // MongoDB requires a password.
+  const extra = $("#runtime-extra");
+  extra.innerHTML = "";
+  if (rt === "kubernetes") {
+    extra.append(el("label", {},
+      el("input", { type: "checkbox", name: "mongo_operator", id: "mongo-operator" }),
+      " MongoDB via the official operator (adds SCRAM authentication)"));
+  }
+  syncAdvancedForRuntime(spec);
   syncDeploymentFields();
+}
+
+function pickRuntime(name) {
+  if ($("#runtime-value").value === name) return;
+  $("#runtime-value").value = name;
+  // The new runtime's DEFAULT, unconditionally -- not "keep the old one if it is
+  // still legal". Both runtimes offer `monolith`, so keeping it looked considerate
+  // and produced a real divergence: `--runtime k8s` on the CLI defaults to
+  // microservices, and the dialog would hand you monolith because that is what
+  // Compose had selected a moment earlier. The value sitting there was never a
+  // choice about Kubernetes.
+  const spec = RUNTIMES.find((r) => r.name === name);
+  $("#deployment-value").value = spec ? spec.default_deployment : "";
+  renderRuntimeAxes();
+}
+
+function pickDeployment(name) {
+  $("#deployment-value").value = name;
+  renderRuntimeAxes();
+}
+
+// Advanced follows the runtime too, and it is a DIFFERENT SET rather than a
+// cosmetic difference: the fields below do not work on Kubernetes, and each was
+// once accepted and silently dropped. The list comes from the server's own refusal
+// registry, so the form cannot claim something is unavailable that has since been
+// built -- `--reg-token` and every preset were on that list until they were.
+const ADV_GONE_LABEL = {
+  https: "HTTPS", domain: "a public domain",
+  fresh: "rebuild and DELETE data",
+};
+
+function syncAdvancedForRuntime(spec) {
+  const gone = new Set(((spec && spec.unsupported) || []).map((u) => u.field));
+
+  // HTTPS is a block of its own, so it goes entirely.
+  const https = $("#create-https-block");
+  if (https) https.hidden = gone.has("https") || gone.has("domain");
+
+  // `fresh` is ONE OPTION of the existing-name select, not the whole control:
+  // `reuse` and `force` work on both runtimes, and hiding the row would take a
+  // working choice away to remove a broken one. The option is removed and put back
+  // rather than disabled, for the same reason the privileged fields are hidden.
+  const existing = $("#create-form").existing;
+  if (existing) {
+    const has = [...existing.options].some((o) => o.value === "fresh");
+    if (gone.has("fresh") && has) {
+      if (existing.value === "fresh") existing.value = "reuse";
+      [...existing.options].find((o) => o.value === "fresh").remove();
+    } else if (!gone.has("fresh") && !has) {
+      existing.append(el("option", { value: "fresh" },
+        "Rebuild it and DELETE its data — users, channels, messages, uploads"));
+    }
+  }
+
+  const note = $("#adv-gone");
+  if (!note) return;
+  const named = [...gone].map((f) => ADV_GONE_LABEL[f] || f);
+  note.hidden = !named.length;
+  note.textContent = named.length
+    ? "Not on this runtime: " + named.join(" · ")
+      + ". Each is refused with its reason rather than accepted and dropped."
+    : "";
 }
 
 function syncDeploymentFields() {
   // --replicas means something on both runtimes, but nothing at all on a monolith.
   // Offering a field that is silently ignored is how `--seed` and `--https` were
   // quietly dropped on this runtime.
-  $("#replicas-row").hidden = $("#deployment-select").value === "monolith";
+  $("#replicas-row").hidden = $("#deployment-value").value === "monolith";
 }
 
 function renderPresetParams() {
@@ -3080,6 +3627,23 @@ $("#whoami").addEventListener("click", (e) => {
   }
 });
 document.addEventListener("click", closeMe);
+// ---- the narrow layout's two disclosures ------------------------------------
+// Both are body classes rather than inline styles, so the CSS decides whether they
+// mean anything: above 760px the popover and the pane are laid out as columns and
+// these classes select nothing. A layout switched by JS is a layout that is wrong
+// until the next resize event.
+function closeNav() {
+  document.body.classList.remove("nav-open");
+  $("#nav-toggle").setAttribute("aria-expanded", "false");
+}
+$("#nav-toggle").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const open = !document.body.classList.contains("nav-open");
+  document.body.classList.toggle("nav-open", open);
+  $("#nav-toggle").setAttribute("aria-expanded", String(open));
+});
+document.addEventListener("click", closeNav);
+$("#toplinks").addEventListener("click", closeNav);
 $("#me-menu").addEventListener("click", (e) => e.stopPropagation());
 $("#me-sessions").addEventListener("click", () => { closeMe(); openSessions(); });
 $("#me-people").addEventListener("click", () => { closeMe(); openPeople(); });
@@ -3123,7 +3687,9 @@ $("#btn-new").addEventListener("click", () => openCreate());
 $("#btn-scenarios").addEventListener("click", openScenarios);
 $("#btn-home").addEventListener("click", goHome);
 $(".brand").addEventListener("click", goHome);
-$("#btn-refresh").addEventListener("click", loadRepros);
+// Refresh re-probes the cluster too, which the poll deliberately does not: that is
+// what somebody presses after installing k3s or starting a cluster.
+$("#btn-refresh").addEventListener("click", () => { loadRepros(); refreshKube(); });
 
 // ---- theme ------------------------------------------------------------------
 // Stored per browser, not per account: it is a property of the screen you are
@@ -3182,8 +3748,8 @@ $("#scope-filter").addEventListener("change", (e) => {
   view.scope = e.target.value; localStorage.setItem("rc_scope", view.scope); render();
 });
 $("#preset-select").addEventListener("change", renderPresetParams);
-$("#runtime-select").addEventListener("change", renderRuntimeAxes);
-$("#deployment-select").addEventListener("change", syncDeploymentFields);
+// The fork and the segmented control carry their own handlers, so there is nothing
+// to bind here: a <select>'s change event was the only reason those lines existed.
 $("#https-mode").addEventListener("change", syncHttpsFields);
 // The profile only means anything when seeding is on, so don't show it otherwise.
 function syncCreateSeed() {
@@ -3234,7 +3800,6 @@ $("#import-preview").addEventListener("click", (e) => { e.preventDefault(); prev
 $("#import-apply").addEventListener("click", applyImport);
 $("#perf-cancel").addEventListener("click", () => $("#perf-dialog").close());
 $("#perf-submit").addEventListener("click", submitPerf);
-$("#btn-bench").addEventListener("click", openBench);
 $("#btn-jobs").addEventListener("click", () => openJobs("running"));
 $("#pat-close").addEventListener("click", () => $("#pat-dialog").close());
 $("#pat-copy").addEventListener("click", () => copy(PAT_HEADERS));
@@ -3251,15 +3816,13 @@ $("#call-form").addEventListener("submit", (e) => { e.preventDefault(); submitCa
 $("#call-close").addEventListener("click", () => $("#call-dialog").close());
 $("#call-copy").addEventListener("click", () =>
   CALL_TEXT ? copy(CALL_TEXT) : toast("nothing to copy — send a request first"));
-$("#docker-badge").addEventListener("click", openDoctor);
+$("#doctor-badge").addEventListener("click", openDoctor);
 $("#edge-badge").addEventListener("click", openEdge);
 $("#edge-close").addEventListener("click", () => $("#edge-dialog").close());
 $("#doctor-recheck").addEventListener("click", openDoctor);
 $("#doctor-close").addEventListener("click", () => $("#doctor-dialog").close());
 $("#cap-cancel").addEventListener("click", () => $("#cap-dialog").close());
 $("#cap-submit").addEventListener("click", submitCap);
-$("#bench-cancel").addEventListener("click", () => $("#bench-dialog").close());
-$("#bench-submit").addEventListener("click", (e) => { e.preventDefault(); submitBench(); });
 
 const POLL_MS = 4000;
 let pollTimer = null;
@@ -3273,4 +3836,5 @@ document.addEventListener("visibilitychange", () => {
 });
 
 loadRepros();
+refreshKube();
 startPolling();

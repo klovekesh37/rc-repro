@@ -124,7 +124,15 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
    The status bar takes the same token, so the two edges of the frame agree. */
 .brand { font-family: var(--mono); font-weight: 700; font-size: 1.05rem; letter-spacing: -.01em; }
 .brand .dollar { color: var(--green); }
-.topbar-actions { margin-left: auto; display: flex; gap: .5rem; }
+.topbar-actions { margin-left: auto; display: flex; align-items: center; gap: .5rem; }
+.toplinks { display: flex; align-items: center; gap: .5rem; }
+/* The hamburger exists only where the links would wrap onto a second row, and the
+   disclosure that reveals the action pane only where the pane is not a column. Both
+   qualified by the class that sets their `display`, because `.chip.iconbtn` and
+   `.btn.small` are two-class selectors and a bare `.navtoggle` loses to them --
+   which is how a hamburger came to sit on a 1440px bar next to the links it
+   replaces. */
+.chip.navtoggle, .btn.panetoggle { display: none; }
 
 /* ---- how everything you can touch behaves ----
    One rule, so a chip, a tab, a workspace row and a button all answer a pointer
@@ -323,14 +331,36 @@ input:focus, select:focus, textarea:focus {
 /* Each workspace is a card, so it needs its own ground and its own edge. It had
    neither: an unselected row was text on the rail with a 2px state bar beside it,
    which is why nothing looked like a card until you happened to select one. */
-.rows { flex: 1; overflow: auto; padding: .55rem; display: grid; gap: .4rem;
-  align-content: start; }
+/* `minmax(0, 1fr)`, not the implicit `auto` track. An auto track is at least as wide
+   as its widest item's MIN-content, and a row whose name is `white-space: nowrap` has
+   a min-content of the whole name -- so one long workspace name made every row 484px
+   wide inside a 287px rail, which the rail then scrolled sideways: the state tags and
+   the group counts were clipped off the right edge. */
+.rows { flex: 1; overflow: auto; padding: .55rem; display: grid;
+  grid-template-columns: minmax(0, 1fr); gap: .4rem; align-content: start; }
 .rail-foot { padding: .6rem .9rem .8rem; border-top: 1px solid var(--line); }
 
-/* One row per workspace: the whole name (it is the thing you scan for), the
-   version right-aligned, and the state as a left gutter that encodes itself by
-   SHAPE as well as hue -- so it survives greyscale, which is how these end up
-   pasted into a ticket. No buttons: six repeated per card was 36 on a screen. */
+/* A GROUP HEADING, saying what the rows under it want from you. Rendered only when
+   more than one group has rows -- over a list that is entirely one state it would be
+   a label for the thing it is inside, and the pill in the rail head already says it. */
+.rgrp { display: flex; align-items: center; gap: .45rem; padding: .55rem .35rem .15rem; }
+.rgrp:first-child { padding-top: .1rem; }
+.rgrp-t { font-size: .6rem; font-weight: 600; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--dim); }
+.rgrp-n { margin-left: auto; font-family: var(--mono); font-size: .64rem; color: var(--dim); }
+.rdot { width: 6px; height: 6px; border-radius: 50%; background: var(--dim); }
+.rdot.ok { background: var(--green); }
+.rdot.warn { background: var(--amber); }
+.rdot.off { background: transparent; box-shadow: inset 0 0 0 1px var(--dim); }
+
+/* One ROW per workspace: the whole name (it is the thing you scan for), the version
+   right-aligned, what it is and whose, and the state as a left gutter that encodes
+   itself by SHAPE as well as hue -- so it survives greyscale, which is how these end
+   up pasted into a ticket. No buttons: six repeated per card was 36 on a screen.
+
+   One line was tried and reverted. It fits more rows and pays for them with the port,
+   the owner and the scenario, which are what people search a rail BY on a shared box.
+   The grouping above is what "which one is unhappy" needed. */
 .wrow { position: relative; display: grid; gap: 3px; width: 100%; text-align: left;
   padding: .55rem .7rem .55rem .9rem; border: 1px solid var(--line);
   border-radius: var(--r-sm); background: var(--bg); color: var(--ink);
@@ -374,18 +404,33 @@ input:focus, select:focus, textarea:focus {
 .stage { overflow: auto; min-height: 0; }
 
 /* ---- the action pane ---- */
-/* Persistent, not a dropdown: the grouping is the teaching. "Put data in it"
-   explains what Seed does to somebody who never read the CLI's help -- but only
-   if they can SEE it. Equal 30px rows and single-line labels are most of what
-   makes a list look composed; the destructive action is pinned to the bottom
-   rather than trailing the last group, because it is not the eleventh item on a
-   menu. */
+/* Persistent, not a dropdown, and it LEADS with the one or two things this
+   workspace's state actually admits, each with the reason it was chosen. Four titled
+   groups over eleven equally-weighted items is a taxonomy, and a taxonomy is what you
+   need when you do not know what you are looking for -- the question people arrive
+   with is "what do I do with this one now", and a heading called "Keep or move it"
+   does not answer it. Equal 30px rows and single-line labels are most of what makes
+   the rest look composed; the destructive action is pinned to the bottom rather than
+   trailing the last item, because it is not the eleventh thing on a menu. */
 .actpane { background: var(--panel); border-left: 1px solid var(--line);
   overflow: auto; display: flex; flex-direction: column; padding-bottom: 1.1rem; }
 .apgroup { display: flex; align-items: center; gap: .6rem; padding: 1.05rem .95rem .35rem;
   font-size: .62rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase;
   color: var(--dim); }
 .apgroup::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+/* The suggestions: the heading says these are suggestions, and each item says what it
+   does. Nothing else -- a reason written under each one was a sentence to read before
+   you could act. Blue: the rule at the top of this file gives blue to "you can click
+   it", and these are the things it is suggesting you click. */
+.apnext { display: grid; gap: .35rem; padding: 0 .8rem; }
+.apn { display: block; text-align: left; padding: .5rem .7rem;
+  border: 1px solid var(--line2); border-radius: var(--r-sm); background: var(--bg);
+  font: inherit; color: var(--ink); cursor: pointer; }
+.apn:first-child { border-color: var(--accent); background: var(--accent-soft); }
+.apn:hover { border-color: var(--accent); }
+.apn b { font-size: .8rem; }
+.apn:first-child b { color: var(--blue); }
+
 .aplist { display: grid; }
 .aplist button { display: flex; align-items: center; height: 30px; padding: 0 .95rem;
   font: inherit; font-size: .8rem; color: var(--ink); background: none; border: 0;
@@ -419,17 +464,46 @@ input:focus, select:focus, textarea:focus {
 .d-head .name { font-weight: 700; font-size: 1.35rem; letter-spacing: -.02em; }
 .d-head .close { margin-left: auto; background: none; border: none; color: var(--muted); font-size: 1.3rem; cursor: pointer; line-height: 1; }
 .d-head .close:hover { color: var(--ink); }
-.tabs { display: flex; gap: 1.2rem; border-bottom: 1px solid var(--line); margin: 1rem 0; }
+/* Five uppercase tabs need 402px and a phone gives 380. The shell's
+   `overflow: hidden` used to swallow the difference, which meant BACKUPS was off
+   the edge and unreachable with nothing to say so. It scrolls in its own strip
+   now -- the rule this file already applies to any wide content. */
+.tabs { display: flex; gap: 1.2rem; border-bottom: 1px solid var(--line); margin: 1rem 0;
+  overflow-x: auto; scrollbar-width: thin; }
+.tab { flex: 0 0 auto; }
 .tab { font-size: .7rem; font-weight: 600; letter-spacing: .09em;
   text-transform: uppercase; color: var(--dim); background: none; border: none;
   padding: .5rem 0; cursor: pointer; border-bottom: 2px solid transparent; }
 .tab:hover { color: var(--ink); }
 .tab.active { color: var(--blue); border-bottom-color: var(--blue); }
 .d-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: 1.1rem; }
-/* Three columns, and exactly six facts fill them — the seventh used to be the
-   owner, which now reads as part of the identity line above. Cells carry their
-   own right/bottom rule and the third in each row drops the right one, so a rare
-   seventh fact adds a row instead of a hole. */
+/* THE TRIAGE BLOCK -- what is wrong and what to do about it, above the tabs.
+   Amber on purpose: the rule at the top of this file gives red to "about to destroy
+   something", and a crash-looping workspace wants you rather than threatening you.
+   Spending red here would leave nothing louder for the Down button. */
+.triage { display: grid; gap: .5rem; margin: .9rem 0 0; }
+.tri { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .1rem .7rem;
+  align-items: start; padding: .85rem 1rem .9rem;
+  background: rgba(180,83,9,.07); border: 1px solid rgba(180,83,9,.4);
+  border-radius: var(--r-md); }
+[data-theme="dark"] .tri { background: rgba(240,180,41,.08); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .tri { background: rgba(240,180,41,.08); }
+}
+.tri-i { color: var(--amber); font-size: .78rem; line-height: 1.5; }
+.tri-t { font-size: .84rem; line-height: 1.6; }
+.tri-t b { display: block; font-size: .9rem; }
+.tri-t span { color: var(--muted); }
+.tri-a { grid-column: 2; display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .6rem; }
+
+/* Three columns, and exactly six facts fill them. Cells carry their own right/bottom
+   rule and the third in each row drops the right one, so a rare seventh fact adds a
+   row instead of a hole.
+
+   Rows were tried here and reverted: a fact reads as a READING, and a reading wants
+   size and a box. Stacked into label/value lines the same six became a form, and
+   health and uptime -- the two that change -- stopped being findable without looking
+   for them. */
 .kv-grid { display: grid; grid-template-columns: repeat(3, 1fr);
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-md);
   overflow: hidden; margin-bottom: 1.3rem; }
@@ -437,6 +511,13 @@ input:focus, select:focus, textarea:focus {
   border-bottom: 1px solid var(--line); }
 .kv:nth-child(3n) { border-right: 0; }
 .kv:nth-last-child(-n+3) { border-bottom: 0; }
+.kv .k { font-size: .64rem; font-weight: 600; color: var(--dim);
+  text-transform: uppercase; letter-spacing: .1em; }
+.kv .v { font-family: var(--mono); font-size: 1.15rem; font-weight: 600;
+  letter-spacing: -.02em; margin-top: .28rem; overflow-wrap: anywhere; }
+.kv .v.green { color: var(--green); }
+.kv .v.bad { color: var(--red); }
+.kv .v.warn { color: var(--amber); }
 
 /* The identity line: the pairing this product exists to get right, then what
    kind of workspace it is and whose. */
@@ -446,13 +527,6 @@ input:focus, select:focus, textarea:focus {
 .d-sub b { font-size: .92rem; font-weight: 700; color: var(--ink); letter-spacing: -.02em; }
 .d-sub i { font-style: normal; color: var(--line2); }
 .d-sub .bad { color: var(--red); }
-.kv .k { font-size: .64rem; font-weight: 600; color: var(--dim);
-  text-transform: uppercase; letter-spacing: .1em; }
-.kv .v { font-family: var(--mono); font-size: 1.15rem; font-weight: 600;
-  letter-spacing: -.02em; margin-top: .28rem; }
-.kv .v.green { color: var(--green); }
-.kv .v.bad { color: var(--red); }
-.kv .v.warn { color: var(--amber); }
 .section-label { font-size: .64rem; font-weight: 600; color: var(--dim);
   text-transform: uppercase; letter-spacing: .1em; margin: 1.4rem 0 .55rem; }
 .chart-box { border: 1px solid var(--line); border-radius: var(--r-md); padding: .8rem; background: var(--bg); }
@@ -461,7 +535,12 @@ input:focus, select:focus, textarea:focus {
    into the page it sits on. */
 .urlbox { border: 1px solid var(--line); border-radius: var(--r-md); padding: .8rem .9rem;
   background: var(--panel); box-shadow: var(--shadow-1), var(--edge);
-  display: flex; align-items: center; margin-top: 1.2rem; }
+  display: flex; align-items: center; gap: .6rem; margin-top: 1.2rem; }
+/* The value shrinks; the copy button does not. Without this the workspace path -- the
+   longest string on the panel -- ran UNDER the button on a narrow screen, which is
+   both unreadable and a click that copies while looking like it hit the text. */
+.urlbox > div:first-child { min-width: 0; }
+.urlbox .copy { flex: 0 0 auto; }
 .urlbox .k { font-family: var(--mono); font-size: .72rem; color: var(--muted); }
 .urlbox a { font-family: var(--mono); color: var(--blue); text-decoration: none; display: block; margin-top: .2rem; }
 /* A urlbox value that is text, not a link (admin login, workspace path). */
@@ -550,12 +629,30 @@ input:focus, select:focus, textarea:focus {
    it. `contain-intrinsic-size` keeps the scrollbar honest while they are skipped. */
 .logrow { display: flex; gap: .6rem; padding: .05rem 0; white-space: pre-wrap;
   word-break: break-word; content-visibility: auto; contain-intrinsic-size: auto 1.2rem; }
-.logrow .lt { color: var(--dim); flex: 0 0 auto; }
+/* Every column a fixed width, so the four line up down the whole view. `.lt` was
+   `auto` and a line without a timestamp -- which is every line a service prints
+   without JSON -- collapsed it to nothing, so the level and the service of that row
+   sat one column to the left of the rows around it. Columns that do not line up are
+   most of what "the logs are not readable" means. */
+.logrow .lt { flex: 0 0 5rem; color: var(--dim); }
 .logrow .ll { flex: 0 0 46px; font-weight: 700; }
-.logrow .ls { flex: 0 0 92px; color: var(--muted); }
+/* Wide enough for `authorization`, the longest service the chart names: at 92px it
+   wrapped onto a second line and pushed its own message down with it. */
+.logrow .ls { flex: 0 0 7rem; color: var(--muted); }
 .logrow .lm { flex: 1; color: var(--ink); }
 [data-theme="dark"] .logrow .lm { color: #c9d1d9; }
-.ll.lv-error, .ll.lv-fatal { color: var(--red); } .logrow.lv-error .lm, .logrow.lv-fatal .lm { color: #ffb4b0; }
+.ll.lv-error, .ll.lv-fatal { color: var(--red); }
+/* An error's message takes the red of the theme it is in. It was a literal `#ffb4b0`
+   in both -- a pale pink chosen for a near-black ground, which on the light theme's
+   white put the one line anybody opened the logs to read at the lowest contrast on the
+   screen. Tokens, for exactly this reason. */
+.logrow.lv-error .lm, .logrow.lv-fatal .lm { color: var(--red); }
+[data-theme="dark"] .logrow.lv-error .lm,
+[data-theme="dark"] .logrow.lv-fatal .lm { color: #ffb4b0; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .logrow.lv-error .lm,
+  :root:not([data-theme="light"]) .logrow.lv-fatal .lm { color: #ffb4b0; }
+}
 .ll.lv-warn { color: var(--amber); }
 .ll.lv-info { color: var(--green); }
 .ll.lv-debug, .ll.lv-trace { color: var(--dim); }
@@ -616,6 +713,52 @@ form textarea { font-family: var(--mono); font-size: .8rem; resize: vertical; }
 .adv summary:hover { color: var(--ink); }
 .adv summary:hover { color: var(--ink); }
 form menu { display: flex; justify-content: flex-end; gap: .5rem; padding: 0; margin: 1.1rem 0 0; }
+/* ---- the create dialog's three sections ----
+   Moved from .docs/design/prototype/create.html as-is: every value is a token this
+   system already has, and the prototype introduced no colour, radius or shadow of
+   its own. The NUMBER is not decoration -- choosing a runtime re-shapes the form,
+   and the number says which part changed rather than leaving fields to appear and
+   vanish in a scroll. */
+.sec { border-top: 1px solid var(--line); padding-top: .9rem; margin-top: 1rem; }
+.sec:first-of-type { border-top: 0; padding-top: 0; margin-top: 0; }
+.sec-h { display: flex; align-items: baseline; gap: .5rem; margin-bottom: .7rem; }
+.sec-n { font: 600 .7rem/1.5 var(--mono); color: var(--dim);
+  min-width: 1.15rem; height: 1.15rem; text-align: center;
+  border: 1px solid var(--line2); border-radius: var(--r-pill); }
+.sec-t { font-weight: 600; font-size: .9rem; color: var(--ink); }
+.sec-sub { font-size: .78rem; color: var(--muted); margin-left: auto; }
+
+/* The runtime fork. Two cards rather than a select, because the two facts that
+   decide it -- what it costs and what it cannot do -- have nowhere to live inside
+   an <option>. Blue is "you can click it", which is what these are. */
+.forks { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
+.fork { text-align: left; padding: .7rem .8rem; border: 1px solid var(--line2);
+  border-radius: var(--r-md); background: var(--panel); cursor: pointer;
+  transition: border-color var(--t) var(--ease), background var(--t) var(--ease); }
+.fork:hover { border-color: var(--accent); }
+.fork[aria-pressed="true"] { border-color: var(--accent);
+  background: var(--accent-soft); box-shadow: 0 0 0 3px var(--accent-ring); }
+.fork-n { display: flex; align-items: center; gap: .4rem;
+  font-weight: 600; font-size: .88rem; color: var(--ink); }
+.fork-dot { width: .5rem; height: .5rem; border-radius: var(--r-pill);
+  border: 1px solid var(--line2); }
+.fork[aria-pressed="true"] .fork-dot { background: var(--accent); border-color: var(--accent); }
+.fork-cost { font: .72rem/1.4 var(--mono); color: var(--muted); margin: .3rem 0 .35rem; }
+.fork-can { font-size: .74rem; color: var(--muted); }
+
+/* Arrangement is DEPENDENT on the runtime, so it is a segmented control inside the
+   same section rather than a second peer dropdown beside it. */
+.seg { display: inline-flex; border: 1px solid var(--line2);
+  border-radius: var(--r-sm); overflow: hidden; margin-top: .85rem; }
+.seg button { border: 0; background: var(--panel); color: var(--muted);
+  padding: .38rem .8rem; font: inherit; font-size: .82rem; cursor: pointer;
+  border-right: 1px solid var(--line2); }
+.seg button:last-child { border-right: 0; }
+.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--ink);
+  font-weight: 600; }
+.seg-note { font-size: .76rem; color: var(--muted); margin: .45rem 0 0; }
+.adv-gone { margin: 0 0 .7rem; font-size: .76rem; color: var(--muted);
+  padding-left: .6rem; border-left: 2px solid var(--line2); }
 .hint { color: var(--muted); font-size: .82rem; margin: .1rem 0 .4rem; }
 /* A server message quoted verbatim, where the newlines in it carry meaning: the
    metrics-server install is two commands, the helm upgrade is one long one. Without
@@ -725,21 +868,146 @@ button.jobrow:hover { background: var(--panel2); }
 .toast.ok { background: var(--green); color: #06210d; }
 .toast.info { background: var(--blue); color: #04162e; }
 
-/* Responsive: the layout's first track had a hard 360px floor, so with a repro
-   selected the page scrolled horizontally below ~465px and the detail column was
-   squeezed to nothing between there and ~800px. There were no @media rules at all. */
+/* ---- responsive ----
+   The three panes are a 288px rail, the stage, and a 244px action pane: 532px of
+   fixed chrome. There was nothing responsive about them at all -- the @media rules
+   here still named `.layout`, the class the workbench redesign replaced with
+   `.panes`, so they had matched nothing since. Measured, at 900px height:
+
+     width   stage   result
+      768    236px   unusable
+      640    108px   unusable
+      480     42px   AND the page scrolled sideways (532 > 480)
+
+   Two steps, each removing one fixed track rather than hiding a control. Nothing
+   becomes unreachable at any width: the actions move under the panel, and the rail
+   moves above it. A control you cannot reach on a laptop is worse than one you have
+   to scroll to. */
 @media (max-width: 1100px) { .kv-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 900px) {
-  .layout { grid-template-columns: 1fr; }
-  .detail { position: static; max-height: none; }
+
+/* Step one: the action pane stops being a column and becomes a strip under the
+   stage, full width. It keeps its own scroll and its danger zone stays at the end. */
+@media (max-width: 1080px) {
+  .panes { grid-template-columns: 288px minmax(0, 1fr); }
+  .actpane { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line);
+    max-height: 40vh; }
+  .aplist { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+    gap: .25rem; }
+}
+
+/* Step two: one column. The rail is a capped, scrollable strip above the stage --
+   it is how you choose a workspace, so it cannot simply go. */
+@media (max-width: 760px) {
+  /* Normal flow, not a one-column grid. A grid still sizes its rows from the track
+     it was given, so the stage's row stayed as short as the shell allowed and the
+     cards simply PAINTED over the action pane and the status bar below them. In
+     block flow each pane is as tall as its own content and they follow each other. */
+  .panes, .panes.no-detail { display: block; }
+  .rail { border-right: 0; border-bottom: 1px solid var(--line); max-height: 38vh; }
+  /* The stage is `position: sticky` so it stays put while the rail scrolls beside
+     it. In ONE column there is nothing beside it, and a sticky box in a grid row
+     rides up over the row above -- the rail ended up underneath the panel, and
+     the workspace rows could not even be clicked. The reset for this lived in the
+     old `.layout` rule, which stopped matching anything when the panes were
+     renamed and took this with it. */
+  .detail, .stage { position: static; top: auto; min-height: 0; }
+  /* And the shell stops being viewport-locked. On a desktop each pane scrolls
+     inside a 100vh frame, which is right when they sit side by side. Stacked into
+     one column that same frame gives each of the three a third of the screen and
+     its own scrollbar: the panel came out as a ~200px window showing four of six
+     cells with every notes card below the cut, reachable only by scrolling a box
+     most readers would not know was a box. THIS is what "everything collapses on
+     resize" was. In one column the PAGE scrolls and the panel is as tall as its
+     content; the rail stays capped on purpose, because it is a picker.
+
+     `body.shell` is where the lock actually is -- 100vh plus `overflow: hidden`,
+     which also pinned the status bar to the viewport, so it came out drawn across
+     the middle of the panel rather than under it. */
+  body.shell { height: auto; min-height: 100vh; overflow: visible; }
+  .stage { overflow: visible; }
+  .actpane { max-height: none; }
+  .forks { grid-template-columns: 1fr; }
   .statusbar { flex-wrap: wrap; gap: .5rem 1rem; }
   .grafana-embed { height: 240px; }
+
+  /* ---- D: designed for this width, rather than merely surviving it ---- */
+
+  /* The four top links become a popover off one button. Four links, a theme toggle
+     and an account name wrapped onto a second row of chrome here, which on a 430px
+     screen is a quarter of the height spent before anything is said about a
+     workspace. Same four buttons, moved -- not a second copy. */
+  .chip.navtoggle { display: inline-flex; }
+  .toplinks { position: absolute; top: calc(100% + .3rem); right: .6rem; z-index: 40;
+    display: none; flex-direction: column; align-items: stretch; gap: 0;
+    min-width: 11rem; padding: .3rem; background: var(--panel);
+    border: 1px solid var(--line2); border-radius: var(--r-md);
+    box-shadow: var(--shadow-2); }
+  body.nav-open .toplinks { display: flex; }
+  .toplinks .toplink { padding: .5rem .6rem; text-align: left; border-radius: var(--r-sm); }
+  .toplinks .toplink:hover { background: var(--panel2); }
+  /* The current-page marker is a 2px rule under a horizontal nav; stacked it would
+     be a line across the middle of the item below it. */
+  .toplinks .toplink::after { content: none; }
+  .topbar { position: relative; }
+
+  /* The rail becomes a horizontal picker, one row high. It is how you choose a
+     workspace so it cannot go, and a capped vertical strip spent 38vh of a phone on
+     a list of four names. */
+  .rail { max-height: none; }
+  .rail-controls { display: flex; flex-direction: row; align-items: center;
+    padding: .5rem .6rem .55rem; overflow-x: auto; scrollbar-width: thin; }
+  .rail-controls > * { flex: 0 0 auto; }
+  .rail-controls .input { width: 11rem; }
+  /* `.block` is width:100% -- in a row it took the whole strip and pushed the filter
+     and the three selects off the right edge of a scroller nothing said was one. */
+  .rail-controls .btn.block { width: auto; }
+  .rail-two { display: flex; gap: .4rem; }
+  .rows { display: flex; flex-direction: row; overflow-x: auto; scrollbar-width: thin;
+    padding: .5rem .55rem .6rem; }
+  /* A CHIP here, whatever shape the row has on a wide screen: at 430px a picker is
+     one row high, and the port and owner that earn their place in a 288px column are
+     what has to go when the column becomes a strip. */
+  .wrow { flex: 0 0 auto; display: flex; align-items: center; width: auto;
+    max-width: 15rem; border-radius: 999px; padding: .35rem .8rem .35rem 1.35rem; }
+  .wrow::before { left: .65rem; top: 50%; bottom: auto; width: 6px; height: 6px;
+    margin-top: -3px; border-radius: 50%; }
+  .wrow .nm { min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  /* The group headings do not survive a horizontal strip -- the ORDER does, and
+     wants-you is still first. */
+  .rgrp { display: none; }
+  .wrow .ver, .wrow .meta, .wrow .r3 { display: none; }
+
+  /* The state actions become a bar that stays put while the panel scrolls, and the
+     rest of the pane is one tap away rather than a screen and a half below. A
+     wrapping grid of eleven items pushed the danger zone off the bottom of the
+     document.
+
+     ORDERED LAST, which is the whole reason it works: `bottom` stickiness holds an
+     element that would fall BELOW the scrollport, and it does not drag one down from
+     above -- so with the bar in its document position, above the panel body, the inset
+     did nothing whatsoever and the bar scrolled away like any other row. Ordered to
+     the end of the flex column it floats at the bottom of the screen while the panel
+     scrolls and settles at the end of it. */
+  .stage { display: flex; flex-direction: column; }
+  .d-actions { order: 9; position: sticky; bottom: 0; z-index: 20; margin: 0 -1.1rem;
+    padding: .6rem 1.1rem; background: var(--bar); border-top: 1px solid var(--line); }
+  .btn.panetoggle { display: inline-flex; margin-left: auto; }
+  .actpane { display: none; }
+  body.pane-open .actpane { display: flex; }
 }
 @media (max-width: 560px) {
   .bar, .toolbar-controls { flex-wrap: wrap; }
   .topbar-actions { flex-wrap: wrap; }
+  .kv-grid { grid-template-columns: 1fr; }
+  dialog { width: calc(100vw - 1.5rem); }
 }
-body { overflow-x: hidden; }
+/* `clip`, not `hidden`. Both stop a sideways scroll, and `hidden` on one axis makes
+   the OTHER axis compute to `auto` -- which turns body into a scroll container that
+   never scrolls, and a `position: sticky` descendant measures against that instead of
+   the viewport and so never sticks. That is why the narrow layout's action bar scrolled
+   away with the panel. `clip` creates no scroll container. */
+body { overflow-x: clip; }
 
 /* the job dialog has no <form>, so `form menu` never matched its footer */
 #job-dialog menu { display: flex; justify-content: flex-end; padding: 0; margin: .8rem 0 0; }
@@ -854,7 +1122,7 @@ body { overflow-x: hidden; }
 
 /* ---- scenarios ---- */
 .scen-b { padding: .85rem 1rem; }
-.scen-d { margin: 0; font-size: .86rem; line-height: 1.6; color: var(--muted); max-width: 68ch; }
+.scen-d { margin: 0; font-size: .86rem; line-height: 1.6; color: var(--muted); }
 /* Notes are pre-wrapped for an 80-column terminal. Re-flowing them into a narrow
    column produces "…reaches Keycloak at the same / URL Rocket.Chat's backend
    uses", which reads as broken text rather than as instructions. */
@@ -910,14 +1178,44 @@ button.brand:hover { color: var(--blue); }
   border: 1px solid var(--line); border-radius: var(--r-md); padding: 1rem 1.1rem; }
 .notes code.inline { font-family: var(--mono); font-size: .82em; padding: .1em .35em;
   background: var(--panel2); border: 1px solid var(--line); border-radius: var(--r-xs); }
-.note-p { margin: 0; font-size: .84rem; line-height: 1.65; color: var(--muted);
-  max-width: 74ch; }
+/* NO `ch` cap. A 74ch measure is the right idea for a page of running text and the
+   wrong one inside a card: it made a paragraph 647px wide in an 832px card at 1440, and
+   the same 647px in a 1344px card at 1920 -- half the box, with the code block under it
+   running the full width. The card is the measure; the panel column is what bounds it. */
+.note-p { margin: 0; font-size: .84rem; line-height: 1.65; color: var(--muted); }
 .note-p a { color: var(--blue); }
+/* A grouped note's facts. A table because that is what they are -- a lookup, not a
+   sentence -- and `tabular-nums` so versions and counts line up down the column. */
+.notetable { width: 100%; border-collapse: collapse; font-size: .82rem;
+  font-variant-numeric: tabular-nums; }
+.notetable tr { border-top: 1px solid var(--line); }
+.notetable tr:first-child { border-top: 0; }
+.notetable th { text-align: left; font-weight: 500; color: var(--muted);
+  padding: .42rem 1.15rem; width: 10.5rem; white-space: nowrap; }
+.notetable td { font-family: var(--mono); font-size: .78rem; color: var(--ink);
+  padding: .42rem 1.15rem .42rem 0; overflow-wrap: anywhere; }
+@media (max-width: 560px) {
+  .notetable th { width: auto; white-space: normal; }
+}
+
 /* The line you have to type. It was one <div> among five and read as prose. */
 .note-cmd { display: flex; align-items: center; gap: .6rem; padding: .45rem .55rem;
+  min-width: 0;
   background: var(--panel2); border: 1px solid var(--line); border-radius: var(--r-sm); }
-.note-cmd code { flex: 1; font-family: var(--mono); font-size: .78rem; color: var(--ink);
-  overflow-x: auto; white-space: pre; }
+.note-cmd code { flex: 1; min-width: 0; font-family: var(--mono); font-size: .78rem;
+  color: var(--ink); overflow-x: auto; white-space: pre; }
+/* `min-width: 0` on BOTH -- the box and the code inside it -- is the whole fix, and
+   without it the `overflow-x` here never engaged. A flex or grid item defaults to
+   `min-width: auto`, which refuses to shrink below its content's intrinsic width, so
+   a long line pushed its own container wide; `.note-cmd` is a grid item of
+   `.panelcard-b.notes`, so it needed the same thing its `<code>` child did.
+   Measured on a Kubernetes workspace, whose notes carry
+   `export KUBECONFIG=<absolute path>`: `.note-cmd` came out 1147px inside an 824px
+   panel, and `.panelcard`'s `overflow-x: hidden` silently CLIPPED the difference --
+   so the reader was told to paste a path whose end they could not see. `white-space:
+   pre` has to stay (a pasted line's spacing is load-bearing and a test asserts it),
+   which is exactly why the box has to scroll rather than the text wrap. Same bug as
+   `.rail-two .input`, two hundred lines up. */
 .cp { font-size: .68rem; font-family: var(--sans); color: var(--muted); background: none;
   border: 1px solid var(--line2); border-radius: var(--r-xs); padding: .18rem .45rem; cursor: pointer;
   flex: 0 0 auto; }
@@ -954,7 +1252,7 @@ button.brand:hover { color: var(--blue); }
 /* Indented to the url column, so the second line reads as part of the row rather
    than as a new one that happens to sit under it. */
 .linkrow .l-sub { flex: 0 0 100%; padding-left: 9.5rem; font-size: .78rem;
-  line-height: 1.6; color: var(--muted); max-width: 76ch; }
+  line-height: 1.6; color: var(--muted); }
 .linkrow .l-sub a { color: var(--blue); }
 .linkrow .l-sub code.inline { font-family: var(--mono); font-size: .82em; padding: .1em .35em;
   background: var(--panel2); border: 1px solid var(--line); border-radius: var(--r-xs); }
@@ -977,11 +1275,14 @@ button.brand:hover { color: var(--blue); }
   color: var(--ink); opacity: .84; }
 .note-p::before { content: ""; position: absolute; left: .1rem; top: .68em;
   width: 4px; height: 4px; border-radius: 50%; background: var(--dim); }
+/* One paragraph is not a list of one -- see renderNoteItems. */
+.note-p.solo { padding-left: 0; }
+.note-p.solo::before { content: none; }
 .note-cmd { border-radius: var(--r-md); padding: .55rem .65rem; }
 .note-cmd code { font-size: .8rem; }
 /* The scenario card: a document, not a form. */
 .scen-b { padding: 1rem 1.15rem 1.15rem; }
-.scen-d { font-size: .88rem; line-height: 1.7; color: var(--ink); opacity: .8; max-width: 72ch; }
+.scen-d { font-size: .88rem; line-height: 1.7; color: var(--ink); opacity: .8; }
 .scen-f { padding: .8rem 1.15rem; font-size: .74rem; }
 .hcard, .capcard { border-radius: var(--r-lg); }
 .hcard-h { padding: .8rem 1.1rem; }

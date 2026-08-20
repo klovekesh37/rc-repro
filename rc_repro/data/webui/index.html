@@ -11,14 +11,27 @@
     <button class="brand" title="Back to this machine"><span class="dollar">$</span> rc-repro</button>
     <!-- Status on the left, account on the right. Both badges keep the position
          they have always had; only the ground under them changed. -->
-    <button id="docker-badge" class="chip" title="Run the environment check">docker: ?</button>
+    <!-- The DOCTOR button, named for what it does. It said "docker: up", which was
+         the whole environment when Docker was the only runtime and is now one engine
+         of two -- and it made the one control that answers "is this box usable"
+         look like a status label. What each engine is doing moved to the footer. -->
+    <button id="doctor-badge" class="chip" title="Run the environment check">doctor</button>
     <button id="edge-badge" class="chip" title="The shared Traefik serving every https name" hidden></button>
     <div class="topbar-actions">
-      <button id="btn-home" class="toplink">Home</button>
-      <button id="btn-jobs" class="toplink">Activity</button>
-      <button id="btn-scenarios" class="toplink">Scenarios</button>
-      <button id="btn-bench" class="toplink">Benchmark</button>
-      <button id="btn-refresh" class="toplink">Refresh</button>
+      <!-- ONE set of links, in a wrapper the narrow layout turns into a popover. A
+           second copy behind a hamburger is two things to keep in step, and they
+           drift: this is the same four buttons either way, moved by CSS. -->
+      <div id="toplinks" class="toplinks">
+        <button id="btn-home" class="toplink">Home</button>
+        <button id="btn-jobs" class="toplink">Activity</button>
+        <button id="btn-scenarios" class="toplink">Scenarios</button>
+        <button id="btn-refresh" class="toplink">Refresh</button>
+      </div>
+      <!-- Shown only where the four links would wrap onto a second row of chrome,
+           which on a 430px screen is a quarter of the height before anything is said
+           about a workspace. -->
+      <button id="nav-toggle" class="chip iconbtn navtoggle" title="Menu"
+              aria-haspopup="menu" aria-expanded="false">☰</button>
       <button id="theme-toggle" class="chip iconbtn" title="Switch between the light and dark theme"></button>
       <!-- The account menu. Clicking the name used to open the sessions DIALOG,
            which meant "sign out" and "change your password" were behind a modal
@@ -88,7 +101,9 @@
   <footer class="statusbar">
     <span id="sb-count">—</span>
     <span id="sb-refreshed">Last refreshed: —</span>
-    <span class="sb-right" id="sb-docker">docker: ?</span>
+    <!-- Both engines, because a workspace can run in either and the answer for one
+         says nothing about the other. -->
+    <span class="sb-right" id="sb-engines">docker: ? · k8s: ?</span>
   </footer>
 
   <!-- Create dialog -->
@@ -101,17 +116,46 @@
            wants something from you, and it is a notice -- it changes no field and
            no URL. -->
       <p id="create-bind-hint" class="banner warn" hidden></p>
-      <label>Rocket.Chat version <input name="version" placeholder="8.5.1" required></label>
-      <p id="version-hint" class="hint"></p>
-      <div class="row2">
-        <label>Runs on <select name="runtime" id="runtime-select"></select></label>
-        <label>Arrangement <select name="deployment" id="deployment-select"></select></label>
-      </div>
-      <p id="runtime-hint" class="hint"></p>
-      <label>Preset <select name="preset" id="preset-select"></select></label>
-      <p id="preset-desc" class="hint"></p>
-      <div id="preset-params"></div>
-      <label>Host port (blank = auto) <input name="port" type="number" min="1024" max="65535" placeholder="auto"></label>
+
+      <!-- THREE NUMBERED SECTIONS. The numbers are not decoration: choosing a
+           runtime re-shapes the form, and numbering says WHICH part changed rather
+           than leaving fields to appear and vanish somewhere in a long scroll.
+           Sections 1 and 3 are identical across runtimes; only 2 and Advanced
+           differ, which is the honest picture. -->
+      <section class="sec">
+        <div class="sec-h"><span class="sec-n">1</span>
+          <span class="sec-t">Which Rocket.Chat</span></div>
+        <label>Version <input name="version" placeholder="8.5.1" required></label>
+        <p id="version-hint" class="hint"></p>
+      </section>
+
+      <section class="sec">
+        <div class="sec-h"><span class="sec-n">2</span>
+          <span class="sec-t">Where it runs</span>
+          <span class="sec-sub" id="create-room"></span></div>
+        <!-- Two CARDS rather than a select. The runtime decides what the other
+             twenty-odd fields mean, and the two facts that decide it -- what it
+             costs and what it cannot do -- have nowhere to live inside an
+             <option>. The hidden input keeps the submit path unchanged. -->
+        <div class="forks" id="runtime-forks" role="group" aria-label="Runtime"></div>
+        <input type="hidden" name="runtime" id="runtime-value">
+        <!-- Arrangement is DEPENDENT on the runtime, so it is a segmented control
+             inside this section, changing when its parent changes. Two peer
+             dropdowns said they were independent and the code then had to fight
+             that -- it produced two live bugs. -->
+        <div class="seg" id="deployment-seg" role="group" aria-label="Arrangement"></div>
+        <input type="hidden" name="deployment" id="deployment-value">
+        <p id="runtime-hint" class="hint seg-note"></p>
+        <div class="checks" id="runtime-extra"></div>
+      </section>
+
+      <section class="sec">
+        <div class="sec-h"><span class="sec-n">3</span>
+          <span class="sec-t">What to reproduce</span></div>
+        <label>Preset <select name="preset" id="preset-select"></select></label>
+        <p id="preset-desc" class="hint"></p>
+        <div id="preset-params"></div>
+        <label>Host port (blank = auto) <input name="port" type="number" min="1024" max="65535" placeholder="auto"></label>
       <div class="checks">
         <label><input type="checkbox" name="monitor"> Monitoring (Prometheus + Grafana)</label>
         <label><input type="checkbox" name="seed"> Seed sample data (users, channels, messages)</label>
@@ -128,12 +172,15 @@
              has it. Buried under Advanced it was below "Root URL override", which
              is a long way to hide the switch that decides whether this
              workspace's MongoDB requires a password. -->
-        <label id="mongo-operator-row" hidden><input type="checkbox" name="mongo_operator">
-          MongoDB via the official operator (adds SCRAM authentication)</label>
       </div>
+      </section>
 
       <details class="adv">
         <summary>Advanced options</summary>
+        <!-- Filled by syncAdvancedForRuntime from the server's own refusal registry,
+             so this can never claim a field is unavailable that has since been
+             built. It said `--reg-token` and every preset until they were. -->
+        <p id="adv-gone" class="adv-gone" hidden></p>
         <label>Name (blank = derived) <input name="name" placeholder="e.g. rc8-5-1-ldap"></label>
         <label>If that name already exists
           <select name="existing">
@@ -319,20 +366,6 @@
   </dialog>
 
   <!-- Benchmark dialog -->
-  <dialog id="bench-dialog">
-    <form id="bench-form" method="dialog">
-      <h2>Benchmark versions</h2>
-      <p class="hint">Boots each version in a throwaway sandbox, runs the identical seed workload, and compares. Sequential — can take a while.</p>
-      <label>Versions (comma-separated) <input name="versions" placeholder="8.4.1,8.5.1"></label>
-      <label>Seed profile
-        <select name="seed_profile"><option>small</option><option selected>standard</option><option>large</option></select>
-      </label>
-      <menu>
-        <button type="button" id="bench-cancel" class="btn">Cancel</button>
-        <button class="btn primary" id="bench-submit">Run benchmark</button>
-      </menu>
-    </form>
-  </dialog>
 
   <!-- API token. Its own dialog rather than reusing the job log, which a
        detached background job may still be writing into. -->

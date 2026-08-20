@@ -91,7 +91,8 @@ CHECKS: tuple[str, ...] = (
     "gui-accounts", "gui-admin", "gui-roles", "gui-create-policy",
     "state-file-perms", "home-perms", "sessions-file", "identity",
     "kubernetes", "kubernetes-tools", "kubernetes-cluster",
-    "kubernetes-storage", "kubernetes-other-clusters", "inotify",
+    "kubernetes-storage", "kubernetes-ingress", "kubernetes-loadbalancer",
+    "kubernetes-metrics", "kubernetes-other-clusters", "inotify",
 )
 
 
@@ -398,6 +399,16 @@ def run_checks() -> dict:
             if pre.cluster_reachable:
                 where = (f", {len(pre.namespaces)} workspace namespace(s)"
                          if pre.namespaces else "")
+                # WHAT it is and what SHAPE it is, on the line that names it. The
+                # distribution is a label for exactly this -- so a reader is told "k3s"
+                # rather than left to infer it from a context called `default` -- and
+                # the node count is what decides whether a node-local StorageClass can
+                # bite.
+                shape = ", ".join(
+                    [f"{pre.node_count} node" + ("s" if pre.node_count != 1 else "")]
+                    + ([", ".join(pre.architectures)] if pre.architectures else []))
+                where = (f" ({pre.distribution or 'unknown'}, {shape})" if shape
+                         else f" ({pre.distribution or 'unknown'})") + where
                 if pre.provider == k8s.PROVIDER_EXTERNAL:
                     # Saying whose cluster it is, before anything is created in it.
                     # rc-repro owns the namespaces it labels and never the cluster,
@@ -413,21 +424,68 @@ def run_checks() -> dict:
                     line(needed, f"Cluster {pre.context!r} has no default "
                                  "StorageClass — a workspace's volume would stay "
                                  "Pending with no error naming storage", check="kubernetes-storage")
+                else:
+                    line("ok", f"Storage: {pre.default_storage_class} (default)",
+                         check="kubernetes-storage")
+
+                # WHAT THIS CLUSTER PROVIDES, reported the same way on every
+                # distribution so the difference between two of them is visible rather
+                # than implied. All three are `ok` rows on purpose: a capability is a
+                # FACT, and severity belongs to whatever needs it -- an absent ingress
+                # controller cannot affect a workspace reached by port-forward, and
+                # `ingress_blocker` is what refuses when something asks for a hostname.
+                # A doctor that warns about a feature you are not using teaches people
+                # to ignore its warnings.
+                if pre.ingress_classes:
+                    line("ok", "Ingress: " + ", ".join(pre.ingress_classes)
+                         + " — a hostname can be served from this cluster",
+                         check="kubernetes-ingress")
+                else:
+                    line("ok", "Ingress: none installed — workspaces are reached by "
+                               "port-forward, which needs no controller",
+                         check="kubernetes-ingress")
+                if pre.loadbalancer:
+                    line("ok", f"Load balancer: working — {pre.loadbalancer}",
+                         check="kubernetes-loadbalancer")
+                else:
+                    # Not "absent": no address means either no controller or nobody
+                    # asked for one, and those cannot be told apart from outside.
+                    line("ok", "Load balancer: not confirmed — no LoadBalancer Service "
+                               "here has an address", check="kubernetes-loadbalancer")
+                if pre.metrics:
+                    line("ok", "Metrics: metrics-server answering — `rc-repro stats` "
+                               "works here", check="kubernetes-metrics")
+                else:
+                    line("ok", "Metrics: no metrics-server — `rc-repro stats` refuses "
+                               "and says how to install it", check="kubernetes-metrics")
             elif pre.probe_failed:
                 # NOT "does not exist". `kind` talks to Docker, so this is what a
                 # stopped Docker looks like -- and telling someone their cluster is
                 # absent would send them to create one that is already there.
                 line(needed, f"Could not tell whether cluster {k8s.CLUSTER_NAME!r} "
                              f"exists ({pre.probe_failed}) — kind needs Docker", check="kubernetes-cluster")
-            elif pre.context:
-                line(needed, f"Cluster {pre.context!r} is configured but its API "
-                             "server is not answering", check="kubernetes-cluster")
-            elif pre.can_provision:
+            elif pre.will_create:
+                # Ordered BEFORE the not-answering branch, which would otherwise
+                # claim a cluster nobody has made yet is broken.
                 line("fail" if in_use else "ok",
                      f"No cluster yet — {k8s.CLUSTER_NAME!r} is created on first use"
                      if not in_use else
                      f"Cluster {k8s.CLUSTER_NAME!r} is gone and its workspaces "
                      "cannot be reached", check="kubernetes-cluster")
+                # The box that has BOTH. Saying which one is about to be used is not
+                # enough on its own -- someone with a running k3s and no kind cluster
+                # needs to be told their cluster was seen and set aside, or the next
+                # question is why rc-repro is building a second one.
+                other = k8s.active_context()
+                if other and other != pre.context and k8s.reachable(other):
+                    line("ok", f"Your cluster {other!r} "
+                               f"({k8s.distribution(other) or 'unknown'}) is running and "
+                               f"will NOT be used — rc-repro creates its own while kind "
+                               f"is installed. Uninstall kind to use {other!r} instead",
+                         check="kubernetes-other-clusters")
+            elif pre.context:
+                line(needed, f"Cluster {pre.context!r} is configured but its API "
+                             "server is not answering", check="kubernetes-cluster")
             elif pre.tools_ready:
                 # kubectl and helm but no kind and no kubeconfig: usable the moment
                 # a cluster is pointed at, and the two ways to get one are named.

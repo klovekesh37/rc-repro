@@ -139,6 +139,37 @@ def _require_docker() -> None:
         _fail(exc)
 
 
+def _not_answering(m: runner.Metadata, exc: Exception, what: str) -> NoReturn:
+    """A REST command that could not reach or could not authenticate to a workspace.
+
+    A CONNECTION failure is NOT_READY -- exit 5, "poll again" -- and not the
+    unclassified 1. Every one of these messages already told the reader to run
+    `rc-repro ready`, while exiting the one code that tells a script not to bother
+    polling; and `services/monitor.py` raises NotReadyError for the very same
+    condition, so an unreachable workspace answered differently depending on which
+    verb you reached for. Measured: `api` against a workspace whose Rocket.Chat
+    container was still coming back from an `env` change exited 1.
+
+    Anything else -- a refused login, a 2FA challenge nothing can satisfy -- stays
+    unclassified, because it is not something waiting will fix.
+    """
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        _fail(errors.NotReadyError(
+            f"{m.name!r} is not answering yet, so {what} cannot run — wait for it with "
+            f"`rc-repro ready --name {m.name}`"))
+    # A 429 is the other "wait and it will work": Rocket.Chat rate-limits token
+    # creation per user, so two perf runs back to back -- which is exactly the
+    # `--save baseline` then `--compare baseline` pair the README prints -- have the
+    # second refused. Reported as unclassified it read like a broken workspace.
+    if "429" in str(exc) or "Too Many Requests" in str(exc):
+        _fail(errors.NotReadyError(
+            f"Rocket.Chat is rate-limiting token creation on {m.name!r}, so {what} "
+            "cannot run yet. Its limiter resets in about a minute — try again then."))
+    # No "ready?" here: the two conditions waiting actually fixes are handled above, so
+    # telling everybody else to poll sent them to a command that could not help.
+    _err(f"{what} failed: {exc}")
+
+
 def _login(meta: runner.Metadata) -> rcapi.Auth:
     """Admin login for a repro. Passes the repro's Mailpit URL (email preset)
     so rcapi can satisfy an email-2FA challenge automatically."""
@@ -528,18 +559,70 @@ def _print_seed_result(s: dict, total: float, resources, meta: runner.Metadata) 
     _print_resources(resources or {}, meta.name)
 
 
+def _note_lines(line: str, width: int) -> list[str]:
+    """One note line, as terminal lines.
+
+    An INDENTED line is something to paste, and is never wrapped. It used to be, and
+    the box it was wrapped inside made it worse: `kubectl -n rc-repro-x port-forward
+    deployment/rocketchat-` on one line and `  rocketchat 3000:3000` on the next is a
+    command that fails when it is pasted, which is the only thing anybody does with
+    it. It overflows the width instead, and the terminal soft-wraps a line that is
+    still one line to select.
+    """
+    text = _ascii(line)
+    if text[:1] == " " and text.strip():
+        return ["      " + text.strip()]
+    # break_on_hyphens=False: the default splits "metrics-server" across two lines,
+    # and a reader who greps for the word it named does not find it.
+    return textwrap.wrap(text, width=width, initial_indent="    ",
+                         subsequent_indent="    ", break_on_hyphens=False) or [""]
+
+
 def _print_notes(meta: runner.Metadata) -> None:
-    notes = meta.extra.get("notes")
-    if not notes:
-        return
-    inner = min(shutil.get_terminal_size((90, 24)).columns, 88) - 4
-    lines: list[str] = []
-    for n in notes:
-        n = _ascii(n)
-        lead = len(n) - len(n.lstrip())               # keep a note's own indent
-        lines += textwrap.wrap(n, width=inner, subsequent_indent=" " * (lead + 2)) or [""]
-    typer.echo("")
-    ui.box("notes", lines, inner, title_color=typer.colors.CYAN)
+    """What is in this workspace, as sections rather than one wall of bullets.
+
+    Rendered from the GROUPS (see services/lifecycle.note_group), so the terminal and
+    the browser show the same structure from one definition -- facts as an aligned
+    two-column block, prose wrapped, and the things you have to paste set off on their
+    own and never wrapped.
+
+    No box. A box has to wrap its content to its own width, and the content here
+    includes commands that must survive a copy; the group titles already say where one
+    section ends and the next begins, which is the only thing the border was doing.
+    """
+    groups = lcsvc.note_groups_of(meta)
+    if not groups:
+        # A workspace with notes that no group accounts for: still shown, ungrouped,
+        # through the same renderer rather than a second one.
+        flat = list(meta.extra.get("notes") or []) if isinstance(meta.extra, dict) else []
+        if not flat:
+            return
+        groups = [lcsvc.note_group("", body=flat)]
+    width = min(shutil.get_terminal_size((90, 24)).columns, 88)
+    ui.line("")
+    # A dim divider, not a heading: the group titles below are the headings, and a
+    # second cyan bold line above them made the two read as peers.
+    head = "what is in this workspace "
+    ui.line("  " + typer.style(head + "-" * max(1, width - len(head) - 3),
+                               fg=typer.colors.BRIGHT_BLACK))
+    for g in groups:
+        rows = g.get("rows") or []
+        body = g.get("body") or []
+        cmds = g.get("commands") or []
+        if not (rows or body or cmds):
+            continue                      # a title with nothing under it is not a section
+        ui.line("")
+        if g.get("title"):
+            ui.note("  " + _ascii(str(g["title"])), bold=True)
+        if rows:
+            kw = max(len(str(k)) for k, _ in rows)
+            for k, v in rows:
+                ui.line(f"    {_ascii(str(k)).ljust(kw)}   {_ascii(str(v))}")
+        for line in body:
+            for out in _note_lines(line, width - 6):
+                ui.line(out)
+        for c in cmds:
+            ui.line("      " + _ascii(str(c)))
 
 
 @app.command()
@@ -686,8 +769,26 @@ def prune(
         stray = lcsvc.orphan_namespaces() if orphans else []
     except errors.ReproError as exc:
         _fail(exc)
+    # The CLUSTER is reclaimable separately from any workspace: with everything gone,
+    # rc-repro's own kind control plane is 514 MiB holding nothing, and both the README
+    # and the agent skill said `prune` gives it back -- which nothing did.
+    reclaim = _cluster_reclaimable()
     if not targets and not stray:
-        typer.echo("Nothing to prune.")
+        if not reclaim:
+            typer.echo("Nothing to prune.")
+            return
+        if not yes:
+            typer.echo("Nothing to prune, but rc-repro's own Kubernetes cluster is "
+                       "empty and can be given back (about 0.5 GB).")
+            typer.confirm("Delete the cluster?", abort=True)
+        try:
+            res = lcsvc.prune(confirm=True, orphans=orphans, emit=_cli_emit)
+        except errors.ReproError as exc:
+            _fail(exc)
+        if res.get("cluster"):
+            ui.ok("✓ the cluster is gone — the next Kubernetes workspace creates a new one.")
+        else:
+            typer.echo("Nothing to prune.")
         return
     if not yes:
         typer.echo("These down repros will be deleted — containers, data volumes, and records:")
@@ -714,6 +815,18 @@ def prune(
         ui.ok(f"✓ pruned {len(res['removed'])}: {', '.join(res['removed'])}")
     else:
         typer.echo("Nothing to prune.")
+    if res.get("cluster"):
+        ui.ok("✓ the cluster is gone too — the next Kubernetes workspace creates a new one.")
+
+
+def _cluster_reclaimable() -> bool:
+    """Whether `prune` has a cluster to give back. Never raises: a cleanup verb must not
+    fail because a probe did."""
+    try:
+        from rc_repro.services import k8s
+        return k8s.cluster_reclaimable()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _say_reattach(target: str) -> None:
@@ -1370,7 +1483,7 @@ def token(name: str = typer.Option("", "--name", "-n")) -> None:
     try:
         auth = _login(m)
     except Exception as exc:  # noqa: BLE001 - surface any auth/connection failure
-        _err(f"could not log in (is it ready? `rc-repro ready --name {m.name}`): {exc}")
+        _not_answering(m, exc, "logging in")
     typer.echo(f'-H "X-Auth-Token: {auth.token}" -H "X-User-Id: {auth.user_id}"')
 
 
@@ -1398,7 +1511,7 @@ def api(
             token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, bypass_2fa=True, workspace=m.name)
             auth = rcapi.Auth(token=token, user_id=auth.user_id)  # use the PAT as the auth token
     except Exception as exc:  # noqa: BLE001
-        _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
+        _not_answering(m, exc, "this API call")
 
     try:
         body = json.loads(data) if data else None
@@ -1436,7 +1549,7 @@ def pat(
         auth = _login(m)
         token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, token_name=label, bypass_2fa=bypass_2fa, workspace=m.name)
     except Exception as exc:  # noqa: BLE001
-        _err(f"could not create PAT (ready? `rc-repro ready --name {m.name}`): {exc}")
+        _not_answering(m, exc, "minting a token")
     typer.echo(f"# Personal Access Token for {m.name} ({m.root_url}) — bypass_2fa={bypass_2fa}")
     typer.echo(f'-H "X-Auth-Token: {token}" -H "X-User-Id: {auth.user_id}"')
 
@@ -2196,7 +2309,7 @@ def loadtest(
                                    token_name="rc-repro-loadtest", bypass_2fa=True,
                                    workspace=m.name)
     except Exception as exc:  # noqa: BLE001
-        _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
+        _not_answering(m, exc, "this API call")
 
     # Real per-user identity: log in as seeded users and hand them to k6 so VUs
     # round-robin across them. The custom scenario stays on the admin PAT —
@@ -2487,7 +2600,7 @@ def capacity(
                                    token_name="rc-repro-loadtest", bypass_2fa=True,
                                    workspace=m.name)
     except Exception as exc:  # noqa: BLE001
-        _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
+        _not_answering(m, exc, "this API call")
     users = _login_seed_users(m, users_n) if users_n > 0 else []
 
     # As in loadtest: every mutation (resource caps, rate limiter, the Prometheus

@@ -413,3 +413,58 @@ def test_every_json_command_answers_with_exactly_one_envelope(
         # A failure names a code from the published set, and exits non-zero.
         assert env["error"]["code"] in jsonout.capabilities(cli.app)["error_codes"]
         assert res.exit_code != 0
+
+
+def test_a_workspace_that_is_not_answering_yet_exits_five_not_one(monkeypatch, tmp_path):
+    """Every REST command's failure message told the reader to run `rc-repro ready`, and
+    every one of them exited 1 -- the code that tells a script not to bother polling. And
+    `services/monitor.py` raises NotReadyError for the identical condition, so an
+    unreachable workspace answered differently depending on which verb you reached for.
+
+    Measured: `api` against a workspace whose Rocket.Chat container was still coming back
+    from an `env` change exited 1 while saying "ready?".
+    """
+    import json as _json
+
+    import requests
+    from typer.testing import CliRunner
+
+    from rc_repro import cli, errors, rcapi
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    (tmp_path / "repros" / "w").mkdir(parents=True)
+    (tmp_path / "repros" / "w" / "repro.json").write_text(_json.dumps({
+        "name": "w", "project": "p", "rc_version": "8.5.1", "rc_image": "i",
+        "mongo_tag": "8.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3001", "host_port": 3001, "version_source": "x",
+        "extra": {}}))
+    monkeypatch.setattr(cli, "_require_docker", lambda: None)
+
+    def refuse(*_a, **_k):
+        raise requests.ConnectionError("connection refused")
+    monkeypatch.setattr(rcapi, "login", refuse)
+
+    runner = CliRunner()
+    res = runner.invoke(cli.app, ["api", "--name", "w", "GET", "/api/v1/me"])
+    assert res.exit_code == 5, f"exit {res.exit_code}: {res.output}"
+    assert errors.EXIT_CODES[5] == "not_ready", "the code this asserts must keep meaning"
+    assert "not answering yet" in res.output, res.output
+
+    # A 429 is the other "wait and it will work": Rocket.Chat rate-limits token
+    # creation, so the `--save baseline` / `--compare baseline` pair the README prints
+    # had its second half refused, and it read like a broken workspace.
+    def limited(*_a, **_k):
+        raise RuntimeError("429 Client Error: Too Many Requests for url: ...")
+    monkeypatch.setattr(rcapi, "login", limited)
+    res = runner.invoke(cli.app, ["api", "--name", "w", "GET", "/api/v1/me"])
+    assert res.exit_code == 5, f"exit {res.exit_code}: {res.output}"
+    assert "rate-limiting" in res.output and "about a minute" in res.output, res.output
+
+    # A refused LOGIN is not something waiting fixes, so it stays unclassified -- and
+    # it no longer tells the reader to run `ready`, which could not have helped.
+    def deny(*_a, **_k):
+        raise RuntimeError("Unauthorized")
+    monkeypatch.setattr(rcapi, "login", deny)
+    res = runner.invoke(cli.app, ["api", "--name", "w", "GET", "/api/v1/me"])
+    assert res.exit_code == 1, res.output
+    assert "ready" not in res.output.lower(), res.output
