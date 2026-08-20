@@ -3113,7 +3113,24 @@ function syncBindHint() {
 // the dialog ends up offering a combination the service layer refuses.
 let RUNTIMES = [];
 
-const RUNTIME_LABEL = { docker: "Docker Compose", kubernetes: "Kubernetes (kind)" };
+const RUNTIME_LABEL = { docker: "Docker Compose", kubernetes: "Kubernetes" };
+
+// WHICH Kubernetes, from the server's probe rather than from a word written here.
+// The label was the literal "Kubernetes (kind)", which was true while kind was the
+// only way to have a cluster and became a lie the moment rc-repro could adopt one:
+// on a box with no kind and a running k3s, the card named a cluster that would not
+// be touched -- the same defect `doctor` had, in the other front-end.
+//
+// The branch order is `plan_cluster`'s, so the card cannot promise a different
+// cluster than the create will use: kind present wins even when something else is
+// running, because rc-repro makes its own.
+function runtimeLabel(name) {
+  if (name !== "kubernetes") return RUNTIME_LABEL[name] || name;
+  const k = KUBE || {};
+  if (k.can_provision) return "Kubernetes (kind)";
+  if (k.usable && k.reachable && k.distribution) return `Kubernetes (${k.distribution})`;
+  return "Kubernetes";
+}
 const DEPLOYMENT_LABEL = {
   monolith: "monolith — one Rocket.Chat",
   "multi-instance": "multi-instance — several behind a load balancer",
@@ -3169,7 +3186,7 @@ function renderRuntimeAxes() {
       onclick: () => pickRuntime(spec.name),
     },
       el("span", { class: "fork-n" }, el("span", { class: "fork-dot" }),
-         RUNTIME_LABEL[spec.name] || spec.name),
+         runtimeLabel(spec.name)),
       // What it BUILDS, not what it might weigh. The memory figure was an
       // estimate dressed as a fact -- it depends on the preset, the arrangement
       // and what else is running -- and the free-space line in this same header

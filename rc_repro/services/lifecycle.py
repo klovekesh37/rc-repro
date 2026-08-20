@@ -2574,9 +2574,18 @@ _KUBERNETES_UNSUPPORTED: tuple[tuple[str, str], ...] = (
     # guard keyed on a name nobody checks is worse than no guard, because the
     # docstring then says the case is handled. Hence the loop reads real fields and
     # the test drives it through CreateReq rather than a hand-made object.
-    ("https", "HTTPS needs an ingress controller and cert-manager, not the Traefik "
-              "edge Compose uses"),
-    ("domain", "a public domain needs the ingress that HTTPS needs"),
+    # The reason, stated as what rc-repro has not built rather than as what your
+    # cluster lacks. The first version read "HTTPS needs an ingress controller and
+    # cert-manager" -- and told a k3s user their cluster was missing both when it
+    # ships Traefik as the DEFAULT ingress class with a LoadBalancer already on :443.
+    # Verified by hand on k3s: an Ingress with a TLS secret minted from rc-repro's own
+    # local CA served Rocket.Chat over https with `ssl_verify_result: 0`, no
+    # cert-manager anywhere. So the blocker is this side of the fence, and naming
+    # someone else's cluster for it sends them to install something they do not need.
+    ("https", "rc-repro creates no Ingress for a workspace, and the Traefik edge it "
+              "terminates TLS on for Compose holds host ports and routes to container "
+              "names -- a cluster has neither. Reach the workspace on its port-forward"),
+    ("domain", "a hostname needs the Ingress that --https needs"),
     ("fresh", "--fresh means DELETE this workspace's data, and the Kubernetes path "
               "keeps the PersistentVolumeClaim — use `rc-repro down --name <n> "
               "--volumes` first, which does delete it"),

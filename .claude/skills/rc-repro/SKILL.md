@@ -122,6 +122,11 @@ One decision, made for you, and it is the only thing k3s and kind change:
 With both a `kind` binary and a running k3s on the box, **kind wins** — the binary
 being present is the test. Everything after provisioning is identical code on either.
 
+Which to pick, when the choice is yours: **k3s** already provides ingress, a load
+balancer, storage and metrics-server, so `stats` works and no control plane is added;
+**kind** is rc-repro's own, so `prune` can reset the whole cluster and nothing you
+care about is at risk.
+
 `rc-repro doctor --json` is the authority on which one applies and on what the
 cluster provides: `storage`, `ingress`, `loadbalancer` and `metrics` are reported as
 facts per cluster. A stock k3s has all four; a stock kind has storage only, so
@@ -131,9 +136,11 @@ facts per cluster. A stock k3s has all four; a stock kind has storage only, so
 
 These are refusals, not gaps — the refusal names the reason and the alternative:
 
-- `--https` / `--domain`: HTTPS needs an ingress controller, not the Traefik edge
-  Compose uses. Reach the workspace on `http://localhost:<port>` via its
-  port-forward.
+- `--https` / `--domain`: rc-repro does not create an Ingress for a Kubernetes
+  workspace yet. Reach it on `http://localhost:<port>` via its port-forward, or use
+  `--runtime docker` when the case needs TLS. Do NOT tell a user their cluster is
+  missing an ingress controller or cert-manager -- a stock k3s has Traefik as the
+  default class and needs neither.
 - `loadtest` / `capacity`: a Kubernetes workspace is reached through a
   `kubectl port-forward`, a single userspace relay that saturates long before
   Rocket.Chat does — the numbers would measure the forward. Run these against a

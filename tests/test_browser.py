@@ -2124,6 +2124,46 @@ def test_the_create_dialog_says_what_it_builds_and_what_the_box_has_left(
         assert page.errors == [], page.errors
 
 
+def test_the_runtime_card_names_the_cluster_that_will_actually_be_used(
+        page, serve, monkeypatch):
+    """The card read the literal "Kubernetes (kind)". That was true while kind was the
+    only way to have a cluster and became wrong the moment rc-repro could adopt one:
+    on a box with no kind and a running k3s it named a cluster the create would not
+    touch -- the same defect `doctor` had, in the other front-end. So the label comes
+    from the probe, in `plan_cluster`'s branch order."""
+    from rc_repro.services import k8s, users as usersvc
+
+    usersvc.add("alice", PASSWORD, role="admin")
+
+    # A cluster rc-repro did NOT create and cannot create: no kind binary, so
+    # `can_provision` is false and the adopted distribution is what matters.
+    adopted = k8s.Preflight(tools={
+        "kubectl": k8s.Tool(name="kubectl", path="/usr/bin/kubectl",
+                            version=(1, 30, 0), raw="v1.30.0"),
+        "helm": k8s.Tool(name="helm", path="/usr/bin/helm",
+                         version=(3, 14, 0), raw="v3.14.0"),
+    })
+    adopted.context = "default"
+    adopted.distribution = "k3s"
+    adopted.cluster_reachable = True
+    monkeypatch.setattr(k8s, "preflight", lambda *a, **k: adopted)
+
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#btn-new")
+        # The footer proves the probe reached the page before the dialog is opened.
+        page.wait_for_function(
+            "() => document.querySelector('#sb-engines')"
+            ".textContent.includes('k3s')", timeout=15000)
+        page.click("#btn-new")
+        page.wait_for_selector("#create-dialog[open]")
+        page.wait_for_selector("#runtime-forks button")
+        kube = page.locator("#runtime-forks button").nth(1).inner_text()
+        assert "Kubernetes (k3s)" in kube, kube
+        assert "kind" not in kube, "named a cluster the create would not use"
+        assert page.errors == [], page.errors
+
+
 def test_the_arrangement_says_what_it_builds(serve, page, monkeypatch):
     """The note under the segmented control describes the ARRANGEMENT, which is the
     choice directly above it. It used to describe the runtime and repeat "HTTPS is

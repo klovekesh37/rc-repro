@@ -195,6 +195,38 @@ Neither is a fault — a workspace reached by port-forward needs no ingress at a
 `doctor` reports each as a fact rather than a warning, so the two clusters can be
 compared at a glance.
 
+### Which one should you use?
+
+Both work, and rc-repro behaves the same in either. Pick on what you want from the
+cluster, not on what rc-repro needs:
+
+**Use k3s when you want the cluster to already provide things.** A stock k3s ships
+**Traefik as the default ingress class**, a **LoadBalancer** with a real address on
+:80/:443, **local-path** storage and **metrics-server**. So `rc-repro stats` works
+there and not on a stock kind, a hostname *can* be served from the cluster, and
+nothing costs an extra control plane — rc-repro adds a namespace to a cluster you were
+running anyway. It is also the closer match to a customer's real cluster, which is
+often the point of reproducing on Kubernetes at all.
+
+**Use kind when you want rc-repro to own the cluster.** It creates
+`rc-repro-local`, and `prune` gives it back — so a Kubernetes repro is disposable at
+the *cluster* level, not just the namespace level, and a wedged cluster is one command
+away from a clean one. Nothing rc-repro does can touch a cluster you care about,
+because it made its own. That costs ~600 MB for the control plane, once per machine.
+
+| | k3s (adopted) | kind (created) |
+|---|---|---|
+| Ingress controller | **yes** — Traefik, default class, LB on :443 | none unless you install one |
+| `rc-repro stats` | **works** — metrics-server ships | refuses; says how to install metrics-server |
+| Extra RAM | **none** | ~600 MB control plane |
+| Reset the whole cluster | your job | `rc-repro prune` |
+| Risk to the cluster | rc-repro only ever adds/removes its namespaces | none — it is rc-repro's own |
+
+**HTTPS is not one of the differences.** `--https` and `--domain` are refused on the
+Kubernetes runtime on **both** clusters — rc-repro creates no Ingress for a workspace
+(see the refusals table above), so the cluster having Traefik makes no difference to
+what the tool will do. HTTPS means `--runtime docker`.
+
 **The ownership rule is what makes adopting your cluster safe:** rc-repro owns the
 namespaces it labels and never the cluster. In a cluster you supplied it creates
 namespaces, removes them on `down`, and leaves everything else — including the cluster
@@ -205,7 +237,7 @@ only ever targets `rc-repro-local`.
 
 | Refused | Because |
 |---|---|
-| `--https`, `--domain` | HTTPS needs an ingress controller and cert-manager, not the Traefik edge Compose uses |
+| `--https`, `--domain` | rc-repro does not create an Ingress for a Kubernetes workspace yet; the Traefik edge it uses on Compose holds host ports and routes to container names, and a cluster has neither |
 | `--fresh` | it means *delete this workspace's data*, and this path keeps the PVC — use `down --volumes` |
 | `loadtest`, `capacity` | the port-forward is one userspace relay; it saturates first, so the numbers would measure the forward |
 | `env --set` | an environment variable is a helm value there; the refusal hands over the `helm upgrade` that changes one |
