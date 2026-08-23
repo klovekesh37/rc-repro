@@ -29,7 +29,7 @@ from rc_repro import compose, rcapi, runner, versions
 from rc_repro.errors import (ConflictError, DockerError, NotReadyError,
                              ReproError, ValidationError)
 from rc_repro.services import backup as backupsvc
-from rc_repro.services import lifecycle
+from rc_repro.services import lifecycle, topology
 from rc_repro.services.events import Emit, info, null_emit, warn
 
 #: Where the automatic pre-upgrade bundle is recorded, so --rollback can find it
@@ -51,8 +51,12 @@ def require_running(name: str) -> runner.Metadata:
     Checked here in the service layer so the CLI and the GUI cannot disagree about
     when the action is available.
     """
-    lifecycle.require_docker()
     target = lifecycle.resolve_name(name)
+    # THE RIGHT ENGINE, not always Docker. This was `require_docker()` above the
+    # resolve, so an upgrade of a Kubernetes workspace on a host without Docker --
+    # the adopt-an-existing-cluster setup this runtime exists for -- refused with
+    # "Docker isn't running" and never reached the dispatch below.
+    lifecycle.require_engine(target)
     # BEFORE the running check, not after. `rc_state` asks docker about containers,
     # so a healthy Kubernetes workspace was reported as "has no containers (it was
     # `down`ed)" -- advice that is wrong twice over: it was never downed, and `up`
@@ -218,8 +222,24 @@ def _run_locked(target: str, to_version: str, *, offline: bool, force: bool,
     p = plan(target, to_version, offline=offline)
     if not p["allowed"] and not force:
         raise ValidationError(p["blocked_reason"] + ". Pass --force to try anyway.")
-    if p["mongo_blocked"] and not force:
-        raise ValidationError(p["mongo_blocked"])
+    if p["mongo_blocked"]:
+        # `--force` DOES NOT DO WHAT THE REFUSAL IMPLIES, so it says so rather than
+        # silently proceeding. README and `plan()`'s own comment both describe a
+        # cross-major MongoDB jump as "refused rather than attempted" -- and `_apply_image`
+        # rewrites only the Rocket.Chat services and the oplog variable. Nothing touches
+        # the `mongodb` service and `meta.mongo_tag` is left alone, so a forced upgrade
+        # gives new Rocket.Chat against the OLD MongoDB, with the record still naming the
+        # old pairing. That is not "attempted anyway", it is a different operation, and
+        # the refusal did not mention `--force` at all.
+        if not force:
+            raise ValidationError(
+                p["mongo_blocked"] + " `--force` upgrades Rocket.Chat only and leaves "
+                "MongoDB where it is, which is usually not what you want; `backup` then "
+                "a fresh `up` at the new version is.")
+        warn(emit, "--force: upgrading Rocket.Chat ONLY. " + p["mongo_blocked"]
+             + " MongoDB stays at its current version and the record keeps naming it, "
+               "so this workspace is a combination rc-repro does not pair by itself.",
+             phase="upgrade")
     for line in p["warnings"]:
         warn(emit, line, phase="upgrade")
 
@@ -405,7 +425,21 @@ def _migration_errors(name: str, tail: int = 400) -> list[str]:
     reproducing the whole log, which `rc-repro logs` already does.
     """
     try:
-        text = runner.compose_logs_capture(name, tail=tail)
+        # RUNTIME-AWARE. `compose_logs_capture` on a Kubernetes workspace answers
+        # "no configuration file provided", which the except below swallowed -- so a
+        # Kubernetes migration failure reported no diagnostics at all, silently, at
+        # the one moment they are worth most.
+        if topology.of_repro(name) == topology.KUBERNETES:
+            from rc_repro.services import k8s
+            meta = runner.read_meta(name)
+            context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
+            proc = k8s.log_process(name, context=context, tail=tail, follow=False)
+            try:
+                text = "".join(proc.stdout or [])
+            finally:
+                proc.wait(timeout=10)
+        else:
+            text = runner.compose_logs_capture(name, tail=tail)
     except Exception:  # noqa: BLE001 - logs are a nicety, never a failure
         return []
     hits = []
@@ -431,8 +465,8 @@ def _rollback(target: str, previous_compose: str, previous: dict, bundle: str,
 
 def rollback(name: str, *, bundle: str = "", emit: Emit = null_emit) -> dict:
     """Undo the last upgrade of this repro from its automatic pre-upgrade backup."""
-    lifecycle.require_docker()
     target = lifecycle.resolve_name(name)
+    lifecycle.require_engine(target)          # same reason as require_running
     meta = runner.read_meta(target)
     extra = meta.extra if isinstance(meta.extra, dict) else {}
     path = bundle or str(extra.get(LAST_BACKUP_KEY) or "")

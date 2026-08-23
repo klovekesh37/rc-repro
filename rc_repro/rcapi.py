@@ -238,9 +238,12 @@ def fetch_email_otp(
 def complete_setup_wizard(root_url: str, auth: Auth, password: str, timeout: float = 15.0) -> bool:
     """Mark the setup wizard completed so the repro is usable immediately.
 
-    INITIAL_USER creates the admin but leaves the wizard at 'in_progress' (the
-    cloud-registration step), which beats OVERWRITE_SETTING_Show_Setup_Wizard.
-    Best-effort; never raises.
+    Rocket.Chat leaves the wizard at 'in_progress' (the cloud-registration step)
+    after auto-provisioning the admin, and that beats
+    OVERWRITE_SETTING_Show_Setup_Wizard. Best-effort; never raises.
+
+    This used to credit `INITIAL_USER` with creating the admin. It never did -- see
+    compose.py, where removing the variable changed nothing except the log noise.
     """
     return set_setting(root_url, auth, password, "Show_Setup_Wizard", "completed", timeout=timeout)
 

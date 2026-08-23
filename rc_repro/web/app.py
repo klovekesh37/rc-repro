@@ -76,8 +76,25 @@ def _signin_failed(source: str) -> None:
 
 
 def _signin_ok(source: str) -> None:
+    """Forget this address's failures after a SUCCESSFUL sign-in.
+
+    It used to `pop` the whole window, so one valid low-privilege credential reset the
+    throttle between guessing rounds from the same address: sign in as the readonly
+    account, and the next batch of attempts against an admin name starts from zero. The
+    bound is per address by design (see the comment above), so the reset has to be too
+    -- but a reset earned by knowing ONE password should not buy an unbounded number of
+    guesses at another.
+    Half the window is dropped instead: a legitimate user who mistyped once and then
+    succeeded is unaffected, and a caller working through a list still accumulates.
+    """
     with _signin_lock:
-        _signin_fails.pop(source, None)
+        seen = _signin_fails.get(source)
+        if not seen:
+            return
+        if len(seen) <= 1:
+            _signin_fails.pop(source, None)
+        else:
+            _signin_fails[source] = seen[len(seen) // 2:]
 
 
 # The minimum role for every route, by (method, route template). Three rules make
@@ -293,6 +310,37 @@ def _route_host(edgesvc, name: str) -> str:
     return ""
 
 
+def _confined_backup_in(bundle: str, backupsvc) -> str:
+    """A caller-supplied bundle to READ, restricted to the managed directory.
+
+    The WRITE side was deliberately confined -- "unconfined, this wrote a tar.gz
+    anywhere the server user could" -- and the read side was not. `POST /api/restore`
+    and `POST /api/backups/compatibility` both took the path straight to
+    `Path(bundle).expanduser()`, so a member+ got a filesystem oracle with three
+    distinguishable answers (no such file / not a bundle / a manifest) plus tarfile's
+    error text for any readable `.tar.gz` on the box.
+
+    Not remote code execution -- `_safe_members` rejects absolute paths, `..` and links,
+    and `extractall(filter="data")` is a second layer -- but the CLI is where an
+    arbitrary path belongs, not the HTTP API.
+    """
+    if not bundle:
+        raise ValidationError("no bundle given")
+    root = backupsvc.backups_dir().resolve()
+    src = Path(bundle).expanduser()
+    if not src.is_absolute():
+        src = root / src
+    try:
+        src = src.resolve()
+    except OSError as exc:
+        raise ValidationError(f"could not read {bundle!r}: {exc}") from exc
+    if src != root and root not in src.parents:
+        raise ValidationError(
+            f"`bundle` must be inside {root} — the HTTP API cannot read arbitrary "
+            "paths on the server (the CLI still can)")
+    return str(src)
+
+
 def _confined_backup_out(out: str, backupsvc) -> str:
     """A caller-supplied backup destination, restricted to the managed directory.
 
@@ -447,6 +495,21 @@ def create_app(allow_hosts: list[str] | None = None, *,
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # STARTUP. Whatever the last process was killed in the middle of is still
+        # true: the drain below is bounded, and a SIGKILL or an OOM skips it
+        # entirely, so a previous run can have left Rocket.Chat stopped or the API
+        # rate limiter off with nothing in memory recording it. `journal.recover`
+        # acts only on notes whose owning process is provably gone, so a CLI
+        # operation running right now is left alone.
+        try:
+            from rc_repro.services import journal
+            repaired = await asyncio.to_thread(journal.recover)
+            for row in repaired:
+                mark = "repaired" if row["repaired"] else "STILL BROKEN"
+                print(f"rc-repro: {mark}: {row['what']}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 - a box that cannot be repaired must still serve
+            print(f"rc-repro: could not check for interrupted work: {exc}",
+                  file=sys.stderr)
         yield
         # Shutdown. Job threads are daemons, so without this a `systemctl restart`
         # kills them mid-operation and skips every `finally` -- leaving Rocket.Chat
@@ -1208,7 +1271,14 @@ def create_app(allow_hosts: list[str] | None = None, *,
             pre = k8s.preflight()
         except Exception:  # noqa: BLE001 - a badge must never be the thing that breaks
             return {"usable": False, "reachable": False}
-        return {"usable": pre.tools_ready, "reachable": pre.cluster_reachable,
+        # `usable` HERE MEANT tools_ready, AND `Preflight.usable` MEANS tools_ready AND
+        # cluster_reachable. A box with the tools and no cluster answered
+        # `{"usable": true, "reachable": false}`. app.js reads the pair and is correct
+        # today; a second consumer reading `usable` alone would be wrong, and the same
+        # word meaning two things across a seam is how that happens. `tools_ready` is
+        # published under its own name and `usable` now matches Preflight.
+        return {"usable": pre.usable, "tools_ready": pre.tools_ready,
+                "reachable": pre.cluster_reachable,
                 "context": pre.context, "distribution": pre.distribution,
                 "can_provision": pre.can_provision, "nodes": pre.node_count,
                 "workspaces": len(pre.namespaces)}
@@ -1567,9 +1637,26 @@ def create_app(allow_hosts: list[str] | None = None, *,
     def logs(name: str, tail: int = 200):
         target = lc.resolve_name(name)
         lines: list[str] = []
-        runner.compose_stream(target, "logs", "--no-color",
-                              "--tail", str(_clamp_tail(tail)),
-                              on_line=lines.append)
+        # DISPATCHED, like the WebSocket handler seventy lines above -- which carries
+        # a comment explaining exactly this and was the only half that got it. A
+        # Kubernetes workspace answered every request here with compose's "no
+        # configuration file provided", so the streaming log view worked and the REST
+        # one did not, for the same workspace, in the same GUI.
+        if topology.of_repro(target) == topology.KUBERNETES:
+            from rc_repro.services import k8s
+            meta = runner.read_meta(target)
+            context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
+            proc = k8s.log_process(target, context=context,
+                                   tail=_clamp_tail(tail), follow=False)
+            try:
+                for line in proc.stdout or []:
+                    lines.append(line.rstrip("\n"))
+            finally:
+                proc.wait(timeout=10)
+        else:
+            runner.compose_stream(target, "logs", "--no-color",
+                                  "--tail", str(_clamp_tail(tail)),
+                                  on_line=lines.append)
         return {"name": target, "logs": "\n".join(lines)}
 
     # --- mutating ------------------------------------------------------------
@@ -1613,14 +1700,45 @@ def create_app(allow_hosts: list[str] | None = None, *,
                     "where it listens. An admin can widen it again with "
                     "`rc-repro config set gui.create_policy anyone`." + extra)
         creq = lc.CreateReq(**fields)
+        # REFUSED ON THE REQUEST, like the state and teardown preflights. A bad preset
+        # name is pure argument validation, and validating it inside the job meant a
+        # caller got 200 and a job id and had to open the Activity list to learn the
+        # request was wrong on arrival. Found by driving this route live: the escape
+        # WAS blocked -- the job failed with a ValidationError and nothing was created
+        # -- but the answer arrived in the wrong place.
+        if creq.preset:
+            # Converted here rather than in `presets`: that module raises plain
+            # ValueError throughout and `_create_repro_locked` translates it at the
+            # service boundary (lifecycle.py:1258). Doing the same at this preflight
+            # keeps one convention -- without it the refusal was a 500, because the web
+            # layer maps ReproError and nothing else.
+            try:
+                presets_mod._user_path(creq.preset)
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
         job = jobs.submit("create", lc.create_repro, creq, stream_output=True,
                           label=creq.name or creq.version)
         return {"job_id": job.id}
 
     @app.post("/api/repros/{name}/state")
     def state(name: str, body: dict = Body(...)):
-        lc.set_state(name, body.get("action", ""))
-        return {"ok": True}
+        """Stop/start/restart, as a JOB rather than a blocking call.
+
+        It used to be synchronous, and three things followed from that. The progress
+        the service emits went nowhere -- on Kubernetes `stop` waits up to 60s for
+        pods to go and says so as it waits. It was invisible in the Activity list, so
+        on a shared box nobody could see a state change was in flight. And it was
+        outside `jobs.drain()`, so a `systemctl restart` could cut it mid-scale with
+        nothing recording that anything had been interrupted.
+        """
+        # REFUSED HERE, QUEUED THERE. A job answers 200 with an id, so validating
+        # inside it would turn "that is not an action" and "no such workspace" into a
+        # job that failed -- a 200 for a request that was wrong on arrival. The checks
+        # are pure argument validation and cost nothing.
+        action = body.get("action", "")
+        target = lc.check_state_request(name, action)
+        job = jobs.submit("state", lc.set_state, target, str(action), label=target)
+        return {"job_id": job.id}
 
     @app.post("/api/repros/{name}/up")
     def bring_up(name: str):
@@ -1756,6 +1874,17 @@ def create_app(allow_hosts: list[str] | None = None, *,
     def monitor(name: str, off: bool = False):
         from rc_repro.services import monitor as monitorsvc
         target = lc.resolve_name(name)
+        # THE TERNARY STAYS, AND THE WALK READS IT NOW. As an `ast.IfExp` this was
+        # skipped by `test_every_engine_heavy_job_kind_lands_in_a_pool` -- by
+        # construction, with a comment naming this very route as the case it skipped --
+        # so `monitor` sat outside every pool unnoticed. And `monitorsvc.attach` does a
+        # PULLING `runner.up`: Prometheus, Grafana, Loki, an OTel collector and two
+        # exporters. N members clicking Monitor was N pulling compose-ups on one
+        # engine, which is the exact failure the pool was added for.
+        #
+        # Teaching the walk to resolve a two-constant ternary was the fix, rather than
+        # contorting this call: the escape hatch is closed instead of moved, and the
+        # walk now REFUSES a kind it cannot read rather than skipping it.
         job = jobs.submit("monitor-off" if off else "monitor",
                           monitorsvc.detach if off else monitorsvc.attach, target,
                           label=target)
@@ -1781,8 +1910,9 @@ def create_app(allow_hosts: list[str] | None = None, *,
         is already serving, and the caller wants the value back.
         """
         from rc_repro import rcapi
-        lc.require_docker()
-        meta = runner.read_meta(lc.resolve_name(name))
+        target = lc.resolve_name(name)
+        lc.require_engine(target)
+        meta = runner.read_meta(target)
         label = str(body.get("label") or "rc-repro")
         bypass_2fa = bool(body.get("bypass_2fa", True))
         try:
@@ -1870,9 +2000,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
         downgrade is refused while choosing, not after starting a job.
         """
         from rc_repro.services import backup as backupsvc
-        bundle = str(body.get("bundle") or "")
-        if not bundle:
-            raise ValidationError("no bundle given")
+        bundle = _confined_backup_in(str(body.get("bundle") or ""), backupsvc)
         manifest = backupsvc.read_manifest(bundle)
         target = str(body.get("name") or "")
         if not target:
@@ -1884,9 +2012,7 @@ def create_app(allow_hosts: list[str] | None = None, *,
     @app.post("/api/restore")
     def restore(body: dict = Body(...)):
         from rc_repro.services import backup as backupsvc
-        bundle = str(body.get("bundle") or "")
-        if not bundle:
-            raise ValidationError("no bundle given")
+        bundle = _confined_backup_in(str(body.get("bundle") or ""), backupsvc)
         job = jobs.submit("restore", backupsvc.restore, bundle,
                           name=str(body.get("name") or ""),
                           new=bool(body.get("new", False)),
@@ -1977,8 +2103,9 @@ def create_app(allow_hosts: list[str] | None = None, *,
         import requests
 
         from rc_repro import rcapi
-        lc.require_docker()
-        meta = runner.read_meta(lc.resolve_name(name))
+        target = lc.resolve_name(name)
+        lc.require_engine(target)
+        meta = runner.read_meta(target)
 
         method = str(body.get("method") or "GET").upper()
         if method not in _API_METHODS:
@@ -2035,11 +2162,33 @@ def create_app(allow_hosts: list[str] | None = None, *,
 
     @app.delete("/api/repros/{name}")
     def teardown(name: str, volumes: bool = False, confirm: bool = False):
-        return lc.teardown(name, volumes=volumes, confirm=confirm)
+        """Destroy a workspace, as a job.
+
+        MEASURED at 48.5s on kind and 61s on k3s -- `delete_namespace` waits for the
+        namespace and its PersistentVolumeClaims to actually go, which is deliberate
+        and is why returning early once left an orphan. Held open as an HTTP request
+        that whole time it occupied a threadpool worker, streamed none of the progress
+        it emits, and -- the part that matters -- was not joined by `jobs.drain()`, so
+        a graceful shutdown could cut it between `kubectl delete --wait=false` and the
+        confirmation loop and leave a half-deleted namespace with nothing recording it.
+        """
+        # The confirmation and the ownership gate stay on the REQUEST: a member who
+        # asked to destroy a colleague's workspace must be told so by the call they
+        # made, not by a job they then have to go and read.
+        target = lc.check_teardown_request(name, volumes=volumes, confirm=confirm)
+        job = jobs.submit("teardown", lc.teardown, target, volumes=volumes,
+                          confirm=confirm, label=target)
+        return {"job_id": job.id}
 
     @app.post("/api/prune")
     def prune(body: dict = Body(default={})):
-        return lc.prune(confirm=bool(body.get("confirm", False)))
+        """Sweep every `down` workspace, as a job. Serial over each one, so it scales
+        with how many there are -- 18.7s for two workspaces and two orphan namespaces
+        -- and it emits a line per workspace that a synchronous call discarded."""
+        job = jobs.submit("prune", lc.prune,
+                          confirm=bool(body.get("confirm", False)),
+                          orphans=bool(body.get("orphans", False)))
+        return {"job_id": job.id}
 
     # --- jobs ----------------------------------------------------------------
     @app.get("/api/jobs")

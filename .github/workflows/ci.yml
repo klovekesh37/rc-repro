@@ -4,12 +4,32 @@ on:
   push:
   pull_request:
 
+# One run per ref. Without this, a push on top of a push leaves the first run
+# grinding through a 7-minute suite nobody will read.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only. The default token is read-write on `push`, and nothing here needs to
+# write anything.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    # test_browser.py starts real uvicorns on real ports. A wedged one held a
+    # runner for the account's full 6h default; the suite takes ~7 minutes.
+    timeout-minutes: 25
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+    env:
+      # Makes the extras a HARD requirement rather than a hope -- see the
+      # `require-extras` test. Both `importorskip`s below report green while
+      # testing nothing, so a silent under-install has to fail loudly somewhere.
+      RC_REPRO_REQUIRE_EXTRAS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

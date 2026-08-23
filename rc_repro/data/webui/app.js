@@ -89,6 +89,27 @@ async function api(path, opts = {}) {
   return data;
 }
 
+// The same call for a MULTIPART body. `api()` sets Content-Type: application/json
+// whenever there is a body, which is exactly wrong for a FormData upload -- the
+// browser has to set its own boundary. So this shares everything that matters (the
+// same-origin session cookie, the 401 redirect, the status-carrying error) and
+// differs only in not touching Content-Type.
+//
+// The config-import preview used a bare `fetch` for this reason and lost the 401
+// with it: an expired session showed an error inside a dialog that could no longer
+// do anything, instead of returning the reader to sign-in.
+async function apiForm(path, opts = {}) {
+  const r = await fetch(path, Object.assign({ credentials: "same-origin" }, opts));
+  const data = await r.json().catch(() => ({}));
+  if (r.status === 401) { toSignIn("expired"); throw new Error("signed out"); }
+  if (!r.ok) {
+    const err = new Error(data.error || `HTTP ${r.status}`);
+    err.status = r.status;
+    throw err;
+  }
+  return data;
+}
+
 // ---- where is this browser? -------------------------------------------------
 // Nothing is DETECTED here. Whether `serve` is on EC2, on a colleague's desktop or
 // on the reader's own laptop is not a question this needs answered -- the only thing
@@ -154,6 +175,10 @@ const HEALTH_TONE = { running: "green", bad: "bad", warn: "warn", stopped: "warn
 function healthClass(r) {
   const h = (r.health || "").toLowerCase();
   if (h.includes("unhealthy")) return "bad";
+  // AMBER, not green. A degraded workspace is running -- something it needs is not --
+  // so falling through to stateClass painted it green, which is this file's word for
+  // "fine". Colour is a signal here, never decoration: amber is "wants you".
+  if (h === "degraded") return "warn";
   if (h.includes("starting")) return "warn";
   if (h === "healthy" || h === "running") return "running";
   return stateClass(r.state);
@@ -164,6 +189,22 @@ let ME = "";                  // the signed-in user, "" when nobody is signed in
 // "running" made every one of them look like it had already finished.
 const jobActive = (s) => s === "running" || s === "queued";
 const dstate = { tab: "overview", detail: null, statsTimer: null, points: [] };
+
+// Restart counts already seen, keyed "<workspace>/<pod>". A restart COUNT is
+// cumulative and says nothing about now: a microservices workspace whose
+// ddp-streamer came up before NATS restarts two or three times during a normal boot
+// and is then stable for days. Warning on the total meant "keeps restarting" -- present
+// tense -- sat on a healthy workspace forever, which is how a banner teaches people to
+// ignore it. `services/lifecycle.py`'s own boot watcher already had the right rule
+// (`rc >= 2 and rc > seen["restarts"]`); this is that rule, on this side.
+const RESTARTS_SEEN = {};
+
+function restartsClimbing(workspace, service, count) {
+  const key = `${workspace}/${service}`;
+  const before = RESTARTS_SEEN[key];
+  RESTARTS_SEEN[key] = count;
+  return before !== undefined && count > before;
+}
 
 async function loadRepros() {
   try {
@@ -1062,7 +1103,12 @@ function triageOf(d) {
   // Restarting, or a restart count that is climbing. Two restarts is the line
   // because one is what a slow first boot looks like.
   const n = d.restarts || 0;
-  if (d.state === "restarting" || n >= 2) {
+  // CLIMBING, or unhealthy right now -- not a total. A workspace that restarted twice
+  // while booting and has served ever since is not restarting, and saying so in the
+  // present tense is false. The count itself is still in the containers tab, which is
+  // where a fact belongs when it is not asking for anything.
+  const rcClimbing = restartsClimbing(d.name, "__rocketchat__", n);
+  if (d.state === "restarting" || (n >= 2 && (rcClimbing || healthClass(d) === "bad"))) {
     // The free-memory sentence only when the number is actually known -- the home
     // stage fetches it, and inventing one would be worse than leaving it out.
     const free = HOME.cap && HOME.cap.known
@@ -1086,7 +1132,15 @@ function triageOf(d) {
   // ddp-streamer or presence pod could crash-loop all day with the panel calling the
   // workspace healthy -- and it is the same fault, one layer along. `app` is the
   // server's answer to "which pod is Rocket.Chat", from the label it selects on.
-  const flapping = (d.containers || []).filter((c) => !c.app && (c.restarts || 0) >= 2);
+  const flapping = (d.containers || []).filter((c) => {
+    if (c.app) return false;
+    const count = c.restarts || 0;
+    const climbing = restartsClimbing(d.name, c.service, count);
+    // `health` is the server's answer to "is every container in this pod ready",
+    // decided next to the list that defines it. A pod that is ready now is not
+    // crash-looping now, whatever its history.
+    return count >= 2 && (climbing || c.health !== "healthy");
+  });
   if (flapping.length) {
     const one = flapping.length === 1;
     push(one ? `${flapping[0].service} keeps restarting`
@@ -1912,10 +1966,21 @@ function renderLogs(body, d) {
 
 function startStats() {
   if (dstate.statsTimer) clearInterval(dstate.statsTimer);
+  // ONE IN FLIGHT, AND ONLY FOR THE WORKSPACE THAT ASKED. `docker stats` can take
+  // most of a minute on a loaded box while this fires every three seconds, so
+  // without a guard the calls pile up and each one makes the next slower. And the
+  // response carries no workspace name: a poll started for A that lands after the
+  // reader has clicked B pushed A's CPU and memory onto B's chart, which is a
+  // plausible-looking wrong answer rather than a visible glitch.
+  let inFlight = false;
   const poll = async () => {
     if (document.hidden) return;   // same reasoning as the dashboard poll below
+    if (inFlight) return;
+    const asked = SELECTED;
+    inFlight = true;
     try {
-      const s = await api(`/api/repros/${SELECTED}/stats`);
+      const s = await api(`/api/repros/${asked}/stats`);
+      if (asked !== SELECTED) return;      // the reader moved on; this is A's data
       dstate.points.push({ cpu: s.cpu || 0, mem: s.mem_mb || 0 });
       if (dstate.points.length > 60) dstate.points.shift();
       drawChart();
@@ -1931,6 +1996,11 @@ function startStats() {
         if (box) { box.innerHTML = ""; box.append(el("p", { class: "hint pre" }, e.message)); }
       }
       /* anything else is transient: keep polling */
+    } finally {
+      // RELEASED ON EVERY PATH, including the early return above. A guard that
+      // leaks stops the chart forever, which is a worse failure than the pile-up
+      // it prevents.
+      inFlight = false;
     }
   };
   poll();
@@ -2042,14 +2112,33 @@ async function refreshDetail({ force = false } = {}) {
   if (!force && dstate.tab === "logs" && dstate.logsWS) return;
   renderDetail();
 }
-// Stop/start/restart are a synchronous POST (no job to stream), and `docker compose
-// stop` alone spends RC's 10s SIGTERM grace period before returning -- so runAction
-// carries the feedback. It also owns the reload, which is why nothing here calls
-// loadRepros/refreshDetail itself.
+// Stop/start/restart take real time -- `docker compose stop` alone spends RC's 10s
+// SIGTERM grace period, and a Kubernetes stop waits up to 60s for pods to go -- so
+// they are jobs, and the job dialog carries the feedback runAction used to.
 const STATE_LABEL = { stop: "Stop", start: "Start", restart: "Restart" };
-function doState(name, action) {
-  return runAction(name, STATE_LABEL[action] || action, () =>
-    api(`/api/repros/${name}/state`, { method: "POST", body: JSON.stringify({ action }) }));
+async function doState(name, action) {
+  // A JOB, like every other operation that takes real time. On Kubernetes a stop
+  // waits up to 60s for pods to go and says so while it waits; as a blocking call
+  // all of that was discarded and the button just sat there.
+  //
+  // A KUBERNETES START IS ALSO NOT FINISHED WHEN THE SCALE RETURNS. The URL is a
+  // port-forward that died with the old pod, and one can only be attached after the
+  // pod is ready. The service reports that as `needs_ready` rather than leaving this
+  // file to infer it from "did anything get emitted" -- a proxy that would answer
+  // wrongly the moment any other warning was added.
+  try {
+    const { job_id } = await api(`/api/repros/${name}/state`,
+                                 { method: "POST", body: JSON.stringify({ action }) });
+    streamJob(job_id, `${STATE_LABEL[action] || action}: ${name}`, async (res) => {
+      await loadRepros();
+      if (res && res.needs_ready) {
+        try {
+          const r = await api(`/api/repros/${name}/ready`, { method: "POST" });
+          streamJob(r.job_id, `Waiting for ${name} to serve`, renderCreateResult);
+        } catch (e) { toast(e.message); }
+      }
+    });
+  } catch (e) { toast(e.message); }
 }
 async function doMonitor(name, off) {
   if (off && !confirm(`Detach Prometheus + Grafana from ${name}?\n\nThis also deletes their data volumes.`)) return;
@@ -2080,10 +2169,14 @@ async function doDown(name) {
   const vol = confirm(
     `Also DELETE ${name}'s data volume and record?${whose}\n\n` +
     `OK = delete everything (irreversible).\nCancel = keep the data.`);
-  // Also synchronous, and slower than Stop (it tears containers down and may
-  // remove volumes), so it gets the same treatment.
-  return runAction(name, "Down", () =>
-    api(`/api/repros/${name}?volumes=${vol}&confirm=${vol}`, { method: "DELETE" }));
+  // A job now. Measured at 48-61s on Kubernetes, where the teardown waits for the
+  // namespace and its PersistentVolumeClaims to actually go -- a wait worth watching
+  // rather than a button that looks hung for a minute.
+  try {
+    const { job_id } = await api(`/api/repros/${name}?volumes=${vol}&confirm=${vol}`,
+                                 { method: "DELETE" });
+    streamJob(job_id, `${vol ? "Destroying" : "Stopping"} ${name}`, () => loadRepros());
+  } catch (e) { toast(e.message); }
 }
 // ---- seed dialog ------------------------------------------------------------
 let SEED_TARGET = null;
@@ -2155,10 +2248,12 @@ async function previewImport() {
   fd.append("only", f.only.value.trim());
   let plan;
   try {
-    const r = await fetch(`/api/repros/${IMPORT_TARGET}/config-import/plan`, {
-      method: "POST", credentials: "same-origin", body: fd });
-    plan = await r.json();
-    if (!r.ok) throw new Error(plan.error || `HTTP ${r.status}`);
+    // `apiForm`, not a bare fetch: `api()` is what redirects to sign-in on 401, and
+    // this call opted out of it -- so an expired session showed an error inside a
+    // dialog that could no longer do anything. `apiForm` is the multipart sibling
+    // (see its comment): it parses and raises, so there is no Response here.
+    plan = await apiForm(`/api/repros/${IMPORT_TARGET}/config-import/plan`, {
+      method: "POST", body: fd });
   } catch (e) { toast(e.message); return; }
   finally { $("#import-preview").disabled = false; }
   const box = $("#import-plan");
@@ -2187,11 +2282,17 @@ async function showLogs(name) {
   catch (e) { $("#job-log").textContent = "error: " + e.message; }
 }
 function reportPrune(r) {
+  r = r || {};
   const targets = (r.targets || []).length, removed = (r.removed || []).length;
-  if (!targets) { toast("nothing to prune", "info"); return; }
+  // ORPHANED NAMESPACES COUNT AS WORK DONE. They and their PersistentVolumeClaims are
+  // deleted irreversibly, and reporting only `removed` said "nothing to prune" about
+  // a sweep that had just destroyed them -- the same defect the CLI had.
+  const orphans = (r.orphans || []).length;
+  if (orphans) toast(`removed ${orphans} orphaned namespace(s): ${(r.orphans || []).join(", ")}`, "ok");
+  if (!targets) { if (!orphans) toast("nothing to prune", "info"); return; }
   if (removed === targets) { toast(`pruned ${removed}`, "ok"); return; }
-  // lifecycle.prune() warns per-repro through emit, and the endpoint is synchronous
-  // so those warnings are discarded -- the shortfall is the only signal we get.
+  // prune() warns per-repro through emit; those now arrive in the job dialog, and
+  // the shortfall is still worth saying out loud here.
   toast(`pruned ${removed} of ${targets}; ${targets - removed} could not be cleaned up`);
 }
 
@@ -2214,9 +2315,12 @@ async function doPrune() {
   if (!confirm("Delete every 'down' repro, including data volumes and records?")) return;
   await withBusy($("#btn-prune"), "Pruning…", async () => {
     try {
-      const r = await api("/api/prune", { method: "POST", body: JSON.stringify({ confirm: true }) });
-      reportPrune(r);
-      await loadRepros();
+      const { job_id } = await api("/api/prune",
+                                   { method: "POST", body: JSON.stringify({ confirm: true }) });
+      streamJob(job_id, "Pruning down workspaces", async (r) => {
+        reportPrune(r);
+        await loadRepros();
+      });
     } catch (e) { toast(e.message); }
   });
 }
@@ -2274,6 +2378,29 @@ function finishJob(job, failed, data) {
   loadRepros().then(refreshDetail);
 }
 
+// The slow path, for when SSE cannot be kept open. Ten seconds rather than the
+// stream's immediacy: this is a fallback, and a dialog that reports the truth a few
+// seconds late is worth far more than one that reports nothing at all.
+function pollJobUntilDone(job) {
+  const tick = async () => {
+    if (JOB !== job || job.finished) return;         // the reader closed or moved on
+    let state;
+    try { state = await api(`/api/jobs/${job.id}`); }
+    catch (e) {
+      logLine({ level: "error", message: `could not query the job: ${e.message}` });
+      finishJob(job, true, {});
+      return;
+    }
+    if (jobActive(state.status)) { setTimeout(tick, 10000); return; }
+    logLine(state.status === "error"
+      ? { level: "error", message: state.error || "failed" }
+      : { level: "info", message: "done" });
+    finishJob(job, state.status === "error",
+              { result: state.result, error: state.error });
+  };
+  setTimeout(tick, 10000);
+}
+
 async function reconcileJob(job) {
   let state;
   try { state = await api(`/api/jobs/${job.id}`); }
@@ -2287,7 +2414,16 @@ async function reconcileJob(job) {
       logLine({ level: "warn", message: "progress stream dropped — reconnecting…" });
       setTimeout(() => { if (JOB === job && !job.finished) connectJob(job); }, 1000);
     } else {
-      logLine({ level: "warn", message: `still running, but the progress stream keeps dropping (${job.id})` });
+      // GIVING UP ON THE STREAM IS NOT GIVING UP ON THE JOB. This logged "still
+      // running" and stopped, so a job that then finished -- or failed -- was never
+      // reported in the dialog the reader was watching. A reverse proxy with an idle
+      // SSE timeout makes that the normal case, not an edge one.
+      //
+      // The stream was only ever the fast path; `/api/jobs/<id>` carries the same
+      // outcome. So fall back to asking, slowly, until it reaches a terminal state.
+      logLine({ level: "warn", message: "the progress stream keeps dropping — "
+        + "watching the job's status instead; this dialog will still report the result." });
+      pollJobUntilDone(job);
     }
     return;
   }
@@ -2957,7 +3093,18 @@ async function renderRunning(box) {
   try { rows = (await api("/api/jobs")).jobs; }
   catch (e) { box.innerHTML = ""; box.append(el("p", { class: "empty" }, e.message)); return; }
   box.innerHTML = "";
-  if (!rows.length) { box.append(el("div", { class: "empty" }, "No jobs yet.")); return; }
+  // FILTERED. The tab is labelled "In progress" and rendered every retained job, so
+  // finished and failed ones sat under it -- which makes the one question this view
+  // exists to answer, "is anything running right now", unanswerable. History is the
+  // other tab and already shows all of them.
+  const all = rows.length;
+  rows = rows.filter((j) => jobActive(j.status));
+  if (!rows.length) {
+    box.append(el("div", { class: "empty" }, all
+      ? `Nothing running. ${all} finished job${all === 1 ? "" : "s"} in History.`
+      : "No jobs yet."));
+    return;
+  }
   for (const j of rows) {
     // The API has returned `actor` since accounts landed and this dropped it on
     // the floor -- which is most of why the shared box could not answer "who?".

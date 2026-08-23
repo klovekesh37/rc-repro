@@ -1685,6 +1685,11 @@ def test_an_interrupted_kubernetes_create_still_leaves_a_record(monkeypatch, tmp
     from rc_repro.services import k8s, topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    # The namespace-ownership preflight talks to the cluster and lives OUTSIDE
+    # `create_workspace`, so stubbing that one is no longer enough to keep a test
+    # off a real kubectl. Refusing to guess is the point of it, so it is stubbed
+    # rather than softened.
+    monkeypatch.setattr(k8s, "assert_namespace_available", lambda *a, **kw: None)
     monkeypatch.setattr(lc, "require_docker", lambda: None)
     monkeypatch.setattr(lc, "check_capacity", lambda *a, **kw: None)
     monkeypatch.setattr(lc.runner, "pick_port", lambda *a, **kw: 3999, raising=False)
@@ -2217,6 +2222,17 @@ def _fake_run(mapping):
 
     def run(argv, timeout=None, own=False):
         joined = " ".join(argv)
+        # A NAMESPACE-LABELS QUERY WITH NO STUB MEANS THE NAMESPACE IS NOT THERE,
+        # which is what a create test is describing. Answered before the mapping
+        # because the natural `"get namespace"` entry matches this query too, and
+        # rc=0 with an empty body now reads as "exists, carrying no labels" -- an
+        # unlabelled namespace is refused rather than adopted, since rc-repro cannot
+        # tell one an older version made from one somebody else made. A mapping that
+        # wants to describe an EXISTING namespace says so with a `labels` key.
+        if "{.metadata.labels}" in joined and not any("labels" in n for n in mapping):
+            return sp.CompletedProcess(
+                argv, 1, "",
+                'Error from server (NotFound): namespaces "x" not found')
         for needle, (rc, out) in mapping.items():
             if needle in joined:
                 return sp.CompletedProcess(argv, rc, out, "")
@@ -2613,11 +2629,16 @@ def test_doctor_reports_the_cluster_that_took_the_edge_s_port(monkeypatch, tmp_p
     chosen.will_create = True
     monkeypatch.setattr(k8s, "preflight", lambda *a, **k: chosen)
     monkeypatch.setattr(k8s, "active_context", lambda: "default")
-    monkeypatch.setattr(k8s, "reachable", lambda ctx=None: True)
+    monkeypatch.setattr(k8s, "reachable", lambda ctx=None, **kw: True)
+    monkeypatch.setattr(k8s.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(k8s, "loadbalancer_service",
                         lambda ctx: ("traefik", "172.16.0.2") if ctx == "default" else ("", ""))
     monkeypatch.setattr(k8s, "cert_manager_installed", lambda ctx: False)
-    monkeypatch.setattr(doctor, "_is_local_address", lambda ip: ip == "172.16.0.2")
+    monkeypatch.setattr(k8s, "host_port_claim",
+                        lambda ctx, **kw: k8s.PortClaim(
+                            context=ctx, service="kube-system/traefik",
+                            address="172.16.0.2", ports=[80, 443])
+                        if ctx == "default" else None)
 
     from rc_repro.services import edge as edgesvc
     monkeypatch.setattr(edgesvc, "installed", lambda: True)
@@ -3327,6 +3348,14 @@ def test_a_failed_create_leaves_no_namespace_nobody_can_see(monkeypatch, tmp_pat
         if "get storageclass" in joined:
             return sp.CompletedProcess(argv, 0, '{"items":[{"metadata":{"name":"s",'
                 '"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}]}', "")
+        if "{.metadata.labels}" in joined:
+            # WHAT A REAL CLUSTER SAYS about a namespace that is not there. This spy
+            # answered every `get namespace` with rc=0 and an empty body, which now
+            # reads as "exists, carrying no labels" -- and an unlabelled namespace is
+            # refused rather than adopted, because rc-repro cannot tell one an older
+            # version made from one somebody else made.
+            return sp.CompletedProcess(
+                argv, 1, "", 'Error from server (NotFound): namespaces "x" not found')
         if "get ingressclass" in joined or "get namespace" in joined:
             return sp.CompletedProcess(argv, 0, "", "")
         if "delete namespace" in joined:
@@ -3553,8 +3582,6 @@ def test_a_dead_port_forward_is_replaced_rather_than_trusted(monkeypatch, tmp_pa
     # Our own process is alive but is NOT a port-forward, which is the recycled-pid
     # case: believing it would leave the workspace unreachable AND, at teardown,
     # signal something unrelated.
-    import os as _os
-    assert k8s.forward_alive(_os.getpid()) is False
 
     spawned = []
     monkeypatch.setattr(k8s, "run", _fake_run({"jsonpath": (0, "Running")}))
@@ -3810,6 +3837,14 @@ def test_teardown_waits_for_the_namespace_rather_than_claiming_it_is_gone(
     def spy(argv, timeout=None, own=False):
         import subprocess as sp
         joined = " ".join(argv)
+        # TWO jsonpath queries reach here now, and they ask different questions:
+        # `.metadata.labels` proves the namespace is rc-repro's before anything is
+        # deleted, `.status.phase` watches it go. One branch answered both and fed
+        # the phase string to the label parser.
+        if "{.metadata.labels}" in joined:
+            return sp.CompletedProcess(argv, 0, json.dumps({
+                k8s.OWNER_LABEL_KEY: k8s.OWNER_LABEL_VALUE,
+                k8s.WORKSPACE_LABEL: "k"}), "")
         if "get namespace" in joined and "jsonpath" in joined:
             return sp.CompletedProcess(argv, 0, phases.pop(0) if phases else "", "")
         if "get namespace" in joined:
@@ -3843,7 +3878,15 @@ def test_the_admin_and_the_setup_wizard_reach_a_kubernetes_workspace():
            k8s.values_for(rc_version="8.5.1", rc_image="img",
                           microservices=True)["extraEnv"]}
     assert env["OVERWRITE_SETTING_Show_Setup_Wizard"] == "completed"
-    assert env["INITIAL_USER"] == "yes", "without this no admin is created at all"
+    # NO `INITIAL_USER`. It was here as "yes", which Rocket.Chat parses as JSON and
+    # rejects -- `SyntaxError: Unexpected token 'y'` on every boot of every workspace --
+    # and `true`, which RC's docs use, is worse: it parses, finds no `_id`, and logs
+    # "Ignoring environment variable INITIAL_USER". The admin never came from it.
+    # Measured on a fresh 8.5.1 database with the variable absent: zero INITIAL_USER
+    # lines, login succeeds, /api/v1/me reports roles ['admin'], Show_Setup_Wizard
+    # reads `completed`.
+    assert "INITIAL_USER" not in env, (
+        "INITIAL_USER is back; it does nothing but add a parse error to every boot")
     assert env["ADMIN_USERNAME"] == config.ADMIN_USERNAME
     assert env["ADMIN_PASS"] == config.ADMIN_PASSWORD
     assert env["ADMIN_EMAIL"] == config.ADMIN_EMAIL
@@ -3938,6 +3981,11 @@ def test_up_brings_a_downed_kubernetes_workspace_back_instead_of_refusing(
     from rc_repro.services import k8s, topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    # The namespace-ownership preflight talks to the cluster and lives OUTSIDE
+    # `create_workspace`, so stubbing that one is no longer enough to keep a test
+    # off a real kubectl. Refusing to guess is the point of it, so it is stubbed
+    # rather than softened.
+    monkeypatch.setattr(k8s, "assert_namespace_available", lambda *a, **kw: None)
     m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
                            rc_image="i", mongo_tag="8.0", mongo_flavor="official",
                            preset="default", root_url="u", host_port=3000,
@@ -4043,6 +4091,11 @@ def test_a_workspace_comes_back_on_the_port_it_left_on(monkeypatch, tmp_path):
     from rc_repro.services import k8s, topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    # The namespace-ownership preflight talks to the cluster and lives OUTSIDE
+    # `create_workspace`, so stubbing that one is no longer enough to keep a test
+    # off a real kubectl. Refusing to guess is the point of it, so it is stubbed
+    # rather than softened.
+    monkeypatch.setattr(k8s, "assert_namespace_available", lambda *a, **kw: None)
     m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
                            rc_image="i", mongo_tag="8.0", mongo_flavor="official",
                            preset="default", root_url="http://localhost:3382",
@@ -4084,6 +4137,11 @@ def test_up_waits_before_seeding_a_kubernetes_workspace(monkeypatch, tmp_path):
     from rc_repro.services import k8s, topology
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    # The namespace-ownership preflight talks to the cluster and lives OUTSIDE
+    # `create_workspace`, so stubbing that one is no longer enough to keep a test
+    # off a real kubectl. Refusing to guess is the point of it, so it is stubbed
+    # rather than softened.
+    monkeypatch.setattr(k8s, "assert_namespace_available", lambda *a, **kw: None)
     order: list = []
     monkeypatch.setattr(lc, "check_capacity", lambda *a, **kw: None)
     monkeypatch.setattr(lc, "pick_host_port", lambda *a, **kw: 3000)
@@ -4490,6 +4548,52 @@ def test_detaching_monitoring_leaves_it_up_for_the_workspaces_still_using_it(
     calls.clear()
     assert k8s.remove_monitoring(context=k8s.CONTEXT) is True
     assert any("uninstall" in a for argv in calls for a in argv), calls
+
+
+def test_the_chart_repo_and_the_install_share_one_helm_home(monkeypatch, tmp_path):
+    """`owned_env` set the kubeconfig AND every HELM_* variable together, and that
+    conflation broke `up --runtime kubernetes` on a cluster rc-repro ADOPTED. The chart
+    repo went into rc-repro's Helm home (`ensure_repo`, `own=True`) while the install that
+    needed it read the user's (`is_ours(context)` is False on an adopted cluster). Two
+    different repositories.yaml, so the create failed at 60% -- after the namespace, the
+    operator and MongoDB had all been built -- with
+
+        helm install failed: Error: repo rocketchat not found
+
+    and then rolled the namespace back. Reproduced against a live k3s cluster with the
+    user's Helm home moved aside: the pre-fix environment gives exactly that error and
+    `helm_env` gives rc 0.
+
+    The MongoDB operator path worked only because BOTH its halves used the user's home --
+    consistent, and also wrong, because it wrote repositories into the home `owned_env`
+    exists to keep rc-repro out of."""
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.delenv("KUBECONFIG", raising=False)
+
+    owned = k8s.owned_env()                       # what ensure_repo uses
+    adopted = k8s.helm_env("default")             # a cluster we did not create
+    ours = k8s.helm_env(k8s.CONTEXT)              # our own kind cluster
+
+    key = "HELM_REPOSITORY_CONFIG"
+    assert owned[key] == adopted[key] == ours[key], (
+        "the repo and the install must read one repositories.yaml, whoever owns the "
+        "cluster")
+    for var in ("HELM_CACHE_HOME", "HELM_CONFIG_HOME", "HELM_DATA_HOME",
+                "HELM_REPOSITORY_CACHE"):
+        assert adopted[var] == owned[var], f"{var} escaped to the user's home"
+        assert str(tmp_path) in adopted[var], f"{var} is not under RC_REPRO_HOME"
+
+    # The kubeconfig is the half that MUST differ: ours for our cluster, the user's for
+    # one we adopted -- which is what `owned_env` got right and could not express alone.
+    assert "KUBECONFIG" not in adopted, "an adopted cluster must use the user's kubeconfig"
+    assert ours["KUBECONFIG"] == str(k8s.owned_kubeconfig())
+
+    # And an explicitly-set KUBECONFIG is preserved rather than deleted.
+    monkeypatch.setenv("KUBECONFIG", "/tmp/theirs.yaml")
+    assert k8s.helm_env("default")["KUBECONFIG"] == "/tmp/theirs.yaml"
+    assert k8s.helm_env(k8s.CONTEXT)["KUBECONFIG"] == str(k8s.owned_kubeconfig())
 
 
 def test_a_missing_compose_plugin_is_a_preflight_not_a_mid_create_crash(monkeypatch):
@@ -5089,7 +5193,9 @@ def test_a_scenarios_settings_reach_the_rocket_chat_container(monkeypatch):
     assert got.get("OVERWRITE_SETTING_LDAP_Host") == "openldap", got
     assert got.get("OVERWRITE_SETTING_LDAP_Enable") in ("true", "True"), got
     # The workspace's own admin env must survive alongside it.
-    assert got["ADMIN_USERNAME"] and got["INITIAL_USER"] == "yes"
+    # The workspace's own admin env survives alongside it; INITIAL_USER is gone from
+    # both runtimes and does not come back (see the extraEnv test above).
+    assert got["ADMIN_USERNAME"] and "INITIAL_USER" not in got
 
     # A preset wins over a base default, rather than the other way round.
     override = k8s.values_for(rc_version="8.5.1", rc_image="i", microservices=False,
@@ -6133,7 +6239,8 @@ def test_down_volumes_takes_the_monitoring_stack_with_it(monkeypatch, tmp_path):
                         lambda **kw: called.setdefault("monitoring", kw) is None)
 
     stopped = []
-    monkeypatch.setattr(lc, "_stop_port_forward", stopped.append)
+    monkeypatch.setattr(lc, "_stop_port_forward",
+                        lambda pid, **kw: stopped.append(pid))
     lc.teardown("mon", volumes=True, confirm=True)
     assert "monitoring" in called, "the monitoring stack was left running"
     # And the Grafana forward, which targets a deployment in `rc-repro-system` and so
@@ -6305,3 +6412,2154 @@ def test_an_existing_cluster_is_never_planned_as_one_to_create(monkeypatch):
 
     monkeypatch.setattr(k8s, "clusters", lambda: ([], ""))
     assert k8s.plan_cluster().create is True, "and a missing one still is"
+
+
+def _k8s_svc_json(*services):
+    """A `kubectl get svc -A -o json` document, as kubectl really shapes it."""
+    import json
+    return json.dumps({"items": list(services)})
+
+
+def _lb(name, ns, addr, ports, kind="LoadBalancer"):
+    return {"metadata": {"name": name, "namespace": ns},
+            "spec": {"type": kind, "ports": [{"port": p} for p in ports]},
+            "status": {"loadBalancer": {"ingress": [{"ip": addr}] if addr else []}}}
+
+
+def test_host_port_claim_reads_the_ports_the_service_actually_asks_for(monkeypatch):
+    """The ports are the diagnosis, and nothing read them.
+
+    A cluster holding :443 breaks serving and the TLS-ALPN challenge; one holding
+    :80 breaks HTTP-01 and the redirect. The detection only ever asked whether a
+    LoadBalancer had a local address, so it reported ":443" whatever it found --
+    including on a box configured for `acme.challenge http`, where :80 was the port
+    that mattered and the report named the wrong one.
+    """
+    import subprocess
+
+    from rc_repro.services import k8s
+
+    doc = _k8s_svc_json(
+        # Skipped: a ClusterIP takes no host port however it is addressed.
+        _lb("kubernetes", "default", "10.43.0.1", [443], kind="ClusterIP"),
+        # Skipped: a LoadBalancer nobody answered for holds nothing.
+        _lb("pending", "apps", "", [80]),
+        # Skipped: an address this host does not hold is somebody else's problem.
+        _lb("elsewhere", "apps", "203.0.113.9", [80, 443]),
+        _lb("traefik", "kube-system", "172.16.0.2", [80, 443]),
+    )
+    monkeypatch.setattr(k8s, "run", lambda *a, **k: subprocess.CompletedProcess(
+        args=a, returncode=0, stdout=doc, stderr=""))
+    monkeypatch.setattr(k8s, "is_local_address", lambda ip: ip == "172.16.0.2")
+
+    claim = k8s.host_port_claim("default")
+    assert claim is not None, "the local LoadBalancer must be found"
+    assert claim.ports == [80, 443], claim
+    assert claim.service == "kube-system/traefik", "say WHICH service, so it can be patched"
+    assert claim.address == "172.16.0.2"
+
+    # Only :80. This is the case the old check called ":443".
+    only80 = _k8s_svc_json(_lb("traefik", "kube-system", "172.16.0.2", [80]))
+    monkeypatch.setattr(k8s, "run", lambda *a, **k: subprocess.CompletedProcess(
+        args=a, returncode=0, stdout=only80, stderr=""))
+    assert k8s.host_port_claim("default").ports == [80]
+
+    # A port set that does not overlap the edge's is not a conflict at all.
+    monkeypatch.setattr(k8s, "host_port_claim",
+                        lambda ctx, **kw: k8s.PortClaim(context=ctx, service="a/b",
+                                                        address="172.16.0.2", ports=[8080]))
+    monkeypatch.setattr(k8s, "reachable", lambda ctx=None, **kw: True)
+    monkeypatch.setattr(k8s.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(k8s, "active_context", lambda: "default")
+    assert k8s.port_claiming_cluster() is None, "8080 is not the edge's port"
+
+
+def test_the_edge_port_row_names_the_port_it_found_not_always_443(monkeypatch, tmp_path):
+    """A cluster holding only :80 was reported as holding :443.
+
+    That is not cosmetic: the reader is being told which challenge cannot complete
+    and which port to give back. On the box this came from, `acme.challenge` was
+    `http` -- so :80 was the whole problem and the report pointed at the other port.
+    """
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    pre = k8s.Preflight(tools={
+        n: k8s.Tool(name=n, path=f"/usr/bin/{n}", version=(9, 9, 9), raw="v9.9.9")
+        for n in ("kubectl", "helm")})
+    pre.context = "default"
+    pre.cluster_reachable = False
+    monkeypatch.setattr(k8s, "preflight", lambda *a, **k: pre)
+    monkeypatch.setattr(k8s, "active_context", lambda: "default")
+    monkeypatch.setattr(k8s, "reachable", lambda ctx=None, **kw: True)
+    monkeypatch.setattr(k8s.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(k8s, "host_port_claim",
+                        lambda ctx, **kw: k8s.PortClaim(
+                            context=ctx, service="kube-system/traefik",
+                            address="172.16.0.2", ports=[80]))
+
+    from rc_repro.services import edge as edgesvc
+    monkeypatch.setattr(edgesvc, "installed", lambda: True)
+    monkeypatch.setattr(edgesvc, "registered", lambda: ["w1"])
+    monkeypatch.setattr(edgesvc, "current", lambda: None)
+
+    hit = [r for r in doctor.run_checks()["checks"]
+           if r.get("check") == "kubernetes-edge-port"]
+    assert hit, "a cluster holding :80 is still a cluster holding the edge's port"
+    msg = hit[0]["message"]
+    assert ":80" in msg, msg
+    assert ":443" not in msg, "it does not hold :443, and saying so sends the reader wrong"
+    assert "http-01" in msg, "name the challenge that cannot complete"
+    # The patch has to name the service that was found, not a guessed one.
+    assert "patch svc traefik" in msg, msg
+    # The recurrence is the point: the patch is undone by the next k3s install.
+    assert "--disable servicelb" in msg, msg
+
+
+def _idp_meta(preset: str = "oidc"):
+    from rc_repro.services import postready
+    return postready.runner.Metadata(
+        name="w", project="p", rc_version="8.5.1", rc_image="i", mongo_tag="8.0",
+        mongo_flavor="official", preset=preset, root_url="http://localhost:3001",
+        host_port=3001, version_source="t")
+
+
+def test_an_oidc_provider_that_did_not_configure_is_reported_as_a_failure(monkeypatch):
+    """The oidc preset's only self-config action could not be reported as failed.
+
+    `run_post_ready` collects a failure on an explicit False, and this handler
+    returned None on EVERY path -- so a workspace whose OAuth provider could not be
+    created printed one warning, was left out of the "only partly configured"
+    summary that exists for exactly this, and exited 0.
+    """
+    from rc_repro.services import postready
+
+    monkeypatch.setattr(postready.rcapi, "add_oauth_service", lambda *a, **kw: False)
+    said: list = []
+    m = _idp_meta()
+    m.extra["post_ready"] = [{"action": "create_oauth_provider", "name": "Keycloak",
+                              "settings": {"a": 1}}]
+    failed = postready.run_post_ready(m, object(), lambda e: said.append(e.message))
+    assert failed == ["create_oauth_provider"], failed
+    joined = " ".join(said)
+    assert "partly configured" in joined, joined
+
+
+def test_a_provider_created_without_its_settings_is_not_a_success(monkeypatch):
+    """Creating the provider is not the same as the provider working.
+
+    The settings carry the realm URL, the client id and the secret. Every
+    `set_setting` result was discarded, so a provider created with none of them
+    reported "login button registered" -- and the button really was registered,
+    pointing at nothing. That is what a support engineer sees as "I click the OIDC
+    button and the page is blank".
+    """
+    from rc_repro.services import postready
+
+    monkeypatch.setattr(postready.rcapi, "add_oauth_service", lambda *a, **kw: True)
+    monkeypatch.setattr(postready.time, "sleep", lambda s: None)
+    # The url is the one that matters, and it is the one that refuses.
+    monkeypatch.setattr(postready.rcapi, "set_setting",
+                        lambda url, auth, pw, sid, val: "-url" not in sid)
+    said: list = []
+    settings = {"Accounts_OAuth_Custom-Keycloak": True,
+                "Accounts_OAuth_Custom-Keycloak-url": "http://keycloak:8085/realms/x"}
+    m = _idp_meta()
+    m.extra["post_ready"] = [{"action": "create_oauth_provider", "name": "Keycloak",
+                              "settings": settings}]
+    failed = postready.run_post_ready(m, object(), lambda e: said.append(e.message))
+    assert failed == ["create_oauth_provider"], failed
+    joined = " ".join(said)
+    assert "-url" in joined, "name the setting that did not apply"
+    assert "lead nowhere" in joined, joined
+    # And the happy path stays a success, or the fix would just refuse everything.
+    monkeypatch.setattr(postready.rcapi, "set_setting", lambda *a, **kw: True)
+    said.clear()
+    assert postready.run_post_ready(m, object(), lambda e: said.append(e.message)) == []
+
+
+def test_every_post_ready_handler_reports_a_boolean(monkeypatch):
+    """The collection reads `is False`, so a handler that returns None opts itself
+    out of it silently. Two did, and one of them was the oidc preset's only action.
+
+    Enforced on the signatures rather than by calling them: a handler added later
+    with `-> None` is the same bug again, and nothing else would catch it.
+    """
+    import inspect
+
+    from rc_repro.services import postready
+
+    for name, fn in postready._POST_READY_ACTIONS.items():
+        ret = inspect.signature(fn).return_annotation
+        assert ret == "bool", f"{name} is annotated {ret!r}, not bool"
+        src = inspect.getsource(fn)
+        assert "return False" in src, f"{name} has no failure path to report"
+        assert "return True" in src, f"{name} never reports success"
+
+
+def test_the_idp_host_is_taken_from_the_url_the_caller_already_gave():
+    """`--root-url` and `--domain` are the caller saying "people will type this".
+
+    The saml/oidc presets otherwise address their IdP as this machine, so a
+    workspace created with a public URL shipped SSO that pointed at the visitor's own
+    laptop -- and the only clue was a login page the browser bounced back to. Nothing
+    had to be guessed: the address was on the request all along.
+    """
+    from rc_repro.services import lifecycle as lc
+
+    # `--bind` throughout: a host is only derived when the ports are published
+    # somewhere it could answer. See
+    # test_a_browser_host_is_only_derived_when_something_could_reach_it for why
+    # deriving under the default loopback bind makes things worse rather than better.
+    said: list = []
+    req = lc.CreateReq(version="8.5.1", name="n", preset="saml", bind="0.0.0.0",
+                       root_url="https://rc.example.com")
+    lc._derive_idp_host(req, lambda e: said.append(e.message))
+    assert req.params["idp_host"] == "rc.example.com", req.params
+    assert "rc.example.com" in " ".join(said), "say it, rather than doing it silently"
+
+    # A domain is the same statement in a different flag.
+    dom = lc.CreateReq(version="8.5.1", name="n", preset="oidc", bind="0.0.0.0",
+                       domain="sso.example.com")
+    lc._derive_idp_host(dom)
+    assert dom.params["idp_host"] == "sso.example.com", dom.params
+
+    # Explicit always wins.
+    mine = lc.CreateReq(version="8.5.1", name="n", preset="saml", bind="0.0.0.0",
+                        root_url="https://rc.example.com", params={"idp_host": "other"})
+    lc._derive_idp_host(mine)
+    assert mine.params["idp_host"] == "other", mine.params
+
+    # Nothing is invented for a plain local workspace, or for a preset with no IdP.
+    for req in (lc.CreateReq(version="8.5.1", name="n", preset="saml"),
+                lc.CreateReq(version="8.5.1", name="n", preset="saml", bind="0.0.0.0",
+                             root_url="http://localhost:3001"),
+                lc.CreateReq(version="8.5.1", name="n", preset="ldap", bind="0.0.0.0",
+                             root_url="https://rc.example.com")):
+        lc._derive_idp_host(req)
+        assert not (req.params or {}).get("idp_host"), req.params
+
+
+def test_the_idp_host_is_derived_on_kubernetes_too(tmp_path, monkeypatch):
+    """It was derived below the runtime dispatch, so it was derived on Compose and
+    not at all on Kubernetes.
+
+    That is the defect the derivation exists to fix, surviving inside the runtime
+    nobody was testing -- exactly the shape of the `doctor`/`plan_cluster` split that
+    named one cluster while `up` built another. Both runtimes resolve the preset from
+    `req.params`, so one call site above the fork covers both by construction, and
+    this test is on the call site rather than on either branch.
+    """
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    seen: dict = {}
+
+    def _fake_k8s(req, emit=None, **kw):
+        seen["params"] = dict(req.params or {})
+        return {"ok": True}
+
+    monkeypatch.setattr(lc, "_create_kubernetes", _fake_k8s)
+    req = lc.CreateReq(version="8.5.1", name="k", preset="oidc", runtime="kubernetes",
+                       bind="0.0.0.0", root_url="http://box.example.com:3007")
+    lc._create_repro_locked(req)
+    assert seen["params"].get("idp_host") == "box.example.com", seen
+
+    # `--domain` is the other way a caller says it, but this runtime refuses that
+    # flag outright (it needs the Ingress `--https` needs), so `--root-url` is the
+    # only route in here. Asserted for saml as well as oidc: they take the same param
+    # and it would be easy to wire one.
+    seen.clear()
+    lc._create_repro_locked(lc.CreateReq(version="8.5.1", name="k2", preset="saml",
+                                         runtime="kubernetes", bind="0.0.0.0",
+                                         root_url="http://box.example.com:3007"))
+    assert seen["params"].get("idp_host") == "box.example.com", seen
+
+    # Nothing invented for a plain Kubernetes workspace.
+    seen.clear()
+    lc._create_repro_locked(lc.CreateReq(version="8.5.1", name="k3", preset="oidc",
+                                         runtime="kubernetes"))
+    assert not seen["params"].get("idp_host"), seen
+
+
+def test_a_shared_workspace_says_which_host_its_preset_pages_are_on(tmp_path, monkeypatch):
+    """Four presets print browser URLs that say `localhost` — phpLDAPadmin, MinIO's
+    console, Mailpit's inbox, the livechat demo page.
+
+    All were written when the browser was assumed to be on the docker host. On a
+    workspace bound wide or given a public URL it is not, and `localhost` then names
+    the reader's own machine: the same mistake that made the saml and oidc buttons
+    fail silently, in prose instead of a setting. A preset builder is never given the
+    bind host or the advertised URL, so the correction belongs to the record.
+    """
+    from rc_repro import runner
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    def meta(**extra):
+        m = runner.Metadata(name="w", project="p", rc_version="8.5.1", rc_image="i",
+                            mongo_tag="8.0", mongo_flavor="official", preset="ldap",
+                            root_url="http://localhost:3007", host_port=3007,
+                            version_source="t")
+        m.extra.update(extra)
+        return m
+
+    shared = lc.note_groups_of(meta(
+        sidecar_ports=[8082], bind_host="0.0.0.0",
+        advertised_url="http://box.example.com:3007"))
+    body = " ".join(l for g in shared for l in (g.get("body") or []))
+    assert "box.example.com:8082" in body, body
+    assert "localhost" in body, "name the thing being corrected, not just the fix"
+
+    # Bound wide with no URL given: the host is unknown, so it is not invented.
+    wide = lc.note_groups_of(meta(sidecar_ports=[8082], bind_host="0.0.0.0"))
+    assert "<this-box>:8082" in " ".join(
+        l for g in wide for l in (g.get("body") or [])), wide
+
+    def titles(groups):
+        return [g.get("title") for g in groups]
+
+    # An ordinary laptop workspace gains nothing: localhost really is localhost.
+    assert "Reaching this preset's own pages" not in titles(
+        lc.note_groups_of(meta(sidecar_ports=[8082], bind_host="127.0.0.1")))
+    # And a preset with no pages of its own has nothing to correct.
+    assert "Reaching this preset's own pages" not in titles(
+        lc.note_groups_of(meta(bind_host="0.0.0.0")))
+
+    # THE CORRECTION MUST NOT DESCRIBE TEXT THAT IS NOT THERE. A `saml` workspace with
+    # a derived `idp_host` already prints the real host in every line, and the first
+    # version of this told its reader "the URLs above say localhost" about notes that
+    # said no such thing. Keyed on the notes, so it stays silent here.
+    saml = runner.Metadata(name="s", project="p", rc_version="8.5.1", rc_image="i",
+                           mongo_tag="8.0", mongo_flavor="official", preset="saml",
+                           root_url="http://localhost:3007", host_port=3007,
+                           version_source="t")
+    saml.extra.update({"sidecar_ports": [8081], "bind_host": "0.0.0.0",
+                       "advertised_url": "http://box.example.com:3007",
+                       "params": {"idp_host": "box.example.com"}})
+    groups = lc.note_groups_of(saml)
+    assert "Reaching this preset's own pages" not in titles(groups), titles(groups)
+    assert not any("localhost" in l for g in groups
+                   for l in (g.get("body") or [])), groups
+
+
+def test_a_browser_host_is_only_derived_when_something_could_reach_it(tmp_path,
+                                                                     monkeypatch):
+    """Deriving a host whose port is on loopback makes things WORSE, not better.
+
+    OIDC's url serves the browser AND Rocket.Chat's own backend. Moving it off compose
+    DNS -- which always worked -- onto the host's address breaks the backend leg too
+    unless the ports are published somewhere a container can reach: measured, a port
+    published on 127.0.0.1 is unreachable from a container by the host's address
+    (connect fails) and reachable when published on 0.0.0.0 (200). `up --preset oidc
+    --domain rc.example.com` is the plausible invocation that hits it, so the
+    derivation is gated on the bind and the un-derivable states are reported instead.
+    """
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    def derived(**kw):
+        req = lc.CreateReq(version="8.5.1", name="n", **kw)
+        lc._derive_idp_host(req)
+        return (req.params or {}).get("idp_host")
+
+    # Nothing to derive from, or nothing that could answer: left alone.
+    assert derived(preset="saml") is None
+    assert derived(preset="oidc", root_url="http://172.16.0.2:3013") is None, \
+        "loopback bind — the derived host would be unreachable from RC itself"
+    assert derived(preset="oidc", domain="rc.example.com") is None, \
+        "same, and this is the invocation somebody would actually type"
+    assert derived(preset="oidc", root_url="http://localhost:3001") is None
+
+    # A bind that can carry it: derived.
+    assert derived(preset="oidc", root_url="http://172.16.0.2:3013",
+                   bind="0.0.0.0") == "172.16.0.2"
+    assert derived(preset="saml", domain="rc.example.com",
+                   bind="0.0.0.0") == "rc.example.com"
+
+    # A configured bind counts the same as the flag, or the two would disagree about
+    # the same workspace.
+    from rc_repro import config
+    cfg = config.load_config()
+    cfg["bind_host"] = "0.0.0.0"
+    config.save_config(cfg)
+    assert derived(preset="oidc", root_url="http://172.16.0.2:3013") == "172.16.0.2"
+
+
+def test_the_requested_bind_is_read_in_one_place():
+    """The derivation gates on the bind and the create publishes on it. Two spellings
+    of `req.bind or cfg or default` is how they come to disagree about one workspace --
+    and the disagreement would be silent, because each is right on its own."""
+    import inspect
+
+    from rc_repro.services import lifecycle as lc
+
+    src = inspect.getsource(lc._create_repro_locked)
+    assert "_requested_bind_host(req)" in src, src[:200]
+    assert 'req.bind or cfg.get("bind_host")' not in src, \
+        "the bind expression was inlined again; call _requested_bind_host"
+
+
+def test_the_engine_gate_asks_for_the_engine_the_workspace_actually_runs_on(
+        tmp_path, monkeypatch):
+    """`require_docker()` ran before anything looked at the runtime.
+
+    So on a host with no Docker — the documented adopt-an-existing-cluster setup —
+    `upgrade`, `rollback`, `ready`, `logs`, `token`, `api`, `pat`, `seed`,
+    `config-import` and `down` all refused a healthy Kubernetes workspace with
+    "Docker isn't running". `teardown` is the sharpest: it dispatches on the runtime
+    *inside* itself, under a comment about a workspace that could be created and
+    never removed, and the gate three lines above defeated that dispatch.
+
+    `backup.py`, `monitor.py` and `envvars.py` already got this right and said so in
+    comments. Nobody generalised it, so each new call site started from the Compose
+    assumption again.
+    """
+    import shutil as _shutil
+
+    from rc_repro.errors import DockerError, PreflightError
+    from rc_repro.services import lifecycle as lc, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    # Docker is NOT available, which is the whole point.
+    monkeypatch.setattr(lc.runner, "docker_available", lambda **k: False)
+
+    monkeypatch.setattr(topology, "of_repro", lambda n: topology.KUBERNETES)
+    monkeypatch.setattr(_shutil, "which", lambda n: f"/usr/bin/{n}")
+    lc.require_engine("k")          # must not raise: Docker is irrelevant here
+
+    # A Compose workspace still needs Docker, or the gate would protect nothing.
+    monkeypatch.setattr(topology, "of_repro", lambda n: topology.DOCKER)
+    with pytest.raises(DockerError):
+        lc.require_engine("c")
+
+    # And a Kubernetes workspace still needs kubectl — said here rather than failing
+    # one layer down in a subprocess whose "command not found" names nothing.
+    monkeypatch.setattr(topology, "of_repro", lambda n: topology.KUBERNETES)
+    monkeypatch.setattr(_shutil, "which", lambda n: None)
+    with pytest.raises(PreflightError) as caught:
+        lc.require_engine("k")
+    assert "kubectl" in str(caught.value)
+
+
+def test_upgrade_reaches_a_kubernetes_workspace_with_no_docker_on_the_box(
+        tmp_path, monkeypatch):
+    """The reproduction from the review, at the service layer.
+
+    `require_running` called `require_docker()` before resolving the name, so it
+    could not tell a Kubernetes workspace from a Compose one when it mattered most.
+    """
+    import shutil as _shutil
+
+    from rc_repro.services import k8s, lifecycle as lc, topology, upgrade
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    meta = runner_meta = _idp_meta("default")
+    runner_meta.extra["runtime"] = "kubernetes"
+    monkeypatch.setattr(upgrade.runner, "read_meta", lambda n: meta)
+    monkeypatch.setattr(lc, "resolve_name", lambda n, actor="": "k")
+    monkeypatch.setattr(topology, "of_repro", lambda n: topology.KUBERNETES)
+    monkeypatch.setattr(_shutil, "which", lambda n: f"/usr/bin/{n}")
+    monkeypatch.setattr(lc.runner, "docker_available", lambda **k: False)
+    monkeypatch.setattr(k8s, "workload_exists", lambda *a, **k: True)
+
+    assert upgrade.require_running("k") is meta, "a healthy k8s workspace, no Docker"
+
+
+def test_kubernetes_migration_errors_come_from_kubernetes_logs(tmp_path, monkeypatch):
+    """`_migration_errors` always read Compose logs and swallowed every failure.
+
+    On a Kubernetes workspace `compose_logs_capture` answers "no configuration file
+    provided", the bare `except` turned that into an empty list, and a migration
+    failure therefore reported no diagnostics at all — silently, at the one moment
+    they are worth most.
+    """
+
+    from rc_repro.services import k8s, topology, upgrade
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(topology, "of_repro", lambda n: topology.KUBERNETES)
+    monkeypatch.setattr(upgrade.runner, "read_meta", lambda n: _idp_meta("default"))
+
+    def _no(*a, **k):
+        raise AssertionError("compose logs must not be read for a k8s workspace")
+
+    monkeypatch.setattr(upgrade.runner, "compose_logs_capture", _no)
+
+    class _Proc:
+        stdout = ["ok\n", "Migration failed: could not apply 305\n"]
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(k8s, "log_process", lambda *a, **k: _Proc())
+    hits = upgrade._migration_errors("k")
+    assert hits == ["Migration failed: could not apply 305"], hits
+
+
+def test_scale_prefill_refuses_kubernetes_instead_of_asking_compose(tmp_path, monkeypatch):
+    """`scaleseed` bulk-inserts through `compose_exec_capture`, so on a Kubernetes
+    workspace this reached for a compose project that is not there and answered
+    docker's "no configuration file provided: not found".
+
+    Found while widening the engine gate: making `seed` runtime-aware without this
+    would have traded a clear "Docker isn't running" for that.
+    """
+    from rc_repro.errors import ValidationError
+    from rc_repro.services import data as datasvc, lifecycle as lc, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "resolve_name", lambda n, actor="": "k")
+    monkeypatch.setattr(topology, "of_repro", lambda n: topology.KUBERNETES)
+    for fn in (lambda: datasvc.run_scale("k", "users=10"),
+               lambda: datasvc.clear_scale("k")):
+        with pytest.raises(ValidationError) as caught:
+            fn()
+        assert "seed" in str(caught.value).lower(), caught.value
+
+
+def test_doctor_says_which_build_is_actually_answering(tmp_path, monkeypatch):
+    """`__version__` comes from INSTALLED distribution metadata, so a stale editable
+    install or a pipx that was never refreshed reports an old number while the
+    checkout beside it holds the fix.
+
+    Three shipped fixes looked ineffective for exactly that reason this week, and
+    nothing in the tool said which build was answering.
+    """
+    from rc_repro.services import doctor
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    rows = doctor.run_checks()["checks"]
+    hit = [r for r in rows if r.get("check") == "install-fresh"]
+    assert hit, [r.get("check") for r in rows]
+    # This checkout is in step with its own install, which is the ok case.
+    assert hit[0]["status"] == "ok", hit[0]
+    assert "rc-repro" in hit[0]["message"], hit[0]
+
+
+def test_the_create_claim_names_the_binary_that_makes_it_true(tmp_path, monkeypatch):
+    """"No cluster yet — 'rc-repro-local' is created on first use" said nothing about
+    what would create it.
+
+    Reported as confusing by someone who believed kind was not installed: the row
+    promised a cluster and gave the reader no way to tell the claim was well-founded.
+    It requires kind (`can_provision`), so naming the kind settles it either way.
+    """
+    from rc_repro.services import doctor, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    pre = k8s.Preflight(tools={
+        "kubectl": k8s.Tool(name="kubectl", path="/k", version=(1, 30), raw="v1.30.0"),
+        "helm": k8s.Tool(name="helm", path="/h", version=(3, 14), raw="v3.14.0"),
+        "kind": k8s.Tool(name="kind", path="/kd", version=(0, 32, 0),
+                         raw="kind v0.32.0 go1.26.3 linux/amd64"),
+    })
+    pre.context = k8s.CONTEXT
+    pre.will_create = True
+    monkeypatch.setattr(k8s, "preflight", lambda *a, **kw: pre)
+    monkeypatch.setattr(k8s, "active_context", lambda: "")
+
+    hit = [r for r in doctor.run_checks()["checks"]
+           if r.get("check") == "kubernetes-cluster"]
+    assert hit, "the cluster row must still be reported"
+    msg = hit[0]["message"]
+    assert "created on first use" in msg, msg
+    assert "by kind 0.32.0" in msg, "cite the binary, and the parsed version not the banner"
+    assert "go1.26" not in msg, "the raw version banner is not a version"
+
+
+def test_doctor_reports_a_workspace_whose_idp_points_at_this_machine(tmp_path, monkeypatch):
+    """`up` warns about this at create time now, and every workspace made before that
+    is silent.
+
+    An IdP preset addresses its own service as THIS machine by default, which on a
+    shared box names each visitor's own laptop: the SAML button returns to the login
+    page, the OIDC popup opens blank, presigned previews fail, and none of them logs
+    anything.
+    """
+    from rc_repro import runner
+    from rc_repro.services import doctor
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    def meta(name, preset, **extra):
+        m = runner.Metadata(name=name, project="p", rc_version="8.5.1", rc_image="i",
+                            mongo_tag="8.0", mongo_flavor="official", preset=preset,
+                            root_url="http://localhost:3001", host_port=3001,
+                            version_source="t")
+        m.extra.update(extra)
+        return m
+
+    listed = [
+        meta("wide", "saml", bind_host="0.0.0.0"),                       # reported
+        meta("told", "oidc", bind_host="0.0.0.0",
+             params={"idp_host": "box.example.com"}),                    # already handled
+        meta("local", "saml", bind_host="127.0.0.1"),                    # localhost is true
+        meta("plain", "default", bind_host="0.0.0.0"),                   # no IdP at all
+    ]
+    monkeypatch.setattr(doctor.runner, "list_meta", lambda: listed)
+
+    hits = [r for r in doctor.run_checks()["checks"]
+            if r.get("check") == "preset-browser-host"]
+    assert len(hits) == 1, [h["message"][:60] for h in hits]
+    assert "'wide'" in hits[0]["message"], hits[0]
+    assert "--set idp_host=" in hits[0]["message"], hits[0]
+
+
+def _completed(rc=0, out="", err=""):
+    import subprocess
+    return subprocess.CompletedProcess(args=["kubectl"], returncode=rc,
+                                       stdout=out, stderr=err)
+
+
+def test_a_namespace_rc_repro_did_not_make_is_refused_not_adopted(monkeypatch):
+    """`ensure_namespace` ran `create` (ignoring the result, so an existing namespace
+    was fine) and then `label --overwrite` whatever was there.
+
+    That stamped rc-repro's ownership onto a namespace it did not make, after which
+    `down --volumes` deletes it and its PersistentVolumeClaims. The realistic trigger
+    is not a stranger: it is two rc-repro users on one adopted cluster, because name
+    collisions are guarded through the local repro.json and another user's home is
+    invisible from here. The namespace's own labels are the only evidence there is,
+    and overwriting them destroyed it.
+    """
+    from rc_repro.errors import ConflictError
+    from rc_repro.services import k8s
+
+    def _labels_are(labels):
+        monkeypatch.setattr(k8s, "namespace_labels", lambda ns, **kw: labels)
+
+    labelled = {k8s.OWNER_LABEL_KEY: k8s.OWNER_LABEL_VALUE,
+                k8s.WORKSPACE_LABEL: "mine"}
+
+    # Somebody else's namespace, or one an older rc-repro left unlabelled: refused
+    # either way, because rc-repro cannot tell them apart and being wrong deletes data.
+    _labels_are({})
+    with pytest.raises(ConflictError) as caught:
+        k8s.ensure_namespace("mine", context="c")
+    assert "not managed by rc-repro" in str(caught.value)
+    assert "kubectl delete namespace" in str(caught.value), "name the manual step"
+
+    # rc-repro's, but another workspace's.
+    _labels_are({**labelled, k8s.WORKSPACE_LABEL: "theirs"})
+    with pytest.raises(ConflictError) as caught:
+        k8s.ensure_namespace("mine", context="c")
+    assert "'theirs'" in str(caught.value)
+
+    # rc-repro's, this workspace, another user.
+    _labels_are({**labelled, k8s.OWNER_OF_LABEL: "bob"})
+    with pytest.raises(ConflictError) as caught:
+        k8s.ensure_namespace("mine", context="c", owner="alice")
+    assert "bob" in str(caught.value)
+
+    # Ours, this workspace: reused, and never re-created.
+    _labels_are(labelled)
+    calls = []
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: calls.append(argv) or _completed())
+    assert k8s.ensure_namespace("mine", context="c") == k8s.namespace_for("mine")
+    assert not any("create" in a for a in calls), calls
+    assert any("label" in a for a in calls), calls
+
+
+def test_cannot_ask_the_cluster_is_not_the_same_answer_as_nothing_is_there(monkeypatch):
+    """`workspace_namespaces()` returned [] both when there was nothing there and when
+    the cluster could not be asked, and `delete_namespace` read the second as the
+    first.
+
+    So a wrong kube-context, an expired credential or an RBAC denial reported
+    "nothing to remove" -- and the caller then deleted the local record and said the
+    namespace and its PersistentVolumeClaim were gone, while all of it went on running
+    with the only record that knew about it destroyed.
+    """
+    from rc_repro.errors import DockerError
+    from rc_repro.services import k8s
+
+    # Genuinely absent.
+    monkeypatch.setattr(k8s, "run", lambda *a, **k: _completed(
+        1, err='Error from server (NotFound): namespaces "rc-repro-x" not found'))
+    assert k8s.namespace_labels("rc-repro-x", context="c") is None
+
+    # Could not ask -- and that must not look like absence.
+    monkeypatch.setattr(k8s, "run", lambda *a, **k: _completed(
+        1, err="Unable to connect to the server: dial tcp: i/o timeout"))
+    with pytest.raises(DockerError) as caught:
+        k8s.namespace_labels("rc-repro-x", context="c")
+    assert "refusing to guess" in str(caught.value)
+    with pytest.raises(DockerError):
+        k8s.delete_namespace("x", context="c", volumes=True)
+
+
+def test_a_namespace_still_terminating_is_not_reported_as_gone(monkeypatch):
+    """`delete_namespace` waited, then returned True even while the namespace was
+    still Terminating -- and True is read as "confirmed absent", so the caller deleted
+    the local record and tore down the shared operator and monitoring stack.
+
+    Finalizers can wedge indefinitely; the workspace was then an orphan with no
+    rc-repro path left to it.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(k8s, "namespace_labels",
+                        lambda ns, **kw: {k8s.OWNER_LABEL_KEY: k8s.OWNER_LABEL_VALUE,
+                                          k8s.WORKSPACE_LABEL: "x"})
+    monkeypatch.setattr(k8s, "workspace_pvcs", lambda *a, **k: ["data-x-0"])
+
+    def _run(argv, **kw):
+        if "delete" in argv:
+            return _completed(0)
+        return _completed(0, out="Terminating")      # never goes away
+
+    monkeypatch.setattr(k8s, "run", _run)
+    said: list = []
+    assert k8s.delete_namespace("x", context="c", volumes=True,
+                                emit=lambda e: said.append(e.message),
+                                sleep=lambda s: None) is False
+    joined = " ".join(said)
+    assert "still terminating" in joined, joined
+    assert "record is KEPT" in joined, "say what was NOT done"
+
+
+def test_prune_does_not_need_docker_when_every_workspace_is_kubernetes(tmp_path, monkeypatch):
+    """`prunable()` called `require_docker()` at the top, so `prune` was refused
+    outright on a host that uses only an adopted cluster and has no Docker -- while
+    the loop below it has asked Kubernetes about Kubernetes workspaces for a while.
+    The gate contradicted the runtime it was gating.
+    """
+    from rc_repro import runner
+    from rc_repro.services import k8s, lifecycle as lc, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = runner.Metadata(name="k", project="p", rc_version="8.5.1", rc_image="i",
+                        mongo_tag="8.0", mongo_flavor="official", preset="default",
+                        root_url="http://localhost:3001", host_port=3001,
+                        version_source="t")
+    m.extra["runtime"] = "kubernetes"
+    monkeypatch.setattr(lc.runner, "list_meta", lambda: [m])
+    monkeypatch.setattr(topology, "of_meta", lambda meta: topology.KUBERNETES)
+    monkeypatch.setattr(lc, "may_destroy", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(k8s, "workload_exists", lambda *a, **k: False)
+
+    def _no_docker(*a, **k):
+        raise AssertionError("Docker must not be required for a Kubernetes-only host")
+
+    monkeypatch.setattr(lc, "require_docker", _no_docker)
+    assert lc.prunable() == ["k"]
+
+
+def test_a_recycled_pid_is_not_our_port_forward(monkeypatch):
+    """The check was "is this process a kubectl port-forward" -- liveness wearing
+    identity's clothes.
+
+    A recycled pid belonging to another workspace's forward, or another user's on a
+    shared box, passed it: so rc-repro could believe a workspace was reachable when it
+    was not, decline to start the forward it needed, and signal a stranger's process at
+    teardown. The argv already carries the proof.
+    """
+    from rc_repro.services import k8s
+
+    def _argv(*parts):
+        class _P:
+            def read_bytes(self):
+                return "\0".join(parts).encode()
+        monkeypatch.setattr(k8s, "Path", lambda _p: _P())
+
+    ours = ("kubectl", "--context", "c", "-n", "rc-repro-mine", "port-forward",
+            "deployment/rocketchat-rocketchat", "3001:3000")
+    _argv(*ours)
+    assert k8s.forward_alive(42, namespace="rc-repro-mine", host_port=3001)
+
+    # Someone else's workspace, same box, recycled pid.
+    _argv("kubectl", "--context", "c", "-n", "rc-repro-theirs", "port-forward",
+          "deployment/rocketchat-rocketchat", "3002:3000")
+    assert not k8s.forward_alive(42, namespace="rc-repro-mine", host_port=3001)
+
+    # Same namespace, different port -- and a substring test would have matched.
+    _argv("kubectl", "--context", "c", "-n", "rc-repro-mine", "port-forward",
+          "deployment/rocketchat-rocketchat", "13001:3000")
+    assert not k8s.forward_alive(42, namespace="rc-repro-mine", host_port=3001), \
+        "13001 must not satisfy 3001"
+
+    # Not a port-forward at all.
+    _argv("python", "-m", "http.server")
+    assert not k8s.forward_alive(42, namespace="rc-repro-mine", host_port=3001)
+
+
+def test_a_kubeconfig_error_is_not_read_as_an_absent_namespace(monkeypatch):
+    """The first cut tested `"not found" in text`, and kubectl says
+
+        Error in configuration: context was not found for specified context: nope
+
+    for a bad --context. That contains "not found", so a kubeconfig problem was
+    classified as an absent namespace -- which is precisely the "I could not ask"
+    case this function exists to separate out, reintroduced by a sloppy match.
+    Measured against a live cluster with a bogus context: `delete_namespace` returned
+    False, meaning "nothing there", for a cluster it had never reached.
+
+    Only the API says `Error from server (NotFound)`.
+    """
+    from rc_repro.errors import DockerError
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(k8s, "run", lambda *a, **k: _completed(
+        1, err="Error in configuration: context was not found for specified "
+               "context: no-such-context"))
+    with pytest.raises(DockerError):
+        k8s.namespace_labels("rc-repro-x", context="no-such-context")
+
+    # The server's own reason still reads as absence.
+    monkeypatch.setattr(k8s, "run", lambda *a, **k: _completed(
+        1, err='Error from server (NotFound): namespaces "rc-repro-x" not found'))
+    assert k8s.namespace_labels("rc-repro-x", context="c") is None
+
+
+def test_not_knowing_who_you_are_is_not_proof_the_namespace_is_yours(monkeypatch):
+    """The owner comparison was `held_by and owner and held_by != owner`, so an empty
+    owner skipped it.
+
+    `_cli_actor()` returns "" until accounts exist -- team mode is opt-in -- so on a
+    plain CLI box the check could not fire at all. Done on a live cluster: a namespace
+    labelled `owner=bob` was adopted and Rocket.Chat installed into it.
+    """
+    from rc_repro.errors import ConflictError
+    from rc_repro.services import k8s
+
+    labels = {k8s.OWNER_LABEL_KEY: k8s.OWNER_LABEL_VALUE,
+              k8s.WORKSPACE_LABEL: "w", k8s.OWNER_OF_LABEL: "bob"}
+    monkeypatch.setattr(k8s, "namespace_labels", lambda ns, **kw: labels)
+
+    with pytest.raises(ConflictError) as caught:
+        k8s.assert_namespace_available("w", context="c")          # no owner at all
+    assert "RC_REPRO_USER is not set" in str(caught.value), caught.value
+    assert "RC_REPRO_USER=bob" in str(caught.value), "say how to identify yourself"
+
+    with pytest.raises(ConflictError):
+        k8s.assert_namespace_available("w", context="c", owner="alice")
+
+    # bob himself is fine.
+    monkeypatch.setattr(k8s, "run", lambda *a, **k: _completed())
+    k8s.assert_namespace_available("w", context="c", owner="bob")
+
+
+def test_a_refused_create_is_refused_before_the_write_ahead_record():
+    """A refusal that created nothing must leave nothing behind.
+
+    The provisional `repro.json` exists so a create that dies HALF WAY can still be
+    found and removed -- a different situation from one that never started. With the
+    ownership check only inside `ensure_namespace`, a refused create left an
+    `incomplete` record that `prune` then offered to delete. Seen on a live cluster.
+
+    Asserted on the order in the source, the same way the Kubernetes refusals are.
+    """
+    import inspect
+
+    from rc_repro.services import lifecycle as lc
+
+    src = inspect.getsource(lc._create_kubernetes)
+    guard = src.index("assert_namespace_available")
+    record = src.index('repro.json"')
+    assert guard < record, "the ownership refusal must precede the write-ahead record"
+
+
+# --- the journal: side effects a killed process must not leave behind ---------
+#
+# `web/jobs.py` runs long operations on DAEMON threads, so a restart, an OOM kill or
+# a plain SIGKILL ends them where they stand and skips every `finally`. Those blocks
+# are doing real work -- `backup` stops Rocket.Chat, `loadtest` turns the API rate
+# limiter off -- and the registry is in memory, so a restart loses even the knowledge
+# that a job existed. Measured: under SIGKILL the `finally` does not run.
+
+def test_a_live_owner_means_the_note_is_not_abandoned(tmp_path, monkeypatch):
+    """Repairing an entry whose job is still running would re-enable the rate limiter
+    underneath a load test that has not finished.
+
+    So liveness is checked by pid AND the owner's start time -- pid alone is not
+    enough, because the OS recycles them, which is the same mistake `forward_alive`
+    was making about port-forwards.
+    """
+    import os
+
+    from rc_repro.services import journal
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    mine = journal.record(journal.RATE_LIMITER_OFF, "w")
+    assert mine, "the entry must be written"
+    assert len(journal.open_entries()) == 1
+    assert journal.abandoned() == [], "this process is alive; leave it alone"
+
+    # A RECYCLED pid: still a live process, but not the one that wrote this.
+    entry = journal.open_entries()[0]
+    assert entry.pid == os.getpid()
+    (journal.journal_dir() / f"{entry.id}.json").write_text(json.dumps({
+        **{k: getattr(entry, k) for k in ("id", "kind", "workspace", "pid", "at")},
+        "started": "999999999", "detail": {}}))
+    assert len(journal.abandoned()) == 1, \
+        "same pid, different start time -- a different process, so the owner is gone"
+
+
+def test_the_note_is_cleared_when_the_cleanup_runs_and_kept_when_it_does_not(
+        tmp_path, monkeypatch):
+    """A surviving entry has to mean precisely "the cleanup did not happen"."""
+    from rc_repro.services import journal
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    with journal.side_effect(journal.RATE_LIMITER_OFF, "w"):
+        assert len(journal.open_entries()) == 1
+    assert journal.open_entries() == [], "cleared on the way out"
+
+    # Cleared on an exception too: the `finally` ran, so the state was restored.
+    with pytest.raises(RuntimeError):
+        with journal.side_effect(journal.RATE_LIMITER_OFF, "w"):
+            raise RuntimeError("boom")
+    assert journal.open_entries() == []
+
+    # An unknown kind is refused, because recovery has to know how to undo it --
+    # a note nothing can repair would sit there forever looking like a fault.
+    with pytest.raises(ValueError):
+        journal.record("something_new", "w")
+
+
+def test_recovery_restarts_rocketchat_and_re_enables_the_rate_limiter(
+        tmp_path, monkeypatch):
+    """The two states an interrupted job leaves behind, and what undoes each.
+
+    `_Quiesced`'s own docstring calls a workspace left stopped "a worse outcome than
+    the failure itself"; the rate limiter being off is a security-relevant setting
+    nobody chose. Verified live as well: SIGKILL a real quiesce and `serve` starts
+    Rocket.Chat again at its next startup.
+    """
+    from rc_repro.services import journal
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(journal.runner, "exists", lambda n: True)
+    dead = {"pid": 999999, "started": "1"}
+
+    def _plant(kind, **detail):
+        eid = journal.record(kind, "w", **detail)
+        path = journal.journal_dir() / f"{eid}.json"
+        data = json.loads(path.read_text())
+        data.update(dead)
+        path.write_text(json.dumps(data))
+        return eid
+
+    started: list = []
+    monkeypatch.setattr(journal.runner, "start_services",
+                        lambda n, svcs: started.append((n, svcs)) or 0)
+    _plant(journal.ROCKETCHAT_STOPPED, services=["rocketchat"])
+    rows = journal.recover()
+    assert rows and rows[0]["repaired"] is True, rows
+    assert started == [("w", ["rocketchat"])], started
+    assert journal.open_entries() == [], "a repaired note is cleared"
+
+    # The rate limiter, and a repair that FAILS must keep its note.
+    from rc_repro import rcapi
+    from rc_repro.services import lifecycle
+    monkeypatch.setattr(lifecycle, "login", lambda m: object())
+    monkeypatch.setattr(journal.runner, "read_meta",
+                        lambda n: _idp_meta("default"))
+    monkeypatch.setattr(rcapi, "set_setting", lambda *a, **k: False)
+    _plant(journal.RATE_LIMITER_OFF)
+    rows = journal.recover()
+    assert rows[0]["repaired"] is False, rows
+    assert len(journal.open_entries()) == 1, "an unrepaired note must survive"
+
+    monkeypatch.setattr(rcapi, "set_setting", lambda *a, **k: True)
+    assert journal.recover()[0]["repaired"] is True
+    assert journal.open_entries() == []
+
+
+def test_a_note_for_a_workspace_that_is_gone_is_not_a_failure(tmp_path, monkeypatch):
+    """Whatever was done to it went with it, so clearing the note is the right
+    outcome -- not an unrepairable warning that never goes away."""
+    from rc_repro.services import journal
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(journal.runner, "exists", lambda n: False)
+    eid = journal.record(journal.ROCKETCHAT_STOPPED, "deleted-long-ago")
+    path = journal.journal_dir() / f"{eid}.json"
+    data = json.loads(path.read_text())
+    data.update(pid=999999, started="1")
+    path.write_text(json.dumps(data))
+    rows = journal.recover()
+    assert rows[0]["repaired"] is True, rows
+    assert journal.open_entries() == []
+
+
+def test_doctor_tells_a_cli_box_about_interrupted_work(tmp_path, monkeypatch):
+    """`serve` repairs from the journal at startup, and a CLI-only box never starts
+    one -- so `doctor` is the only place that would ever mention it there.
+
+    An entry a LIVE job holds is reported as progress, not as a fault.
+    """
+    from rc_repro.services import doctor, journal
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    journal.record(journal.RATE_LIMITER_OFF, "mine")        # this process: alive
+    rows = [r for r in doctor.run_checks()["checks"]
+            if r.get("check") == "interrupted-work"]
+    assert rows and rows[0]["status"] == "ok", rows
+    assert "in progress" in rows[0]["message"], rows[0]
+
+    entry = journal.open_entries()[0]
+    path = journal.journal_dir() / f"{entry.id}.json"
+    data = json.loads(path.read_text())
+    data.update(pid=999999, started="1")
+    path.write_text(json.dumps(data))
+    rows = [r for r in doctor.run_checks()["checks"]
+            if r.get("check") == "interrupted-work"]
+    assert rows and rows[0]["status"] == "warn", rows
+    assert "rate limiter" in rows[0]["message"], rows[0]
+
+
+def test_the_namespace_preflight_is_skipped_when_the_cluster_is_about_to_be_made(
+        tmp_path, monkeypatch):
+    """The ownership preflight asks kubectl about a namespace, and on a fresh box the
+    context it would ask about does not exist yet.
+
+    `namespace_labels` correctly refuses to read "context was not found" as "no
+    namespace" -- so with the check running unconditionally, the FIRST Kubernetes
+    create on any box failed with rc-repro's own "refusing to guess". Found by doing
+    exactly that after `prune` had reclaimed the cluster; every earlier live run of
+    the check passed only because a cluster happened to be there.
+
+    A cluster that does not exist holds no namespace to collide with, and
+    `ensure_namespace` repeats the check once it is up.
+    """
+    import inspect
+
+    from rc_repro.services import lifecycle as lc
+
+    src = inspect.getsource(lc._create_kubernetes)
+    guard = src.index("assert_namespace_available")
+    # The call must sit under a `not plan.create` test, not at the top level.
+    before = src[:guard]
+    assert "if not plan.create:" in before.split("plan = k8s.plan_cluster()")[-1], \
+        "the preflight must be skipped when rc-repro is about to create the cluster"
+
+    # And it must still run when the cluster is already there.
+    asked: list = []
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    from rc_repro.services import k8s
+    monkeypatch.setattr(k8s, "assert_namespace_available",
+                        lambda name, **kw: asked.append(name))
+    monkeypatch.setattr(k8s, "plan_cluster",
+                        lambda *a, **kw: k8s.ClusterPlan(context="default",
+                                                         distribution="k3s",
+                                                         create=False))
+    monkeypatch.setattr(lc, "check_capacity", lambda *a, **kw: None)
+    monkeypatch.setattr(lc, "pick_host_port", lambda *a, **kw: 3000)
+    monkeypatch.setattr(lc.versions, "resolve", lambda v, offline=False: type(
+        "R", (), {"rc_version": v, "rc_image": "i", "mongo_tag": "8.0",
+                  "mongo_flavor": "official", "source": "t", "oplog": False})())
+    monkeypatch.setattr(k8s, "create_workspace", lambda **kw: {
+        "context": "default", "namespace": "rc-repro-x", "chart_version": "7.0.0",
+        "release": k8s.RELEASE, "port_forward_pid": 0, "bind_host": ""})
+    try:
+        lc._create_repro_locked(lc.CreateReq(version="8.5.1", name="x",
+                                             runtime="kubernetes"))
+    except Exception:  # noqa: BLE001 - the call above is what is being asserted
+        pass
+    assert asked == ["x"], asked
+
+
+def test_a_finished_create_clears_every_earlier_claim_that_it_did_not_finish(
+        tmp_path, monkeypatch):
+    """Notes are per-process, and some facts invalidate other processes' notes.
+
+    A create that FAILED left a `CREATE_UNFINISHED` note; a later create of the same
+    name that succeeded cleared only the note it had written itself, so the stale one
+    went on claiming a complete workspace had never finished. Seen exactly that way:
+    one attempt died on a preflight, the retry succeeded, and the warning stayed.
+    """
+    from rc_repro.services import journal
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    for at in ("T1", "T2"):
+        eid = journal.record(journal.CREATE_UNFINISHED, "w")
+        path = journal.journal_dir() / f"{eid}.json"
+        data = json.loads(path.read_text())
+        data["at"] = at
+        path.write_text(json.dumps(data))
+    journal.record(journal.CREATE_UNFINISHED, "elsewhere")
+    assert len(journal.open_entries()) == 3
+
+    assert journal.clear_kind(journal.CREATE_UNFINISHED, "w") == 2
+    assert [e.workspace for e in journal.open_entries()] == ["elsewhere"], \
+        "another workspace's note is not this workspace's business"
+
+
+def test_an_advisory_note_for_a_workspace_that_is_gone_stops_warning(
+        tmp_path, monkeypatch):
+    """Advisory notes are never repaired, so nothing would ever clear one whose
+    workspace has been removed -- it would warn forever about something that cannot be
+    acted on. A create that failed and rolled back is exactly that case."""
+    from rc_repro.services import journal
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(journal.runner, "exists", lambda n: False)
+    eid = journal.record(journal.CREATE_UNFINISHED, "rolled-back")
+    path = journal.journal_dir() / f"{eid}.json"
+    data = json.loads(path.read_text())
+    data.update(pid=999999, started="1")
+    path.write_text(json.dumps(data))
+
+    assert journal.recover() == [], "nothing to report about a workspace that is gone"
+    assert journal.open_entries() == [], "and the note is dropped, not kept"
+
+    # While the workspace IS there, it is reported and deliberately not repaired.
+    monkeypatch.setattr(journal.runner, "exists", lambda n: True)
+    eid = journal.record(journal.CREATE_UNFINISHED, "still-here")
+    path = journal.journal_dir() / f"{eid}.json"
+    data = json.loads(path.read_text())
+    data.update(pid=999999, started="1")
+    path.write_text(json.dumps(data))
+    rows = journal.recover()
+    assert len(rows) == 1 and rows[0]["repaired"] is False, rows
+    assert "rc-repro ready" in rows[0]["why"], rows[0]
+    assert len(journal.open_entries()) == 1, "kept until somebody acts on it"
+
+
+def test_the_bench_workspace_and_the_constraints_can_be_undone(tmp_path, monkeypatch):
+    """The two side effects added beside the first pair. `benchmark` leaves the most
+    expensive thing on this branch behind -- a Rocket.Chat and a MongoDB per version --
+    and a performance run's CPU/RAM caps have to go back to the PRIOR values rather
+    than to "unlimited", which is why the note carries them."""
+    from rc_repro.perf import constrain as constrain_mod
+    from rc_repro.services import journal
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(journal.runner, "exists", lambda n: True)
+    dead = {"pid": 999999, "started": "1"}
+
+    def _plant(kind, **detail):
+        eid = journal.record(kind, "w", **detail)
+        path = journal.journal_dir() / f"{eid}.json"
+        data = json.loads(path.read_text())
+        data.update(dead)
+        path.write_text(json.dumps(data))
+
+    removed: list = []
+    monkeypatch.setattr(journal.runner, "down",
+                        lambda n, volumes=False: removed.append((n, volumes)))
+    monkeypatch.setattr(journal.runner, "remove", lambda n: None)
+    _plant(journal.BENCH_WORKSPACE)
+    assert journal.recover()[0]["repaired"] is True
+    assert removed == [("w", True)], "the volume goes too; it was a throwaway"
+
+    # Constraints: the prior values survive the round trip and reach restore().
+    got: list = []
+    monkeypatch.setattr(constrain_mod, "restore", lambda applied: got.extend(applied) or [])
+    _plant(journal.CONSTRAINTS_APPLIED, applied=[{
+        "container": "abc", "service": "rocketchat", "prior_nano": 2_000_000_000,
+        "prior_mem": 1073741824, "prior_swap": -1, "set_cpus": True,
+        "set_mem": False}])
+    assert journal.recover()[0]["repaired"] is True
+    assert len(got) == 1 and got[0].prior_nano == 2_000_000_000, got
+    assert got[0].set_mem is False, "restore must not cap a dimension nobody capped"
+
+
+def test_describe_only_describes(monkeypatch):
+    """`describe()` is a formatting function and must not DO anything.
+
+    It briefly did: a repair block was inserted with an anchor that matched the first
+    `if entry.kind == ROCKETCHAT_STOPPED:` in the file, which is in `describe`, not in
+    `_repair`. So describing an entry tore down a workspace and returned True instead
+    of a sentence -- caught because a test asserted `repaired is True` and got False,
+    with `what` holding a boolean.
+    """
+    import inspect
+
+    from rc_repro.services import journal
+
+    src = inspect.getsource(journal.describe)
+    for forbidden in ("runner.", "restore(", "subprocess", "clear("):
+        assert forbidden not in src, f"describe() must not reach for {forbidden!r}"
+    for kind in journal.KINDS:
+        text = journal.describe(journal.Entry(id="i", kind=kind, workspace="w", pid=1,
+                                              at="T"))
+        assert isinstance(text, str) and "w" in text, (kind, text)
+
+
+def test_a_done_warning_reaches_the_terminal_and_a_done_info_does_not(capsys):
+    """`_cli_emit` suppressed EVERY event at `phase="done"`, at every level.
+
+    The suppression is right for the informational ones -- the command wrapper prints
+    the final panel and would say it twice. It was wrong for warnings, and six of them
+    are raised at exactly that phase, because `done` is where a service says what it
+    finished doing. So a CLI user was never told that an orphaned namespace could not be
+    removed, that a workspace was skipped by `prune`, that the cluster was left alone,
+    that a monitoring volume was left behind, or -- the sharpest -- that `stop` on an
+    operator-managed workspace frees Rocket.Chat's memory and not MongoDB's, which is a
+    warning written specifically so `stop` would say it instead of staying quiet.
+    """
+    from rc_repro import cli
+    from rc_repro.services.events import Event
+
+    # The full 3x2 matrix, so this cannot pass by accident on one level.
+    for level in ("info", "warn", "error"):
+        for phase in ("done", "teardown"):
+            capsys.readouterr()
+            cli._cli_emit(Event(f"{level}-{phase}", phase=phase, level=level))
+            out = capsys.readouterr()
+            printed = f"{level}-{phase}" in (out.out + out.err)
+            want = not (phase == "done" and level == "info")
+            assert printed is want, (
+                f"level={level} phase={phase}: printed={printed}, expected {want}")
+
+    # A terminal event stays suppressed whatever its level -- that half was never the bug.
+    capsys.readouterr()
+    cli._cli_emit(Event("terminal-warn", phase="teardown", level="warn", terminal=True))
+    out = capsys.readouterr()
+    assert "terminal-warn" not in (out.out + out.err)
+
+
+def test_prune_says_which_namespaces_it_destroyed(monkeypatch, tmp_path):
+    """`prune --orphans` deleted namespaces and their PersistentVolumeClaims and then
+    printed "Nothing to prune."
+
+    `lifecycle.prune` returns them as `orphans`; the CLI rendered `removed` alone, so a
+    sweep that removed no local record -- the normal case for the situation --orphans
+    exists for -- reported the irreversible half of the command as the no-op half. The
+    confirmation prompt did name them, which is no help under `--yes`.
+    """
+    from typer.testing import CliRunner
+
+    from rc_repro import cli
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "prunable", lambda *a, **k: [])
+    monkeypatch.setattr(lc, "orphan_namespaces", lambda *a, **k: ["rc-repro-ghost"])
+    monkeypatch.setattr(cli, "_cluster_reclaimable", lambda *a, **k: False)
+    monkeypatch.setattr(lc, "prune", lambda **k: {
+        "targets": [], "removed": [], "orphans": ["rc-repro-ghost"], "cluster": False})
+
+    res = CliRunner().invoke(cli.app, ["prune", "--orphans", "--yes"])
+
+    assert res.exit_code == 0, res.output
+    assert "rc-repro-ghost" in res.output, res.output
+    assert "Nothing to prune" not in res.output, res.output
+
+
+def test_prune_audits_the_namespaces_it_swept_not_just_the_records(monkeypatch, tmp_path):
+    """The audit subject was `",".join(targets)` -- local records only.
+
+    A sweep of three namespaces and no records therefore wrote `prune` with an empty
+    subject, so between that and the silent stdout there was no trace anywhere of what
+    had been destroyed.
+    """
+    from rc_repro.services import audit as auditsvc
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    seen = []
+    monkeypatch.setattr(auditsvc, "record", lambda a, s="", **k: seen.append((a, s)))
+    monkeypatch.setattr(lc, "prunable", lambda *a, **k: [])
+    monkeypatch.setattr(lc, "orphan_namespaces", lambda *a, **k: ["rc-repro-ghost"])
+    monkeypatch.setattr(lc, "_reclaim_cluster", lambda *a, **k: False)
+
+    # The audit is written before the sweep, so the sweep itself is not stubbed and
+    # whatever it does with no cluster to talk to is not what this asserts.
+    try:
+        lc.prune(confirm=True, orphans=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+    assert seen, "prune recorded no audit entry at all"
+    action, subject = seen[0]
+    assert action == "prune"
+    assert "rc-repro-ghost" in subject, subject
+
+
+def test_a_workspace_whose_database_is_gone_is_not_reported_healthy(monkeypatch, tmp_path):
+    """Rocket.Chat serves /api/info with NO DATABASE behind it.
+
+    Measured on a live workspace: `docker stop <mongodb>`, then /api/info 200, login
+    000 after 15s, `ready` exit 0 "ready", `list` running, `detail()` state=running
+    health=healthy uptime="2 minutes" -- and the same payload's containers array
+    holding ("mongodb", "exited"). The summary contradicted its own detail. Every
+    remediation the tool then offered pointed back at `ready`: `api` exits 5 with
+    "wait for it with `rc-repro ready`" and `seed` exits 1 with the same, and `ready`
+    reports success. There was no exit from that loop without reading `docker ps`.
+
+    `degraded_reason` is one rule, consulted by the list, the panel and `ready`, so
+    they cannot drift -- the same remedy `repro_state()` needed when the list and the
+    panel disagreed about state.
+    """
+    from rc_repro.services.lifecycle import ESSENTIAL_SERVICES, degraded_reason
+
+    healthy = {"mongodb": "Up 2 hours", "rocketchat": "Up 2 hours (healthy)"}
+    dead_db = {"mongodb": "Exited (0) 3 minutes ago",
+               "rocketchat": "Up 2 hours (healthy)"}
+
+    assert degraded_reason(healthy) == ""
+    assert degraded_reason(dead_db) == "mongodb is exited", degraded_reason(dead_db)
+    # A workspace with no mongodb container at all (Kubernetes, or an external Mongo)
+    # is not evidence of a fault -- absence is not the same as stopped.
+    assert degraded_reason({"rocketchat": "Up 2 hours (healthy)"}) == ""
+    # SIDE SERVICES ARE NOT ESSENTIAL. A stopped Mailpit is something a person lives
+    # with; treating every preset sidecar as fatal would refuse workspaces that work.
+    assert "mailpit" not in ESSENTIAL_SERVICES
+    assert degraded_reason({"mongodb": "Up 1 hour", "mailpit": "Exited (1) ago"}) == ""
+
+
+def test_the_detail_summary_cannot_contradict_its_own_containers(monkeypatch, tmp_path):
+    """`detail()` derived state AND health from the Rocket.Chat container alone."""
+    from rc_repro import runner
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "resolve_name", lambda n: "dbgone")
+    monkeypatch.setattr(runner, "read_meta", lambda n: lc.runner.Metadata(
+        name=n, project=f"rcrepro-{n}", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="default",
+        root_url="http://localhost:3000", host_port=3000, version_source="map"))
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(runner, "container_details", lambda n: [
+        {"service": "mongodb", "state": "exited",
+         "status": "Exited (0) 3 minutes ago", "health": ""},
+        {"service": "rocketchat", "state": "running",
+         "status": "Up 2 hours (healthy)", "health": "healthy"},
+    ])
+    monkeypatch.setattr(runner, "rc_restart_count", lambda n: 0)
+    monkeypatch.setattr(runner, "read_compose", lambda n: {})
+
+    d = lc.detail("dbgone")
+
+    assert d["state"] == "running"          # it IS running; that part was never wrong
+    assert d["health"] == "degraded", d["health"]
+    assert d["degraded"] == "mongodb is exited", d["degraded"]
+
+
+def test_a_readiness_failure_asks_diagnose_instead_of_asserting_memory_pressure(
+        monkeypatch, tmp_path):
+    """`diagnose` holds the signature list and the readiness path never called it.
+
+    Its only caller was the `docker compose up` non-zero branch. So a workspace that
+    came up and then failed to serve -- the commonest real shape -- got a hardcoded
+    sentence instead. Measured: `env --set MONGO_URL=mongodb://nope:27017/...`, the
+    product's own feature, then `ready` -> exit 5 after 303s saying "Rocket.Chat
+    restarted 10x; likely resource pressure (free repros / raise Docker CPU+RAM)" on a
+    box with 5.7 GB free, while RC's own logs said "Topology is closed" and
+    diagnose.match() on those exact logs returned the right answer.
+
+    Two things are asserted: the diagnosis is PREFERRED, and the resource-pressure
+    sentence survives only as a possibility and only when nothing matched -- stated as
+    fact it sends a reader hunting for memory they already have.
+    """
+    from rc_repro import rcapi, runner
+    from rc_repro.errors import NotReadyError
+    from rc_repro.services import diagnose
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    meta = lc.runner.Metadata(
+        name="slow", project="rcrepro-slow", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="default",
+        root_url="http://localhost:3000", host_port=3000, version_source="map")
+    monkeypatch.setattr(runner, "rc_state", lambda n: "running")
+    monkeypatch.setattr(runner, "rc_restart_count", lambda n: 0)
+    # raising=False: this test is about the MESSAGE, and must fail against the
+    # pre-fix tree for that reason rather than on a missing attribute name.
+    monkeypatch.setattr(runner, "services_by_project", lambda: {}, raising=False)
+
+    def timeout(*a, **k):
+        raise rcapi.NotReady("Rocket.Chat did not become ready within 300s")
+    monkeypatch.setattr(rcapi, "wait_ready", timeout)
+
+    # 1. A KNOWN cause is preferred and the guess is nowhere in the message.
+    monkeypatch.setattr(diagnose, "diagnose_failure",
+                        lambda n: "MongoDB is up but its replica set never initialised")
+    try:
+        lc.wait_serving(meta, lambda ev: None, 1.0)
+    except NotReadyError as exc:
+        assert "replica set never initialised" in str(exc), str(exc)
+        assert "resource pressure" not in str(exc).lower(), str(exc)
+        assert "raise Docker" not in str(exc), str(exc)
+    else:
+        raise AssertionError("wait_serving did not raise")
+
+    # 2. Nothing matched and no restarts: no invented cause at all.
+    monkeypatch.setattr(diagnose, "diagnose_failure", lambda n: None)
+    try:
+        lc.wait_serving(meta, lambda ev: None, 1.0)
+    except NotReadyError as exc:
+        assert "did not become ready" in str(exc), str(exc)
+        assert "resource pressure" not in str(exc).lower(), str(exc)
+    else:
+        raise AssertionError("wait_serving did not raise")
+
+
+def test_a_crash_loop_stops_waiting_once_the_cause_is_known(monkeypatch, tmp_path):
+    """`ready` spent the full 300s polling through a visible crash loop.
+
+    `is_alive()` returns True for "restarting", so a crash-looping container is
+    intermittently alive and the fail-fast callback never fired; `tick` counted the
+    restarts, warned, and nothing acted on the count.
+
+    Giving up on the COUNT alone would be wrong -- v0.71.1 is the whole lesson: a boot
+    that restarts twice and settles is ordinary, and a banner that is always on is one
+    nobody reads. A matched log signature is different: that is evidence, so this stops
+    on evidence and keeps waiting without it.
+    """
+    from rc_repro import rcapi, runner
+    from rc_repro.errors import NotReadyError
+    from rc_repro.services import diagnose
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    meta = lc.runner.Metadata(
+        name="loop", project="rcrepro-loop", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="default",
+        root_url="http://localhost:3000", host_port=3000, version_source="map")
+    monkeypatch.setattr(runner, "rc_state", lambda n: "restarting")
+    monkeypatch.setattr(runner, "rc_restart_count", lambda n: 3)
+    # raising=False: this test is about the MESSAGE, and must fail against the
+    # pre-fix tree for that reason rather than on a missing attribute name.
+    monkeypatch.setattr(runner, "services_by_project", lambda: {}, raising=False)
+
+    ticks = {"n": 0}
+
+    def never_ready(root_url, timeout=300.0, is_alive=None, on_tick=None, **k):
+        # Two ticks is a fraction of the 100 the real 300s wait would spend.
+        for i in range(2):
+            ticks["n"] += 1
+            on_tick(float(i))
+        raise rcapi.NotReady("Rocket.Chat did not become ready within 300s")
+    monkeypatch.setattr(rcapi, "wait_ready", never_ready)
+
+    monkeypatch.setattr(diagnose, "diagnose_failure",
+                        lambda n: "MongoDB refused the connection")
+    try:
+        lc.wait_serving(meta, lambda ev: None, 300.0)
+    except NotReadyError as exc:
+        assert "MongoDB refused the connection" in str(exc), str(exc)
+    else:
+        raise AssertionError("wait_serving did not raise")
+    assert ticks["n"] == 1, (
+        f"kept polling for {ticks['n']} ticks after the cause was known")
+
+    # And WITHOUT a known cause it keeps waiting, rather than aborting on a count.
+    ticks["n"] = 0
+    monkeypatch.setattr(diagnose, "diagnose_failure", lambda n: None)
+    try:
+        lc.wait_serving(meta, lambda ev: None, 300.0)
+    except NotReadyError:
+        pass
+    assert ticks["n"] == 2, f"gave up after {ticks['n']} ticks with no evidence"
+
+
+def test_every_side_effect_that_outlives_a_kill_is_journalled():
+    """The walk that makes the journal a registry rather than a habit.
+
+    THIS TEST USED TO PASS FOR THE WRONG REASON, TWICE, and a second reviewer found
+    both. It was a hardcoded four-function list rather than a walk, so `rc_repro/seed.py`
+    and `rc_repro/configimport.py` -- which both disable the API rate limiter, and seed
+    also disables email-2FA -- were simply outside its scope. And even once they were in
+    scope the assertion silently skipped, because the guard was the source text
+    `"config.RC_RATE_LIMITER_SETTING" in src` while both files spelled the setting as
+    the bare literal `"API_Enable_Rate_Limiter"`. A test whose guard is defeated by the
+    very drift it is meant to catch.
+
+    So it walks the package now, and it matches on the SETTING STRING rather than on
+    how a file happens to spell the constant -- there is no spelling that dodges it
+    short of building the name at runtime, which the invariant below forbids.
+
+    Why it matters in use: README promises "Email-2FA and the rate limiter are disabled
+    while seeding and restored afterwards." A GUI seed of the `large` profile is minutes
+    long against `jobs.drain`'s 25 seconds, so a `systemctl restart` mid-seed is
+    routine. What survived was a workspace with the limiter AND email-2FA off, silently
+    different from the one an engineer was about to measure, and invisible to both
+    `doctor`'s `interrupted-work` row and `serve`'s startup recovery.
+    """
+    import ast
+    import pathlib as _pl
+
+    from rc_repro import config
+    from rc_repro.services import journal
+
+    root = _pl.Path(config.__file__).parent
+
+    #: setting value -> the journal kind that undoes turning it off/on.
+    GUARDED = {
+        "API_Enable_Rate_Limiter": "RATE_LIMITER_OFF",
+        journal.EMAIL_2FA_SETTING: "EMAIL_2FA_OFF",
+    }
+    #: Calls that arm something a kill must not strand, and the kind for each.
+    ARMING_CALLS = {
+        "constrain_mod.apply": "CONSTRAINTS_APPLIED",
+        "mongoprof.start": "MONGO_PROFILER_ON",
+    }
+
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        # journal.py is the REPAIR side by definition -- `_repair` puts these settings
+        # back, so it mentions every one of them and journals none. Excluded by name
+        # rather than by a cleverer predicate, because "the module that undoes them" is
+        # the honest reason and a predicate would drift.
+        if "/data/" in str(path) or path.name == "journal.py":
+            continue
+        text = path.read_text()
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:                                    # pragma: no cover
+            continue
+        for fn in [n for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            body = ast.unparse(fn)
+            recorded = {ast.unparse(c.args[0]).rsplit(".", 1)[-1]
+                        for c in ast.walk(fn)
+                        if isinstance(c, ast.Call)
+                        and ast.unparse(c.func).endswith("journal.record") and c.args}
+            where = f"{path.name}:{fn.name}"
+            for value, kind in GUARDED.items():
+                # Armed = set to False somewhere in this function. Matched on the
+                # VALUE, so `config.RC_RATE_LIMITER_SETTING` and the bare literal are
+                # the same question.
+                names = {value, "RC_RATE_LIMITER_SETTING", "EMAIL_2FA_SETTING"}
+                mentions = any(n in body for n in names if n == value) or (
+                    value == "API_Enable_Rate_Limiter"
+                    and "RC_RATE_LIMITER_SETTING" in body)
+                if value == journal.EMAIL_2FA_SETTING:
+                    mentions = value in body or "EMAIL_2FA_SETTING" in body
+                if mentions and ", False)" in body and kind not in recorded:
+                    offenders.append(f"{where} disables {value} and records no {kind}")
+            for call, kind in ARMING_CALLS.items():
+                if call + "(" in body and kind not in recorded:
+                    offenders.append(f"{where} calls {call}() and records no {kind}")
+
+    assert not offenders, (
+        "these arm a side effect that outlives a SIGKILL and journal nothing:\n  "
+        + "\n  ".join(offenders))
+
+    # The kinds this walk depends on must exist, so a rename cannot turn the whole
+    # thing into a no-op that reports green.
+    for kind in ("RATE_LIMITER_OFF", "EMAIL_2FA_OFF", "CONSTRAINTS_APPLIED",
+                 "MONGO_PROFILER_ON", "RC_METRICS_ON"):
+        assert hasattr(journal, kind), kind
+
+def test_a_dry_run_of_the_journal_does_not_change_it():
+    """`recover(dry_run=True)` DELETED advisory notes whose workspace was gone.
+
+    The clear sat above the dry_run check, so a dry run over two notes reported one and
+    removed the other -- and a dry run is the only way to inspect the journal without
+    repairing it, which makes mutating one a contradiction in terms.
+    """
+    from rc_repro import runner
+    from rc_repro.services import journal
+
+    import os
+    ident = journal.record(journal.CREATE_UNFINISHED, "ghost-workspace")
+    assert ident, "the note was not written"
+    # Owned by a process that cannot be us, so `abandoned()` includes it.
+    path = journal.journal_dir() / f"{ident}.json"
+    import json as _json
+    doc = _json.loads(path.read_text())
+    doc["pid"] = 999999 if os.getpid() != 999999 else 999998
+    doc["started"] = "1"
+    path.write_text(_json.dumps(doc))
+
+    assert not runner.exists("ghost-workspace")     # the branch under test
+    rows = journal.recover(dry_run=True)
+
+    assert path.exists(), "a dry run deleted the note it was only meant to report"
+    assert any(r["workspace"] == "ghost-workspace" for r in rows), rows
+
+
+def test_a_refused_create_leaves_no_note_behind(monkeypatch, tmp_path):
+    """The write-ahead note is for a create that died HALF WAY, not one that never
+    started.
+
+    `record` then `_create_repro_locked` then `clear`, with no try/finally, so ANY
+    refusal stranded the note -- a bad version, a taken port, the capacity preflight, a
+    namespace-ownership check, a Kubernetes-unsupported flag -- one per attempt. Seven
+    accumulated during the audit, three of them for the same never-created name. Worse
+    than untidy: `doctor` then warns "the create started at ... never finished ...
+    `rc-repro ready --name X` completes it", and that command exits 4 NOT_FOUND. On a
+    CLI-only box nothing ever clears them, because recovery runs at `serve` startup and
+    `doctor` reports without repairing.
+    """
+    from rc_repro.errors import ValidationError
+    from rc_repro.services import journal
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "_create_repro_locked",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            ValidationError("--https is not supported on kubernetes")))
+
+    before = len(journal.open_entries())
+    try:
+        lc.create_repro(lc.CreateReq(version="8.5.1", name="refu"))
+    except ValidationError:
+        pass
+    else:
+        raise AssertionError("the refusal did not propagate")
+
+    after = journal.open_entries()
+    assert len(after) == before, (
+        f"a refused create left {len(after) - before} note(s): "
+        f"{[e.kind + ':' + e.workspace for e in after]}")
+
+
+def test_ready_carries_the_seed_the_interrupted_create_asked_for(monkeypatch, tmp_path):
+    """`ready` cleared the note and never ran the pending seed.
+
+    The note says the workspace "may be running WITHOUT its preset configuration or
+    seed data" and names `ready` as what completes it. `wait_and_finalize` ran
+    post_ready -- recoverable, because meta.extra["post_ready"] is persisted -- and
+    then `clear_kind`. It could not seed and did not say so: `req.seed` lived only in
+    the dead process's CreateReq, `meta.extra["seed"]` is written only AFTER a seed
+    succeeds, and `journal.record` was called with no detail at all although it accepts
+    **detail.
+
+    Verified live: SIGKILL an `up --wait --seed` once compose has detached, run `ready`,
+    get "ready" and exit 0, and find the workspace holding two users and one channel --
+    with the note gone. That is worse than leaving it, because the engineer follows the
+    tool's own instruction, is told the workspace is complete, doctor agrees, and the
+    evidence that anything was missing has been deleted.
+    """
+    from rc_repro.services import journal
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+
+    # 1. THE NOTE `create_repro` WRITES carries the request. That is where the detail
+    #    was missing -- `journal.record` has always accepted **detail and was called
+    #    with none -- so asserting on a hand-written note would prove nothing.
+    seen: dict = {}
+
+    def capture(*a, **k):
+        for e in journal.open_entries():
+            if e.kind == journal.CREATE_UNFINISHED and e.workspace == "halfmade":
+                seen.update(e.detail)
+        raise RuntimeError("stop here; the note has been read")
+
+    monkeypatch.setattr(lc, "_create_repro_locked", capture)
+    try:
+        lc.create_repro(lc.CreateReq(version="8.5.1", name="halfmade", seed=True,
+                                     seed_profile="standard"))
+    except RuntimeError:
+        pass
+    assert seen.get("seed") is True, (
+        f"the create's own note does not record that a seed was asked for: {seen}")
+    assert seen.get("seed_profile") == "standard", seen
+
+    ident = journal.record(journal.CREATE_UNFINISHED, "halfmade",
+                           seed=True, seed_profile="standard", seed_stats=False)
+
+    # 2. And `pending_seed` reads it back, so `ready` has something to act on. Only
+    #    ABANDONED notes count: one whose owner is alive belongs to a create still
+    #    running, and seeding under it would seed twice.
+    import json as _json
+    import os
+    path = journal.journal_dir() / f"{ident}.json"
+    doc = _json.loads(path.read_text())
+    assert journal.pending_seed("halfmade") == {}, (
+        "a note owned by a LIVE process was treated as pending work")
+    doc["pid"] = 999999 if os.getpid() != 999999 else 999998
+    doc["started"] = "1"
+    path.write_text(_json.dumps(doc))
+
+    pending = journal.pending_seed("halfmade")
+    assert pending.get("seed") is True, pending
+    assert pending.get("seed_profile") == "standard", pending
+    # A create that asked for NO seed leaves nothing for `ready` to do.
+    assert journal.pending_seed("never-existed") == {}
+
+
+def test_an_explicitly_wide_bind_is_warned_about(monkeypatch, tmp_path):
+    """`--bind 0.0.0.0` published fixed weak credentials and said nothing.
+
+    The exposure warning fired only on `req.bind_public`, which rc-repro sets ITSELF
+    when it widens the bind for an ACME challenge -- so the derived case was announced
+    and the case a person deliberately asked for was silent. Verified from the box's
+    own LAN address: /api/info 200, and POST /api/v1/login with admin/admin123
+    returning a full admin authToken, after an `up` that printed the normal panel with
+    a URL reading `http://localhost:<port>`.
+
+    `config.DEFAULT_BIND_HOST`'s comment states this threat model exactly and
+    `errors.GATE_PUBLIC_EXPOSURE` was declared for it. The opt-in is deliberate and
+    stays; being quiet about it was an omission, not a decision.
+    """
+    import inspect
+
+    from rc_repro.services import lifecycle as lc
+
+    src = inspect.getsource(lc._create_repro_locked)
+    # The derived branch, and the ASKED-FOR branch beside it.
+    assert "req.bind_public and bind_host not in" in src
+    assert "elif bind_host not in _LOOPBACK_BINDS:" in src, (
+        "an explicitly requested wide bind still has no warning branch")
+    after = src.split("elif bind_host not in _LOOPBACK_BINDS:", 1)[1][:2600]
+    for expected in ("admin/admin123", "trusted network", "--bind"):
+        assert expected in after, f"the wide-bind warning does not mention {expected!r}"
+    assert "username as their password" in after, (
+        "seeded users are the worse credential and are not mentioned")
+
+
+def test_a_restore_retargets_site_url_at_the_workspace_it_landed_in(monkeypatch,
+                                                                    tmp_path):
+    """A restore is a full mongorestore, so the bundle brings its Site_Url with it.
+
+    Measured: source on 3111, restored to 3000, `env` reporting
+    ROOT_URL=http://localhost:3000 and `GET /api/v1/settings/Site_Url` answering
+    http://localhost:3111 -- with /api/info then advertising
+    `"workspaceUrl": "localhost:3111"` while serving on 3000. ROOT_URL does not
+    override a stored setting.
+
+    Wrong in exactly the field a restored workspace is usually restored to look at:
+    Rocket.Chat derives email links, OAuth/SAML/OIDC redirect URIs, integration
+    callbacks and mobile deep links from it -- and if the source is still running, all
+    of them open the source. `configimport.py` denies Site_Url on import for this
+    reason and the restore path had no equivalent.
+    """
+    import inspect
+
+    from rc_repro import rcapi
+    from rc_repro import runner
+    from rc_repro.services import backup, lifecycle as lc
+
+    # FIRST, and by source: the pre-fix tree has no retarget step at all, and this must
+    # fail for that reason rather than on a missing attribute name.
+    assert "Site_Url" in inspect.getsource(backup), (
+        "nothing in the restore path touches Site_Url - a bundle from another "
+        "workspace still names that workspace")
+    # `restore()` resolves the target and delegates; the work is in `_restore_locked`.
+    assert "_retarget_site_url" in inspect.getsource(backup._restore_locked), (
+        "the restore path does not retarget Site_Url")
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    meta = lc.runner.Metadata(
+        name="restored", project="rcrepro-restored", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="official", preset="default",
+        root_url="http://localhost:3000", host_port=3000, version_source="map")
+    monkeypatch.setattr(runner, "read_meta", lambda n: meta)
+    monkeypatch.setattr(lc, "login", lambda m: object())
+    monkeypatch.setattr(backup.lifecycle, "login", lambda m: object())
+    monkeypatch.setattr(rcapi, "get_setting",
+                        lambda *a, **k: "http://localhost:3111")
+    wrote: list = []
+    monkeypatch.setattr(rcapi, "set_setting",
+                        lambda url, auth, pw, key, val: wrote.append((key, val)) or True)
+
+    said: list = []
+    backup._retarget_site_url("restored", lambda ev: said.append(ev.message))
+
+    assert wrote == [("Site_Url", "http://localhost:3000")], wrote
+    assert any("3111" in m for m in said), said
+
+    # A workspace whose Site_Url ALREADY matches is left alone -- this must not write
+    # a setting on every restore into the same workspace.
+    wrote.clear()
+    monkeypatch.setattr(rcapi, "get_setting",
+                        lambda *a, **k: "http://localhost:3000")
+    backup._retarget_site_url("restored", lambda ev: None)
+    assert wrote == [], wrote
+
+
+def test_doctor_says_the_home_is_not_writable_rather_than_blaming_kind(monkeypatch,
+                                                                       tmp_path):
+    """A read-only RC_REPRO_HOME passed `doctor` and surfaced as a kind problem.
+
+    `home-perms` asks whether OTHER local users can read the accounts and sessions;
+    nothing asked whether rc-repro can write. So `list` and `doctor` exited 0 while
+    `up` and `users add` raised a bare PermissionError -- and doctor's only mention of
+    it was "Could not tell whether cluster 'rc-repro-local' exists ([Errno 13]
+    Permission denied) - kind needs Docker", because the error surfaced through the
+    kind probe (which writes rc-repro's own kubeconfig dir) and was attributed to
+    Docker. The symptom was found and blamed on the wrong thing.
+    """
+    import os
+
+    from rc_repro.services import doctor as doctorsvc
+
+    home = tmp_path / "ro-home"
+    home.mkdir()
+    os.chmod(home, 0o500)
+    monkeypatch.setenv("RC_REPRO_HOME", str(home))
+    try:
+        rows = doctorsvc.run_checks()["checks"]
+    finally:
+        os.chmod(home, 0o700)
+
+    hits = [r for r in rows if r.get("check") == "home-writable"]
+    assert hits, ("doctor reported no home-writable row on a home it cannot write: "
+                  + str(sorted({r.get("check") for r in rows})))
+    assert hits[0]["status"] == "fail", hits[0]
+    assert "not writable" in hits[0]["message"], hits[0]["message"]
+    assert "home-writable" in doctorsvc.CHECKS
+
+
+def test_a_bad_settings_file_is_a_validation_error_not_a_traceback(tmp_path):
+    """A customer dump is exactly the file that arrives wrong.
+
+    Truncated by a download, HTML from an expired share link, or the whole support
+    bundle instead of the settings file inside it. `json.loads` raised a bare
+    `json.JSONDecodeError`, which is not a `ReproError` -- so the CLI printed a
+    traceback and the web layer answered 500, where every other bad input in this path
+    says what is wrong with the file.
+    """
+    import json as _json
+
+    from rc_repro import configimport
+
+    html = tmp_path / "customer-settings.json"
+    html.write_text("<html><body>Link expired</body></html>")
+    try:
+        configimport.build_plan(html)
+    except ValueError as exc:
+        assert not isinstance(exc, _json.JSONDecodeError), (
+            "still the raw decoder error, which no front-end handles")
+        assert "customer-settings.json" in str(exc), str(exc)
+        assert "not valid JSON" in str(exc), str(exc)
+        assert "HTML" in str(exc), "the commonest cause is not mentioned"
+    else:
+        raise AssertionError("a non-JSON dump was accepted")
+
+    # And the service layer turns it into the typed error both front-ends render.
+    from rc_repro.errors import ValidationError
+    from rc_repro.services import data as datasvc
+    try:
+        datasvc._build_plan(str(html), None)
+    except ValidationError:
+        pass
+    else:
+        raise AssertionError("services/data.py did not type the failure")
+
+
+def test_journal_timestamps_are_utc_like_every_other_record(tmp_path, monkeypatch):
+    """`time.strftime` with no second argument is LOCAL time.
+
+    So one event read 22:29 in a journal note and 16:59 in the repro.json written
+    beside it -- and a note is read next to `doctor`, `list` and an audit line, all of
+    which are UTC.
+    """
+    import time as _time
+
+    from rc_repro.services import journal
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    ident = journal.record(journal.RATE_LIMITER_OFF, "clocktest")
+    entry = next(e for e in journal.open_entries() if e.id == ident)
+
+    assert entry.at.endswith("Z"), f"not marked as UTC: {entry.at}"
+    stamped = _time.strptime(entry.at, "%Y-%m-%dT%H:%M:%SZ")
+    now = _time.gmtime()
+    # Within a minute of UTC now. On a box whose local time is UTC this would pass
+    # either way, so the "Z" assertion above is what actually pins it.
+    assert abs(_time.mktime(stamped) - _time.mktime(now)) < 60, (entry.at,
+                                                                _time.asctime(now))
+
+
+def test_prune_waits_for_the_namespaces_it_swept_before_reclaiming_the_cluster():
+    """`prune --orphans` needed running TWICE to give the cluster back.
+
+    The sweep deletes with `--wait=false` and `_reclaim_cluster` ran immediately after
+    in the same call, so `delete_cluster` refused -- correctly -- because the namespaces
+    prune had just deleted were still Terminating. Observed: run 1 left rc-repro-local
+    and its control plane, run 2 twenty seconds later printed "the cluster is gone".
+    About 600 MB survived the prune that had emptied it.
+    """
+    import inspect
+
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+
+    src = inspect.getsource(lc.prune)
+    assert "wait_namespace_gone" in src, (
+        "prune still reclaims the cluster without waiting for its own sweep")
+    # Ordered: the wait must come BEFORE the reclaim it guards, or it changes nothing.
+    # `rindex`, because the FIRST `_reclaim_cluster` is the nothing-to-prune early
+    # return -- there is no sweep to wait for on that path.
+    assert src.index("wait_namespace_gone") < src.rindex("_reclaim_cluster"), src
+    assert callable(k8s.wait_namespace_gone)
+    # Same bound as delete_namespace's own loop rather than a second opinion.
+    assert "NS_GONE_TRIES" in inspect.getsource(k8s.wait_namespace_gone)
+
+
+def test_use_resolves_the_name_like_every_other_command(monkeypatch, tmp_path):
+    """`use` called `runner.exists()` on the literal argument.
+
+    So `use TICKET-1234` failed on a workspace really named `ticket-1234` while
+    `info --name TICKET-1234` found it -- and `name_candidates()`'s docstring is
+    written about exactly that defect and says it was fixed. `use` was missed. On a box
+    with accounts the owner-prefix half bites too: `up --name test` makes `alice-test`,
+    and `use test` could not find it. Exit was 1, where the table says 4.
+    """
+    from typer.testing import CliRunner
+
+    from rc_repro import cli
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    seen: list = []
+    monkeypatch.setattr(lc, "resolve_name",
+                        lambda n: seen.append(n) or "ticket-1234")
+
+    res = CliRunner().invoke(cli.app, ["use", "TICKET-1234"])
+    assert res.exit_code == 0, res.output
+    assert seen == ["TICKET-1234"], "use did not go through resolve_name"
+    assert "ticket-1234" in res.output, res.output
+    from rc_repro import config
+    assert config.load_config().get("default_repro") == "ticket-1234"
+
+    # And an unknown name exits 4, not 1.
+    def missing(n):
+        from rc_repro.errors import NotFoundError
+        raise NotFoundError(f"no repro named {n!r}")
+    monkeypatch.setattr(lc, "resolve_name", missing)
+    res = CliRunner().invoke(cli.app, ["use", "nope"])
+    assert res.exit_code == 4, (res.exit_code, res.output)
+
+
+def test_a_failed_cap_restore_keeps_its_note(monkeypatch, tmp_path):
+    """`journal.clear(constrain_note)` sat ABOVE the restore that may fail.
+
+    `constrain_mod.restore` RETURNS problems rather than raising, and the loop beside
+    it exists to report them -- so a failed restore left the containers capped with the
+    note already deleted, throwing away the prior values CONSTRAINTS_APPLIED carries
+    for exactly that repair. Its three siblings in the same `finally` all clear after a
+    successful restore; this one did not, at all four sites.
+    """
+    import inspect
+
+    from rc_repro import cli
+    from rc_repro.services import perf as perfsvc
+
+    for fn in (perfsvc.run_loadtest, perfsvc.run_capacity, cli.loadtest, cli.capacity):
+        src = inspect.getsource(fn)
+        if "constrain_note" not in src:
+            continue
+        name = getattr(fn, "__name__", str(fn))
+        # The clear must be guarded by the problem list, not unconditional.
+        assert "if not _cap_problems:" in src, (
+            f"{name} clears the constraints note unconditionally")
+        assert src.index("_cap_problems = constrain_mod.restore") \
+            < src.index("journal.clear(constrain_note)"), (
+            f"{name} still clears the note before restoring")
+
+
+def test_the_cli_records_the_seed_it_is_about_to_run(monkeypatch, tmp_path):
+    """`cli.up` built `CreateReq(..., seed=False)` because it seeds itself afterwards.
+
+    So the write-ahead note recorded `seed: False` with the profile defaulted, and
+    `create_repro` cleared it before control returned -- which meant the `pending_seed`
+    recovery landed in v0.72.2 covered the GUI and NOT `rc-repro up --seed`, the
+    invocation the README documents. Exactly the scenario lifecycle.py describes:
+    "told the workspace is complete, doctor agrees, and the evidence that anything was
+    missing has been deleted."
+    """
+    from typer.testing import CliRunner
+
+    from rc_repro import cli
+    from rc_repro.services import journal
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    captured: dict = {}
+
+    # The INNER function, so the real `create_repro` runs and actually writes the
+    # write-ahead note -- stubbing `create_repro` itself would mean no note existed to
+    # observe, which is a test that cannot see the thing it is about.
+    def fake_locked(req, emit=None, stream_output=False):
+        captured["req"] = req
+        for e in journal.open_entries():
+            if e.kind == journal.CREATE_UNFINISHED:
+                captured["note"] = dict(e.detail)
+        raise RuntimeError("stop before the CLI seeds")
+
+    monkeypatch.setattr(lc, "_create_repro_locked", fake_locked)
+    CliRunner().invoke(cli.app, ["up", "--version", "8.5.1", "--name", "sd",
+                                 "--seed", "--seed-profile", "standard", "--offline"])
+
+    req = captured.get("req")
+    assert req is not None, "create_repro was never called"
+    assert req.seed is True, "the CLI still hides its seed intent from the service"
+    assert req.seed_profile == "standard", req.seed_profile
+    # `seed_here` keeps the two-phase shape: the CLI runs the seed, so the service
+    # must not, or the workspace would be seeded twice.
+    assert req.seed_here is True, "seed_here not set; create_repro would seed too"
+
+    note = captured.get("note")
+    assert note, "no write-ahead note existed during the create"
+    assert note.get("seed") is True, note
+    assert note.get("seed_profile") == "standard", note
+
+
+def test_create_repro_does_not_seed_when_the_caller_will():
+    """`seed_here` exists so the two front-ends cannot both seed.
+
+    The manifest only ever ADDS, so a double pass makes the readback report rooms
+    holding more than planned and the second attempt collide on names it just created.
+    """
+    import inspect
+
+    from rc_repro.services import lifecycle as lc
+
+    src = inspect.getsource(lc)
+    assert "if req.seed and not req.seed_here:" in src, (
+        "an in-service seed site is not guarded against seed_here")
+    assert src.count("if req.seed and not req.seed_here:") == 3, (
+        f"expected all 3 seed sites guarded, found "
+        f"{src.count('if req.seed and not req.seed_here:')}")
+    assert "if req.seed:\n        result[\"seed\"]" not in src, "an unguarded site remains"
+
+
+def test_a_seed_is_serialised_like_every_other_mutation():
+    """`run_seed_inline` was the only data-mutating operation with no `repro_lock`.
+
+    `create_repro`, `set_state`, `teardown`, `set_env`, `monitor.attach`,
+    `backup.create`, `upgrade.run`, `run_scale` and `clear_scale` all take it; a seed
+    writes the same collections through a different door and took nothing.
+    `run_scale`'s own comment states the rule -- "running it while a backup is dumping
+    would put half of it in the archive" -- and the worse direction is the other one:
+    `_Quiesced` STOPS Rocket.Chat for the dump, so a seed running into it fails
+    mid-manifest and the readback reports faults nobody caused.
+    """
+    import inspect
+
+    from rc_repro.services import lifecycle as lc
+
+    src = inspect.getsource(lc.run_seed_inline)
+    assert "repro_lock" in src, "a seed still races every other mutator"
+    # Reentrant per thread, so `up --seed` (which already holds it) is unaffected.
+    assert "reentrant" in src.lower() or "re-entering" in src.lower()
+
+    # And the seed is pooled: hundreds of REST writes against one workspace.
+    from rc_repro.web import jobs
+    assert jobs._slots_for("seed") is not None, "seed submits unbounded"
+
+
+def test_the_monitor_job_is_pooled_and_the_walk_can_see_it():
+    """`monitor` chose its kind with a ternary, and the pool walk skipped non-constant
+    kinds BY CONSTRUCTION -- with a comment naming this very route as the case it
+    skipped.
+
+    So `monitor` sat outside every pool unnoticed, and `monitorsvc.attach` does a
+    PULLING `runner.up`: Prometheus, Grafana, Loki, an OTel collector and two exporters.
+    N members clicking Monitor was N pulling compose-ups on one engine, which is the
+    failure the pool was added for.
+    """
+    from rc_repro.web import jobs
+
+    for kind in ("monitor", "monitor-off"):
+        assert jobs._slots_for(kind) is not None, f"{kind} is unpooled"
+    # Both resolve to the SAME pool, since they are the same work in two directions.
+    assert jobs._slots_for("monitor") is jobs._slots_for("monitor-off")
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_job_that_dies_of_a_baseexception_does_not_stay_running_forever():
+    """Only `ReproError` and `Exception` were caught.
+
+    So anything else -- a KeyboardInterrupt delivered to the worker thread, a
+    SystemExit from a library, a MemoryError -- left `status` at "running". That is in
+    ACTIVE_STATUSES, so `_evict_locked` can never drop the job, `_trim_results` never
+    releases its result, and the SSE stream never terminates: a browser tab holds the
+    connection open waiting for an event that cannot arrive.
+    """
+    from rc_repro.web import jobs
+
+    reg = jobs.JobManager()
+
+    def boom(emit=None):
+        raise KeyboardInterrupt("delivered to the worker")
+
+    job = reg.submit("ready", boom, label="x")
+    reg.drain(timeout=15.0)
+
+    got = reg.get(job.id)
+    assert got is not None
+    assert got.status not in jobs.ACTIVE_STATUSES, (
+        f"status is {got.status!r} — the job is still active and can never be evicted")
+    assert got.status == "error", got.status
+    assert "KeyboardInterrupt" in (got.error or ""), got.error
+    # The exception is RE-RAISED after being recorded, which is why pytest sees an
+    # unhandled thread exception above: swallowing a BaseException is its own bug, and
+    # the worker thread is ending either way. The warning is the cost of being honest.
+
+
+def test_doctor_never_raises_out_of_a_bad_check_id():
+    """A bare `assert` guarded a published contract.
+
+    `doctor.CHECKS` is the registry of ids `doctor --json` publishes, and `line()`
+    asserted membership. Asserts are stripped under `python -O`, so the guard vanishes
+    exactly where a mis-declared id becomes unnoticeable -- and unstripped it raised
+    AssertionError out of `GET /api/doctor`, which is a 500 and directly contradicts
+    this function's own rule that a check must never break the report.
+    """
+    import inspect
+
+    from rc_repro.services import doctor as doctorsvc
+
+    src = inspect.getsource(doctorsvc.run_checks)
+    assert "assert cid in CHECKS" not in src, "still a bare assert"
+    assert '"preflight"' in src, "no fallback id for an undeclared check"
+    # `preflight` exists for "the report itself could not be assembled", so it is the
+    # honest place for a row whose own id is broken.
+    assert "preflight" in doctorsvc.CHECKS
+
+
+def test_a_private_key_is_never_written_at_the_umask():
+    """`atomic_write` wrote at the umask, and `certs/<host>.key` went through it.
+
+    So the edge's leaf key landed 0644 on a box where `~/.rc-repro` is only tightened to
+    0700 by `serve` or a config save -- neither of which runs on a CLI-only
+    `up --https`. And the local CA key is created by `openssl genrsa -out`, which makes
+    the file at 0666 & ~umask with the chmod landing after it: a real, if brief,
+    world-readable key that can mint a certificate for any name the browser trusts.
+    """
+    import inspect
+    import tempfile
+    from pathlib import Path
+
+    from rc_repro import runner
+    from rc_repro.services import edge as edgesvc
+
+    # The mode is applied to the TEMP file, so the target never exists at the umask
+    # even for an instant.
+    src = inspect.getsource(runner.atomic_write)
+    assert "mode: int | None" in src
+    assert src.index("os.chmod(tmp, mode)") < src.index("os.replace(tmp, path)"), src
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "k.key"
+        runner.atomic_write(target, "secret", mode=0o600)
+        assert oct(target.stat().st_mode)[-3:] == "600", oct(target.stat().st_mode)
+
+    # And the edge passes it for the key but not the certificate, which is public.
+    esrc = inspect.getsource(edgesvc.issue_local_cert)
+    assert 'f"{host}.key", key_pem, mode=0o600' in esrc, esrc[-400:]
+
+    # The CA directory is created 0700 before the key is generated in it.
+    from rc_repro import tls_local
+    csrc = inspect.getsource(tls_local)
+    assert "mkdir(parents=True, exist_ok=True, mode=0o700)" in csrc
+
+
+def test_a_successful_signin_does_not_hand_back_the_whole_throttle_window():
+    """One valid low-privilege credential reset the per-address failure window.
+
+    So an attacker with any working account could sign in between rounds and start each
+    batch of guesses against an admin name from zero. The bound is per address by design
+    -- `services/users.py` cannot refuse on a counter without also refusing correct
+    passwords -- so the reset has to be per address too; it just must not be total.
+    """
+    import rc_repro.web.app as appmod
+
+    with appmod._signin_lock:
+        appmod._signin_fails.clear()
+        appmod._signin_fails["1.2.3.4"] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+    appmod._signin_ok("1.2.3.4")
+    left = appmod._signin_fails.get("1.2.3.4") or []
+    assert left, "a success cleared the entire window"
+    assert len(left) < 6, "a success changed nothing at all"
+    # A legitimate user who mistyped once and then succeeded is unaffected.
+    with appmod._signin_lock:
+        appmod._signin_fails["5.6.7.8"] = [1.0]
+    appmod._signin_ok("5.6.7.8")
+    assert not appmod._signin_fails.get("5.6.7.8")
+    with appmod._signin_lock:
+        appmod._signin_fails.clear()

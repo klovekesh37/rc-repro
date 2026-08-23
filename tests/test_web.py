@@ -130,11 +130,18 @@ def test_reproerror_maps_to_http_status(monkeypatch):
 
 
 def test_validation_error_maps_to_400(monkeypatch):
-    def boom(name, volumes=False, confirm=False, emit=None):
-        raise errors.ValidationError("need confirm")
-    monkeypatch.setattr(lc, "teardown", boom)
+    """Through the REAL refusal rather than a stubbed one.
+
+    This used to stub `lc.teardown` to raise. Teardown is a job now, and a job answers
+    200 with an id -- so the refusal moved to `check_teardown_request`, which runs on
+    the request thread precisely so that a wrong request still gets its status code.
+    Exercising the genuine unconfirmed-volumes path asserts the mapping AND that the
+    check is still reached, which the stub could not.
+    """
+    monkeypatch.setattr(lc, "resolve_name", lambda n: n)
     r = client().delete("/api/repros/x?volumes=true", headers=H)
-    assert r.status_code == 400
+    assert r.status_code == 400, r.text
+    assert "irreversible" in r.json()["error"]
 
 
 def test_create_returns_job_id(monkeypatch):
@@ -967,14 +974,25 @@ def test_compatibility_is_answerable_before_committing(monkeypatch):
                                          "blocked_reason": "downgrade"})
     import rc_repro.web.app as appmod
     monkeypatch.setattr(appmod.runner, "read_meta", lambda n: object())
+    # A bundle NAME, resolved inside the managed directory -- which is what the GUI
+    # sends. `/a.rcbak` used to work here and is now refused: the read side of the
+    # backup API is confined the way the write side always was.
+    inside = str(bk.backups_dir() / "a.rcbak")
     r = client().post("/api/backups/compatibility", headers=H,
-                      json={"bundle": "/a.rcbak", "name": "old"})
-    assert r.status_code == 200
+                      json={"bundle": inside, "name": "old"})
+    assert r.status_code == 200, r.text
     assert r.json()["compatibility"]["allowed"] is False
+
+    # AN OUTSIDE PATH IS REFUSED. Unconfined, this was a filesystem oracle with three
+    # distinguishable answers plus tarfile's error text for any readable .tar.gz.
+    r = client().post("/api/backups/compatibility", headers=H,
+                      json={"bundle": "/etc/passwd", "name": "old"})
+    assert r.status_code == 400, r.text
+    assert "must be inside" in r.json()["error"], r.text
 
     # No target named -> just the manifest, no verdict to give.
     r = client().post("/api/backups/compatibility", headers=H,
-                      json={"bundle": "/a.rcbak"})
+                      json={"bundle": inside})
     assert r.status_code == 200 and r.json()["compatibility"] is None
 
 
@@ -992,10 +1010,16 @@ def test_restore_is_a_job_carrying_its_flags(monkeypatch):
                         force=False, emit=None:
                         seen.update(bundle=bundle, name=name, new=new,
                                     allow_upgrade=allow_upgrade, force=force) or {})
+    inside = str(bk.backups_dir() / "a.rcbak")
     r = client().post("/api/restore", headers=H,
-                      json={"bundle": "/a.rcbak", "new": True, "allow_upgrade": True})
+                      json={"bundle": inside, "new": True, "allow_upgrade": True})
     assert r.status_code == 200 and r.json()["job_id"].startswith("job_")
     assert seen["new"] is True and seen["allow_upgrade"] is True
+
+    # And a path outside the managed directory is refused rather than read.
+    r = client().post("/api/restore", headers=H,
+                      json={"bundle": "/etc/hosts"})
+    assert r.status_code == 400, r.text
 
 
 def test_upgrade_gate_is_a_server_decision(monkeypatch):
@@ -2040,7 +2064,9 @@ def test_help_on_a_colleagues_workspace_stays_open(basic_client, tmp_path, monke
     """Only DESTRUCTION is gated. Covering somebody's ticket is the workflow this
     exists for, so start/stop/logs/seed on their workspace stay allowed."""
     from rc_repro.services import users as usersvc
-    monkeypatch.setattr(lc, "set_state", lambda n, a: None)
+    # `**kw`: set_state takes an emit now, so the route can carry what the
+    # service says -- a Kubernetes start cannot restore the URL and must say so.
+    monkeypatch.setattr(lc, "set_state", lambda n, a, **kw: None)
     usersvc.add("bob", "bobs-good-password", role="member")
     _workspace("alices-box", "alice", tmp_path)
     _as(basic_client, "bob", "bobs-good-password")
@@ -2604,3 +2630,267 @@ def test_settings_publishes_what_each_runtime_costs_and_refuses(monkeypatch, tmp
     assert micro["workspace_mb"] > kube["cost"]["monolith"]["workspace_mb"], \
         "microservices is not a monolith with a label"
     assert micro["cluster_mb"] == lcsvc.CLUSTER_MB, "charged once per machine"
+
+
+def test_the_rest_logs_route_is_kubernetes_aware_like_the_websocket_one(monkeypatch):
+    """The WebSocket log handler dispatches on topology — with a comment saying so —
+    and the REST route seventy lines below it did not.
+
+    So the same Kubernetes workspace in the same GUI had a streaming log view that
+    worked and a REST one that answered compose's "no configuration file provided".
+    Anything using the documented HTTP API got the broken half.
+    """
+    from rc_repro.services import k8s, topology
+    from rc_repro.web import app as webapp
+
+    monkeypatch.setattr(webapp.lc, "resolve_name", lambda n, actor="": "k")
+    monkeypatch.setattr(topology, "of_repro", lambda n: topology.KUBERNETES)
+
+    def _no_compose(*a, **k):
+        raise AssertionError("compose must not be asked about a k8s workspace")
+
+    monkeypatch.setattr(webapp.runner, "compose_stream", _no_compose)
+    monkeypatch.setattr(webapp.runner, "read_meta",
+                        lambda n: type("M", (), {"extra": {"context": "ctx"}})())
+
+    class _Proc:
+        stdout = ["pod line one\n", "pod line two\n"]
+        def wait(self, timeout=None):
+            return 0
+
+    seen = {}
+
+    def _log_process(name, **kw):
+        seen.update(name=name, **kw)
+        return _Proc()
+
+    monkeypatch.setattr(k8s, "log_process", _log_process)
+
+    c = client()
+    r = c.get("/api/repros/k/logs", headers=_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["logs"] == "pod line one\npod line two", r.json()
+    assert seen["context"] == "ctx", seen
+    assert seen["follow"] is False, "the REST route is not a stream"
+
+
+def test_serve_repairs_interrupted_work_at_startup(monkeypatch):
+    """The drain at shutdown is bounded, and a SIGKILL skips it entirely — so the
+    next start is the only chance to put right what the last one was killed in the
+    middle of.
+
+    Asserted through the lifespan, because that is what actually runs it: a
+    `recover()` defined and never called is the shape this whole journal exists to
+    avoid.
+    """
+    from rc_repro.services import journal
+
+    called: list = []
+    monkeypatch.setattr(journal, "recover", lambda *a, **k: called.append(True) or [
+        {"id": "x", "kind": journal.ROCKETCHAT_STOPPED, "workspace": "w",
+         "what": "'w': Rocket.Chat was stopped for a backup", "repaired": True,
+         "why": ""}])
+    with client():
+        pass
+    assert called, "startup must consult the journal"
+
+
+def test_a_failing_recovery_does_not_stop_serve_from_serving(monkeypatch):
+    """A box that cannot be repaired still has to be able to serve. Anything else
+    turns one stuck workspace into an outage of the whole GUI."""
+    from rc_repro.services import journal
+
+    def _explode(*a, **k):
+        raise RuntimeError("cluster unreachable")
+
+    monkeypatch.setattr(journal, "recover", _explode)
+    c = client()
+    assert c.get("/api/health", headers=_auth()).status_code == 200
+
+
+def test_every_engine_heavy_job_kind_lands_in_a_pool():
+    """A job's POOL is chosen by its kind STRING, and the kind string is not the work.
+
+    Two routes submitted engine-heavy work under a label nobody had added to
+    `_HEAVY_KINDS`: "up" calls `lc.create_repro`, the same function as "create", and
+    "rollback" restores a bundle exactly as "restore" does. Both resolved to no pool at
+    all, so N concurrent `POST /api/repros/{name}/up` calls ran N compose-ups at once,
+    past a `check_capacity` each passes independently because none has finished
+    allocating yet. A GUI that retries a failed start reaches that by accident.
+
+    This is the shape of nearly every defect this codebase has shipped: a registry that
+    is correct and is not enforced by a walk. `ROUTE_ROLES` has had one since
+    test_web.py:1534 and has never drifted; the job pools had none. Parsed rather than
+    grepped, because a 26-line grep window straddles route boundaries in app.py and
+    gives the wrong answer -- that mistake was made while finding this.
+    """
+    import ast
+    import pathlib
+
+    from rc_repro.web import jobs
+
+    src = pathlib.Path(jobs.__file__).with_name("app.py").read_text()
+    submits: list[tuple[str, str]] = []
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "submit"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "jobs"):
+            continue
+        if not node.args:
+            continue
+        # A TERNARY IS TWO KINDS, NOT AN OPAQUE ONE. This used to skip anything that
+        # was not an `ast.Constant`, with a comment naming the monitor route as the
+        # case it skipped -- and that route was the one sitting outside every pool.
+        # A skip whose comment names its own blind spot is a blind spot.
+        first = node.args[0]
+        if isinstance(first, ast.Constant):
+            kinds = [str(first.value)]
+        elif (isinstance(first, ast.IfExp)
+              and isinstance(first.body, ast.Constant)
+              and isinstance(first.orelse, ast.Constant)):
+            kinds = [str(first.body.value), str(first.orelse.value)]
+        else:
+            raise AssertionError(
+                f"jobs.submit's kind is {ast.dump(first)[:60]}, which this walk cannot "
+                f"read -- hoist it into a local so the pool can be checked")
+        target = node.args[1] if len(node.args) > 1 else None
+        for k in kinds:
+            submits.append((k, ast.unparse(target) if target else ""))
+
+    assert len(submits) >= 14, f"only found {len(submits)} jobs.submit sites - parser drifted"
+
+    # RULE 1: two kinds submitting the SAME callable must resolve to the same pool.
+    # This is what "up" and "create" violated, and it needs no maintained list.
+    by_target: dict[str, set[str]] = {}
+    for kind, target in submits:
+        if target:
+            by_target.setdefault(target, set()).add(kind)
+    for target, kinds in by_target.items():
+        pools = {id(jobs._slots_for(k)) for k in kinds}
+        assert len(pools) == 1, (
+            f"{target} is submitted as {sorted(kinds)}, which resolve to different "
+            f"pools - the same work must be bounded the same way")
+
+    # RULE 2: work that costs a container engine a whole workspace is pooled. A
+    # maintained list, so adding an unpooled one is a visible decision rather than an
+    # omission; the names are dotted so "run" and "create" cannot collide.
+    engine_heavy = {
+        "lc.create_repro", "backupsvc.create", "backupsvc.restore",
+        "upgradesvc.run", "upgradesvc.rollback", "lc.teardown", "lc.prune",
+        "datasvc.run_scale",
+        # `attach` does a pulling `runner.up` of six containers; `detach` removes them
+        # and their volumes. The ternary above hid this from Rule 1.
+        "monitorsvc.detach if off else monitorsvc.attach",
+        # Hundreds of REST writes against one workspace.
+        "lc.run_seed_inline",
+    }
+    for kind, target in submits:
+        if target in engine_heavy:
+            assert jobs._slots_for(kind) is not None, (
+                f"job kind {kind!r} submits {target}, which costs an engine a whole "
+                f"workspace, and lands in no pool - add it to jobs._HEAVY_KINDS")
+
+
+def test_the_queue_ceiling_counts_the_pool_it_protects_not_the_kind():
+    """`MAX_QUEUED_PER_KIND` counted per KIND against pools shared by many kinds.
+
+    The measurement in jobs.py's own comment -- 40 capacity submissions producing 40
+    live OS threads -- motivated a bound of 32. Counting per kind made the reachable
+    total 3x32 against the measurement pool of 1, so the bound written to stop 40
+    threads permitted 96. `_evict_locked` cannot claw any of it back either: a queued
+    job is correctly counted active, so MAX_JOBS is unenforceable against exactly the
+    jobs this refuses.
+
+    Referenced by the OLD constant name, which survives as an alias, so this asserts
+    the counting BEHAVIOUR rather than the presence of a renamed constant -- failing
+    on `AttributeError` would prove only that a name is new.
+    """
+    import threading as _threading
+
+    from rc_repro.errors import ConflictError
+    from rc_repro.web import jobs
+
+    ceiling = jobs.MAX_QUEUED_PER_KIND
+    reg = jobs.JobManager()
+    blocked = _threading.Event()
+    try:
+        accepted = 0
+        # The three kinds that SHARE the measurement pool, round-robin.
+        for i in range(ceiling * 3 + 8):
+            kind = ("loadtest", "capacity", "benchmark")[i % 3]
+            try:
+                reg.submit(kind, lambda emit=None: blocked.wait(30), label=f"j{i}")
+                accepted += 1
+            except ConflictError:
+                break
+        # One escapes the queue into the single running slot, hence the slack.
+        assert accepted <= ceiling + 2, (
+            f"{accepted} jobs accepted across three kinds sharing one pool, against a "
+            f"ceiling of {ceiling} - the count is per kind, not per pool")
+    finally:
+        blocked.set()
+        reg.drain(timeout=10.0)
+
+
+def test_a_refused_destructive_request_is_answered_not_queued(basic_client, tmp_path,
+                                                              monkeypatch):
+    """A refusal must reach the REQUEST, and must leave no job behind.
+
+    Stop/start/restart, down and prune are jobs now, and a job answers 200 with an id.
+    Validating inside one would turn "that is not an action", "no such workspace" and
+    "that workspace belongs to alice" into a 200 followed by a job the caller has to go
+    and read -- so the cheap checks run on the request thread, and only the work is
+    queued. The same preflight shape v0.70.9 settled on for namespace ownership: a
+    refusal leaves no record.
+    """
+    from rc_repro.services import users as usersvc
+
+    monkeypatch.setattr(lc, "require_docker", lambda: None)
+    usersvc.add("bob", "bobs-good-password", role="member")
+    _workspace("alices-box", "alice", tmp_path)
+    _as(basic_client, "bob", "bobs-good-password")
+
+    # Through the API, because the registry is per-app instance -- and this is the
+    # list a person would open to look for the job that should not be there.
+    before = len(basic_client.get("/api/jobs", headers=_auth()).json()["jobs"])
+    r = basic_client.delete("/api/repros/alices-box?volumes=true&confirm=true",
+                            headers=_auth())
+    assert r.status_code == 409, r.text
+    assert "belongs to alice" in r.json()["error"]
+    assert "job_id" not in r.json(), "a refusal must not hand back a job to watch"
+    after = len(basic_client.get("/api/jobs", headers=_auth()).json()["jobs"])
+    assert after == before, (
+        "a refused destroy queued a job - the ownership gate ran inside the work")
+
+
+def test_a_path_as_a_preset_is_refused_on_the_request_not_inside_the_job(monkeypatch):
+    """Found by driving the create route live, after the escape itself was fixed.
+
+    `presets._user_path` refuses a path, so the escape WAS blocked -- the job failed
+    with a ValidationError and nothing was created. But the caller got `200
+    {"job_id": ...}` and had to open the Activity list to learn the request was wrong on
+    arrival, which is the same mistake `check_state_request` and `check_teardown_request`
+    exist to prevent. And the first attempt at this preflight returned **500**, because
+    `presets` raises plain `ValueError` throughout and the web layer maps `ReproError`
+    only -- so the conversion belongs here, where `_create_repro_locked` already does
+    the same thing at the service boundary.
+    """
+    r = client().post("/api/repros", headers=H,
+                      json={"version": "8.5.1", "preset": "/tmp/anything",
+                            "name": "escapi"})
+    assert r.status_code == 400, r.text
+    assert "not a preset name" in r.json()["error"], r.text
+    assert "job_id" not in r.json(), "a refused create handed back a job to watch"
+
+    for bad in ("../../etc/passwd", "sub/dir", "UPPER"):
+        r = client().post("/api/repros", headers=H,
+                          json={"version": "8.5.1", "preset": bad, "name": "x"})
+        assert r.status_code == 400, (bad, r.status_code, r.text)
+
+    # A REAL preset name still reaches the job, which is the half a blunt fix breaks.
+    monkeypatch.setattr(lc, "create_repro",
+                        lambda req, emit, stream_output=False: {"name": "ok"})
+    r = client().post("/api/repros", headers=H,
+                      json={"version": "8.5.1", "preset": "ldap", "name": "ok"})
+    assert r.status_code == 200 and r.json()["job_id"].startswith("job_"), r.text

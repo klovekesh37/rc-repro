@@ -7,12 +7,14 @@ presets can deep-merge extra services / env / RC patches into it.
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import yaml
 
 from rc_repro import config
+from rc_repro.errors import ValidationError
 from rc_repro.presets import Preset
 
 if TYPE_CHECKING:                      # only for the Spec.tls annotation
@@ -101,7 +103,24 @@ def _rc_environment(spec: Spec) -> dict:
         # (rc-repro also finalizes it over the API on `ready`) and auto-provision
         # the first admin. Presets only add their scenario-specific settings.
         "OVERWRITE_SETTING_Show_Setup_Wizard": "completed",
-        "INITIAL_USER": "yes",
+        # NO `INITIAL_USER`, and its absence is measured rather than assumed. It used
+        # to be here as "yes", and Rocket.Chat parses this one as JSON: every boot of
+        # every workspace logged `Error processing environment variable INITIAL_USER
+        # SyntaxError: Unexpected token 'y', "yes" is not valid JSON`, on both
+        # runtimes, forever -- noise in exactly the artefact a support engineer reads
+        # to find the customer's real problem.
+        #
+        # `true` is what RC's docs use and it is WORSE, which is why this was booted
+        # rather than edited: RC parses it, finds no `_id` on it, and logs `No _id
+        # provided; Ignoring environment variable INITIAL_USER`. One warning traded
+        # for another that says the variable is being ignored.
+        #
+        # Removing it entirely is what works, because the admin never came from it --
+        # ADMIN_USERNAME/ADMIN_PASS/ADMIN_EMAIL below do that. Verified on a fresh
+        # 8.5.1 database with the variable absent: zero INITIAL_USER lines in the log,
+        # login succeeds, /api/v1/me reports roles ['admin'], and Show_Setup_Wizard
+        # reads `completed`. Checked on 6.5.3 too, the oldest series booted for this,
+        # whose log still prints "Inserting admin user:".
         "ADMIN_USERNAME": config.ADMIN_USERNAME,
         "ADMIN_NAME": config.ADMIN_NAME,
         "ADMIN_EMAIL": config.ADMIN_EMAIL,
@@ -389,6 +408,10 @@ def build(spec: Spec) -> dict:
     return doc
 
 
+#: "8000-8005:8000-8005", and the single-sided "8000-8005" form.
+_RANGE_RE = re.compile(r"^\d+-\d+(:\d+(-\d+)?)?$")
+
+
 def _bind_ports(doc: dict, bind: str) -> None:
     """Prefix every published port with the bind host, unless one is already
     given. Applied to ALL services in one pass — RC, multi-instance direct
@@ -396,12 +419,23 @@ def _bind_ports(doc: dict, bind: str) -> None:
     rocketchat-compose `${BIND_IP}:${HOST_PORT}:${PORT}` pattern."""
     if not bind:
         return
-    for svc in doc["services"].values():
+    for name, svc in doc["services"].items():
         ports = svc.get("ports")
         if not ports:
             continue
         out: list[str] = []
         for p in ports:
+            # THE TYPE CHECK COMES FIRST. `str(p)` on compose long syntax gives
+            # "{'target': 80, 'published': 8080}", which contains two colons and so
+            # matched the already-IP-qualified branch below -- the dict's repr was
+            # appended as a ports entry. Any shape that is not a string has to be
+            # recognised before it is stringified.
+            if isinstance(p, dict):
+                long = dict(p)
+                if "published" in long and not long.get("host_ip"):
+                    long["host_ip"] = bind
+                out.append(long)
+                continue
             s = str(p)
             if s.count(":") >= 2:
                 # Already IP-qualified ("127.0.0.1:8025:8025") — prefixing again
@@ -415,8 +449,25 @@ def _bind_ports(doc: dict, bind: str) -> None:
                 # IP::CONTAINER form: an ephemeral host port, still bound to
                 # `bind` rather than every interface.
                 out.append(f"{bind}::{s}")
+            elif _RANGE_RE.match(s):
+                # A PORT RANGE ("8000-8005:8000-8005"). This fell through to the
+                # `else` below and was appended UNCHANGED, so it published on every
+                # interface while `info` and the detail panel both reported the
+                # workspace as loopback-bound: a silent opt-out of the posture
+                # `config.DEFAULT_BIND_HOST`'s own comment describes, on a workspace
+                # running fixed weak credentials. Legal Compose, and reachable through
+                # the custom presets the README documents.
+                out.append(f"{bind}:{s}")
             else:
-                out.append(s)
+                # NOT SILENTLY PASSED THROUGH. Everything above is a shape this
+                # function understands; anything else is a published port it would be
+                # leaving on every interface, which is the one outcome that must never
+                # be the default. Named so the preset author can see what to change.
+                raise ValidationError(
+                    f"port entry {p!r} in service {name!r} is a shape rc-repro cannot "
+                    f"bind to {bind}. Write it as \"HOST:CONTAINER\", a range, or "
+                    f"compose long syntax with `published:` -- leaving it unbound "
+                    f"would publish it on every interface.")
         svc["ports"] = out
 
 

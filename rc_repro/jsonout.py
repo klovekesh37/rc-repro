@@ -101,6 +101,40 @@ PHASES: tuple[str, ...] = (
 #: on the rest, which is the worst of both: a contract that holds until it matters.
 _ACTIVE = False
 
+#: Warnings collected for THIS command's envelope.
+#:
+#: The field has been in the envelope since it was defined and nothing ever wrote to
+#: it: `grep -n 'warnings=' cli.py` returned nothing and all ten `reply()` sites
+#: omitted it. So a caller reading the documented field for the documented purpose got
+#: [] on every command, every time -- including the two cases that most need it.
+#:
+#: `doctor --json` returned `{"ok": true, "warnings": [], "data": {"verdict": "warn",
+#: "counts": {"warn": 6, ...}}}`: six warnings, none of them in `warnings`. And `up
+#: --version 7.0.0` against an existing 8.5.1 workspace reuses it and IGNORES the
+#: version -- which it says loudly in prose and, in JSON, only as an NDJSON progress
+#: event, leaving the envelope `ok: true, warnings: []`. For a tool whose single
+#: purpose is version-matching, a caller following the documented read-the-last-line
+#: strategy saw success.
+_WARNINGS: list[dict] = []
+
+
+def warn_once(code: str, message: str, **detail) -> None:
+    """Add a warning to this command's envelope. Deduplicated by code.
+
+    `code` is the stable half and `message` is prose, exactly as in the error payload,
+    so a caller can branch on the code without matching English.
+    """
+    if any(w.get("code") == code for w in _WARNINGS):
+        return
+    entry = {"code": code, "message": message}
+    if detail:
+        entry["detail"] = dict(detail)
+    _WARNINGS.append(entry)
+
+
+def warnings_so_far() -> list[dict]:
+    return list(_WARNINGS)
+
 
 def activate() -> None:
     """Enter JSON mode for the rest of the process. Idempotent."""
@@ -118,6 +152,7 @@ def json_mode_reset() -> None:
     """Leave JSON mode. For tests only: one real process runs one command, but a
     test process runs many, and a leaked flag would move the next command's prose
     to stderr where nothing is looking for it."""
+    _WARNINGS.clear()
     global _ACTIVE
     _ACTIVE = False
     from rc_repro import ui
@@ -189,8 +224,17 @@ def emit(payload: dict) -> None:
 
 def reply(kind: str, data: Any = None, *, schema_version: int = 1,
           warnings: list[dict] | None = None) -> None:
-    """The success envelope, which must be the last line the command writes."""
-    emit(envelope(kind, data, schema_version=schema_version, warnings=warnings))
+    """The success envelope, which must be the last line the command writes.
+
+    Collected warnings are folded in by DEFAULT, so a call site cannot forget them --
+    which is how the field came to be inert on all ten of them.
+    """
+    collected = warnings_so_far()
+    if warnings:
+        collected += [w for w in warnings
+                      if not any(c.get("code") == w.get("code") for c in collected)]
+    emit(envelope(kind, data, schema_version=schema_version,
+                  warnings=collected or None))
 
 
 def fail(exc: BaseException) -> None:
@@ -280,7 +324,11 @@ def _error_codes() -> list[str]:
 
     def walk(cls: type) -> None:
         code = getattr(cls, "code", None)
-        if code:
+        # `advertised = False` marks a class the hierarchy knows about and this build
+        # never raises. The exclusion above was applied to GATE_CODES and not to the
+        # class that carries them, so the base "GATE" was published regardless -- the
+        # very thing the paragraph above forbids, by the mechanism it describes.
+        if code and getattr(cls, "advertised", True):
             seen.add(code)
         for sub in cls.__subclasses__():
             walk(sub)
@@ -314,6 +362,12 @@ def _commands(app: Any) -> list[dict]:
             flags.extend(d for d in decls if d.startswith("--"))
             if param.name in ("json_out", "json_output"):
                 speaks_json = True
+        # `capabilities` ITSELF. It answers in an envelope and always has -- it has no
+        # `--json` flag because it has no other mode -- so deriving the flag from a
+        # parameter made the one document whose purpose is saying which commands speak
+        # JSON report that this one does not, while speaking it.
+        if name == "capabilities":
+            speaks_json = True
         entry: dict[str, Any] = {"name": (prefix + name).strip(),
                                  "flags": sorted(set(flags)), "json": speaks_json}
         if speaks_json:

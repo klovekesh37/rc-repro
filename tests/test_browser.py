@@ -1649,10 +1649,24 @@ def test_creating_a_kubernetes_workspace_sends_the_axes(serve, page, monkeypatch
         _sign_in(page, s.url)
         page.wait_for_selector("#btn-new")
         sent = []
-        page.route("**/api/repros", lambda route: (
-            sent.append(route.request.post_data),
+
+        # POST ONLY. `page.route` matches every method, and the dashboard polls GET
+        # /api/repros every four seconds (POLL_MS in app.js) -- so a poll landing
+        # first put a GET at sent[0], whose post_data is None, and the assertion below
+        # died on `json.loads(None)` instead of saying anything useful. It also
+        # answered that poll with `{"job_id": "j1"}`, giving the dashboard a nonsense
+        # workspace list mid-test. Rare on an idle box, seen once in a full-suite run
+        # on a loaded one; a test that fails one run in ten teaches people to re-run
+        # rather than read, which is worse than a test that does not exist.
+        def _capture(route):
+            if route.request.method != "POST":
+                route.continue_()
+                return
+            sent.append(route.request.post_data)
             route.fulfill(status=200, content_type="application/json",
-                          body='{"job_id": "j1"}')))
+                          body='{"job_id": "j1"}')
+
+        page.route("**/api/repros", _capture)
         page.click("#btn-new")
         page.wait_for_selector("#create-dialog[open]")
         page.fill("input[name=version]", "8.5.1")
@@ -1666,6 +1680,7 @@ def test_creating_a_kubernetes_workspace_sends_the_axes(serve, page, monkeypatch
             page.wait_for_timeout(100)
 
     assert sent, "the create was never POSTed"
+    assert sent[0] is not None, "a POST with no body reached the route"
     import json as _json
     body = _json.loads(sent[0])
     assert body["runtime"] == "kubernetes", body
@@ -3091,16 +3106,68 @@ def test_a_sidecar_that_keeps_restarting_is_a_fault_on_kubernetes(serve, page, m
         _sign_in(page, s.url)
         page.wait_for_selector("#repros")
         page.click("text=t1234")
-        page.wait_for_selector("#detail .triage .tri")
+        # The OVERVIEW, not a banner: waiting for `.triage .tri` would wait for the
+        # very thing this test says must not appear, and time out instead of asserting.
+        page.wait_for_selector("#detail .dtable, #detail .tabs")
         m = page.evaluate("""() => [...document.querySelectorAll('#detail .triage .tri')].map(
           (t) => [t.querySelector('.tri-t b').textContent,
                   t.querySelector('.tri-t span').textContent])""")
-        assert len(m) == 1, m
-        assert m[0][0] == "rocketchat-ddp-streamer-768f896d7-rpcw9 keeps restarting", m
-        assert "restarted 3×" in m[0][1], m[0][1]
-        assert "presence" not in m[0][1], "one restart is a slow boot, not a fault"
-        page.click("#detail .triage .tri-a button")
-        page.wait_for_selector("#d-body .dtable")
+        # NOT A BANNER ANY MORE, and that is the correction. Every pod here is
+        # `1/1 ready`; ddp-streamer restarted three times while NATS came up, which is
+        # what a normal microservices boot looks like. "keeps restarting" is present
+        # tense, so on a workspace that has served ever since it was simply false --
+        # and a banner that is always there is one nobody reads. Reported from a live
+        # workspace in exactly this state.
+        assert m == [], m
+        # The count is not hidden, only demoted: the server puts "· 3 restarts" in the
+        # pod's status string, so the containers tab still carries it -- which is where
+        # a fact belongs when it is not asking anything of the reader.
+        assert "3 restarts" in d["containers"][1]["status"]
+
+
+def test_a_sidecar_that_is_not_ready_and_restarting_is_still_a_fault(serve, page, monkeypatch):
+    """The other half: dropping the cumulative-count banner must not drop the real
+    crash-loop it was there for. A pod in CrashLoopBackOff is not ready, so `health`
+    tells them apart -- decided by the server, next to the list that defines it."""
+    d = _kube_detail(restarts=0, containers=[
+        {"service": "rocketchat-rocketchat-579c867b87-mwq4w", "state": "running",
+         "status": "1/1 ready", "health": "healthy", "app": True, "restarts": 0},
+        {"service": "rocketchat-ddp-streamer-768f896d7-rpcw9", "state": "running",
+         "status": "CrashLoopBackOff · 7 restarts", "health": "", "app": False,
+         "restarts": 7}])
+    _stub_lifecycle(monkeypatch, d)
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.click("text=t1234")
+        page.wait_for_selector("#detail .triage .tri")
+        m = page.evaluate("""() => [...document.querySelectorAll('#detail .triage .tri')].map(
+          (t) => t.querySelector('.tri-t b').textContent)""")
+        assert m == ["rocketchat-ddp-streamer-768f896d7-rpcw9 keeps restarting"], m
+
+
+def test_a_restart_count_that_climbs_is_a_fault_even_while_ready(serve, page, monkeypatch):
+    """A pod flapping on a slow cycle is ready half the time, so readiness alone would
+    miss it. The count CLIMBING is the honest test -- the same rule the boot watcher in
+    `services/lifecycle.py` already used (`rc >= 2 and rc > seen["restarts"]`).
+
+    Exercised on the rule itself, in the page: a browser test cannot easily make the
+    server answer differently between two polls, and the arithmetic is the part that
+    was wrong.
+    """
+    _stub_lifecycle(monkeypatch, _kube_detail(restarts=0))
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        seen = page.evaluate("""() => [
+          restartsClimbing('w', 'pod', 3),   // first sight: not evidence of anything
+          restartsClimbing('w', 'pod', 3),   // unchanged
+          restartsClimbing('w', 'pod', 4),   // climbing
+          restartsClimbing('w', 'pod', 4)]   // settled again
+        """)
+        assert seen == [False, False, True, False], seen
         assert page.errors == [], page.errors
 
 
@@ -3196,3 +3263,83 @@ def test_the_doctor_chip_goes_red_only_when_nothing_can_run_a_workspace(
         assert "down" in classes["bothDown"], "nothing can run: that is red"
         assert "up" in classes["dockerOnly"]
         assert page.errors == [], page.errors
+
+
+def test_in_progress_shows_only_jobs_that_are(serve, page, monkeypatch):
+    """The tab is labelled "In progress" and rendered every retained job, so finished
+    and failed ones sat under it — making the one question it exists to answer, "is
+    anything running", unanswerable.
+
+    `jobActive` already existed and was already used by the job dialog; this view
+    simply did not consult it.
+    """
+    import json
+
+    _stub_lifecycle(monkeypatch, _fake_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        page.route("**/api/jobs", lambda route: route.fulfill(
+            status=200, content_type="application/json", body=json.dumps({"jobs": [
+                {"id": "j1", "kind": "create", "label": "a", "status": "running"},
+                {"id": "j2", "kind": "backup", "label": "b", "status": "queued"},
+                {"id": "j3", "kind": "create", "label": "c", "status": "done"},
+                {"id": "j4", "kind": "seed", "label": "d", "status": "error"}]})))
+        page.click("#btn-jobs")
+        page.wait_for_selector("#jobs-list")
+        page.wait_for_timeout(400)
+        shown = page.evaluate(
+            """() => [...document.querySelectorAll('#jobs-list .jstatus')]
+                       .map((e) => e.textContent)""")
+        assert sorted(shown) == ["queued", "running"], (
+            shown, page.inner_html("#jobs-list")[:400])
+        assert page.errors == [], page.errors
+
+
+def test_the_gui_has_exactly_one_jobActive_and_the_page_parses(serve, page, monkeypatch):
+    """A second `const jobActive` at module scope is a SyntaxError, and app.js is one
+    module with global state -- so it would not merely break this view, it would leave
+    the WHOLE GUI blank.
+
+    Nearly shipped exactly that while adding the filter above, because a helper of the
+    same name already existed 2800 lines earlier. Asserted on the source as well as by
+    rendering, since a blank page is the symptom and a duplicate declaration is the
+    cause.
+    """
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "rc_repro" / "data" / "webui" / "app.js").read_text()
+    assert src.count("const jobActive") == 1, "duplicate module-scope declaration"
+
+    _stub_lifecycle(monkeypatch, _fake_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        # If the module failed to parse, nothing below would exist.
+        assert page.evaluate("typeof jobActive") == "function"
+        assert page.evaluate("typeof pollJobUntilDone") == "function"
+        assert page.evaluate("typeof apiForm") == "function"
+        assert page.errors == [], page.errors
+
+
+def test_the_stats_poll_discards_another_workspaces_answer(serve, page, monkeypatch):
+    """`docker stats` can take most of a minute while this fires every three seconds,
+    and the response carries no workspace name -- so a poll started for A that lands
+    after the reader clicked B pushed A's CPU onto B's chart. A plausible-looking wrong
+    answer, not a visible glitch.
+
+    Exercised on the guard itself: making a browser deliver two overlapping slow
+    responses in a fixed order is far more fragile than asserting the rule.
+    """
+    _stub_lifecycle(monkeypatch, _fake_detail())
+    usersvc.add("alice", PASSWORD, role="admin")
+    with serve() as s:
+        _sign_in(page, s.url)
+        page.wait_for_selector("#repros")
+        src = page.evaluate("startStats.toString()")
+        assert "inFlight" in src, "a slow poll must not be joined by the next one"
+        assert "asked !== SELECTED" in src, "a late answer for another workspace is discarded"
+        assert "finally" in src, "the guard must be released on every path"

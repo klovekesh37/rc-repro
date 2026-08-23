@@ -66,8 +66,28 @@ def _client() -> dict:
 
 def build(params: dict) -> Preset:
     users = _common.int_param(params, "users", 5)
-    saml_ep = f"http://localhost:{_KC_PORT}/realms/{_KC_REALM}/protocol/saml"
-    descriptor = f"{saml_ep}/descriptor"
+    # THE BROWSER'S ADDRESS FOR THE IdP, not rc-repro's. `entry_point` is the URL the
+    # user's browser is redirected to, and it was hardcoded to `localhost` -- which
+    # names the browser's OWN machine. On a shared box (the deployment this tool now
+    # supports: one `serve` on an EC2 instance, several engineers using the GUI) the
+    # SAML button therefore sent every one of them to port 8081 on their own laptop,
+    # and the browser bounced straight back to the login page having reached nothing.
+    #
+    # Keycloak makes the mismatch unforgiving in the other direction too: it checks
+    # the AuthnRequest's `Destination` against the URL the request actually arrived
+    # on, so reaching the IdP as anything other than what `entry_point` says is
+    # refused with `error="invalid_authn_request" reason="invalid_destination"` --
+    # measured on this box by changing nothing but the hostname. The two must agree,
+    # which is why this is one knob and not a guess.
+    idp_host = _common.str_param(params, "idp_host", "localhost")
+    saml_ep = f"http://{idp_host}:{_KC_PORT}/realms/{_KC_REALM}/protocol/saml"
+    # FETCHED BY rc-repro, so it stays on loopback whatever the browser uses. Same
+    # split as root_url/public_url elsewhere in this codebase: an internal caller and
+    # a browser do not need the same address, and giving the internal one the public
+    # address is how `--set idp_host=<public name>` would break its own cert fetch on
+    # a workspace bound to 127.0.0.1.
+    descriptor = (f"http://localhost:{_KC_PORT}/realms/{_KC_REALM}"
+                  f"/protocol/saml/descriptor")
 
     services = {
         "keycloak": _keycloak.service("./saml/keycloak-realm.json", _KC_PORT),
@@ -96,7 +116,7 @@ def build(params: dict) -> Preset:
         description=(
             f"Keycloak IdP with a generated SAML realm ({users} users user1..user"
             f"{users}, password=username). Click 'Keycloak SSO', log in as "
-            f"user1/user1. Keycloak admin at http://localhost:{_KC_PORT} "
+            f"user1/user1. Keycloak admin at http://{idp_host}:{_KC_PORT} "
             "(admin/admin, realm 'rcrepro')."
         ),
         env=env,
@@ -107,14 +127,23 @@ def build(params: dict) -> Preset:
         files=[("saml/keycloak-realm.json", _keycloak.realm_json([_client()], users))],
         kubernetes_manifests=[_keycloak.manifests(
             _keycloak.realm_json([_client()], users), _KC_PORT)],
-        params_help={"users": "number of Keycloak test users (default 5)"},
+        params_help={"users": "number of Keycloak test users (default 5)",
+                     "idp_host": ("hostname YOUR BROWSER reaches Keycloak on "
+                                  "(default localhost; set it when the browser is "
+                                  "not on this machine)")},
         ports=list(config.PRESET_PORTS["saml"]),
         notes=[
-            f"Keycloak admin console: http://localhost:{_KC_PORT}  (admin / admin)",
+            f"SAML sends your BROWSER to http://{idp_host}:{_KC_PORT} — that address has",
+            "  to resolve and be reachable from wherever the browser is running.",
+            *([] if idp_host != "localhost" else [
+                "  It is 'localhost', so the browser must be on THIS machine. From another",
+                "  machine, re-create with:  --bind 0.0.0.0 --set idp_host=<this host>",
+                "  (Keycloak refuses a request that arrives on any other name.)"]),
+            f"Keycloak admin console: http://{idp_host}:{_KC_PORT}  (admin / admin)",
             f"  Your SAML users live in the '{_KC_REALM}' realm, NOT 'master' (the",
             "  default view). Switch the realm dropdown (top-left) to "
             f"'{_KC_REALM}', or open Users directly:",
-            f"    http://localhost:{_KC_PORT}/admin/master/console/#/{_KC_REALM}/users",
+            f"    http://{idp_host}:{_KC_PORT}/admin/master/console/#/{_KC_REALM}/users",
             "  ('temporary admin' banner on master is normal Keycloak dev mode — ignore it)",
         ],
         post_ready=[

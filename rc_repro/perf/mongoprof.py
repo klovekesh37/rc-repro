@@ -17,8 +17,28 @@ import json
 
 from rc_repro import runner
 
+#: The DEFAULT database, kept only as the fallback when the workspace's own MONGO_URL
+#: cannot be read. `env --set MONGO_URL=...` is a supported and documented override, and
+#: hardcoding this meant the bulk insert (or the profiler) addressed a database
+#: Rocket.Chat was not reading -- reporting `inserted: 50000` while the directory stayed
+#: empty, and `--clear-scale` then reporting it had removed them, so the round trip was
+#: internally consistent and externally wrong. `backup.database_of()` exists for exactly
+#: this reason and says so: "dumping the wrong database would produce an empty backup
+#: that only looks fine."
 DB = "rocketchat"
-_URI = f"mongodb://localhost:27017/{DB}"
+
+
+def _db_of(name: str) -> str:
+    """The database this workspace's Rocket.Chat actually uses."""
+    try:
+        from rc_repro.services.backup import database_of
+        return database_of(name) or DB
+    except Exception:                       # noqa: BLE001 - never fail over a lookup
+        return DB
+
+
+def _uri_for(name: str) -> str:
+    return f"mongodb://localhost:27017/{_db_of(name)}"
 
 
 def _eval(name: str, js: str) -> str | None:
@@ -26,7 +46,7 @@ def _eval(name: str, js: str) -> str | None:
     fallback. Returns stdout, or None if neither shell worked."""
     for shell in ("mongosh", "mongo"):
         rc, out = runner.compose_exec_capture(
-            name, "mongodb", [shell, "--quiet", _URI, "--eval", js])
+            name, "mongodb", [shell, "--quiet", _uri_for(name), "--eval", js])
         if rc == 0 and out.strip():
             return out
     return None
@@ -91,7 +111,7 @@ def collect(name: str, since_epoch_ms: int, limit: int = 5) -> dict | None:
     {total, collscan, slow: [{ns, op, millis, plan, docs, keys, ret, cmd}]}."""
     js = (
         f'var q = {{ts: {{$gte: new Date({int(since_epoch_ms)})}},'
-        f' ns: {{$ne: "{DB}.system.profile"}}}};'
+        f' ns: {{$ne: "{_db_of(name)}.system.profile"}}}};'
         "var docs = db.system.profile.find(q).sort({millis: -1}).limit(200).toArray();"
         "var out = {total: docs.length, collscan: 0, slow: []};"
         "for (var i = 0; i < docs.length; i++) {"

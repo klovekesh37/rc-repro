@@ -27,7 +27,7 @@ _CLIENT_SECRET = "rc-oidc-secret"
 _PROVIDER = "keycloak"   # RC Custom OAuth name -> settings key + /_oauth/keycloak callback
 
 
-def _oidc_client() -> dict:
+def _oidc_client(idp_host: str) -> dict:
     return {
         "clientId": _CLIENT_ID,
         "protocol": "openid-connect",
@@ -36,7 +36,14 @@ def _oidc_client() -> dict:
         "secret": _CLIENT_SECRET,           # pinned so RC's config matches on import
         "standardFlowEnabled": True,        # authorization-code flow
         "directAccessGrantsEnabled": True,
-        "redirectUris": ["http://localhost*", f"http://{_KC_HOST}:{_KC_PORT}/*"],
+        # WHERE KEYCLOAK IS ALLOWED TO SEND THE BROWSER BACK -- which is Rocket.Chat's
+        # own callback, `<Site_Url>/_oauth/keycloak`, and therefore has nothing to do
+        # with the IdP's hostname. `http://localhost*` covers the ordinary case; the
+        # https entry covers a workspace created with `--domain`, whose Site_Url is
+        # `https://<name>.<domain>` and which Keycloak refused outright with "Invalid
+        # parameter: redirect_uri" because no pattern here matched it.
+        "redirectUris": ["http://localhost*", f"http://{idp_host}:{_KC_PORT}/*",
+                         "http://*", "https://*"],
         "webOrigins": ["*"],
         # Keycloak's built-in openid/profile/email scopes already emit
         # preferred_username / email / name / sub — no custom mappers needed.
@@ -45,7 +52,20 @@ def _oidc_client() -> dict:
 
 def build(params: dict) -> Preset:
     users = _common.int_param(params, "users", 5)
-    realm_base = f"http://{_KC_HOST}:{_KC_PORT}/realms/{_KC_REALM}"
+    # ONE hostname for two consumers -- the browser (authorize) and RC's backend
+    # (token/userinfo) -- which is the gotcha this preset's docstring opens with. The
+    # default `keycloak` satisfies the backend over compose DNS and needs a hosts
+    # entry for the browser, and that entry (`127.0.0.1 keycloak`) is only correct
+    # when the browser is on THIS machine. It is not, on the shared-box deployment
+    # this tool now supports, so the popup opened a name that did not resolve and
+    # showed the user a blank window -- reported as "the OIDC page shows nothing".
+    #
+    # Setting this to the host's own address satisfies BOTH and removes the hosts
+    # entry entirely: the browser reaches the published port, and RC's container
+    # reaches the same address over the bridge. It needs `--bind 0.0.0.0`, because
+    # a loopback-bound port is not reachable from either.
+    idp_host = _common.str_param(params, "idp_host", _KC_HOST)
+    realm_base = f"http://{idp_host}:{_KC_PORT}/realms/{_KC_REALM}"
     setting = f"Accounts_OAuth_Custom-{_PROVIDER.capitalize()}"   # Accounts_OAuth_Custom-Keycloak
 
     services = {
@@ -92,21 +112,25 @@ def build(params: dict) -> Preset:
         description=(
             f"Keycloak OIDC IdP (OpenID Connect) with {users} users user1..user"
             f"{users} (password=username). RC logs in via Custom OAuth (popup). "
-            "Click 'Keycloak (OIDC)', sign in as user1/user1. Requires a hosts entry "
-            "(see the note printed on `up`)."
+            "Click 'Keycloak (OIDC)', sign in as user1/user1. "
+            "See the note printed on `up` for how the browser reaches the IdP."
         ),
         env=env,
         services=services,
         depends_on=["keycloak"],
         requires_license=False,
         source="built-in (dynamic)",
-        files=[("oidc/keycloak-realm.json", _keycloak.realm_json([_oidc_client()], users))],
+        files=[("oidc/keycloak-realm.json",
+                _keycloak.realm_json([_oidc_client(idp_host)], users))],
         # The same Keycloak as native resources. One Preset carries both renderings
         # because the intent is identical either way -- see _keycloak.manifests.
         kubernetes_manifests=[_keycloak.manifests(
-            _keycloak.realm_json([_oidc_client()], users), _KC_PORT,
+            _keycloak.realm_json([_oidc_client(idp_host)], users), _KC_PORT,
             http_port=_KC_PORT)],
-        params_help={"users": "number of Keycloak test users (default 5)"},
+        params_help={"users": "number of Keycloak test users (default 5)",
+                     "idp_host": ("hostname BOTH your browser and Rocket.Chat reach "
+                                  "Keycloak on (default 'keycloak', which needs a "
+                                  "hosts entry and only works on this machine)")},
         ports=list(config.PRESET_PORTS["oidc"]),
         post_ready=[
             {"action": "keycloak_master_ssl_off", "service": "keycloak", "port": _KC_PORT},
@@ -114,11 +138,20 @@ def build(params: dict) -> Preset:
             # env, since the provider's settings don't exist until it's created).
             {"action": "create_oauth_provider", "name": _PROVIDER.capitalize(), "settings": oauth_settings},
         ],
-        notes=[
+        notes=([
             "OIDC needs one host entry so your browser can reach Keycloak at the",
             "same URL RC's backend uses. Add this line to /etc/hosts (needs sudo):",
             "    127.0.0.1  keycloak",
+            "  That entry points at THIS machine, so the browser has to be on it. From",
+            "  another machine, re-create with:  --bind 0.0.0.0 --set idp_host=<this host>",
+            "  which needs no hosts entry at all.",
             "Then log in via 'Keycloak (OIDC)' as user1 / user1.",
-            f"Keycloak admin console: http://{_KC_HOST}:{_KC_PORT}  (admin/admin, realm '{_KC_REALM}').",
+        ] if idp_host == _KC_HOST else [
+            f"Your browser AND Rocket.Chat both reach Keycloak at http://{idp_host}:{_KC_PORT}.",
+            "  No hosts entry is needed, but the workspace must be bound wide enough",
+            "  for both to get there (`--bind 0.0.0.0`).",
+            "Log in via 'Keycloak (OIDC)' as user1 / user1.",
+        ]) + [
+            f"Keycloak admin console: http://{idp_host}:{_KC_PORT}  (admin/admin, realm '{_KC_REALM}').",
         ],
     )

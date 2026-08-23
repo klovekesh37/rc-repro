@@ -2499,10 +2499,18 @@ def test_a_state_change_is_never_served_from_the_memo(monkeypatch):
 
 
 def test_docker_available_is_memoised_but_forcible(monkeypatch):
+    """Opts OUT of conftest's engine stub, because this tests the stubbed function.
+
+    `_deterministic_engine` replaces `docker_available` so the suite's result does not
+    depend on whether this machine has a docker binary. That is exactly what must not
+    happen here: the memoisation being tested belongs to the real one.
+    """
     import subprocess
 
     from rc_repro import runner
 
+    monkeypatch.undo()                  # drop the autouse stub, keep the fixture's home
+    monkeypatch.setenv("RC_REPRO_HOME", "/tmp/rc-repro-memo-test")
     runner.invalidate_docker_queries()
     calls = []
 
@@ -2590,18 +2598,40 @@ def test_the_cli_reports_a_down_engine_as_preflight_not_as_a_bug(monkeypatch, tm
 
     It delegates to the service now, so the class decides. The service test covers
     the class; this covers the delegation, which is the behaviour a script sees.
+
+    THE WORKSPACE HAS TO EXIST. This used `--name anything` on an empty home, which
+    worked only while the engine was checked before the name was resolved. The gate is
+    runtime-aware now -- it cannot know which engine to ask for until it knows what it
+    is being asked about -- so a name that resolves to nothing exercises the resolver
+    and never reaches the engine at all.
     """
+    import json as _json
+
     from typer.testing import CliRunner
 
     from rc_repro import cli, runner as runner_mod
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    ws = tmp_path / "repros" / "w"
+    ws.mkdir(parents=True)
+    (ws / "repro.json").write_text(_json.dumps({
+        "name": "w", "project": "p", "rc_version": "8.5.1", "rc_image": "i",
+        "mongo_tag": "8.0", "mongo_flavor": "official", "preset": "default",
+        "root_url": "http://localhost:3001", "host_port": 3001,
+        "version_source": "x", "extra": {}}))
     monkeypatch.setattr(runner_mod, "docker_available", lambda **_k: False)
-    res = CliRunner().invoke(cli.app, ["logs", "--name", "anything"])
+    res = CliRunner().invoke(cli.app, ["logs", "--name", "w"])
     assert res.exit_code == 3, f"engine down exited {res.exit_code}, expected 3"
     # ...and specifically not 5, which would tell a script to keep polling for
     # something polling cannot fix.
     assert res.exit_code != 5
+
+    # And a name that does not exist is NOT_FOUND, not ENGINE_UNAVAILABLE. Pinned
+    # deliberately rather than left as a side effect of the ordering: "Docker isn't
+    # running" is a worse answer than "no such workspace" when the real problem is a
+    # typo, and `resolve_name` reads repro.json without asking any engine anything.
+    missing = CliRunner().invoke(cli.app, ["logs", "--name", "nope"])
+    assert missing.exit_code == 4, f"missing workspace exited {missing.exit_code}"
 
 
 def test_the_rocketchat_service_has_a_healthcheck():
@@ -3300,3 +3330,496 @@ def test_a_discussion_that_lost_its_anchor_is_a_fault():
     verdict = seed.verify(plan, facts)
     assert verdict["ok"] is False
     assert verdict["faults"][0]["room"] == anchored.name
+
+
+def test_the_idp_presets_send_the_browser_to_a_host_it_can_reach():
+    """`entry_point` and the OIDC `url` are followed by the BROWSER, and both were
+    hardcoded to a name that means "this machine".
+
+    On a shared box -- one `serve` on a server, several engineers using the GUI --
+    `localhost:8081` and `keycloak:8085` name each visitor's own laptop. The SAML
+    button reached nothing and the browser returned to the login page; the OIDC popup
+    opened a name that did not resolve and rendered blank. Neither logged anything.
+
+    Keycloak makes it unforgiving in the other direction as well: it compares the
+    AuthnRequest's Destination with the URL the request arrived on and refuses a
+    mismatch with `invalid_authn_request` / `invalid_destination` -- measured against
+    a live workspace by changing nothing but the hostname. So one knob moves both.
+    """
+    from rc_repro import presets
+
+    saml = presets.load("saml", {"idp_host": "rc.example.com"})
+    entry = saml.env["OVERWRITE_SETTING_SAML_Custom_Default_entry_point"]
+    assert entry == "http://rc.example.com:8081/realms/rcrepro/protocol/saml", entry
+    slo = saml.env["OVERWRITE_SETTING_SAML_Custom_Default_idp_slo_redirect_url"]
+    assert slo == entry, "SSO and SLO are the same endpoint; they must move together"
+
+    # The DESCRIPTOR is fetched by rc-repro itself, not the browser, so it stays on
+    # loopback -- otherwise `--set idp_host=<public name>` breaks its own cert fetch
+    # on a workspace whose ports are bound to 127.0.0.1.
+    cert = [a for a in saml.post_ready if a["action"] == "saml_idp_cert"][0]
+    assert cert["descriptor_url"].startswith("http://localhost:8081/"), cert
+
+    oidc = presets.load("oidc", {"idp_host": "rc.example.com"})
+    prov = [a for a in oidc.post_ready if a["action"] == "create_oauth_provider"][0]
+    url = prov["settings"]["Accounts_OAuth_Custom-Keycloak-url"]
+    assert url == "http://rc.example.com:8085/realms/rcrepro", url
+
+    # Default unchanged: a laptop workspace keeps working exactly as before.
+    assert "localhost:8081" in presets.load("saml", {}).env[
+        "OVERWRITE_SETTING_SAML_Custom_Default_entry_point"]
+    assert "keycloak:8085" in presets.load("oidc", {}).post_ready[1][
+        "settings"]["Accounts_OAuth_Custom-Keycloak-url"]
+
+
+def test_the_oidc_realm_accepts_the_callback_of_an_https_workspace():
+    """`--preset oidc --domain x.example.com` gave Rocket.Chat a Site_Url of
+    `https://x.example.com` and a Keycloak client that allowed only
+    `http://localhost*` back.
+
+    Keycloak refuses an unlisted callback outright -- "Invalid parameter:
+    redirect_uri" -- so the combination could never have worked, and nothing refused
+    it at create time either. The callback is Rocket.Chat's own
+    `<Site_Url>/_oauth/keycloak` and has nothing to do with the IdP's hostname, so
+    the patterns have to cover both schemes.
+    """
+    import json
+
+    from rc_repro import presets
+
+    realm = json.loads(presets.load("oidc", {}).files[0][1])
+    uris = realm["clients"][0]["redirectUris"]
+    assert any(u.startswith("https://") for u in uris), uris
+    assert any(u.startswith("http://") for u in uris), uris
+
+
+def test_a_generated_page_for_the_browser_gets_the_advertised_url(tmp_path, monkeypatch):
+    """`{{ROOT_URL}}` substituted the loopback URL even when the caller gave a real one.
+
+    `meta.root_url` is deliberately `http://localhost:<port>` -- the address rc-repro's
+    own API calls use -- and `public_url` is set only by TLS, so `--root-url
+    http://box:3007` reached the compose ROOT_URL and nothing else. The livechat
+    preset's demo page uses this placeholder to load Rocket.Chat's widget script, so
+    on any machine but the docker host it fetched that script from the visitor's own
+    localhost and the widget silently never appeared.
+    """
+    from rc_repro import runner
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    meta = runner.Metadata(name="w", project="rcrepro-w", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="livechat", root_url="http://localhost:3007",
+                           host_port=3007, version_source="t")
+    meta.extra["advertised_url"] = "http://box.example.com:3007"
+    runner.write("w", "services: {}\n", meta,
+                 files=[("livechat/index.html", "src='{{ROOT_URL}}/livechat'")])
+    page = (runner.workspace("w") / "livechat" / "index.html").read_text()
+    assert "http://box.example.com:3007/livechat" in page, page
+    assert "localhost" not in page, page
+
+    # With nothing advertised the loopback URL is still right, and still used.
+    plain = runner.Metadata(name="p", project="rcrepro-p", rc_version="8.5.1",
+                            rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                            preset="livechat", root_url="http://localhost:3008",
+                            host_port=3008, version_source="t")
+    runner.write("p", "services: {}\n", plain,
+                 files=[("livechat/index.html", "src='{{ROOT_URL}}/livechat'")])
+    assert "http://localhost:3008/livechat" in (
+        runner.workspace("p") / "livechat" / "index.html").read_text()
+
+
+def test_presigned_minio_can_be_addressed_by_the_browser_without_a_hosts_entry():
+    """A presigned URL is followed by the BROWSER, and `minio` resolved for it only
+    through a `127.0.0.1 minio` hosts line — which names whichever machine the
+    browser is on.
+
+    Same silent shape as the saml/oidc buttons: on a shared install the entry is
+    right and the previews still break, because loopback is not this box from over
+    there. Proxy mode is untouched — there Rocket.Chat streams the bytes and the
+    browser never contacts MinIO at all, so `minio:9000` over the compose network is
+    the more reliable answer and stays the default.
+    """
+    from rc_repro import presets
+
+    key = "OVERWRITE_SETTING_FileUpload_S3_BucketURL"
+    assert presets.load("s3_minio", {}).env[key] == "http://minio:9000"
+    assert presets.load("s3_minio", {"presigned": "1"}).env[key] == "http://minio:9000"
+
+    moved = presets.load("s3_minio", {"presigned": "1", "s3_host": "box.example.com"})
+    assert moved.env[key] == "http://box.example.com:9000", moved.env[key]
+    # And it stops telling the reader to add a hosts entry it no longer needs.
+    body = " ".join(moved.notes)
+    assert "127.0.0.1  minio" not in body, body
+    assert "no hosts entry is needed" in body, body
+
+    # Proxy mode says nothing about presigned URLs either way.
+    plain = " ".join(presets.load("s3_minio", {}).notes)
+    assert "proxied through RC" in plain, plain
+
+
+def test_two_processes_updating_config_do_not_lose_each_others_keys(tmp_path):
+    """`_CONFIG_LOCK` is a `threading.Lock`, which says nothing about a second
+    process — and two are the normal case: `rc-repro serve` runs continuously while
+    somebody uses the CLI on the same box. Both read config.yaml, each mutates a
+    different key, both write, and the later `os.replace` silently wins.
+
+    Atomic replacement prevents a torn FILE, never a lost UPDATE. Made deterministic
+    rather than probabilistic: each child holds the read-modify-write window open for
+    half a second, so without a cross-process lock the loss is certain, not likely.
+    """
+    import os
+    import subprocess
+    import sys
+
+    import yaml
+
+    env = {**os.environ, "RC_REPRO_HOME": str(tmp_path)}
+    prog = (
+        "import time\n"
+        "from rc_repro import config\n"
+        "def mutate(cfg):\n"
+        "    time.sleep(0.5)\n"
+        "    cfg[%r] = 1\n"
+        "config.update_config(mutate)\n"
+    )
+    procs = [subprocess.Popen([sys.executable, "-c", prog % key], env=env)
+             for key in ("key_from_a", "key_from_b")]
+    for p in procs:
+        assert p.wait(timeout=60) == 0
+
+    cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    assert cfg.get("key_from_a") == 1, cfg
+    assert cfg.get("key_from_b") == 1, cfg
+
+
+def test_the_state_directory_and_config_do_not_depend_on_the_umask(tmp_path):
+    """`serve` tightens an existing loose home and `doctor` reports one, but neither
+    runs on a pure-CLI box — and this directory also holds the audit log, the
+    accounts file and the ACME material.
+
+    config.yaml itself holds no secret (`reg_token` is env/flag only and is never
+    persisted), so this is depth rather than a fix for an exposure.
+    """
+    import os
+    import stat
+
+    from rc_repro import config
+
+    home = tmp_path / "fresh"
+    os.environ["RC_REPRO_HOME"] = str(home)
+    try:
+        config.save_config({"bind_host": "127.0.0.1"})
+        assert stat.S_IMODE(home.stat().st_mode) == 0o700, oct(home.stat().st_mode)
+        mode = stat.S_IMODE((home / "config.yaml").stat().st_mode)
+        assert mode == 0o600, oct(mode)
+    finally:
+        os.environ.pop("RC_REPRO_HOME", None)
+
+
+def test_capacity_says_which_runtime_its_room_is_denominated_in():
+    """`room` divided by WORKSPACE_MB (1100) and was reported as the machine's
+    capacity whatever runtime the reader was about to use.
+
+    A Kubernetes microservices workspace costs 2400 plus 600 for a control plane, which
+    `runtime_cost` already knows and `capacity()` was never told. Observed in the same
+    minute: doctor saying "4128 MB available — room for about 1 more workspace" and
+    `up --runtime kubernetes` exiting 3 with "needs about 2400 MB and only 2144 MB is
+    free to use" -- exactly the disagreement `capacity()`'s own docstring says the one
+    formula exists to prevent.
+    """
+    from rc_repro import runner
+    from rc_repro.services import lifecycle as lc
+
+    real = runner.host_memory
+    try:
+        runner.host_memory = lambda: (16000, 12000, 0)
+        cap = lc.capacity()
+    finally:
+        runner.host_memory = real
+
+    assert cap["known"] is True
+    assert cap["room_denominated_in"] == "docker", cap
+    rooms = cap["room_by_runtime"]
+    assert set(rooms) == {"docker", "kubernetes-monolith", "kubernetes-microservices"}
+    # Strictly fewer of the expensive ones, which is the whole point.
+    assert rooms["docker"] > rooms["kubernetes-monolith"] >= rooms["kubernetes-microservices"], rooms
+    # And `room` keeps its old meaning for the three existing consumers.
+    assert cap["room"] == rooms["docker"], cap
+
+
+def test_a_never_released_version_is_not_resolved_silently():
+    """`versions 99.99.99` exited 0 with a confident pairing.
+
+    `_resolve_online` returned None for ANY non-200 -- a 404 from a reachable endpoint
+    and an unreachable endpoint alike -- so a typo fell through to the curated map,
+    matched a rule for the series, and produced a clean answer for a release that does
+    not exist. `8.5.1-rc.1` did the same. A caller who gets that then spends ten
+    minutes on a failing image pull.
+    """
+    from rc_repro import versions
+
+    res = versions.resolve("99.99.99")
+    assert res.mongo_tag, "no pairing at all would be a different bug"
+    assert res.source == "map (no such release)", res.source
+    assert "has no 99.99.99" in res.note, res.note
+    # An OFFLINE resolve cannot have asked, so it must not claim the release is absent.
+    off = versions.resolve("99.99.99", offline=True)
+    assert off.source == "map (fallback)", off.source
+    assert "has no" not in off.note, off.note
+
+
+def test_the_compatible_mongo_note_says_which_end_it_took():
+    """`_highest` picks the newest compatible MongoDB, and for a support reproduction
+    the interesting one is usually the customer's -- which for an older Rocket.Chat is
+    usually the OLDEST supported.
+
+    RC 4.8.7 offers 3.6,4.0,4.2,4.4,5.0: the live lookup resolves 5.0 while the shipped
+    versions.yaml rule gives 4.4 with the note "needs MONGO_OPLOG_URL". So `up -v 4.8.7`
+    and `up -v 4.8.7 --offline` pair a different MongoDB MAJOR, and one of them changes
+    whether the oplog path is exercised at all. Which end was taken is said now; which
+    end is CHOSEN is unchanged, because changing it would repair one class of
+    reproduction and break another.
+    """
+    from rc_repro import versions
+
+    assert versions._lowest(["3.6", "4.0", "4.4", "5.0"]) == "3.6"
+    assert versions._highest(["3.6", "4.0", "4.4", "5.0"]) == "5.0"
+    # Unparseable tags are skipped rather than crashing the lookup.
+    assert versions._lowest(["latest", "4.4"]) == "4.4"
+    assert versions._lowest([]) is None
+
+
+def test_a_preset_name_cannot_be_a_path(tmp_path, monkeypatch):
+    """`--preset /tmp/x` read /tmp/x.yaml, and the presets directory was never consulted.
+
+    `config.preset_dir() / f"{name}.yaml"` LOOKS like it confines the lookup and does
+    not: pathlib's `/` discards the left operand when the right is absolute. No `..`
+    and no existing presets directory needed.
+
+    It matters because a preset is a container spec -- its `services:` is deep-merged
+    into the compose document -- so any readable YAML on the box became an arbitrary
+    image with arbitrary bind mounts. Reproduced with `volumes: ["/:/host:ro"]`. And
+    `preset` is not in `PRIVILEGED_CREATE_FIELDS`, so `POST /api/repros` is member+:
+    on the shared server the README warns about, any member could hand the serve
+    process a container spec. Two lesser consequences: naming another workspace's
+    `docker-compose.yml` pulled its Keycloak/MinIO/LDAP and their credentials into one
+    of yours, and the three distinguishable errors made the create dialog a filesystem
+    oracle.
+    """
+    from rc_repro import config, presets
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    outside = tmp_path.parent / "escape-probe.yaml"
+    outside.write_text("name: escaped\nservices:\n  evil: {image: alpine:3}\n")
+
+    for bad in (str(outside)[:-5], "/etc/passwd", "../../etc/passwd",
+                "sub/dir", "back\\slash", ".hidden", "-leading", "UPPER", ""):
+        try:
+            presets._user_path(bad)
+        except ValueError as exc:
+            assert "not a preset name" in str(exc) or "outside" in str(exc), (bad, exc)
+        else:
+            raise AssertionError(f"{bad!r} was accepted as a preset name")
+
+    # And a real name still resolves inside the presets directory, which is the half a
+    # blunt fix would break.
+    for good in ("ldap", "my-preset_2", "s3-minio", "x1"):
+        got = presets._user_path(good)
+        assert got.parent == config.preset_dir(), (good, got)
+        assert got.name == f"{good}.yaml"
+
+    # Through the public entry point too: `load` must not read the outside file.
+    try:
+        presets.load(str(outside)[:-5])
+    except ValueError as exc:
+        assert "not a preset name" in str(exc), exc
+    else:
+        raise AssertionError("load() still reads a path")
+
+
+def test_one_unreadable_preset_file_does_not_empty_the_catalog(tmp_path, monkeypatch):
+    """`raw.get("name")` on a list or scalar is an AttributeError, not a ReproError.
+
+    So one malformed file in the presets directory took out `rc-repro presets`,
+    `/api/presets` and the create dialog -- and made `capabilities` report ZERO
+    presets, because it guards its own call with a bare `except Exception` and the
+    failure became silence. A file somebody is halfway through writing must not do
+    that.
+    """
+    from rc_repro import presets
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    (tmp_path / "presets").mkdir(parents=True)
+    (tmp_path / "presets" / "broken.yaml").write_text("- a\n- b\n")
+    (tmp_path / "presets" / "scalar.yaml").write_text("just-a-string\n")
+    (tmp_path / "presets" / "fine.yaml").write_text("name: fine\nenv: {}\n")
+
+    got = {p.name: p for p in presets.list_presets()}
+
+    assert "fine" in got and not got["fine"].error
+    # The built-ins survive, which is the whole point.
+    assert "ldap" in got and "saml" in got, sorted(got)
+    # And the bad ones are NAMED rather than missing.
+    assert got["broken"].error and "not a mapping" in got["broken"].error
+    assert got["scalar"].error
+
+    # _parse itself raises a ValueError the front-ends already render.
+    try:
+        presets._parse("- a\n", source="x")
+    except ValueError as exc:
+        assert "not a mapping" in str(exc), exc
+    else:
+        raise AssertionError("a list parsed as a preset")
+
+
+def test_every_published_port_shape_is_bound_and_the_unknown_is_refused():
+    """`_bind_ports` fell through to `out.append(s)` for anything it could not parse.
+
+    Two legal Compose shapes hit that. A port RANGE ("8000-8005:8000-8005") was appended
+    UNCHANGED, so it published on every interface while `info` and the detail panel both
+    reported the workspace as loopback-bound -- a silent opt-out of the posture
+    `config.DEFAULT_BIND_HOST`'s own comment describes, on a workspace running fixed weak
+    credentials. And long syntax ({'target': 80, 'published': 8080}) was stringified into
+    its own repr, because `str(dict)` contains two colons and matched the
+    already-IP-qualified branch.
+
+    Reachable through the custom presets the README documents. No built-in preset uses
+    either shape today, which is why it was latent rather than reported.
+    """
+    from rc_repro import compose
+    from rc_repro.errors import ValidationError
+
+    doc = {"services": {
+        "range": {"ports": ["8000-8005:8000-8005"]},
+        "long": {"ports": [{"target": 80, "published": 8080}]},
+        "plain": {"ports": ["9000:9000"]},
+        "bare": {"ports": ["8025"]},
+        "already": {"ports": ["127.0.0.1:1:1"]},
+        "unpublished": {"ports": [{"target": 80}]},
+    }}
+    compose._bind_ports(doc, "127.0.0.1")
+    got = {k: v["ports"] for k, v in doc["services"].items()}
+
+    assert got["range"] == ["127.0.0.1:8000-8005:8000-8005"], got["range"]
+    assert got["long"] == [{"target": 80, "published": 8080,
+                            "host_ip": "127.0.0.1"}], got["long"]
+    assert got["plain"] == ["127.0.0.1:9000:9000"]
+    assert got["bare"] == ["127.0.0.1::8025"]
+    assert got["already"] == ["127.0.0.1:1:1"], "an IP-qualified entry was double-bound"
+    # A target with no `published` is not on the host at all, so there is nothing to bind.
+    assert got["unpublished"] == [{"target": 80}]
+
+    # AND AN UNKNOWN SHAPE IS REFUSED, not silently left on every interface. "Unbound"
+    # must never be the fallback for "I did not understand this".
+    try:
+        compose._bind_ports({"services": {"weird": {"ports": [["a", "b"]]}}},
+                            "127.0.0.1")
+    except ValidationError as exc:
+        assert "weird" in str(exc), exc
+        assert "every interface" in str(exc), exc
+    else:
+        raise AssertionError("an unparseable port entry was accepted")
+
+
+def test_scale_and_the_profiler_use_the_workspace_s_own_database():
+    """Both hardcoded `DB = "rocketchat"` and a localhost URI built from it.
+
+    `env --set MONGO_URL=...` is supported and documented, and `backup.database_of()`
+    exists for exactly this reason -- its docstring says "dumping the wrong database
+    would produce an empty backup that only looks fine". On an overridden workspace
+    `seed --scale users=50000` inserted into a database Rocket.Chat was not reading,
+    reported `inserted: 50000`, and left the directory empty; `--clear-scale` then
+    reported removing them, so the round trip was internally consistent and externally
+    wrong. Same for `--diag`'s slow-query capture.
+    """
+    from rc_repro import scaleseed
+    from rc_repro.perf import mongoprof
+    from rc_repro.services import backup as bk
+
+    for mod in (scaleseed, mongoprof):
+        assert hasattr(mod, "_db_of"), f"{mod.__name__} still hardcodes its database"
+        assert hasattr(mod, "_uri_for"), f"{mod.__name__} still hardcodes its URI"
+        assert not hasattr(mod, "_URI"), f"{mod.__name__} kept the hardcoded URI"
+        # And it reads through the one function that already answers this question.
+        import inspect
+        assert "database_of" in inspect.getsource(mod._db_of)
+
+    # The fallback is still the default, so a workspace whose compose cannot be read
+    # behaves as before rather than failing.
+    assert scaleseed._db_of("no-such-workspace") == scaleseed.DB
+    assert bk.database_of.__doc__ and "MONGO_URL" in bk.database_of.__doc__
+
+
+def test_prune_acts_only_on_what_the_prompt_showed(monkeypatch, tmp_path):
+    """`cli.prune` computed `prunable()` for the prompt and `prune()` recomputed it
+    after the answer.
+
+    So on a shared box a workspace that went `down` while somebody read the prompt was
+    deleted without ever appearing on screen -- and the ownership gate does not help,
+    because with the default `owner` policy an admin passes for everybody. README says
+    "`prune` lists what it will delete".
+    """
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    # `a` was shown; `b` appeared afterwards.
+    monkeypatch.setattr(lc, "prunable", lambda: ["a", "b"])
+    monkeypatch.setattr(lc, "orphan_namespaces", lambda *a, **k: [])
+    monkeypatch.setattr(lc, "_reclaim_cluster", lambda *a, **k: False)
+    removed: list = []
+    monkeypatch.setattr(lc.runner, "down", lambda n, volumes=False: removed.append(n) or 0)
+    monkeypatch.setattr(lc.runner, "remove", lambda n: None)
+    monkeypatch.setattr(lc, "_clear_default_if", lambda n: None)
+    monkeypatch.setattr(lc.auditsvc, "record", lambda *a, **k: None)
+    said: list = []
+
+    res = lc.prune(confirm=True, only=["a"], emit=lambda ev: said.append(ev.message))
+
+    assert res["targets"] == ["a"], res["targets"]
+    assert "b" not in removed, f"pruned {removed}, which includes one nobody was shown"
+    assert any("became prunable after the list was shown" in m for m in said), said
+
+
+def test_the_optional_extras_are_present_when_ci_says_they_must_be():
+    """Both optional extras hide their own absence, and nothing failed when they did.
+
+    `tests/test_web.py` `importorskip`s itself without `[gui]` and `tests/test_browser.py`
+    does the same without `[browser]` + a chromium binary. That is right for a developer
+    without a browser and wrong for CI, where `pytest -q` prints "808 passed, 264
+    skipped" and exits 0 -- green for a GUI nobody rendered. It is the exact state that
+    let a broken same-origin form POST ship while 570 HTTP tests passed, and CLAUDE.md
+    and the README both warn about it in prose with no mechanical guard anywhere.
+
+    Gated on an env var CI sets, so a developer without chromium keeps today's skips and
+    the pipeline cannot silently under-install.
+    """
+    import os
+
+    import pytest as _pytest
+
+    if os.environ.get("RC_REPRO_REQUIRE_EXTRAS") != "1":
+        _pytest.skip("set RC_REPRO_REQUIRE_EXTRAS=1 to require the extras (CI does)")
+
+    missing = []
+    try:
+        import fastapi           # noqa: F401
+        import multipart         # noqa: F401
+    except ImportError as exc:
+        missing.append(f"[gui]: {exc}")
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        missing.append(f"[browser]: {exc}")
+    else:
+        # The PACKAGE is not the browser. Without the binary, `launch()` raises and
+        # test_browser.py errors rather than skipping -- better than a skip, and still
+        # not something CI should discover halfway through.
+        try:
+            with sync_playwright() as pw:
+                pw.chromium.launch(headless=True).close()
+        except Exception as exc:  # noqa: BLE001
+            missing.append(f"chromium binary: {str(exc).splitlines()[0][:120]}")
+
+    assert not missing, (
+        "RC_REPRO_REQUIRE_EXTRAS=1 but the suite would have skipped whole layers:\n  "
+        + "\n  ".join(missing))

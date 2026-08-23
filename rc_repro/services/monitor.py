@@ -152,7 +152,9 @@ def _detach_kubernetes(target: str, emit: Emit = null_emit) -> dict:
     removed = k8s.remove_monitoring(context=context, emit=emit)
     pid = (m.extra or {}).get("grafana_pid")
     if pid:
-        lifecycle._stop_port_forward(int(pid))
+        # The Grafana forward lives in the SHARED monitoring namespace, not the
+        # workspace's -- so that is the identity to prove before signalling a pid.
+        lifecycle._stop_port_forward(int(pid), namespace=k8s.MONITORING_NAMESPACE)
     runner.update_meta(m.name, lambda meta: [meta.extra.pop(k, None) for k in
                                              ("monitoring", "monitoring_ports",
                                               "grafana_pid")])

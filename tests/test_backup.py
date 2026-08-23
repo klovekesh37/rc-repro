@@ -1444,7 +1444,11 @@ def test_backup_leaves_a_kubernetes_workspace_reachable_on_its_own_port(
     killed: list[int] = []
     monkeypatch.setattr(k8s, "scale_rocketchat",
                         lambda n, *, replicas, context: scaled.append(replicas) or 0)
-    monkeypatch.setattr(bk.lifecycle, "_stop_port_forward", killed.append)
+    # `**kw`: `_stop_port_forward` takes the namespace now, because "is this a
+    # kubectl port-forward" was liveness dressed as identity and a recycled pid
+    # belonging to another workspace passed it.
+    monkeypatch.setattr(bk.lifecycle, "_stop_port_forward",
+                        lambda pid, **kw: killed.append(pid))
     with bk._Quiesced("k", [], bk.null_emit):
         pass
     assert scaled == [0, 1], f"it must quiesce and restart Rocket.Chat, got {scaled}"
@@ -1505,3 +1509,71 @@ def test_restoring_into_a_kubernetes_workspace_does_not_require_docker(
         bk.restore(tmp_path / "nope.rcbak", name="k")
     except Exception as exc:            # noqa: BLE001
         assert "Docker" not in str(exc), exc
+
+
+def test_the_restore_records_the_window_where_the_database_is_empty(monkeypatch,
+                                                                   tmp_path):
+    """`--drop` is not enough on its own, so the restore drops the DATABASE first --
+    and a multi-GB bundle then takes minutes to load.
+
+    `_Quiesced` journals ROCKETCHAT_STOPPED, so a SIGKILL in that window gets
+    Rocket.Chat restarted by recovery and reported as REPAIRED, against an empty
+    database. Nothing recorded the drop. README promises "the target database is dropped
+    first, so you never get a hybrid" -- true, and it swapped in a worse failure that
+    was invisible.
+
+    Advisory, because re-running a mongorestore at `serve` startup is not something a
+    GUI startup may spend; `doctor`'s `interrupted-work` row reports it and the same
+    `restore` command finishes it.
+    """
+    import inspect
+
+    from rc_repro.services import backup, journal
+
+    assert journal.DATABASE_DROPPED in journal.KINDS
+    assert journal.DATABASE_DROPPED in journal.ADVISORY, (
+        "recovery must not silently re-run a mongorestore at startup")
+
+    src = inspect.getsource(backup._restore_locked)
+    assert "journal.DATABASE_DROPPED" in src, "the drop window is still unrecorded"
+    # BEFORE the drop, or it records nothing useful.
+    assert src.index("journal.DATABASE_DROPPED") < src.index("_drop_database("), src
+    # And cleared only on a successful load.
+    assert "if rc == 0:" in src and "journal.clear(drop_note)" in src
+
+    # The note names the bundle, because "restore it again" needs to say which one.
+    text = journal.describe(journal.Entry(
+        id="i", kind=journal.DATABASE_DROPPED, workspace="w", pid=1, at="T",
+        detail={"bundle": "/b/x.rcbak"}))
+    assert "/b/x.rcbak" in text and "EMPTY" in text, text
+
+
+def test_a_forced_mongo_major_upgrade_says_what_it_actually_does(monkeypatch, tmp_path):
+    """`--force` past a cross-major MongoDB block did not do what the refusal implied.
+
+    README and `plan()`'s own comment both describe it as "refused rather than
+    attempted", and `_apply_image` rewrites only the Rocket.Chat services and the oplog
+    variable -- nothing touches the `mongodb` service, and `meta.mongo_tag` is left
+    alone. So a forced upgrade gave new Rocket.Chat against the OLD MongoDB with the
+    record still naming the old pairing, and the refusal never mentioned `--force` at
+    all.
+    """
+    import inspect
+
+    from rc_repro.services import upgrade as upsvc
+
+    src = inspect.getsource(upsvc._run_locked)
+    # The refusal now names --force AND what it would really do.
+    assert "upgrades Rocket.Chat only" in src, src[:200]
+    # And forcing warns rather than proceeding silently.
+    assert "--force: upgrading Rocket.Chat ONLY" in src
+
+    # `_apply_image` really does leave MongoDB alone -- the premise of the warning.
+    # Asserted on the loop's SELECTOR rather than on the word "mongodb", which also
+    # appears in the oplog URL it sets: it iterates only services named `rocketchat`
+    # or `rocketchat-*`, so no MongoDB service can be reached from it.
+    img = inspect.getsource(upsvc._apply_image)
+    assert 's == "rocketchat" or s.startswith("rocketchat-")' in img, (
+        "if _apply_image no longer selects only Rocket.Chat services, the warning "
+        "above is wrong")
+    assert 'service["image"] = f"{rc_image}:{tag}"' in img

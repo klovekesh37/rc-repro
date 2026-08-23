@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import socket
 
 import requests
 
@@ -91,11 +90,13 @@ CHECKS: tuple[str, ...] = (
     "version-lookup", "ports",
     "edge", "edge-routes-stale", "edge-routes-unreachable",
     "gui-accounts", "gui-admin", "gui-roles", "gui-create-policy",
-    "state-file-perms", "home-perms", "sessions-file", "identity",
+    "state-file-perms", "home-perms", "home-writable", "sessions-file", "identity",
     "kubernetes", "kubernetes-tools", "kubernetes-cluster",
     "kubernetes-storage", "kubernetes-ingress", "kubernetes-loadbalancer",
     "kubernetes-metrics", "kubernetes-other-clusters", "inotify",
-    "kubernetes-cert-manager", "kubernetes-edge-port",
+    "kubernetes-cert-manager", "kubernetes-edge-port", "kubernetes-chart-repo",
+    "install-fresh", "edge-config-drift", "preset-browser-host",
+    "interrupted-work",
 )
 
 
@@ -128,7 +129,19 @@ def run_checks() -> dict:
         cid = check or subject
         # Declared, not free-form: these are published by `doctor --json` as a
         # contract, and a typo would be a check that silently stops being watchable.
-        assert cid in CHECKS, f"undeclared doctor check id {cid!r}"
+        #
+        # NOT AN `assert`. Asserts are stripped under `python -O`, so the guard would
+        # vanish exactly where a mis-declared id becomes unnoticeable -- and unstripped
+        # it raised AssertionError out of `GET /api/doctor`, which is a 500 and directly
+        # contradicts this function's own rule that a check must never break the report.
+        # Falls back to the `preflight` id, which exists for "the report itself could
+        # not be assembled", and says so in the row rather than in a traceback.
+        if cid not in CHECKS:
+            rows.append({"check": "preflight", "status": "warn",
+                         "message": f"internal: check id {cid!r} is not in "
+                                    f"doctor.CHECKS, so this row is unwatchable — "
+                                    f"{msg}"})
+            return
         row = {"check": cid, "status": status, "message": msg}
         if elsewhere:
             row["elsewhere"] = elsewhere
@@ -238,6 +251,36 @@ def run_checks() -> dict:
     except RuntimeError as exc:   # bounded scan found nothing bindable
         line("fail", str(exc))
 
+    subject = "install-fresh"
+    # WHICH BUILD IS ACTUALLY RUNNING. `__version__` comes from the INSTALLED
+    # distribution metadata, so a stale editable install or a pipx that was never
+    # refreshed reports an old number while the checkout beside it holds the fix.
+    # Three shipped fixes looked ineffective for exactly this reason, and nothing in
+    # the tool said which build was answering.
+    try:
+        from pathlib import Path
+
+        import rc_repro as _pkg
+
+        src = Path(_pkg.__file__).resolve().parent.parent / "pyproject.toml"
+        if src.is_file():
+            found = re.search(r'^version = "([^"]+)"', src.read_text(encoding="utf-8"), re.M)
+            checkout = found.group(1) if found else ""
+            if checkout and checkout != _pkg.__version__:
+                line("warn", f"running rc-repro {_pkg.__version__}, but the checkout at "
+                             f"{src.parent} is {checkout} — the installed metadata is "
+                             f"stale, so a fix in that tree is NOT what is answering. "
+                             f"`pip install -e .` (or `pipx reinstall`) to catch up")
+            else:
+                line("ok", f"rc-repro {_pkg.__version__}, matching the checkout at "
+                           f"{src.parent}")
+        else:
+            # A packaged install with no source beside it: nothing to disagree with,
+            # and saying the version is still the useful half of the answer.
+            line("ok", f"rc-repro {_pkg.__version__} (installed, no checkout alongside)")
+    except Exception:  # noqa: BLE001 - a check must never break the report
+        line("warn", "could not determine which rc-repro build is running")
+
     subject = "edge"
     # The shared edge. Silent unless one is set up, so a single-user install
     # sees no rows about a thing it does not have -- but once one exists it is
@@ -267,6 +310,21 @@ def run_checks() -> dict:
                 line("fail", f"Edge{where} is NOT running{because}. Every https "
                              f"name on this box ({len(routes)} route(s)) is "
                              "unreachable. `rc-repro edge start`")
+            if docker_up and edgesvc.running():
+                # CHANGED ON DISK AND NOT APPLIED. The container keeps the command
+                # line it was created with, so a rewritten compose file reaches
+                # nothing until the edge is recreated -- and every other message
+                # went on saying the edge was fine. `edge start` re-applies now;
+                # this is what says the two had diverged in the first place.
+                stale_cfg, live_only = edgesvc.config_drift()
+                if stale_cfg or live_only:
+                    shown = ", ".join((stale_cfg + live_only)[:3])
+                    line("warn", f"the edge's configuration on disk and the running "
+                                 f"container disagree ({shown}"
+                                 f"{'…' if len(stale_cfg + live_only) > 3 else ''}). "
+                                 f"Whatever was changed has not been applied — "
+                                 f"`rc-repro edge restart`",
+                         check="edge-config-drift")
             if docker_up:
                 # A route whose workspace is gone points the edge at nothing, so
                 # that hostname 502s instead of 404ing and the name cannot be
@@ -333,12 +391,46 @@ def run_checks() -> dict:
                 line("ok", "members may set --rc-image/--reg-token/--bind — narrow "
                            "it with `rc-repro config set gui.create_policy admin`",
                      elsewhere="which fields the New workspace form offers", check="gui-create-policy")
+        # `acme/dns.env` is a live DNS-provider API TOKEN, which the README tells people
+        # to chmod by hand, and `ca/ca.key` mints trusted certificates for any name on
+        # this box. Both were outside this loop while audit.log was inside it.
+        from rc_repro import tls as _tlsmod
         for path in (usersvc.users_file(), sessionsvc.sessions_file(),
-                     config.home() / "audit.log"):
+                     config.home() / "audit.log",
+                     _tlsmod.acme_dir() / "dns.env",
+                     config.home() / "ca" / "ca.key"):
             if path.exists() and (path.stat().st_mode & 0o077):
                 line("warn", f"{path} is readable by other local users "
                              f"(mode {oct(path.stat().st_mode)[-3:]}); it should be 0600", check="state-file-perms")
         home = config.home()
+        # WRITABLE, WHICH IS A DIFFERENT QUESTION FROM 0700. `home-perms` asks whether
+        # other local users can READ the accounts and sessions; nothing asked whether
+        # rc-repro can WRITE. On a home it cannot, `list` and `doctor` both exit 0
+        # while `up` and `users add` raise a bare PermissionError -- and doctor's only
+        # hint was "Could not tell whether cluster 'rc-repro-local' exists ([Errno 13]
+        # Permission denied) - kind needs Docker", because the error surfaced through
+        # the kind probe (which writes rc-repro's own kubeconfig dir) and was reported
+        # as a Docker problem. The symptom was found and attributed to the wrong thing.
+        #
+        # Probed rather than derived from st_mode: a mode says what the bits are, and
+        # a read-only mount, a full disk or a container's user mapping all deny a write
+        # with the bits looking fine.
+        from rc_repro.services import journal as journalsvc
+        for label, path in (("state root", home),
+                            ("workspaces", home / "repros"),
+                            ("locks", home / "locks"),
+                            ("journal", journalsvc.journal_dir())):
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                probe = path / ".rc-repro-write-probe"
+                probe.write_text("x")
+                probe.unlink()
+            except OSError as exc:
+                line("fail", f"{path} is not writable ({exc.strerror or exc}) — every "
+                             f"command that creates or records anything will fail with "
+                             f"a bare {type(exc).__name__}. rc-repro's {label}.",
+                     check="home-writable")
+                break
         if home.exists() and (home.stat().st_mode & 0o077):
             line("warn", f"{home} is 0{oct(home.stat().st_mode)[-3:]}, so another "
                          "local user can read the accounts and sessions inside it "
@@ -463,6 +555,26 @@ def run_checks() -> dict:
                                "and says how to install it", check="kubernetes-metrics")
                 # A FACT like the four above it, for the same reason: HTTPS on this
                 # runtime needs an issuer in the cluster, and nothing else does.
+                #
+                # THE CHART, RESOLVED THROUGH THE HOME THE INSTALL WILL USE. `helm_env`
+                # keeps rc-repro's Helm state separate, and for a while the repo was
+                # added to that home while the install read the user's -- so `up` died
+                # at 60% with "Error: repo rocketchat not found" on a box where `helm
+                # repo list` looked fine. Asked here the same way, so the answer is
+                # about the same home.
+                try:
+                    _repo = k8s.run(["helm", "search", "repo", k8s.CHART, "-o", "json"],
+                                    env=k8s.helm_env(pre.context))
+                    if _repo.returncode == 0 and (_repo.stdout or "").strip() not in ("", "[]"):
+                        line("ok", f"chart {k8s.CHART} resolves in rc-repro's Helm home",
+                             check="kubernetes-chart-repo")
+                    else:
+                        line("warn", f"chart {k8s.CHART} does not resolve in the Helm "
+                                     f"home rc-repro installs from — `up` adds the repo "
+                                     f"itself, so this matters only if a create fails "
+                                     f"naming it", check="kubernetes-chart-repo")
+                except Exception:  # noqa: BLE001 - a check must never break the report
+                    pass
                 if k8s.cert_manager_installed(pre.context):
                     line("ok", "cert-manager: installed — a Certificate can be issued "
                                "in this cluster", check="kubernetes-cert-manager")
@@ -480,8 +592,16 @@ def run_checks() -> dict:
             elif pre.will_create:
                 # Ordered BEFORE the not-answering branch, which would otherwise
                 # claim a cluster nobody has made yet is broken.
+                # NAMES THE BINARY THAT MAKES THE CLAIM TRUE. Reported as confusing
+                # by someone who believed kind was not installed: the row promised a
+                # cluster would be created and said nothing about what would create
+                # it, so there was no way to tell the claim was well-founded. It
+                # requires kind (`can_provision`), so saying which kind settles it.
+                _kind = pre.tools.get("kind")
+                _by = f" by kind {_kind.pretty}" if _kind and _kind.present else ""
                 line("fail" if in_use else "ok",
                      f"No cluster yet — {k8s.CLUSTER_NAME!r} is created on first use"
+                     f"{_by}"
                      if not in_use else
                      f"Cluster {k8s.CLUSTER_NAME!r} is gone and its workspaces "
                      "cannot be reached", check="kubernetes-cluster")
@@ -509,57 +629,65 @@ def run_checks() -> dict:
         # OUTSIDE the reachable-cluster block, deliberately. This was inside it, so on a
         # box where rc-repro's own cluster does not exist yet the check never ran -- and
         # that is exactly the box where it fired for real: kind chosen and absent, k3s
-        # alongside it holding :443, the edge installed and its name dark. The conflict
-        # has nothing to do with whether rc-repro has a cluster.
-            # THE PORT, and it is silent today. k3s's ServiceLB claims host
-            # :80/:443 with a hostPort, which is CNI portmap DNAT rather than a
-            # socket bind -- so nothing errors, no pod fails, and kube-proxy's
-            # KUBE-SERVICES chain simply gets the packet before Docker's. Measured
-            # on this box: the edge's own GUI name answered 404 through the host and
-            # 502 direct to the edge, with nothing anywhere connecting the two.
-            #
-            # The CHOSEN cluster is not the only one that can do this, and on the box
-            # where it was measured it was not the one: rc-repro was using kind,
-            # which has no LoadBalancer, while the k3s alongside it held the port. So
-            # whatever `kubectl` points at is checked too -- a cluster rc-repro is
-            # not using can still take the edge's port away.
-            for ctx in dict.fromkeys([pre.context, k8s.active_context()]):
-                if not ctx:
-                    continue
-                # `loadbalancer_service`, not `loadbalancer_address`: the latter
-                # returns "traefik has 172.16.0.2" for the row above, and asking
-                # whether THAT is a local address is always False.
-                if ctx == pre.context and not pre.loadbalancer:
-                    continue          # already probed, and it has none
-                addr = k8s.loadbalancer_service(ctx)[1] if k8s.reachable(ctx) else ""
-                if not addr or not _is_local_address(addr):
-                    continue
-                try:
-                    from rc_repro.services import edge as edgesvc
-                    if not edgesvc.installed():
-                        break        # no edge, no conflict -- and none for any ctx
-                    fd = edgesvc.current()
-                    # The GUI's own name is served by the edge too, and on the box
-                    # where this was measured it was the ONLY affected name -- so
-                    # counting workspace routes alone would have said "0 names" about
-                    # a real outage.
-                    harmed = ([fd.domain] if fd and fd.domain else []) \
-                        + list(edgesvc.registered())
-                except Exception:  # noqa: BLE001 - a check must not break the report
-                    break
-                what = (", ".join(harmed[:3]) + ("…" if len(harmed) > 3 else "")
+        # alongside it holding the ports, the edge installed and its name dark. The
+        # conflict has nothing to do with whether rc-repro has a cluster.
+        #
+        # Detection is `k8s.port_claiming_cluster`, which reports the ports the Service
+        # actually asks for. This block used to say ":443" whatever it found, so the
+        # HTTP-01 half of the same outage -- a cluster holding :80 while the challenge
+        # is `http` -- read as healthy. Both candidate contexts are checked there, for
+        # the reason recorded on that function.
+        claim = None
+        try:
+            claim = k8s.port_claiming_cluster(
+                contexts=tuple(c for c in (pre.context, k8s.active_context()) if c))
+        except Exception:  # noqa: BLE001 - a check must not break the report
+            claim = None
+        if claim:
+            try:
+                from rc_repro.services import edge as edgesvc
+                installed_edge = edgesvc.installed()
+                fd = edgesvc.current() if installed_edge else None
+                # The GUI's own name is served by the edge too, and on the box where
+                # this was measured it was the ONLY affected name -- so counting
+                # workspace routes alone would have said "0 names" about a real outage.
+                harmed = (([fd.domain] if fd and fd.domain else [])
+                          + list(edgesvc.registered())) if installed_edge else []
+            except Exception:  # noqa: BLE001 - a check must not break the report
+                installed_edge, harmed = False, []
+            if installed_edge:
+                what = (", ".join(harmed[:3]) + ("\u2026" if len(harmed) > 3 else "")
                         if harmed else "every name it is given")
+                took = ", ".join(f":{p}" for p in claim.ports if p in (80, 443))
+                # WHICH port decides which half is broken, so both are spelled out.
+                # ACME on this box validates over whichever challenge is configured,
+                # and each one needs a different port back.
+                hurts = []
+                if 443 in claim.ports:
+                    hurts += ["serving https", "the tls-alpn challenge"]
+                if 80 in claim.ports:
+                    hurts += ["the http-01 challenge", "the :80 redirect"]
+                # Guarded, not assumed. `port_claiming_cluster` only returns a claim
+                # that overlaps (80, 443) today, so this list cannot be empty -- but an
+                # IndexError here is swallowed by the section's except and the whole
+                # Kubernetes report collapses to "could not be determined", which is
+                # the failure mode that hides rather than shows.
+                broken = (", ".join(hurts[:-1]) + " and " + hurts[-1] if len(hurts) > 1
+                          else (hurts[0] if hurts else "the edge's ports"))
                 line("warn",
-                     f"cluster {ctx!r} holds this host's :443 at {addr}, so "
-                     f"rc-repro's edge cannot receive there: {what} answers from the "
-                     f"cluster through the host — a 404 and the cluster's own "
-                     f"certificate — while the edge itself is fine. A box serves "
-                     f"HTTPS for one runtime at a time: remove the edge on a "
-                     f"Kubernetes box, or give the host ports back with "
-                     f"`kubectl -n kube-system patch svc traefik -p "
-                     f"'{{\"spec\":{{\"type\":\"NodePort\"}}}}'`",
+                     f"cluster {claim.context!r} holds this host's {took} at "
+                     f"{claim.address} ({claim.service}), so rc-repro's edge cannot "
+                     f"receive there: {what} answers from the cluster through the host "
+                     f"\u2014 a 404 and the cluster's own certificate \u2014 while the "
+                     f"edge itself is fine and bound. This breaks "
+                     f"{broken}. A box serves HTTPS for one runtime at a "
+                     f"time: remove the edge on a Kubernetes box, or give the host "
+                     f"ports back with `kubectl -n kube-system patch svc "
+                     f"{claim.service.split('/')[-1]} -p "
+                     f"'{{\"spec\":{{\"type\":\"NodePort\"}}}}'` \u2014 which the "
+                     f"next k3s install undoes, so make it permanent with `--disable "
+                     f"traefik --disable servicelb`",
                      check="kubernetes-edge-port")
-                break
 
         # "Other" must exclude the one we just said we are USING, or the report
         # describes the same cluster twice and the second mention reads as a
@@ -576,6 +704,62 @@ def run_checks() -> dict:
             line(row[0], row[1], check="inotify")
     except Exception:  # noqa: BLE001 - a check must never break the report
         line("warn", "Kubernetes status could not be determined")
+
+    subject = "interrupted-work"
+    # SIDE EFFECTS NOBODY MEANT TO LEAVE. A GUI job killed mid-operation runs no
+    # `finally`, so a backup can leave Rocket.Chat stopped and a load test can leave
+    # the API rate limiter off -- and `web/jobs.py` keeps its registry in memory, so
+    # a restart loses even the knowledge that a job existed. The journal is the only
+    # durable trace, and `serve` repairs from it at startup; this is what tells a
+    # CLI-only box, which never starts one.
+    try:
+        from rc_repro.services import journal
+        stranded = journal.abandoned()
+        if stranded:
+            for entry in stranded[:5]:
+                # The suffix has to match what recovery will actually DO. An advisory
+                # kind already names its own fix inside `describe`, and telling the
+                # reader `serve` repairs it would be false -- serve reports those and
+                # deliberately does not act, because finishing one means waiting for a
+                # workspace to serve.
+                tail = ("" if entry.kind in journal.ADVISORY
+                        else " — `rc-repro serve` repairs this at startup, or fix it "
+                             "by hand")
+                line("warn", journal.describe(entry) + tail, check="interrupted-work")
+        elif journal.open_entries():
+            # Open but owned by a live process: a job is running right now, which is
+            # not a fault and must not read as one.
+            line("ok", f"{len(journal.open_entries())} operation(s) in progress "
+                       f"(a running job holds them)", check="interrupted-work")
+    except Exception:  # noqa: BLE001 - a check must never break the report
+        pass
+
+    subject = "preset-browser-host"
+    # THE WORKSPACES ALREADY OUT THERE. `up` warns about this at create time now, but
+    # every workspace made before that is silent: an IdP preset addresses its own
+    # service as THIS machine by default, which on a shared box names each visitor's
+    # own laptop -- the SAML button returns to the login page, the OIDC popup opens
+    # blank, presigned previews fail, and none of them logs anything.
+    _HOST_PARAM = {"saml": "idp_host", "oidc": "idp_host", "s3_minio": "s3_host"}
+    try:
+        for meta in runner.list_meta():
+            param = _HOST_PARAM.get((meta.preset or "").strip())
+            if not param:
+                continue
+            extra = meta.extra if isinstance(meta.extra, dict) else {}
+            if (dict(extra.get("params") or {})).get(param):
+                continue          # someone said where the browser is
+            bind = str(extra.get("bind_host") or "")
+            if bind in ("", "127.0.0.1", "localhost"):
+                continue          # local-only, so localhost really is localhost
+            line("warn", f"{meta.name!r} is bound to {bind} but its {meta.preset!r} "
+                         f"preset still points the browser at this machine. From "
+                         f"anywhere else that address is the visitor's own laptop and "
+                         f"login fails silently. Re-create with "
+                         f"`--set {param}=<the host people type>`",
+                 check="preset-browser-host")
+    except Exception:  # noqa: BLE001 - a check must never break the report
+        pass
 
     counts = {s: sum(1 for r in rows if r["status"] == s) for s in ("ok", "warn", "fail")}
     verdict = "fail" if counts["fail"] else ("warn" if counts["warn"] else "ok")
@@ -600,21 +784,6 @@ def run_checks() -> dict:
 #: sidecar sat around 40-60 instances, and the box below had five clusters' worth of
 #: history behind it.
 INOTIFY_PER_CLUSTER = 60
-
-
-def _is_local_address(ip: str) -> bool:
-    """Whether `ip` is one of THIS host's own addresses.
-
-    Bind is the test, because bind is the question: a socket can only bind an address
-    the host holds. Cheaper and more portable than parsing `ip addr`, and it is the
-    same check the kernel would make.
-    """
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind((ip, 0))
-        return True
-    except OSError:
-        return False
 
 
 def inotify_in_use(proc: str = "/proc") -> int | None:

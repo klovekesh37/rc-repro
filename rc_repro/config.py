@@ -3,13 +3,16 @@
 State lives under ~/.rc-repro (override with RC_REPRO_HOME):
 
     ~/.rc-repro/
-      config.yaml            # default_repro, reg_token, rc_image overrides
+      config.yaml            # default_repro, bind_host, acme.*, gui.* — NO secrets:
+                             #   reg_token is env/flag only and is never persisted
+                             #   (see update_config's with_env=False)
       presets/               # user/team presets (override built-ins)
       repros/<name>/         # one workspace per repro
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import uuid
@@ -17,7 +20,8 @@ from pathlib import Path
 
 import yaml
 
-# Serialises read-modify-write of config.yaml (see update_config).
+# Serialises read-modify-write of config.yaml (see update_config). THREADS only --
+# `_config_flock` is the other half, for processes.
 _CONFIG_LOCK = threading.Lock()
 
 # Container-internal Rocket.Chat port. The published host port is chosen per repro.
@@ -90,7 +94,13 @@ _ENV_OVERRIDES = {
 
 
 def home() -> Path:
-    """Root state directory, created on demand."""
+    """Root state directory. RESOLVES a path; it does not create anything.
+
+    The docstring said "created on demand", which reads as a promise this function
+    makes and does not keep -- the mkdir lives in the two writers below (0700, because
+    accounts and sessions live in here), so a reader who trusted this would file the
+    resulting FileNotFoundError against the wrong function.
+    """
     root = os.environ.get("RC_REPRO_HOME")
     base = Path(root) if root else Path.home() / ".rc-repro"
     return base
@@ -140,14 +150,52 @@ def save_config(cfg: dict) -> None:
     A plain write_text could be read half-written — the web GUI runs service calls
     on worker threads, so concurrent readers are real.
     """
-    home().mkdir(parents=True, exist_ok=True)
+    # 0700 ON CREATE, so a box that never runs `serve` is not left depending on the
+    # umask. `serve` tightens an existing loose home (cli.py) and `doctor` reports
+    # one, but neither runs on a pure-CLI box -- and this directory also holds the
+    # audit log, the accounts file and the ACME material. config.yaml itself holds no
+    # secret (see the module docstring), so this is depth rather than a fix.
+    home().mkdir(parents=True, exist_ok=True, mode=0o700)
     path = config_file()
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     try:
-        tmp.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+        # 0600 via os.open rather than write_text, which would take the umask.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(yaml.safe_dump(cfg, sort_keys=False))
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)   # no-op after a successful replace
+
+
+@contextlib.contextmanager
+def _config_flock():
+    """Hold an exclusive lock on config.yaml across PROCESSES, not just threads.
+
+    `_CONFIG_LOCK` is a `threading.Lock`, which says nothing about a second process
+    -- and two are the normal case here: `rc-repro serve` runs continuously while
+    somebody uses the CLI on the same box. Both read config.yaml, each mutates a
+    different key, both write; the later `os.replace` wins and the other change is
+    gone with nothing logged. Atomic replacement prevents a torn FILE, never a lost
+    UPDATE, and those are different problems.
+
+    Same two-layer shape as `runner.repro_lock`, for the same reason and with the
+    same degradation: no fcntl (Windows) means thread-only, because a hard
+    dependency would be worse than the race it prevents.
+    """
+    try:
+        import fcntl
+    except ImportError:                     # pragma: no cover - not POSIX
+        yield
+        return
+    root = home()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(root / ".config.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)                        # releases the flock with it
 
 
 def update_config(mutate) -> dict:
@@ -158,7 +206,7 @@ def update_config(mutate) -> dict:
     with_env=False on purpose: this writes the file back, and an ephemeral
     RC_REPRO_REG_TOKEN must never be persisted into it.
     """
-    with _CONFIG_LOCK:
+    with _CONFIG_LOCK, _config_flock():
         cfg = load_config(with_env=False)
         mutate(cfg)
         save_config(cfg)

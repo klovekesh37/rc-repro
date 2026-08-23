@@ -123,10 +123,19 @@ def test_the_edge_project_is_valid_compose(tmp_path, monkeypatch):
 
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
     fd.write(fd.Edge(domain="support.xyz.com", acme_email="ops@xyz.com"))
-    proc = subprocess.run(
-        ["docker", "compose", "-f", str(fd.compose_path()), "config", "-q"],
-        capture_output=True, text=True, timeout=60)
-    if "docker" in (proc.stderr or "") and proc.returncode == 127:
+    # THE SKIP HAS TO CATCH THE RIGHT FAILURE. This looked for returncode 127, which
+    # is what a SHELL reports for "command not found" -- Python's subprocess raises
+    # FileNotFoundError instead and never reaches the check. So the guard was dead and
+    # the suite needed a docker binary while CLAUDE.md said nothing does. This is the
+    # one test here that genuinely needs docker: it asks compose to parse the project,
+    # which is the whole point of it.
+    try:
+        proc = subprocess.run(
+            ["docker", "compose", "-f", str(fd.compose_path()), "config", "-q"],
+            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        pytest.skip(f"docker not available: {exc}")
+    if proc.returncode == 127:
         pytest.skip("docker not available")
     assert proc.returncode == 0, proc.stderr
 
@@ -578,6 +587,39 @@ def test_resolving_tls_never_starts_a_container(tmp_path, monkeypatch):
     monkeypatch.setattr(fd, "up", boom)
     req = lc.CreateReq(version="8.5.1", domain="t1.example.com", acme_email="o@e.com")
     lc._resolve_tls(req, "w", "127.0.0.1")
+
+
+def test_the_recorded_spec_survives_a_round_trip(tmp_path, monkeypatch):
+    """`current()` reconstructed only the domain and the wildcard flag -- it dropped the
+    email, the GUI host and the GUI port. So nothing but `serve --domain` could rebuild
+    this edge, and `rc-repro edge start` therefore could not apply a changed
+    `acme.challenge`: regenerating the compose file would have pointed the front door at
+    a GUI it no longer knew the address of.
+
+    Measured consequence: `config set acme.challenge http` followed by `edge restart`
+    kept validating over TLS-ALPN against the production CA, and the log went on
+    reporting the identical failure."""
+    from rc_repro.services import edge as fd
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    fd.write(fd.Edge.resolve("gui.example.test", "who@example.test",
+                             gui_host="172.17.0.1", gui_port=9944))
+    back = fd.current()
+    assert back is not None
+    assert back.domain == "gui.example.test"
+    assert back.acme_email == "who@example.test", "the email was the first thing lost"
+    assert back.gui_host == "172.17.0.1", "and the GUI host the most damaging"
+    assert back.gui_port == 9944
+
+    # An edge written by a version that recorded no spec still reads back, at the old
+    # fidelity, rather than failing a start.
+    (fd.edge_dir() / fd.SPEC_FILE).unlink()
+    legacy = fd.current()
+    assert legacy is not None and legacy.domain == "gui.example.test"
+
+    # Garbage does not fail a start either.
+    (fd.edge_dir() / fd.SPEC_FILE).write_text("{not json")
+    assert fd.current() is not None
 
 
 def test_http_01_is_selectable_and_frees_the_challenge_path(tmp_path, monkeypatch):
@@ -1096,3 +1138,109 @@ def test_our_own_edge_is_not_treated_as_foreign(tmp_path, monkeypatch):
 
     monkeypatch.setattr(fd, "_docker", fake_docker)
     assert fd.foreign_edge() == ""
+
+
+def test_edge_start_does_not_claim_success_while_a_cluster_holds_the_ports(
+        tmp_path, monkeypatch):
+    """`edge start` printed "every registered name is served again" about a box that
+    served none of them.
+
+    The edge really does start: k3s's ServiceLB claims host ports by CNI portmap DNAT,
+    not by binding, so compose succeeds, the container binds :80 and :443, and every
+    packet is taken by kube-proxy before Docker sees it. This message was the last
+    thing a manager's install said before two days of the GUI being dark, and it said
+    the opposite of the truth.
+    """
+    import subprocess
+
+    from typer.testing import CliRunner
+
+    from rc_repro import cli
+    from rc_repro.services import edge as edgesvc, k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    edgesvc.write(edgesvc.Edge())
+    monkeypatch.setattr(edgesvc, "up", lambda **k: subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(k8s, "port_claiming_cluster",
+                        lambda *a, **k: k8s.PortClaim(
+                            context="default", service="kube-system/traefik",
+                            address="172.31.46.139", ports=[80, 443]))
+
+    out = CliRunner().invoke(cli.app, ["edge", "start"]).output or ""
+    assert "every registered name is served again" not in out, out
+    assert "NOT reachable" in out, out
+    assert "'default'" in out and "172.31.46.139" in out, out
+    assert "NodePort" in out, "hand over the command that gives the ports back"
+    assert "--disable servicelb" in out, "and how to stop it recurring"
+
+    # With nothing holding the ports the message is the plain success it always was.
+    monkeypatch.setattr(k8s, "port_claiming_cluster", lambda *a, **k: None)
+    plain = CliRunner().invoke(cli.app, ["edge", "start"]).output or ""
+    assert "every registered name is served again" in plain, plain
+    assert "NOT reachable" not in plain, plain
+
+
+def test_the_tls_verdict_stops_waiting_when_no_challenge_can_reach_the_host(
+        tmp_path, monkeypatch):
+    """It waited twenty seconds for a certificate that could not arrive.
+
+    With a cluster holding :80 and :443, neither HTTP-01 nor TLS-ALPN can complete --
+    the challenge request is answered by the cluster. Polling anyway printed "waiting
+    for the certificate…" and then a message saying issuance "may still complete",
+    which is how a reader learns to ignore the line that mattered.
+    """
+    from rc_repro import cli
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "port_claiming_cluster",
+                        lambda *a, **k: k8s.PortClaim(
+                            context="default", service="kube-system/traefik",
+                            address="172.31.46.139", ports=[80, 443]))
+    slept = []
+    monkeypatch.setattr("time.sleep", lambda s: slept.append(s))
+    said = []
+    monkeypatch.setattr(cli.ui, "warn", lambda m, *a, **k: said.append(m))
+    monkeypatch.setattr(cli.ui, "note", lambda m, *a, **k: said.append(m))
+    monkeypatch.setattr(cli.ui, "hint", lambda m, *a, **k: said.append(m))
+    monkeypatch.setattr(cli.ui, "ok", lambda m, *a, **k: said.append(m))
+
+    cli._report_gui_tls("gui.example.test", tries=10, pause=2.0)
+
+    assert not slept, "nothing to wait for — a cluster is answering the challenge"
+    joined = "\n".join(said)
+    assert "cannot get a certificate" in joined, joined
+    assert "may still complete" not in joined, "that is false here"
+    assert "172.31.46.139" in joined, joined
+
+
+def test_the_port_claim_probe_costs_nothing_on_a_box_with_no_kubectl(monkeypatch):
+    """This runs on the way to starting a proxy, so it must be nearly free.
+
+    Four probes at the 8s default is half a minute added to `edge start` — on a box
+    whose kubeconfig points at an unreachable remote cluster, which is an ordinary
+    laptop. A Docker-only box must not pay for a Kubernetes check at all.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(k8s.shutil, "which", lambda name: None)
+    called = []
+    monkeypatch.setattr(k8s, "run", lambda *a, **k: called.append(a) or (_ for _ in ()).throw(
+        AssertionError("no kubectl on this box — nothing should have been run")))
+    assert k8s.port_claiming_cluster() is None
+    assert not called, "a Docker-only box must not shell out at all"
+
+    # With kubectl present, every probe carries the shortened timeout it was given.
+    monkeypatch.setattr(k8s.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(k8s, "active_context", lambda: "default")
+    seen = []
+
+    def _run(argv, **kw):
+        seen.append(kw.get("timeout"))
+        import subprocess
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    monkeypatch.setattr(k8s, "run", _run)
+    k8s.port_claiming_cluster(timeout=3.0)
+    assert seen and all(t == 3.0 for t in seen), seen

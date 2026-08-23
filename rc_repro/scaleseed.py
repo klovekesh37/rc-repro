@@ -22,8 +22,28 @@ import re
 
 from rc_repro import runner
 
+#: The DEFAULT database, kept only as the fallback when the workspace's own MONGO_URL
+#: cannot be read. `env --set MONGO_URL=...` is a supported and documented override, and
+#: hardcoding this meant the bulk insert (or the profiler) addressed a database
+#: Rocket.Chat was not reading -- reporting `inserted: 50000` while the directory stayed
+#: empty, and `--clear-scale` then reporting it had removed them, so the round trip was
+#: internally consistent and externally wrong. `backup.database_of()` exists for exactly
+#: this reason and says so: "dumping the wrong database would produce an empty backup
+#: that only looks fine."
 DB = "rocketchat"
-_URI = f"mongodb://localhost:27017/{DB}"
+
+
+def _db_of(name: str) -> str:
+    """The database this workspace's Rocket.Chat actually uses."""
+    try:
+        from rc_repro.services.backup import database_of
+        return database_of(name) or DB
+    except Exception:                       # noqa: BLE001 - never fail over a lookup
+        return DB
+
+
+def _uri_for(name: str) -> str:
+    return f"mongodb://localhost:27017/{_db_of(name)}"
 _BATCH = 5000                    # docs per insertMany — well under the 16MB BSON cap
 _SCALE_TAG = "rcrepro_scale"     # stamped on every doc so `seed --scale --clear` can undo it
 
@@ -86,7 +106,7 @@ def _eval(name: str, js: str) -> tuple[int, str]:
     out = ""
     for shell in ("mongosh", "mongo"):
         rc, out = runner.compose_exec_capture(
-            name, "mongodb", [shell, "--quiet", _URI, "--eval", wrapped])
+            name, "mongodb", [shell, "--quiet", _uri_for(name), "--eval", wrapped])
         if rc == 0:
             return rc, out
         if out.strip():
@@ -147,10 +167,14 @@ def bulk_messages(name: str, count: int, room: str, *, batch: int = _BATCH) -> t
         }}
         var r = db['rocketchat_message'].insertMany(docs, {{ordered: false}});
         made += docs.length;
-      }}
-      if (made > 0) {{
-        db['rocketchat_room'].updateOne({{_id: room._id}}, {{$inc: {{msgs: made}},
-          $set: {{lm: new Date(), lastMessage: last}}}});
+        // PER BATCH, not once at the end. `clear()` decrements by the number of
+        // TAGGED documents it finds, so a prefill killed after batch 1 of 10 left
+        // 5000 tagged messages with the room counter never incremented -- and the
+        // clear then subtracted 5000 from the room's real count. README says
+        // "--clear-scale removes exactly what --scale added"; that only holds if the
+        // counter is advanced as the documents land.
+        db['rocketchat_room'].updateOne({{_id: room._id}},
+          {{$inc: {{msgs: docs.length}}, $set: {{lm: new Date(), lastMessage: last}}}});
       }}
       print(JSON.stringify({{inserted: made, room: room._id}}));
     }}

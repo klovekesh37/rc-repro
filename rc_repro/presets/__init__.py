@@ -7,6 +7,7 @@ scenario. Built-ins are shipped in data/presets; a file of the same name in
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from importlib import resources
 
@@ -86,10 +87,22 @@ class Preset:
     # adapter reuses ``env`` for Rocket.Chat settings; this field carries only
     # concrete backing resources, not an arbitrary Helm-values overlay.
     kubernetes_manifests: list[str] = field(default_factory=list)
+    #: Why this preset could not be read, when `list_presets` met a bad file. Empty
+    #: for every real preset; a catalog entry carrying it is a placeholder saying so
+    #: rather than a silently missing row.
+    error: str = ""
 
 
 def _parse(text: str, source: str) -> Preset:
     raw = yaml.safe_load(text) or {}
+    # A LIST OR A SCALAR IS NOT A PRESET. `raw.get` on either is an AttributeError,
+    # which is not a ReproError -- so one malformed file in the presets directory took
+    # out `rc-repro presets`, `/api/presets` and the create dialog, and made
+    # `capabilities` report ZERO presets (it guards its own call with a bare
+    # `except Exception`, so the failure became silence).
+    if not isinstance(raw, dict):
+        raise ValueError(f"preset {source} is a {type(raw).__name__}, not a mapping "
+                         f"(a preset file is a YAML mapping with a 'name' key)")
     if not raw.get("name"):
         raise ValueError(f"preset {source} is missing a 'name' field")
     return Preset(
@@ -158,8 +171,54 @@ def _scenario_definitions() -> dict[str, Scenario]:
     return {"ldap": ldap.scenario()}
 
 
+#: A preset name, and nothing that can be read as a path.
+#:
+#: `config.preset_dir() / f"{name}.yaml"` looks like it confines the lookup to the
+#: presets directory and does not: pathlib's `/` DISCARDS the left operand when the
+#: right is absolute, so `--preset /tmp/x` resolved to `/tmp/x.yaml` and the presets
+#: directory was never consulted. No `..` and no existing presets dir required.
+#:
+#: That mattered because a preset is a container spec. Its `services:` is deep-merged
+#: into the compose document (compose.py), so any readable YAML on the box became an
+#: arbitrary image with arbitrary bind mounts, running as whoever runs rc-repro --
+#: reproduced with `volumes: ["/:/host:ro"]`. And `preset` is not in
+#: `PRIVILEGED_CREATE_FIELDS`, so `POST /api/repros` is member+: on the shared server
+#: this file's own README warns about, any member could hand the serve process a
+#: container spec. Two lesser consequences travelled with it: naming another
+#: workspace's `docker-compose.yml` (valid YAML with `name:` and `services:`) pulled
+#: that workspace's Keycloak/MinIO/LDAP and their credentials into one of yours, and
+#: the three distinguishable errors made the create dialog a filesystem oracle.
+#:
+#: The README already says "treat preset files as code — they can run arbitrary
+#: containers and mount files". That is only safe because of the sentence before it,
+#: "drop a YAML file in ~/.rc-repro/presets/<name>.yaml", and that sentence was not
+#: enforced anywhere. It is now, at the one place every reader goes through.
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
 def _user_path(name: str):
-    return config.preset_dir() / f"{name}.yaml"
+    """The user-preset file for `name`, or refuse a name that is not a name.
+
+    Validated here rather than at the call sites so `load`, `resolve` and
+    `list_presets` all inherit it -- a check on two of the three is the shape this
+    bug had in the first place.
+    """
+    if not isinstance(name, str) or not _NAME_RE.match(name):
+        raise ValueError(
+            f"{name!r} is not a preset name (want lower-case letters, digits, '-' "
+            f"and '_', starting with a letter or digit). A preset is a YAML file in "
+            f"{config.preset_dir()}; it is named, never given as a path.")
+    base = config.preset_dir()
+    candidate = base / f"{name}.yaml"
+    # Belt and braces: the regex already forbids '/', '\\' and '.', so this cannot
+    # trigger today. It is here because the regex is one edit away from being
+    # loosened, and the consequence of loosening it is arbitrary container specs.
+    try:
+        if candidate.resolve().parent != base.resolve():
+            raise ValueError(f"preset {name!r} resolves outside {base}")
+    except OSError:
+        pass
+    return candidate
 
 
 def _load_non_scenario(name: str, params: dict) -> Preset:
@@ -235,7 +294,19 @@ def list_presets() -> list[Preset]:
     user_dir = config.preset_dir()
     if user_dir.exists():
         for path in sorted(user_dir.glob("*.yaml")):
-            p = _parse(path.read_text(encoding="utf-8"), source=str(path))
+            # PER FILE, because one bad one used to take out the whole catalog: this
+            # feeds `rc-repro presets`, `/api/presets` and the create dialog, and
+            # `capabilities` swallows the exception and reports ZERO presets. A file
+            # somebody is halfway through writing must not do that. Reported the way
+            # `backup.list_backups` reports an unreadable bundle -- named, not hidden.
+            try:
+                p = _parse(path.read_text(encoding="utf-8"), source=str(path))
+            except (ValueError, OSError, yaml.YAMLError) as exc:
+                seen[path.stem] = Preset(
+                    name=path.stem,
+                    description=f"UNREADABLE — {exc}",
+                    error=str(exc))
+                continue
             seen[p.name] = p
 
     return [seen[k] for k in sorted(seen)]

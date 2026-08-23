@@ -556,6 +556,14 @@ rc-repro users remove alice       # and every session it minted
 | `member` | everyday use — create, seed, load-test, tear down |
 | `readonly` | look, but not touch — and **not** read logs or env vars, which carry LDAP bind passwords and OAuth client secrets |
 
+**Roles govern the web GUI, and only the web GUI.** The table above is enforced by
+`ROUTE_ROLES` in the HTTP layer. The CLI is not role-aware: anyone with a shell on the
+box is already in the `docker` group, so a role check there would be a formality, and
+`RC_REPRO_USER` is an attribution label rather than a credential — the audit log records
+whether an actor was `asserted` (the environment variable) or came from a `session`
+precisely because those are not the same claim. A `readonly` account bounds what someone
+can do **through the browser**; it does not bound someone with SSH.
+
 The first account is an admin; every one after it is a `member` until you say
 otherwise. Passwords are generated (~96 bits) unless `--ask-password`, which enforces
 a 12-character minimum; stored in `~/.rc-repro/users`, mode `0600`, hashed with
@@ -689,7 +697,14 @@ tell "still coming up" from "fix your environment" without parsing prose.
 Only failures raised by the service layer as a typed error carry a code: a mistyped
 flag or an out-of-range `--vus` still exits 1. Branch on `$? -ne 0` for "did it fail",
 and on the table above where the command documents it. Code **6** (authority gate) is
-reserved and nothing raises it yet.
+reserved and nothing raises it — `capabilities` deliberately does not advertise it, and
+an invariant test fails if that changes without a raise site.
+
+**`doctor` is the exception, and it is deliberate.** A `fail` verdict exits **1** in
+prose mode and **3** under `--json` — 3 because `preflight` is what a script wants to
+branch on, and 1 because a person reading the report has already read the reason. Both
+are documented in `--json`'s help; the split is here because §Reference invites you to
+branch on this table, and `doctor` is the one command that does not fit it.
 
 ### How version → MongoDB resolution works
 

@@ -94,6 +94,17 @@ def _bucket_job(bucket: str, workspace: str = "__RC_REPRO_NAME__") -> str:
 
 def build(params: dict) -> Preset:
     presigned = _common.truthy_param(params, "presigned")
+    # THE BROWSER'S ADDRESS FOR MINIO, in presigned mode only. A presigned URL is
+    # followed by the browser, and `minio` resolves for it solely through the
+    # `127.0.0.1 minio` hosts line below -- which names whichever machine the browser
+    # is on. Right on a laptop; wrong on the shared install this tool now runs on,
+    # where the same silent shape broke the saml and oidc buttons. Setting this to the
+    # host's own address satisfies the browser AND RC (which reaches it over the
+    # bridge) and needs no hosts entry, exactly as `idp_host` does for the IdP presets.
+    #
+    # Proxy mode is unaffected: there the browser never touches MinIO at all, which is
+    # why this default stays `minio` and nothing about the ordinary case changes.
+    s3_host = _common.str_param(params, "s3_host", "minio")
     bucket = _common.str_param(params, "bucket", "rcrepro-uploads")
     if not _BUCKET_RE.match(bucket):
         raise ValueError(
@@ -143,7 +154,7 @@ def build(params: dict) -> Preset:
         # Both upload successfully -- MinIO is happy to treat it as a prefix -- which
         # is why this went unnoticed. It is still every object nested one level
         # deeper than it should be, under a directory named after its own bucket.
-        "OVERWRITE_SETTING_FileUpload_S3_BucketURL": f"http://minio:{_S3_PORT}",
+        "OVERWRITE_SETTING_FileUpload_S3_BucketURL": f"http://{s3_host}:{_S3_PORT}",
         "OVERWRITE_SETTING_FileUpload_S3_AWSAccessKeyId": _USER,
         "OVERWRITE_SETTING_FileUpload_S3_AWSSecretAccessKey": _PASSWORD,
         "OVERWRITE_SETTING_FileUpload_S3_Region": "us-east-1",   # MinIO default
@@ -174,13 +185,23 @@ def build(params: dict) -> Preset:
         f"  — bucket '{bucket}' is created automatically; watch uploads land in it.",
         "Upload any file/image in RC; it goes to MinIO instead of GridFS.",
     ]
-    if presigned:
+    if presigned and s3_host == "minio":
         notes += [
             "PRESIGNED MODE: the browser fetches files straight from MinIO, so add",
             "this line to /etc/hosts (needs sudo):",
             "    127.0.0.1  minio",
+            "  That entry points at THIS machine, so the browser has to be on it. From",
+            "  another machine, re-create with:  --bind 0.0.0.0 --set s3_host=<this host>",
             "Remove the line to reproduce the classic 'presigned URL unreachable'",
             "ticket symptom (uploads work, previews/downloads break).",
+        ]
+    elif presigned:
+        notes += [
+            f"PRESIGNED MODE: the browser fetches files straight from "
+            f"http://{s3_host}:{_S3_PORT}, so no hosts entry is needed — but that",
+            "  address must be reachable from the browser (`--bind 0.0.0.0`).",
+            "Point s3_host somewhere unreachable to reproduce the classic 'presigned",
+            "  URL unreachable' ticket symptom (uploads work, previews break).",
         ]
     else:
         notes += [
@@ -219,6 +240,9 @@ def build(params: dict) -> Preset:
         params_help={
             "presigned": "browser fetches presigned MinIO URLs (default false; needs /etc/hosts line)",
             "bucket": "bucket name (default rcrepro-uploads)",
+            "s3_host": ("hostname the BROWSER reaches MinIO on in presigned mode "
+                        "(default 'minio', which needs a hosts entry and only works "
+                        "on this machine)"),
         },
         volumes={"minio_data": {"driver": "local"}},
         ports=list(config.PRESET_PORTS["s3_minio"]),

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from rc_repro import config, rcapi
+from rc_repro.services import journal
 
 # Values a support dump uses to mask a secret it won't export (this dump uses
 # "XXXXXXXX"; others use bullets/asterisks/hashes). We can't apply these (they
@@ -73,7 +74,20 @@ def _is_redacted(v) -> bool:
 def build_plan(settings_json: Path, *, only: set[str] | None = None) -> Plan:
     """Parse a dump's settings list into an import plan. `only` filters to ids
     whose prefix (before the first '_') matches, e.g. {'Livechat', 'LDAP'}."""
-    data = json.loads(settings_json.read_text(encoding="utf-8"))
+    # A CUSTOMER DUMP IS EXACTLY THE FILE THAT ARRIVES WRONG -- truncated by a
+    # download, HTML from an expired share link, or the whole support bundle instead of
+    # the settings file inside it. `json.loads` raised a bare JSONDecodeError, which is
+    # not a ReproError: the CLI printed a traceback and the web layer answered 500,
+    # where every other bad input in this path says what is wrong with the file.
+    raw = settings_json.read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{settings_json.name} is not valid JSON (line {exc.lineno}, column "
+            f"{exc.colno}: {exc.msg}). A Rocket.Chat support dump's "
+            f"*-settings.json is a JSON array; if this came from a browser it may "
+            f"be an HTML error page.") from exc
     if not isinstance(data, list):
         raise ValueError("expected a list of settings (a Rocket.Chat *-settings.json)")
 
@@ -108,7 +122,7 @@ def build_plan(settings_json: Path, *, only: set[str] | None = None) -> Plan:
 
 
 def apply(root_url: str, admin: rcapi.Auth, plan: Plan, *,
-          dry_run: bool = False, log=lambda m: None) -> dict:
+          dry_run: bool = False, log=lambda m: None, workspace: str = "") -> dict:
     """Apply the plan. Disables the API rate limiter during the bulk PATCH and
     restores it in a finally. Returns {applied, failed, skipped, failures}."""
     if dry_run:
@@ -121,8 +135,17 @@ def apply(root_url: str, admin: rcapi.Auth, plan: Plan, *,
     # Disable the rate limiter for the bulk PATCH. But the dump itself may set
     # this setting — if so its value wins; otherwise restore the prior value.
     plan_limiter = next((v for sid, v in plan.apply if sid == limiter), _UNSET)
-    limiter_was_off = rcapi.get_setting(root_url, admin, pw, limiter) is False
-    if not limiter_was_off:
+    # `is True`, not `not (... is False)`: an UNREADABLE setting must not be treated as
+    # "was on" and forced on afterwards -- the rule seed.py states explicitly and both
+    # files were breaking here.
+    limiter_prev = rcapi.get_setting(root_url, admin, pw, limiter)
+    limiter_note = ""
+    if limiter_prev is True:
+        # JOURNALLED. The `finally` below is the only thing that restores this, and it
+        # is the block a SIGKILL does not run -- so an interrupted import left the rate
+        # limiter off with nothing on disk saying so.
+        if workspace:
+            limiter_note = journal.record(journal.RATE_LIMITER_OFF, workspace)
         rcapi.set_setting(root_url, admin, pw, limiter, False)
 
     applied, failures = 0, []
@@ -143,12 +166,17 @@ def apply(root_url: str, admin: rcapi.Auth, plan: Plan, *,
                 failures.append(sid)
     finally:
         if plan_limiter is not _UNSET:
+            # The DUMP sets it, so the dump's value wins and the note is closed either
+            # way: the setting is now whatever the customer's workspace had, which is
+            # the point of the import.
             if rcapi.set_setting(root_url, admin, pw, limiter, plan_limiter):
                 applied += 1
+                journal.clear(limiter_note)
             else:
                 failures.append(limiter)
-        elif not limiter_was_off:
-            rcapi.set_setting(root_url, admin, pw, limiter, True)
+        elif limiter_prev is True:
+            if rcapi.set_setting(root_url, admin, pw, limiter, True):
+                journal.clear(limiter_note)
 
     return {"applied": applied, "failed": len(failures),
             "skipped": len(plan.redacted) + len(plan.denied),

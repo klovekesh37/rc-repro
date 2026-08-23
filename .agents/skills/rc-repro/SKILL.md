@@ -49,11 +49,16 @@ Every `--json` reply is one envelope:
  "generated_at":"...","ok":true,"data":{...},"warnings":[],"error":null}
 ```
 
-`up`, `ready` and `down` **stream**: NDJSON `rc-repro.event.v1` progress lines
-first, then exactly one envelope as the **last line**. So read to end of stream and
-parse the last line. A failure is the same envelope with `ok: false` and
-`error.code` set; there is always exactly one, including when the failure happened
-before any work started.
+`up` and `ready` **stream**: NDJSON `rc-repro.event.v1` progress lines first, then
+exactly one envelope as the **last line**. So read to end of stream and parse the last
+line — which is the right way to read EVERY reply, streaming or not. A failure is the
+same envelope with `ok: false` and `error.code` set; there is always exactly one,
+including when the failure happened before any work started, and including when the
+failure was an unhandled one (its traceback goes to stderr, never stdout).
+
+`down` was listed here as streaming and is not — it emits the envelope alone.
+`capabilities.commands[].streams` is derived from the build and is the authority;
+this sentence was prose that drifted.
 
 `contract` is the wire generation — if you do not recognise it, refuse rather than
 guess. `schema` versions each payload separately. New keys may appear in `data` or

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rc-repro"
-version = "0.70.0"
+version = "0.76.1"
 description = "Launch version-matched Rocket.Chat reproduction environments"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,7 +24,7 @@ gui = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9", "websockets
 browser = ["playwright>=1.44"]
 
 [project.scripts]
-rc-repro = "rc_repro.cli:app"
+rc-repro = "rc_repro.cli:main"
 
 [tool.setuptools]
 packages = ["rc_repro", "rc_repro.presets", "rc_repro.perf", "rc_repro.services", "rc_repro.web"]

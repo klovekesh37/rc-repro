@@ -60,9 +60,16 @@ def ensure_ca() -> tuple[Path, Path]:
     key, crt = d / CA_KEY, d / CA_CRT
     if key.exists() and crt.exists():
         return key, crt
-    d.mkdir(parents=True, exist_ok=True)
+    # 0700 on the directory FIRST, so the key is never reachable even in the window
+    # below: `openssl genrsa -out` creates the file at 0666 & ~umask and the chmod
+    # lands after it, which on a default umask is a real, if brief, 0644 private key
+    # that can mint a certificate for any name the browser will trust.
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(d, 0o700)          # existing directory from an older rc-repro
+    except OSError:
+        pass
     _openssl("genrsa", "-out", str(key), "4096")
-    # 0600: this key can mint a certificate for any name the browser will trust.
     os.chmod(key, 0o600)
     _openssl("req", "-x509", "-new", "-nodes", "-key", str(key), "-sha256",
              "-days", str(_CA_DAYS), "-out", str(crt),

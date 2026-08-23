@@ -180,10 +180,15 @@ def set_env(name: str, sets: dict | None = None, unset: list[str] | None = None,
     # No Kubernetes path yet. Reaching for the compose project answers
     # "no configuration file provided", which names nothing a user can act
     # on -- so this refuses and hands over the command that does the job.
-    topology.require_compose(name, "env",
-                             instead="Use `helm -n rc-repro-{t} upgrade rocketchat --reuse-values --set extraEnv[0].name=...`, or `rc-repro api` for a runtime setting.".replace("{t}", name))
-    lifecycle.require_docker()
+    # RESOLVED FIRST, because the refusal QUOTES the name. `require_compose` ran on
+    # the raw argument, so `env --set X=1 --name TICKET-1234` handed over
+    # `helm -n rc-repro-TICKET-1234 ...` -- a namespace that does not exist, for a
+    # workspace really called `ticket-1234`. A refusal whose suggested command cannot
+    # work is worse than a bare refusal: it sends somebody to debug kubectl.
     target = lifecycle.resolve_name(name)
+    topology.require_compose(target, "env",
+                             instead="Use `helm -n rc-repro-{t} upgrade rocketchat --reuse-values --set extraEnv[0].name=...`, or `rc-repro api` for a runtime setting.".replace("{t}", target))
+    lifecycle.require_docker()
     # Serialised against every other mutating operation on this repro: this does
     # read-compose -> write-compose -> `docker compose up`, and interleaving that
     # with a backup, an upgrade or another env change races compose against itself.

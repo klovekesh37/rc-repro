@@ -304,9 +304,20 @@ def test_capabilities_reports_exactly_the_commands_that_really_speak_json():
         for cmd in getattr(group.typer_instance, "registered_commands", []):
             scan(cmd, prefix=f"{group.name} ")
 
-    assert advertised == real, (
-        f"capabilities advertises {sorted(advertised - real)} that do not take "
-        f"--json, and omits {sorted(real - advertised)} that do")
+    # THE FLAG IS A PROXY, AND FOR ONE COMMAND IT IS THE WRONG ONE. `capabilities`
+    # answers in an envelope and always has -- it has no `--json` because it has no
+    # other mode -- so deriving purely from the parameter made the one document whose
+    # purpose is saying which commands speak JSON report that this one does not, while
+    # speaking it. Named here rather than special-cased silently, and the claim is not
+    # taken on trust: every name in JSON_COMMANDS, this one included, is driven to
+    # completion by test_every_json_command_answers_with_exactly_one_envelope.
+    ALWAYS_JSON = {"capabilities"}
+    assert advertised == real | ALWAYS_JSON, (
+        f"capabilities advertises {sorted(advertised - real - ALWAYS_JSON)} that do "
+        f"not take --json, and omits {sorted((real | ALWAYS_JSON) - advertised)} "
+        f"that do")
+    assert ALWAYS_JSON <= set(JSON_COMMANDS), (
+        "a command declared always-JSON must be exercised by the envelope test")
     assert advertised, "no command speaks JSON, which cannot be right"
 
 
@@ -366,6 +377,8 @@ JSON_COMMANDS: dict[str, tuple[list[str], bool]] = {
     "up": (["up", "--version", "8.5.1", "--set", "nonsense", "--json"], False),
     "loadtest": (["loadtest", "--name", "nope", "--json"], False),
     "capacity": (["capacity", "--name", "nope", "--json"], False),
+    # No `--json`: it has no other mode. See ALWAYS_JSON above.
+    "capabilities": (["capabilities"], True),
 }
 
 
@@ -391,6 +404,15 @@ def test_every_json_command_answers_with_exactly_one_envelope(
     """
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("RC_REPRO_SKILL_HOME", str(tmp_path / "skills"))
+    # THE ENGINE, MADE DETERMINISTIC. `want_ok` below is a fact about the contract,
+    # not about this machine -- and `doctor` and `capacity` legitimately answer
+    # ok=false/exit 3 on a box with no Docker, so the table was only true where one
+    # happened to be installed. CLAUDE.md says nothing in the suite needs Docker;
+    # this is what makes that so for these two rather than hoping for it. Stubbed at
+    # the seam every path funnels through, so the command still runs end to end.
+    from rc_repro import runner as _runner
+    monkeypatch.setattr(_runner, "docker_available", lambda **k: True)
+    monkeypatch.setattr(_runner, "compose_version", lambda **k: "2.29.0")
     argv, want_ok = JSON_COMMANDS[name]
     res = runner_.invoke(cli.app, argv)
 
@@ -438,7 +460,10 @@ def test_a_workspace_that_is_not_answering_yet_exits_five_not_one(monkeypatch, t
         "mongo_tag": "8.0", "mongo_flavor": "official", "preset": "default",
         "root_url": "http://localhost:3001", "host_port": 3001, "version_source": "x",
         "extra": {}}))
-    monkeypatch.setattr(cli, "_require_docker", lambda: None)
+    # `_require_engine`, not `_require_docker`: the gate is runtime-aware now, so a
+    # stub on the old name is inert and this asserted exit 5 while getting 3 from a
+    # real Docker check -- invisible on any box that happens to have Docker running.
+    monkeypatch.setattr(cli, "_require_engine", lambda target: None)
 
     def refuse(*_a, **_k):
         raise requests.ConnectionError("connection refused")
@@ -502,3 +527,277 @@ def test_every_documented_edge_action_is_reachable():
     for action in ("status", "start", "stop", "restart", "logs"):
         assert f'"{action}"' in src, f"`edge {action}` is advertised and unhandled"
 
+
+
+def test_every_advertised_error_code_can_actually_be_raised():
+    """The third registry walk. `capabilities` published a code nothing raises.
+
+    `_error_codes()` deliberately leaves `errors.GATE_CODES` out and says why in its
+    own docstring -- "advertising a code nothing can produce is the exact failure this
+    document exists to prevent, and it would teach a caller to write a branch that
+    never runs". The exclusion was applied to the REGISTRY and not to the class that
+    carries them, so the walk picked up the base `GATE` anyway and `capabilities`
+    advertised it on a build with no `raise AuthorityGateError` anywhere.
+
+    This is the same shape as the job pools and the journal: a rule that is stated
+    correctly in prose and not enforced by a walk.
+    """
+    import ast
+    import pathlib
+
+    from rc_repro import errors, jsonout
+
+    root = pathlib.Path(errors.__file__).parent
+    raised: set[str] = set()
+    for path in root.rglob("*.py"):
+        try:
+            tree = ast.parse(path.read_text())
+        except SyntaxError:                                   # pragma: no cover
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Raise) or node.exc is None:
+                continue
+            exc = node.exc
+            fn = exc.func if isinstance(exc, ast.Call) else exc
+            name = ast.unparse(fn).rsplit(".", 1)[-1]
+            cls = getattr(errors, name, None)
+            if isinstance(cls, type) and getattr(cls, "code", None):
+                raised.add(cls.code)
+
+    advertised = set(jsonout._error_codes())
+    # REPRO_ERROR is the base and is raised through `_err`/`_fail` wrappers rather
+    # than by name, so it is always producible.
+    unraisable = advertised - raised - {errors.ReproError.code}
+    assert not unraisable, (
+        f"capabilities advertises {sorted(unraisable)}, which nothing in rc_repro/ "
+        f"raises — a caller told to expect it would write a branch that never runs")
+
+    # And the converse guard, so the exclusion cannot quietly hide a real code: an
+    # error class that IS raised must be advertised.
+    assert "GATE" not in advertised, (
+        "GATE is advertised again — set AuthorityGateError.advertised in the same "
+        "commit that adds the first raise, not before")
+
+
+def test_an_unhandled_exception_is_still_one_envelope_on_stdout():
+    """"Exactly one envelope, and it is the last line" is the single promise a caller
+    is told it may depend on, and four reachable states broke it.
+
+    A workspace directory with a docker-compose.yml and no repro.json
+    (FileNotFoundError -- what an interrupted create leaves between the two
+    atomic_writes), a repro.json missing fields (TypeError), a malformed config.yaml
+    (yaml.parser.ParserError) and a non-writable RC_REPRO_HOME (PermissionError) each
+    produced a traceback, exit 1, and ZERO BYTES of stdout under `--json`. The contract
+    held until the moment a caller needed it.
+
+    Driven through `cli.main`, because that is where the handler lives and where the
+    console script points -- `CliRunner` catches exceptions itself, so invoking the
+    Typer app would assert against a safety net the real binary does not have.
+    """
+    import json
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    for label, build in (
+        ("no repro.json", lambda h: (
+            (h / "repros" / "half").mkdir(parents=True),
+            (h / "repros" / "half" / "docker-compose.yml").write_text("services: {}"),
+            ["info", "--name", "half", "--json"])[-1]),
+        ("truncated repro.json", lambda h: (
+            (h / "repros" / "trunc").mkdir(parents=True),
+            (h / "repros" / "trunc" / "repro.json").write_text('{"name":"trunc"}'),
+            (h / "repros" / "trunc" / "docker-compose.yml").write_text("services: {}"),
+            ["info", "--name", "trunc", "--json"])[-1]),
+        ("malformed config.yaml", lambda h: (
+            (h / "config.yaml").write_text("a: b: c: ["),
+            ["list", "--json"])[-1]),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            argv = build(home)
+            proc = subprocess.run(
+                [sys.executable, "-c",
+                 "from rc_repro.cli import main; main()", *argv],
+                capture_output=True, text=True, timeout=120,
+                env={"PATH": "/usr/bin:/bin", "RC_REPRO_HOME": str(home),
+                     "HOME": str(home), "PYTHONPATH": str(Path(__file__).parent.parent)},
+            )
+            lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+            assert lines, f"{label}: stdout was EMPTY under --json (exit {proc.returncode})"
+            doc = json.loads(lines[-1])
+            assert doc["ok"] is False, f"{label}: {doc}"
+            assert doc["error"]["code"], f"{label}: no error code"
+            assert proc.returncode != 0, f"{label}: exited 0 on a failure"
+
+
+def test_the_envelope_warnings_array_is_actually_populated():
+    """`warnings` was in the envelope from the start and nothing ever wrote to it.
+
+    `grep -n 'warnings=' cli.py` returned nothing and all ten `reply()` sites omitted
+    it, so a caller reading the documented field for the documented purpose got `[]`
+    every time. The sharpest case is asserted here because it is the one a caller
+    actually hits: `doctor --json` answered `{"ok": true, "warnings": [], "data":
+    {"verdict": "warn", "counts": {"warn": 6, ...}}}` -- warnings counted in `data`,
+    none in `warnings`, reachable only through `data.checks[].status`, which is not
+    what a caller is told to read.
+
+    Driven through the real command rather than the helper, so this fails against the
+    pre-fix tree because the ARRAY IS EMPTY, not because a function has been renamed.
+    """
+    import json
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.run(
+            [sys.executable, "-c", "from rc_repro.cli import app; app()",
+             "doctor", "--json"],
+            capture_output=True, text=True, timeout=180,
+            env={"PATH": "/usr/bin:/bin", "RC_REPRO_HOME": tmp, "HOME": tmp,
+                 "PYTHONPATH": str(Path(__file__).parent.parent)},
+        )
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    assert lines, f"doctor --json wrote nothing (exit {proc.returncode})"
+    doc = json.loads(lines[-1])
+    counted = int(doc["data"]["counts"].get("warn", 0)) + \
+        int(doc["data"]["counts"].get("fail", 0))
+    assert counted > 0, (
+        "this box's doctor reports no warnings at all, so the assertion below cannot "
+        f"mean anything: {doc['data']['counts']}")
+    assert len(doc["warnings"]) == counted, (
+        f"doctor counted {counted} warn/fail checks and put {len(doc['warnings'])} in "
+        f"the envelope's `warnings` — the field a caller is told to read")
+    for w in doc["warnings"]:
+        assert w.get("code", "").startswith("DOCTOR_"), w
+        assert w.get("message"), w
+
+
+def test_a_domain_error_escaping_a_command_exits_with_its_own_code_and_no_traceback():
+    """`main()` guarded the BaseException branch against `typer.Exit` and left the
+    `ReproError` branch three lines above it unguarded.
+
+    `typer.Exit` is RuntimeError-derived, NOT a SystemExit:
+
+        >>> [c.__name__ for c in typer.Exit.__mro__][:3]
+        ['Exit', 'RuntimeError', 'Exception']
+
+    Click converts it inside `app()`; nothing does out here. So `_fail(exc)` called
+    from `main()` propagated as an uncaught exception -- the right message, then a
+    traceback, then exit 1 where the published table says 4. The comment on the
+    `except SystemExit` line claimed it covered "every `_fail`/`_err`", which is
+    exactly the belief that produced the bug.
+
+    Driven as a subprocess through `cli.main`, because CliRunner catches exceptions
+    itself and would assert against a safety net the real binary does not have.
+    """
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    root = str(Path(__file__).parent.parent)
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.run(
+            [sys.executable, "-c", "from rc_repro.cli import main; main()",
+             "env", "--name", "definitely-not-a-repro"],
+            capture_output=True, text=True, timeout=120,
+            env={"PATH": "/usr/bin:/bin", "RC_REPRO_HOME": tmp, "HOME": tmp,
+                 "PYTHONPATH": root},
+        )
+    assert proc.returncode == 4, (
+        f"exited {proc.returncode}, want 4 (not_found)\n{proc.stderr[-400:]}")
+    assert "Traceback" not in proc.stderr, proc.stderr[-600:]
+
+
+def test_a_failure_before_any_command_still_writes_one_envelope():
+    """`--json` is a command PARAMETER, so `jsonout.activate()` runs inside the command
+    -- and some failures happen before any command does.
+
+    `_before_any_command` is the sharp one: it reads the accounts file on EVERY
+    invocation, so an unreadable or wrong-type `~/.rc-repro/users` -- a stale
+    directory, or a file owned by another user on the shared box this tool is built
+    for -- failed there and left a `--json` caller with a traceback and ZERO BYTES of
+    stdout. That is the fifth member of the crash-class family v0.73.0 closed four of.
+    """
+    import json
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    root = str(Path(__file__).parent.parent)
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "users").mkdir()          # a DIRECTORY where a file belongs
+        proc = subprocess.run(
+            [sys.executable, "-c", "from rc_repro.cli import main; main()",
+             "list", "--json"],
+            capture_output=True, text=True, timeout=120,
+            env={"PATH": "/usr/bin:/bin", "RC_REPRO_HOME": tmp, "HOME": tmp,
+                 "PYTHONPATH": root},
+        )
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    assert lines, f"stdout EMPTY under --json (exit {proc.returncode})\n{proc.stderr[-400:]}"
+    doc = json.loads(lines[-1])
+    assert doc["ok"] is False and doc["error"]["code"], doc
+    assert proc.returncode != 0
+    assert "Traceback" not in proc.stderr, proc.stderr[-600:]
+
+
+def test_no_json_command_writes_a_payload_outside_the_envelope():
+    """The failure path was covered and the SUCCESS path was the broken one.
+
+    `JSON_COMMANDS` drives `loadtest` and `capacity` with `--name nope`, which fails at
+    `_resolve_name` and exits through `_fail` -- a correct envelope. So the table proved
+    the contract on the only path where it already held, while both commands printed
+    `typer.echo(json.dumps(result, indent=2))` on success: no `schema`, no `contract`,
+    no `ok`, no `error`, over many lines. `jsonout`'s module docstring names these two
+    as the bug it was written for, and it had been fixed for the error path only.
+
+    README sells `--slo` as the thing that "drops into CI" and tells that CI step to
+    read to end of stream and parse the last line. The last line of `capacity --json`
+    was `}`.
+
+    ASSERTED STRUCTURALLY, and here is the honest reason: driving either command to its
+    success path needs k6, a live workspace and a PAT, so a unit test can only get there
+    through a stub chain deep enough that it would be asserting against the stubs. What
+    can be checked without Docker is that no command in this file's own table writes a
+    machine payload outside `jsonout` -- which is the mistake that was actually made,
+    and which a bare `json.dumps` cannot satisfy. The end-to-end success path stays a
+    live-verification item.
+    """
+    import ast
+    import pathlib as _pl
+
+    from rc_repro import cli
+
+    tree = ast.parse(_pl.Path(cli.__file__).read_text())
+    offenders: list[str] = []
+    for fn in [n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        body = ast.unparse(fn)
+        # Only commands that speak JSON at all can break this contract.
+        if "jsonout.activate()" not in body:
+            continue
+        for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call)]:
+            rendered = ast.unparse(call)
+            if rendered.startswith("typer.echo(json.dumps"):
+                offenders.append(f"{fn.name}: {rendered[:70]}")
+            # `print` would bypass `ui`'s stderr redirection too.
+            if rendered.startswith("print(json.dumps"):
+                offenders.append(f"{fn.name}: {rendered[:70]}")
+
+    assert not offenders, (
+        "these write a JSON payload straight to stdout, outside the envelope, in a "
+        "command that has told the caller stdout is a machine document:\n  "
+        + "\n  ".join(offenders))
+
+    # And both DO reach `jsonout.reply`, so the fix is present rather than the bad call
+    # merely having been deleted.
+    for name in ("loadtest", "capacity"):
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == name)
+        assert "jsonout.reply(" in ast.unparse(fn), f"{name} emits no envelope"

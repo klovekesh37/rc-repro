@@ -38,10 +38,10 @@ from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
 
-from rc_repro import config, runner
+from rc_repro import config, rcapi, runner
 from rc_repro.errors import (ConflictError, DockerError, NotFoundError,
                              NotReadyError, ReproError, ValidationError)
-from rc_repro.services import lifecycle, topology
+from rc_repro.services import journal, lifecycle, topology
 from rc_repro.services.events import Emit, info, null_emit, warn
 
 #: Bundle layout. `schema` is checked on read: a future rc-repro that changes the
@@ -227,6 +227,7 @@ class _Quiesced:
 
     def __init__(self, name: str, services: list[str], emit: Emit, *, skip: bool = False):
         self.name, self.services, self.emit, self.skip = name, services, emit, skip
+        self.note = ""
 
     def __enter__(self):
         if self.skip:
@@ -237,6 +238,14 @@ class _Quiesced:
         info(self.emit, "stopping Rocket.Chat so the dump is consistent "
                         "(Mongo keeps running)", phase="backup", pct=10)
         ctx = _kube(self.name)
+        # BEFORE it goes down, and carrying what will bring it back. `__exit__` starts
+        # it again "no matter what" -- except the one case where nothing runs at all:
+        # a daemon job thread killed by a restart or an OOM. This class's own
+        # docstring calls that outcome worse than the failure it was guarding, and
+        # this note is what lets a later `serve` or `doctor` see it and fix it.
+        self.note = journal.record(journal.ROCKETCHAT_STOPPED, self.name,
+                                   context=ctx, replicas=1,
+                                   services=list(self.services))
         if ctx:
             from rc_repro.services import k8s
             # ONLY Rocket.Chat. `stop_workspace` would take MongoDB with it, and a
@@ -255,7 +264,9 @@ class _Quiesced:
             extra = meta.extra if isinstance(meta.extra, dict) else {}
             pid = extra.get("port_forward_pid")
             if pid:
-                lifecycle._stop_port_forward(int(pid))
+                from rc_repro.services import k8s as _k8s
+                lifecycle._stop_port_forward(
+                    int(pid), namespace=_k8s.namespace_for(self.name))
                 runner.update_meta(self.name,
                                    lambda m: m.extra.pop("port_forward_pid", None))
         else:
@@ -277,11 +288,15 @@ class _Quiesced:
         else:
             failed = runner.start_services(self.name, self.services) != 0
         if failed:
+            # The note DELIBERATELY stays: Rocket.Chat is still stopped, which is
+            # exactly the state recovery exists to repair. Clearing it here would
+            # trade a fixable condition for a warning nobody reads twice.
             warn(self.emit,
                  f"Rocket.Chat did not come back up on {self.name!r} - the data is "
                  f"safe, but the workspace is stopped. Start it with "
                  f"`rc-repro start --name {self.name}`.", phase="backup")
         else:
+            journal.clear(self.note)
             # Rocket.Chat has been STARTED, which is not the same as serving, and
             # `backup` returned on the former. Both runtimes were affected and only
             # one recovered on its own:
@@ -820,16 +835,29 @@ def _restore_locked(target: str, path: Path, manifest: dict, emit: Emit, *,
             # hybrid this is meant to prevent. Drop the database first for a real
             # point-in-time restore; the checksum is already verified above and
             # Rocket.Chat is stopped, so there is nothing racing this.
+            # NOTED BEFORE THE DROP. Between here and the mongorestore returning,
+            # the workspace has NO data -- minutes, for a multi-GB bundle -- and
+            # nothing recorded that. `_Quiesced` journals ROCKETCHAT_STOPPED, so a
+            # SIGKILL in this window gets Rocket.Chat restarted by recovery and
+            # reported as repaired, against an empty database. Advisory, because
+            # re-running a mongorestore at `serve` startup is not something a GUI
+            # startup may spend; `doctor` reports it and the same `restore` finishes it.
+            from rc_repro.services import journal
+            drop_note = journal.record(journal.DATABASE_DROPPED, target,
+                                       bundle=str(path), database=database)
             _drop_database(target, database, emit)
             info(emit, f"restoring into database {database!r}", phase="restore", pct=50)
             started = time.monotonic()
             rc, out = _exec_from_file(target, argv, archive, timeout=DUMP_TIMEOUT)
             elapsed = round(time.monotonic() - started, 1)
+            if rc == 0:
+                journal.clear(drop_note)
         if rc != 0:
             raise DockerError(f"mongorestore failed for {target!r}: {out.strip()[-800:]}")
 
     info(emit, f"restored in {elapsed}s; waiting for Rocket.Chat", phase="restore", pct=85)
     result = lifecycle.wait_and_finalize(runner.read_meta(target), emit)
+    _retarget_site_url(target, emit)
     info(emit, f"{target!r} restored from {path.name}", phase="done", pct=100)
     return {"name": target, "bundle": str(path), "created": created,
             "database": database, "restore_seconds": elapsed,
@@ -852,3 +880,48 @@ def delete(bundle: str | Path) -> dict:
     except OSError as exc:
         raise ValidationError(f"could not delete {path}: {exc}") from exc
     return {"deleted": str(path)}
+
+
+def _retarget_site_url(target: str, emit: Emit = null_emit) -> None:
+    """Point a restored workspace's Site_Url at ITSELF.
+
+    A restore is a full mongorestore, so the bundle's `Site_Url` comes with it and
+    ROOT_URL does not override a stored setting. Measured: source on 3111, restored to
+    3000, `env` reporting ROOT_URL=http://localhost:3000 and
+    `GET /api/v1/settings/Site_Url` answering http://localhost:3111 -- and /api/info
+    then advertising `"workspaceUrl": "localhost:3111"` while serving on 3000.
+
+    That is wrong in exactly the field a restored workspace is usually restored to
+    investigate: Rocket.Chat derives email links, OAuth/SAML/OIDC redirect URIs,
+    integration callbacks, file/CDN URLs and mobile deep links from it. And if the
+    SOURCE workspace is still running, every one of those links opens the source --
+    so an engineer reproducing a customer's OAuth problem is driven to a different
+    workspace without being told.
+
+    `configimport.py` already denies `Site_Url` on import with the comment "breaks
+    localhost access to the repro". The restore path is the same hazard by a different
+    route and had no equivalent guard. Best-effort: a restore that worked must not fail
+    because one setting could not be rewritten.
+    """
+    try:
+        meta = runner.read_meta(target)
+        want = meta.public_url or meta.root_url
+        if not want:
+            return
+        auth = lifecycle.login(meta)
+        current = rcapi.get_setting(meta.root_url, auth, config.ADMIN_PASSWORD,
+                                    "Site_Url")
+        if isinstance(current, str) and current.rstrip("/") == want.rstrip("/"):
+            return
+        if rcapi.set_setting(meta.root_url, auth, config.ADMIN_PASSWORD,
+                             "Site_Url", want):
+            info(emit, f"Site_Url retargeted from {current!r} to {want!r} - the bundle "
+                       f"carried the source workspace's address", phase="restore")
+        else:
+            warn(emit, f"Site_Url still reads {current!r}, which is the workspace this "
+                       f"bundle came from - Rocket.Chat builds email links and OAuth "
+                       f"redirects from it. Set it in Admin > General.", phase="restore")
+    except Exception as exc:  # noqa: BLE001 - a restore that worked must not fail here
+        warn(emit, f"could not check Site_Url after the restore ({exc}); if this "
+                   f"bundle came from another workspace it still names that one",
+             phase="restore")

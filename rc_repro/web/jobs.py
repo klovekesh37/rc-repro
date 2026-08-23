@@ -60,8 +60,27 @@ KEEP_RESULTS = 10
 #     just should not all run at once on one engine.
 #
 # Everything else (reads, state changes, seeds) is unbounded, as before.
+#
+# THE POOL IS CHOSEN BY THE KIND STRING, AND THE KIND STRING IS NOT THE WORK. Two
+# routes submitted engine-heavy work under a label nobody had added here: "up" calls
+# `lc.create_repro` -- the same function as "create" -- and "rollback" restores a
+# bundle exactly as "restore" does. Both therefore resolved to no pool at all, so N
+# concurrent `POST /api/repros/{name}/up` calls ran N compose-ups at once, past a
+# `check_capacity` each of them passes independently because none has finished
+# allocating yet. A GUI that retries a failed start reaches that by accident.
+# `test_every_engine_heavy_job_kind_lands_in_a_pool` walks app.py and fails if a new
+# one is added without a pool, which is the only thing that keeps this honest.
 _MEASURE_KINDS = frozenset({"loadtest", "capacity", "benchmark"})
-_HEAVY_KINDS = frozenset({"create", "restore", "upgrade", "backup", "scale"})
+_HEAVY_KINDS = frozenset({"create", "up", "restore", "rollback", "upgrade",
+                          "backup", "scale", "teardown", "prune",
+                          # `attach` does a PULLING `runner.up` of six containers, and
+                          # `detach` removes them and their volumes. Both were unpooled
+                          # because the route chose the kind with a ternary, which the
+                          # walk test could not read.
+                          "monitor", "monitor-off",
+                          # A seed drives hundreds of REST writes and is the one
+                          # data-mutating operation that had neither a pool nor a lock.
+                          "seed"})
 _measure_slots = threading.BoundedSemaphore(1)
 _heavy_slots = threading.BoundedSemaphore(max(2, (os.cpu_count() or 4) // 2))
 
@@ -76,7 +95,14 @@ _heavy_slots = threading.BoundedSemaphore(max(2, (os.cpu_count() or 4) // 2))
 #
 # Refusing at SUBMIT is the fix: a person who queues a 33rd load test wants a
 # message, not a silent thread. Generous enough that no honest workflow reaches it.
-MAX_QUEUED_PER_KIND = 32
+#
+# PER POOL, not per kind -- see the count in submit(). The first spelling of this was
+# per kind, which multiplied the bound by the number of kinds sharing each pool and
+# let the exact thing it was measured against happen anyway.
+MAX_QUEUED_PER_POOL = 32
+#: Old name, kept so anything reading it still resolves. The bound it described was
+#: never the one that mattered.
+MAX_QUEUED_PER_KIND = MAX_QUEUED_PER_POOL
 
 
 #: A job that has not reached a terminal state. "queued" belongs here: it has not
@@ -258,12 +284,19 @@ class JobManager:
         origin = CURRENT_ORIGIN.get("")
         slots = _slots_for(kind)
         if slots is not None:
+            # COUNTED PER POOL, not per kind. The ceiling protects a resource, and the
+            # resource is the pool -- which three kinds share on the measurement side
+            # and nine on the heavy side. Counting per kind made the reachable total
+            # 3x32 threads against a pool of 1 and 9x32 against a pool of 2, so the
+            # bound written to stop 40 threads permitted 384. And `_evict_locked`
+            # cannot claw any of it back: a queued job is correctly counted active, so
+            # MAX_JOBS is unenforceable against exactly the jobs this refuses.
             with self._lock:
                 waiting = sum(1 for j in self._jobs.values()
-                              if j.kind == kind and j.status == "queued")
-            if waiting >= MAX_QUEUED_PER_KIND:
+                              if j.status == "queued" and _slots_for(j.kind) is slots)
+            if waiting >= MAX_QUEUED_PER_POOL:
                 raise ConflictError(
-                    f"{waiting} {kind} job(s) are already waiting for a free slot. "
+                    f"{waiting} job(s) are already waiting for a free slot. "
                     "Let those finish first — see the Activity list.")
         job = Job(id="job_" + uuid.uuid4().hex[:10], kind=kind, label=label,
                   actor=actor,
@@ -318,6 +351,24 @@ class JobManager:
                 job.status = "error"
                 job.emit(Event(f"internal error: {exc}", phase="done", level="error",
                                terminal=True, data={"error": str(exc)}))
+            except BaseException as exc:  # noqa: BLE001 - see below
+                # NOT AN ACADEMIC BRANCH. Only ReproError and Exception were caught, so
+                # anything else -- a KeyboardInterrupt delivered to this thread, a
+                # SystemExit from a library, a MemoryError -- left `status` at "running"
+                # forever. That is in ACTIVE_STATUSES, so `_evict_locked` can never drop
+                # the job, `_trim_results` never releases its result, and the SSE stream
+                # never terminates: a browser tab holds the connection open waiting for
+                # an event that cannot arrive. Re-raised after being recorded, because
+                # swallowing a BaseException is its own bug.
+                traceback.print_exc()
+                job.error = f"{type(exc).__name__}: {exc}" or repr(exc)
+                job.error_kind = type(exc).__name__
+                job.finished_at = time.time()
+                job.status = "error"
+                job.emit(Event(f"job ended abnormally: {type(exc).__name__}",
+                               phase="done", level="error", terminal=True,
+                               data={"error": str(exc)}))
+                raise
             finally:
                 # In `finally`, not after the try: a job that raises still holds a
                 # slot, and one leaked slot on the measurement pool (size 1) wedges

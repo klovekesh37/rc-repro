@@ -12,7 +12,7 @@ from pathlib import Path
 
 from rc_repro import configimport, runner, scaleseed
 from rc_repro.errors import DockerError, NotReadyError, ValidationError
-from rc_repro.services import lifecycle
+from rc_repro.services import lifecycle, topology
 from rc_repro.services.events import Emit, info, null_emit, warn
 
 
@@ -44,6 +44,15 @@ def _scale_ok(rc: int, out: str, what: str, *, hint: str = "") -> dict:
 def run_scale(name: str, spec_str: str, emit: Emit = null_emit) -> dict:
     """Bulk-insert users/messages per a `--scale` spec (users=N,messages=N@room)."""
     target = lifecycle.resolve_name(name)
+    # COMPOSE ONLY, said here rather than discovered two layers down. `scaleseed`
+    # bulk-inserts through `compose_exec_capture`, so on a Kubernetes workspace this
+    # reached for a compose project that is not there and answered "no configuration
+    # file provided: not found" -- docker's words for something the reader cannot
+    # act on. The REST seed above it is runtime-agnostic; only the bulk path is not.
+    topology.require_compose(
+        target, "--scale prefill",
+        instead="Seed over REST instead (`rc-repro seed --name %s`), which works on "
+                "both runtimes." % target)
     # Bulk prefill writes straight into Mongo; running it while a backup is dumping
     # would put half of it in the archive.
     with runner.repro_lock(target):
@@ -79,6 +88,15 @@ def _run_scale_locked(target: str, spec_str: str, emit: Emit = null_emit) -> dic
 def clear_scale(name: str, emit: Emit = null_emit) -> dict:
     """Remove everything a prior --scale added and restore affected rooms."""
     target = lifecycle.resolve_name(name)
+    # COMPOSE ONLY, said here rather than discovered two layers down. `scaleseed`
+    # bulk-inserts through `compose_exec_capture`, so on a Kubernetes workspace this
+    # reached for a compose project that is not there and answered "no configuration
+    # file provided: not found" -- docker's words for something the reader cannot
+    # act on. The REST seed above it is runtime-agnostic; only the bulk path is not.
+    topology.require_compose(
+        target, "--scale prefill",
+        instead="Seed over REST instead (`rc-repro seed --name %s`), which works on "
+                "both runtimes." % target)
     # Locked like run_scale, which it undoes. Without it the two could interleave
     # on one workspace -- a clear deleting the users a concurrent prefill is still
     # inserting, leaving a count that matches neither.
@@ -128,7 +146,7 @@ def import_apply(name: str, settings_path: str, only: set[str] | None = None,
         auth = lifecycle.login(m)
     except Exception as exc:  # noqa: BLE001
         raise NotReadyError(f"can't import - repro not ready: {exc}") from exc
-    res = configimport.apply(m.root_url, auth, plan,
+    res = configimport.apply(m.root_url, auth, plan, workspace=m.name,
                              log=lambda s: info(emit, s.strip(), phase="config"))
     info(emit, f"imported {res['applied']} setting(s), skipped {res['skipped']}"
                + (f"; {res['failed']} rejected" if res["failed"] else ""), phase="done")

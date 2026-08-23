@@ -27,17 +27,26 @@ from rc_repro import config
 from rc_repro.errors import ConflictError
 
 
-def atomic_write(path: Path, content: str) -> None:
+def atomic_write(path: Path, content: str, *, mode: int | None = None) -> None:
     """Write via a temp file in the same dir + os.replace, so readers never see a
     partially written file (rename is atomic on the same filesystem).
 
     The temp name is unique per call: a fixed `<name>.tmp` meant two concurrent
     writers (two web jobs touching the same repro) shared one temp path and
     clobbered each other, defeating the atomicity this exists to provide.
+
+    `mode` is applied to the TEMP FILE, before the rename -- so the target never exists
+    at the umask's permissions even for an instant. Callers writing a private key pass
+    0o600: `edge.issue_local_cert` wrote `certs/<host>.key` through here and it landed
+    at whatever the umask allowed, typically 0644, on a box where `~/.rc-repro` is only
+    tightened to 0700 by `serve` or a config save -- neither of which runs on a
+    CLI-only `up --https`.
     """
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     try:
         tmp.write_text(content, encoding="utf-8")
+        if mode is not None:
+            os.chmod(tmp, mode)
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)   # no-op after a successful replace
@@ -161,7 +170,14 @@ def write(name: str, compose_yaml: str, meta: Metadata,
     for relpath, content in files or []:
         fp = ws / relpath
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content.replace("{{ROOT_URL}}", meta.root_url), encoding="utf-8")
+        # The ADVERTISED url, falling back to the loopback one. A generated file
+        # carrying this placeholder is read by a BROWSER, and `meta.root_url` is the
+        # address rc-repro uses for its own API calls -- always loopback, by contract.
+        # Substituting that shipped a livechat demo page that only worked on the
+        # machine docker runs on.
+        advertised = (meta.extra.get("advertised_url")
+                      if isinstance(meta.extra, dict) else "") or meta.root_url
+        fp.write_text(content.replace("{{ROOT_URL}}", advertised), encoding="utf-8")
     _restrict(ws)          # again: covers the files just written, and their dirs
 
 
@@ -822,10 +838,24 @@ def rc_status_by_project() -> dict[str, str]:
     """Map compose project -> its rocketchat container `Status` string
     ("Up 2 hours (healthy)"), in ONE `docker ps` call (cheap enough for the whole
     dashboard). Used to show uptime/health per repro without an N-call fan-out."""
-    return _cached_query("rc_status_by_project", _rc_status_by_project_uncached)
+    return {proj: svcs.get("rocketchat") or svcs.get("rocketchat-1") or ""
+            for proj, svcs in services_by_project().items()}
 
 
-def _rc_status_by_project_uncached() -> dict[str, str]:
+def services_by_project() -> dict[str, dict[str, str]]:
+    """Map compose project -> {service: `Status` string} for EVERY container.
+
+    The same single `docker ps` this always ran; it just stopped discarding the rest
+    of the output. `rc_status_by_project` used to keep the rocketchat line and throw
+    the others away, which is why a repro whose MONGODB had exited reported `running`
+    and `healthy` -- both derived from the Rocket.Chat container alone, and Rocket.Chat
+    serves /api/info perfectly well with no database behind it. The truth was one field
+    away in a call already being made.
+    """
+    return _cached_query("services_by_project", _services_by_project_uncached)
+
+
+def _services_by_project_uncached() -> dict[str, dict[str, str]]:
     try:
         proc = subprocess.run(
             ["docker", "ps", "--all", "--format",
@@ -836,11 +866,11 @@ def _rc_status_by_project_uncached() -> dict[str, str]:
         return {}          # same 4s-poll bound as _compose_ls; {} = "couldn't ask"
     if proc.returncode != 0:
         return {}
-    out: dict[str, str] = {}
+    out: dict[str, dict[str, str]] = {}
     for line in (proc.stdout or "").splitlines():
         parts = line.split("\t")
-        if len(parts) >= 3 and parts[1] in ("rocketchat", "rocketchat-1"):
-            out[parts[0]] = parts[2]
+        if len(parts) >= 3 and parts[0]:
+            out.setdefault(parts[0], {})[parts[1]] = parts[2]
     return out
 
 

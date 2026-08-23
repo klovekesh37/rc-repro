@@ -21,7 +21,7 @@ import requests
 from rc_repro import config, rcapi, runner
 from rc_repro import seed as seeder
 from rc_repro.errors import DockerError, NotReadyError, ValidationError
-from rc_repro.services import lifecycle
+from rc_repro.services import journal, lifecycle
 from rc_repro.services.events import Emit, info, null_emit, warn
 
 _GUI_SCENARIOS = ("messages", "login", "read", "mixed", "journey", "badbot")
@@ -162,6 +162,9 @@ def run_loadtest(req: LoadtestReq, emit: Emit = null_emit) -> dict:
 
     applied_constraints: list = []
     limiter_was_off = True
+    limiter_note = ""
+    constrain_note = ""
+    metrics_note = mongo_note = ""
     metrics_changed, mongo_prior, sampler, mon = False, None, None, None
     resources = summary = None
     rcm_report: dict = {}
@@ -170,20 +173,42 @@ def run_loadtest(req: LoadtestReq, emit: Emit = null_emit) -> dict:
         if per_service:
             try:
                 applied_constraints = constrain_mod.apply(m.name, per_service)
+                # NOTED WITH THE PRIOR VALUES, so a killed run can be undone exactly
+                # rather than reset to "unlimited". `restore` runs in the `finally`
+                # below; this is what covers the run that never reaches it.
+                constrain_note = journal.record(
+                    journal.CONSTRAINTS_APPLIED, m.name,
+                    applied=[dc_asdict(a) for a in applied_constraints])
             except RuntimeError as exc:
                 raise DockerError(f"could not apply constrain: {exc}") from exc
             info(emit, f"constrained: {constrain_mod.human(per_service)} (restored after)", phase="k6")
         limiter_was_off = rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                             config.RC_RATE_LIMITER_SETTING) is False
         if not limiter_was_off:
+            # JOURNALLED BEFORE IT IS TURNED OFF. The `finally` below turns it back
+            # on, and a daemon thread killed by a restart or an OOM runs no `finally`
+            # at all -- so the note on disk is what survives to say the API rate
+            # limiter is off on this workspace and nobody meant to leave it that way.
+            limiter_note = journal.record(journal.RATE_LIMITER_OFF, m.name)
             rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                               config.RC_RATE_LIMITER_SETTING, False)
         if req.diag:
             if rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                  monitoring.RC_METRICS_SETTING) is not True:
+                # Journalled like its two neighbours. Both of these are restored in the
+                # `finally` below, which is precisely the block a SIGKILL does not run
+                # -- so without a note a killed --diag run leaves Rocket.Chat's metrics
+                # endpoint open and the profiler armed, with nothing on disk saying so.
+                metrics_note = journal.record(journal.RC_METRICS_ON, m.name)
                 metrics_changed = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                                     monitoring.RC_METRICS_SETTING, True)
             mongo_prior = mongoprof.start(m.name, req.slowms)
+            if mongo_prior is not None:
+                # Carrying the PRIOR level, because `mongoprof.stop` restores to a value
+                # rather than to off, and a workspace that already had profiling on must
+                # keep it. Same distinction CONSTRAINTS_APPLIED already draws.
+                mongo_note = journal.record(journal.MONGO_PROFILER_ON, m.name,
+                                            prior=mongo_prior)
         mon = perf.ResourceMonitor(m.name).start() if req.stats else None
         since_ms = int(time.time() * 1000)
         if req.diag:
@@ -207,12 +232,14 @@ def run_loadtest(req: LoadtestReq, emit: Emit = null_emit) -> dict:
             try:
                 rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                   config.RC_RATE_LIMITER_SETTING, True)
+                journal.clear(limiter_note)
             except Exception:  # noqa: BLE001
                 warn(emit, "could not restore the API rate limiter setting", phase="restore")
         if metrics_changed:
             try:
                 rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                   monitoring.RC_METRICS_SETTING, False)
+                journal.clear(metrics_note)
             except Exception:  # noqa: BLE001
                 warn(emit, "could not restore the Prometheus metrics setting", phase="restore")
         if mongo_prior:
@@ -220,10 +247,19 @@ def run_loadtest(req: LoadtestReq, emit: Emit = null_emit) -> dict:
             # resource-cap restore below and leave the containers capped.
             try:
                 mongoprof.stop(m.name, mongo_prior)
+                journal.clear(mongo_note)
             except Exception:  # noqa: BLE001
                 warn(emit, "could not restore the Mongo profiler level", phase="restore")
-        for problem in constrain_mod.restore(applied_constraints):
+        # CLEARED AFTER, like its three siblings above. Clearing first threw away the
+        # note on the one path it exists for: `restore` RETURNS problems rather than
+        # raising, and the loop below is there to report them -- so a failed restore
+        # left the containers capped with the record of their prior values already
+        # deleted, which is precisely what CONSTRAINTS_APPLIED carries them for.
+        _cap_problems = constrain_mod.restore(applied_constraints)
+        for problem in _cap_problems:
             warn(emit, f"could not restore resource limits - {problem}", phase="restore")
+        if not _cap_problems:
+            journal.clear(constrain_note)
 
     mongo_slow = mongoprof.collect(m.name, since_ms) if (req.diag and mongo_prior) else None
     tl = None
@@ -307,6 +343,9 @@ def run_capacity(req: CapacityReq, emit: Emit = null_emit) -> dict:
 
     applied: list = []
     limiter_was_off = True
+    limiter_note = ""
+    constrain_note = ""
+    metrics_note = ""
     metrics_changed = False
     steps: list[dict] = []
     last_pass = first_fail = None
@@ -338,13 +377,21 @@ def run_capacity(req: CapacityReq, emit: Emit = null_emit) -> dict:
         if per_service:
             try:
                 applied = constrain_mod.apply(m.name, per_service)
+                # NOTED WITH THE PRIOR VALUES, so a killed run can be undone exactly
+                # rather than reset to "unlimited". `restore` runs in the `finally`
+                # below; this is what covers the run that never reaches it.
+                constrain_note = journal.record(
+                    journal.CONSTRAINTS_APPLIED, m.name,
+                    applied=[dc_asdict(a) for a in applied])
             except RuntimeError as exc:
                 raise DockerError(f"could not apply constrain: {exc}") from exc
         limiter_was_off = rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                             config.RC_RATE_LIMITER_SETTING) is False
         if not limiter_was_off:
+            limiter_note = journal.record(journal.RATE_LIMITER_OFF, m.name)
             rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD, config.RC_RATE_LIMITER_SETTING, False)
         if rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD, monitoring.RC_METRICS_SETTING) is not True:
+            metrics_note = journal.record(journal.RC_METRICS_ON, m.name)
             metrics_changed = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                                 monitoring.RC_METRICS_SETTING, True)
         info(emit, f"capacity search: {req.scenario}, SLO {req.slo}, steps of {req.step_duration}", phase="k6")
@@ -372,15 +419,21 @@ def run_capacity(req: CapacityReq, emit: Emit = null_emit) -> dict:
         if not limiter_was_off:
             try:
                 rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD, config.RC_RATE_LIMITER_SETTING, True)
+                journal.clear(limiter_note)
             except Exception:  # noqa: BLE001
                 warn(emit, "could not restore the API rate limiter setting", phase="restore")
         if metrics_changed:
             try:
                 rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD, monitoring.RC_METRICS_SETTING, False)
+                journal.clear(metrics_note)
             except Exception:  # noqa: BLE001
                 warn(emit, "could not restore the Prometheus metrics setting", phase="restore")
-        for problem in constrain_mod.restore(applied):
+        # See run_loadtest: cleared only when the restore actually succeeded.
+        _cap_problems = constrain_mod.restore(applied)
+        for problem in _cap_problems:
             warn(emit, f"could not restore resource limits - {problem}", phase="restore")
+        if not _cap_problems:
+            journal.clear(constrain_note)
         (runner.workspace(m.name) / "loadtest" / "users.json").unlink(missing_ok=True)
 
     if last_pass is None:
@@ -444,6 +497,10 @@ def bench_one(version: str, profile: str, offline: bool, no_pull: bool, emit: Em
             return result
         runner.down(name, volumes=True)
         runner.remove(name)
+    # NOTED BEFORE IT EXISTS. `benchmark` creates a throwaway workspace per version and
+    # removes it in the `finally` below -- one Rocket.Chat and one MongoDB each, so a
+    # run killed part-way is the most expensive thing on this branch to leave behind.
+    bench_note = journal.record(journal.BENCH_WORKSPACE, name)
     mon = None
     try:
         pre = presets_load_default()
@@ -470,7 +527,8 @@ def bench_one(version: str, profile: str, offline: bool, no_pull: bool, emit: Em
         info(emit, f"[{version}] seeding ({profile})", phase="seed")
         mon = perf.ResourceMonitor(name).start()
         ts = time.monotonic()
-        s = seeder.seed(meta.root_url, auth, plan, log=lambda _m: None)
+        s = seeder.seed(meta.root_url, auth, plan, log=lambda _m: None,
+                        workspace=meta.name)
         seed_total = time.monotonic() - ts
         res = mon.stop()
         mon = None
@@ -484,6 +542,7 @@ def bench_one(version: str, profile: str, offline: bool, no_pull: bool, emit: Em
         try:
             runner.down(name, volumes=True)
             runner.remove(name)
+            journal.clear(bench_note)
         except Exception:  # noqa: BLE001
             pass
     return result

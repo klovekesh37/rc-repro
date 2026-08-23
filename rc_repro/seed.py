@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 import requests
 
 from rc_repro import config, rcapi
+from rc_repro.services import journal
 from rc_repro.perf import Timings
 
 # Realistic pools; overflow gets a numeric suffix (e.g. alice, bob, …, alice2).
@@ -421,7 +422,7 @@ def plan_from(profile: str, users=None, channels=None, messages=None) -> Plan:
                 rooms=_build(shape, names))
 
 
-def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None,
+def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None, workspace: str = "",
          tokens_out: dict | None = None) -> dict:
     """Seed the repro. `log(msg)` is called with progress lines.
 
@@ -457,7 +458,13 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None,
     # their users have no mailbox here. Only touch a value we actually observed,
     # and only put back what we actually changed.
     email_2fa_prev = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, email_2fa)
-    limiter_was_off = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, rate_limiter) is False
+    # "UNREADABLE" IS NOT "WAS ON" -- the rule the email-2FA lines above state in as
+    # many words, and the limiter line twelve lines down did not follow. `... is False`
+    # makes an unreadable setting indistinguishable from one that was on, so a single
+    # transient 500 (likely: seeding starts the moment RC answers) made this disable the
+    # limiter and then force it ON in the `finally`, on a workspace that may have had it
+    # off deliberately. Only touch what was actually observed.
+    limiter_prev = rcapi.get_setting(root_url, admin, config.ADMIN_PASSWORD, rate_limiter)
     email_2fa_changed = False
     _authorship_warning = (
         "seeded users may not be loginable, so messages will be authored by admin")
@@ -469,16 +476,34 @@ def seed(root_url, admin: rcapi.Auth, plan: Plan, log=lambda m: None,
             # Previously silent: the bool was discarded, so a failed disable
             # surfaced only as "0 usable as authors" further down.
             log(f"  ⚠ could not disable email-2FA — {_authorship_warning}")
-    if not limiter_was_off and not _set(rate_limiter, False):
-        log("  ⚠ could not disable the API rate limiter — seed rates may be throttled")
+    # JOURNALLED, both of them. The `finally` below is the only thing that puts these
+    # back, and it is exactly the block a SIGKILL, an OOM or a `systemctl restart` does
+    # not run. A GUI seed of the `large` profile is minutes long against `jobs.drain`'s
+    # 25 seconds, so this is a routine interruption, not an exotic one -- and what
+    # survives is a workspace with the rate limiter AND email-2FA off, silently
+    # different from the one somebody is about to measure, with nothing on disk for
+    # `doctor` or `serve`'s recovery to find. `workspace` is optional so the pure
+    # seed path stays callable without a name; every real caller passes it.
+    limiter_note = email_2fa_note = ""
+    if limiter_prev is True:
+        if workspace:
+            limiter_note = journal.record(journal.RATE_LIMITER_OFF, workspace)
+        if not _set(rate_limiter, False):
+            journal.clear(limiter_note)
+            limiter_note = ""
+            log("  ⚠ could not disable the API rate limiter — seed rates may be throttled")
+    if email_2fa_changed and workspace:
+        email_2fa_note = journal.record(journal.EMAIL_2FA_OFF, workspace)
 
     try:
         return _seed_body(root_url, admin_hdr, plan, post, log, tokens_out)
     finally:
-        if not limiter_was_off:
-            _set(rate_limiter, True)
+        if limiter_prev is True:
+            if _set(rate_limiter, True):
+                journal.clear(limiter_note)
         if email_2fa_changed:
-            _set(email_2fa, True)
+            if _set(email_2fa, True):
+                journal.clear(email_2fa_note)
 
 
 def _json(resp) -> dict:

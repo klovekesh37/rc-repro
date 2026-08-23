@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -255,6 +256,37 @@ def owned_env() -> dict[str, str]:
     return env
 
 
+def helm_env(context: str) -> dict[str, str]:
+    """Helm's own state is ALWAYS rc-repro's; the kubeconfig belongs to whoever owns the
+    cluster.
+
+    `owned_env` sets both at once, and that conflation was a real defect. Every helm call
+    was either fully owned or not at all, so on a cluster rc-repro ADOPTED the chart repo
+    went into rc-repro's Helm home (`ensure_repo`, `own=True`) while the install that
+    needed it read the USER's (`is_ours(context)` is False there). Two different
+    repositories.yaml, and the create failed at 60% -- after the namespace, the operator
+    and MongoDB had all been built -- with
+
+        helm install failed: Error: repo rocketchat not found
+
+    then rolled the namespace back. The MongoDB operator path happened to work only
+    because BOTH its halves used the user's home: consistent, and also wrong, because it
+    wrote repositories into the home `owned_env` exists to keep rc-repro out of.
+
+    So HELM_* always points at rc-repro's directories and KUBECONFIG is left as the user
+    has it unless the cluster is ours. kubectl needs no equivalent: it has no client
+    state worth redirecting, and `own=is_ours(context)` already picks its kubeconfig.
+    """
+    env = owned_env()
+    if not is_ours(context):
+        outside = os.environ.get("KUBECONFIG")
+        if outside is None:
+            env.pop("KUBECONFIG", None)
+        else:
+            env["KUBECONFIG"] = outside
+    return env
+
+
 def is_ours(context: str) -> bool:
     """Whether a context names the cluster rc-repro created."""
     return context == CONTEXT
@@ -266,7 +298,8 @@ def which(tool: str) -> str:
 
 
 def run(argv: list[str], *, timeout: float = PROBE_TIMEOUT,
-        own: bool = False) -> subprocess.CompletedProcess:
+        own: bool = False,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Run a kind/kubectl/helm command. Never raises; the caller reads returncode.
 
     `own=True` runs against rc-repro's own client state, so nothing it does can
@@ -282,7 +315,8 @@ def run(argv: list[str], *, timeout: float = PROBE_TIMEOUT,
     try:
         return subprocess.run(argv, capture_output=True, text=True,
                               timeout=timeout, check=False,
-                              env=owned_env() if own else None)
+                              env=env if env is not None
+                              else (owned_env() if own else None))
     except (OSError, subprocess.SubprocessError) as exc:
         return subprocess.CompletedProcess(argv, returncode=127, stdout="",
                                            stderr=str(exc))
@@ -358,11 +392,12 @@ def clusters() -> tuple[list[str], str]:
             if ln.strip() and "No kind clusters" not in ln], ""
 
 
-def reachable(context: str = CONTEXT) -> bool:
+def reachable(context: str = CONTEXT,
+              timeout: float = PROBE_TIMEOUT) -> bool:
     """Whether the API server answers. A cluster can exist and not respond --
     a stopped Docker, a half-deleted cluster, a machine that just woke up."""
     res = run(["kubectl", "--context", context, "get", "--raw", "/readyz"],
-               own=is_ours(context))
+               own=is_ours(context), timeout=timeout)
     return res.returncode == 0 and "ok" in (res.stdout or "").lower()
 
 
@@ -446,6 +481,117 @@ def loadbalancer_address(context: str = CONTEXT) -> str:
     """
     name, addr = loadbalancer_service(context)
     return f"{name} has {addr}" if addr else ""
+
+
+@dataclass
+class PortClaim:
+    """A cluster holding one of THIS host's ports through a LoadBalancer Service.
+
+    The failure this exists to name is silent by construction. k3s's ServiceLB
+    (klipper) claims a host port with a `hostPort`, which is CNI portmap DNAT and
+    not a socket bind -- so nothing conflicts, no pod fails, `ss` shows only
+    docker-proxy, and `docker ps` shows nothing at all because k3s runs on
+    containerd under systemd. rc-repro's edge then binds :80 and :443 perfectly
+    happily and never receives a packet on either: kube-proxy's chain gets them
+    first. Measured on the box where it took a manager's GUI dark for two days --
+    every name answered the cluster's 404 and the cluster's certificate, while
+    `rc-repro edge status` said the edge was running, because it was.
+
+    `ports` is what the Service asks for, so both :80 and :443 are visible. That
+    distinction is the whole diagnosis on an ACME failure: :443 taken breaks
+    TLS-ALPN and serving, :80 taken breaks HTTP-01 -- and a check that only knew
+    about :443 would have called the second one healthy.
+    """
+    context: str
+    service: str
+    address: str
+    ports: list[int] = field(default_factory=list)
+
+
+def is_local_address(ip: str) -> bool:
+    """Whether `ip` is one of THIS host's own addresses.
+
+    Bind is the test, because bind is the question: a socket can only bind an
+    address the host holds. Cheaper and more portable than parsing `ip addr`, and
+    it is the same check the kernel would make.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((ip, 0))
+        return True
+    except OSError:
+        return False
+
+
+def host_port_claim(context: str,
+                    timeout: float = PROBE_TIMEOUT) -> PortClaim | None:
+    """The LoadBalancer Service in `context` claiming ports on this host, or None.
+
+    `-o json` rather than a jsonpath because three facts are wanted per Service --
+    the address, the ports and where it lives -- and a jsonpath that emits three
+    lists leaves the caller re-associating them by position.
+    """
+    res = run(["kubectl", "--context", context, "get", "svc", "-A", "-o", "json"],
+              own=is_ours(context), timeout=timeout)
+    if res.returncode != 0:
+        return None
+    try:
+        items = json.loads(res.stdout or "{}").get("items") or []
+    except (ValueError, AttributeError, TypeError):
+        return None
+    for svc in items:
+        spec = svc.get("spec") or {}
+        if spec.get("type") != "LoadBalancer":
+            continue
+        ingress = ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+        addr = next((i.get("ip") or i.get("hostname") or "" for i in ingress), "")
+        # A LoadBalancer with no address, or one on an address this host does not
+        # hold, takes nothing from anybody -- that is a cloud provider's job or a
+        # controller that never answered.
+        if not addr or not is_local_address(addr):
+            continue
+        ports = sorted({p["port"] for p in spec.get("ports") or []
+                        if isinstance(p.get("port"), int)})
+        if not ports:
+            continue
+        meta = svc.get("metadata") or {}
+        where = f"{meta.get('namespace', 'default')}/{meta.get('name', '?')}"
+        return PortClaim(context=context, service=where, address=addr, ports=ports)
+    return None
+
+
+def port_claiming_cluster(ports: tuple[int, ...] = (80, 443),
+                          contexts: tuple[str, ...] = (),
+                          timeout: float = PROBE_TIMEOUT) -> PortClaim | None:
+    """The first reachable cluster claiming any of `ports` on this host, or None.
+
+    Both candidates are checked, and the one rc-repro USES is not the interesting
+    one: on the box where this was measured rc-repro was on kind, which has no
+    LoadBalancer at all, while the k3s alongside it held the ports. A cluster
+    rc-repro is not using can still take the edge's ports away.
+
+    `timeout` exists because this also runs on the `edge start` path, where it is a
+    WARNING and must cost nearly nothing. Four probes at the 8s default is half a
+    minute added to starting a proxy -- on a box whose kubeconfig points at an
+    unreachable remote cluster, which is a normal laptop. The no-kubectl exit comes
+    first for the same reason: a Docker-only box must not pay for this at all.
+
+    LIMIT, STATED RATHER THAN LEFT TO BE DISCOVERED: only LoadBalancer Services are
+    inspected. The DNAT mechanism this whole function exists to catch is a hostPort,
+    and a DaemonSet with a hostPort on 80/443 -- an ingress-nginx installed that way,
+    for instance -- would claim the ports and not be found here. Default k3s uses a
+    LoadBalancer, which is the case that took a manager's GUI dark for two days and is
+    covered; the gap is real and narrower than it sounds.
+    """
+    if not shutil.which("kubectl"):
+        return None
+    for ctx in dict.fromkeys(contexts or (CONTEXT, active_context())):
+        if not ctx or not reachable(ctx, timeout=timeout):
+            continue
+        claim = host_port_claim(ctx, timeout=timeout)
+        if claim and set(claim.ports) & set(ports):
+            return claim
+    return None
 
 
 def nodes_summary(context: str = CONTEXT) -> tuple[int, list[str]]:
@@ -741,8 +887,39 @@ def plan_cluster() -> ClusterPlan:
         # rollback that the cluster was its to delete. `ensure_cluster` already
         # re-exports the kubeconfig for exactly this case, so the context is knowable
         # before it has been read.
+        # AND THE PROBE'S SECOND RETURN VALUE IS NOT DISCARDED. `clusters()` returns
+        # (names, why_it_could_not_be_answered) precisely so a stopped Docker is not
+        # read as an absent cluster -- and this read `[0]` alone. With kind installed,
+        # Docker down and a healthy k3s beside it, `clusters()` answers ([], "...") so
+        # `create` became True, `ensure_cluster` then failed on `kind create cluster`,
+        # and steps 3 and 4 below -- which would have USED the cluster that works --
+        # were never reached. `preflight()` inherited the same answer and reported
+        # will_create=True.
+        #
+        # Not tested live, and said so: proving it means stopping the Docker daemon,
+        # which on this box would take down an edge somebody else is serving from. The
+        # mechanism is the same conflation `namespace_labels` was fixed for in v0.70.9,
+        # and the remedy is the same -- do not act on "I could not ask" as though it
+        # were "it is not there".
+        names, unasked = clusters()
+        if unasked:
+            ours_now = cluster_context()
+            if ours_now and reachable(ours_now):
+                return ClusterPlan(context=ours_now,
+                                   distribution=distribution(ours_now), create=False)
+            active_now = active_context()
+            if active_now and reachable(active_now):
+                return ClusterPlan(context=active_now,
+                                   distribution=distribution(active_now), create=False)
+            raise PreflightError(
+                f"kind is installed but could not be asked what exists ({unasked}), so "
+                f"rc-repro cannot tell whether its cluster is there. `kubectl` is "
+                + ("not pointed at a working cluster either" if not active_now else
+                   f"pointed at {active_now!r}, which is not answering")
+                + ". Usually this is Docker not running: start it, or point kubectl at "
+                  "a cluster you already have.")
         return ClusterPlan(context=CONTEXT, distribution="kind",
-                           create=CLUSTER_NAME not in clusters()[0])
+                           create=CLUSTER_NAME not in names)
     # No kind binary. Our own kubeconfig may still name a cluster that is up -- one
     # rc-repro made before kind was uninstalled -- and that is ours to use even though
     # we could no longer create or delete it.
@@ -959,7 +1136,21 @@ def _labels(name: str, owner: str = "") -> dict[str, str]:
 
 
 def ensure_repo(emit: Emit = null_emit) -> None:
-    """Add and refresh the Rocket.Chat chart repo in rc-repro's own Helm home."""
+    """Add and refresh the Rocket.Chat chart repo in rc-repro's own Helm home.
+
+    `own=True` UNCONDITIONALLY, and that is correct rather than an oversight -- it has
+    been read as a bug twice, so: every helm call that needs this repo reads it through
+    `helm_env`, which always points HELM_* at rc-repro's directories whatever cluster is
+    targeted. Writer and readers therefore agree by construction.
+
+    The obvious-looking alternative, `own=is_ours(context)`, would fix the older
+    mismatch by writing `rocketchat` into the USER's repositories.yaml -- mutating their
+    Helm configuration as a side effect of running a repro tool, which is the one thing
+    `owned_env` exists to prevent.
+
+    No context is threaded in because none is needed: `repo add`, `repo update` and
+    `search repo` contact no cluster at all, so KUBECONFIG is irrelevant to them.
+    """
     run(["helm", "repo", "add", HELM_REPO, HELM_REPO_URL, "--force-update"],
         timeout=APPLY_TIMEOUT, own=True)
     res = run(["helm", "repo", "update", HELM_REPO], timeout=APPLY_TIMEOUT, own=True)
@@ -992,6 +1183,9 @@ def resolve_chart_version(rc_version: str, emit: Emit = null_emit) -> str:
     `--version` deploys different software after the next chart release, which
     quietly destroys the only property the workspace was created to have.
     """
+    # `own=True` for the same reason as `ensure_repo`, which is what populated this
+    # index: the chart index lives in rc-repro's Helm home, and reading it touches no
+    # cluster.
     res = run(["helm", "search", "repo", CHART, "--versions", "-o", "json"],
               timeout=APPLY_TIMEOUT, own=True)
     if res.returncode != 0:
@@ -1216,7 +1410,6 @@ def values_for(*, rc_version: str, rc_image: str, microservices: bool,
     # wizard. That is the line to check before adding to this list.
     env: list[dict] = [
         {"name": "OVERWRITE_SETTING_Show_Setup_Wizard", "value": "completed"},
-        {"name": "INITIAL_USER", "value": "yes"},
         {"name": "ADMIN_USERNAME", "value": config.ADMIN_USERNAME},
         {"name": "ADMIN_NAME", "value": config.ADMIN_NAME},
         {"name": "ADMIN_EMAIL", "value": config.ADMIN_EMAIL},
@@ -1266,17 +1459,121 @@ def values_for(*, rc_version: str, rc_image: str, microservices: bool,
     return values
 
 
+def _refuse_foreign_namespace(ns: str, name: str, labels: dict[str, str],
+                              owner: str) -> None:
+    """Raise unless `labels` prove this namespace is this workspace's."""
+    if labels.get(OWNER_LABEL_KEY) != OWNER_LABEL_VALUE:
+        raise ConflictError(
+            f"namespace {ns} already exists and is not managed by rc-repro, so it "
+            f"will not be adopted -- `down --volumes` deletes a namespace and its "
+            f"volumes, and rc-repro cannot tell a namespace an older rc-repro made "
+            f"from one somebody else made. Use a different --name, or delete it "
+            f"yourself first: kubectl delete namespace {ns}")
+    theirs = labels.get(WORKSPACE_LABEL, "")
+    if theirs and theirs != name:
+        raise ConflictError(
+            f"namespace {ns} belongs to rc-repro workspace {theirs!r}, not {name!r}. "
+            f"Two workspaces cannot share a namespace; use a different --name")
+    held_by = labels.get(OWNER_OF_LABEL, "")
+    if held_by and held_by != owner:
+        # `owner` EMPTY IS NOT A MATCH. This was `held_by and owner and ...`, so a box
+        # with no accounts -- where `_cli_actor()` returns "" because team mode is
+        # opt-in -- skipped the comparison entirely and adopted a namespace stamped
+        # with somebody else's name. Found by doing it on a live cluster: the label
+        # survived (`--overwrite` only sets the keys it is given) and Rocket.Chat was
+        # installed into their namespace anyway.
+        #
+        # Not knowing who you are is not evidence that you are the owner. An owner
+        # label can only have been written by a box with accounts, so meeting one
+        # while unable to identify yourself is exactly the case to refuse -- and
+        # RC_REPRO_USER is the way to answer it.
+        # An EMPTY owner means RC_REPRO_USER was not set, which is not the same as
+        # "this box has no accounts" -- on a box with adm/mem/ro this said there were
+        # none, and pointed at creating an account rather than at the variable the very
+        # next sentence recommends. The refusal was right; the reason was not.
+        mine = f"you are {owner!r}" if owner else (
+            "rc-repro cannot tell who you are, because RC_REPRO_USER is not set")
+        raise ConflictError(
+            f"namespace {ns} belongs to {held_by!r} on this cluster and {mine}. "
+            f"Adopting it would make `down --volumes` delete their data. Use a "
+            f"different --name, or identify yourself with "
+            f"`RC_REPRO_USER={held_by} rc-repro ...` if it is yours")
+
+
+def namespace_labels(ns: str, *, context: str) -> dict[str, str] | None:
+    """A namespace's labels, `None` if it does not exist -- and RAISES if the cluster
+    could not be asked.
+
+    The three answers are different and were being collapsed into two. "I asked and
+    it is not there" is safe to act on; "I could not ask" is not, and a wrong
+    kube-context, an expired credential or an RBAC denial all produce the second
+    while looking like the first.
+    """
+    res = run(["kubectl", "--context", context, "get", "namespace", ns,
+               "-o", "jsonpath={.metadata.labels}"], own=is_ours(context))
+    if res.returncode == 0:
+        raw = (res.stdout or "").strip()
+        if not raw:
+            return {}
+        try:
+            return {str(k): str(v) for k, v in json.loads(raw).items()}
+        except (ValueError, AttributeError):
+            return {}
+    # THE SERVER'S REASON CODE, not a substring of English. `"not found" in text` was
+    # the first cut and it classified `Error in configuration: context was not found
+    # for specified context: no-such-context` as an absent namespace -- measured
+    # against a live cluster with a bogus --context, which is exactly the "I could not
+    # ask" case this function exists to separate out. Only the API says
+    # `Error from server (NotFound)`; a kubeconfig problem never does.
+    blame = why(res).lower().replace(" ", "")
+    if "fromserver(notfound)" in blame:
+        return None
+    raise DockerError(
+        f"could not ask cluster {context!r} about namespace {ns}: " + why(res)
+        + " — refusing to guess, because 'I cannot ask' and 'it is not there' are "
+          "different answers and only one of them is safe to act on")
+
+
+def assert_namespace_available(name: str, *, context: str, owner: str = "") -> None:
+    """Refuse now if this workspace's namespace belongs to somebody else.
+
+    A PREFLIGHT, so it runs before the write-ahead `repro.json`. `ensure_namespace`
+    makes the same check -- it has to, since it is the thing that would do the
+    labelling -- but by then a provisional record exists, and a refusal that created
+    nothing should leave nothing behind. Observed: a refused create left an
+    `incomplete` record that `prune` then offered to delete.
+    """
+    labels = namespace_labels(namespace_for(name), context=context)
+    if labels is not None:
+        _refuse_foreign_namespace(namespace_for(name), name, labels, owner)
+
+
 def ensure_namespace(name: str, *, context: str, owner: str = "",
                      emit: Emit = null_emit) -> str:
     """Create the workspace's namespace with its ownership labels.
 
-    Labels are applied on every call, not only at creation, so a namespace made by
-    an older rc-repro gains them and becomes visible to teardown. A resource that
-    exists but cannot be selected is worse than one that does not exist.
+    REFUSES A NAMESPACE THAT IS NOT OURS. This used to `create` (ignoring the result,
+    so an existing one was fine) and then `label --overwrite` whatever was there --
+    which stamped rc-repro's ownership onto a namespace it did not make, after which
+    `down --volumes` would delete it and its PVCs.
+
+    The realistic trigger is not a stranger: it is two rc-repro users on one adopted
+    cluster. Name collisions are guarded through the local `repro.json`, and another
+    user's home is invisible from here, so the namespace itself is the only evidence
+    there is -- and overwriting the labels destroyed it.
+
+    An UNLABELLED namespace is refused too, and that is a deliberate change of intent.
+    The old docstring adopted one so "a namespace made by an older rc-repro gains
+    them"; rc-repro cannot tell that from somebody else's namespace, and being wrong
+    deletes data. The refusal names the manual step instead.
     """
     ns = namespace_for(name)
-    run(["kubectl", "--context", context, "create", "namespace", ns],
-        timeout=APPLY_TIMEOUT, own=is_ours(context))
+    existing = namespace_labels(ns, context=context)
+    if existing is not None:
+        _refuse_foreign_namespace(ns, name, existing, owner)
+    else:
+        run(["kubectl", "--context", context, "create", "namespace", ns],
+            timeout=APPLY_TIMEOUT, own=is_ours(context))
     labels = [f"{k}={v}" for k, v in _labels(name, owner).items()]
     res = run(["kubectl", "--context", context, "label", "namespace", ns,
                *labels, "--overwrite"], timeout=APPLY_TIMEOUT, own=is_ours(context))
@@ -1321,7 +1618,7 @@ def install(*, namespace: str, context: str, values: dict,
     try:
         res = subprocess.run(argv, input=json.dumps(values), capture_output=True,
                              text=True, timeout=INSTALL_TIMEOUT, check=False,
-                             env=owned_env() if is_ours(context) else None)
+                             env=helm_env(context))
     except (OSError, subprocess.SubprocessError) as exc:
         raise DockerError(f"helm install failed: {exc}") from exc
     if res.returncode != 0:
@@ -1358,7 +1655,7 @@ def upgrade_image(*, namespace: str, context: str, chart_version: str,
     try:
         res = subprocess.run(argv, capture_output=True, text=True,
                              timeout=INSTALL_TIMEOUT, check=False,
-                             env=owned_env() if is_ours(context) else None)
+                             env=helm_env(context))
     except (OSError, subprocess.SubprocessError) as exc:
         raise DockerError(f"helm upgrade failed: {exc}") from exc
     if res.returncode != 0:
@@ -1380,8 +1677,24 @@ def delete_namespace(name: str, *, context: str, volumes: bool = False,
     """
     ns = namespace_for(name)
     own = is_ours(context)
-    if ns not in workspace_namespaces(context):
+    # `namespace_labels`, not `workspace_namespaces`: that one returns [] both when
+    # there is nothing there and when the cluster could not be asked, and this used
+    # the second as proof of the first. A wrong kube-context, an expired credential
+    # or an RBAC denial therefore reported "nothing to remove" -- after which the
+    # caller deleted the local record and told the reader the namespace and its
+    # PersistentVolumeClaim were gone, while all of it went on running with the only
+    # record that knew about it destroyed. `namespace_labels` raises instead.
+    labels = namespace_labels(ns, context=context)
+    if labels is None:
         return False
+    if labels.get(OWNER_LABEL_KEY) != OWNER_LABEL_VALUE:
+        # Refused rather than deleted. Reaching a namespace rc-repro does not own is
+        # either the adoption bug above leaving one half-labelled, or the wrong
+        # cluster -- and neither is a reason to delete somebody's namespace.
+        raise ConflictError(
+            f"namespace {ns} exists but is not labelled as rc-repro's, so it will "
+            f"not be deleted. Check you are on the right cluster "
+            f"({context!r}), then remove it yourself if you meant to")
     if volumes:
         # Reported as it happens, and WAITED for. `--wait=false` returned instantly
         # and `down` said "removed" while the namespace was still Terminating, the
@@ -1409,19 +1722,35 @@ def delete_namespace(name: str, *, context: str, volumes: bool = False,
                            "volume(s) to go", phase="teardown",
                      pct=min(90, 20 + attempt * 5))
             sleep(NS_GONE_INTERVAL)
-        # Not an error: Kubernetes will finish on its own. Saying so beats either
-        # blocking forever or claiming it is done.
-        warn(emit, f"namespace {ns} is still terminating. Kubernetes will finish; "
-                   f"check with `kubectl get ns {ns}`.", phase="teardown")
-        return True
+        # FALSE, because it is not gone. This returned True, and the caller reads
+        # True as "confirmed absent" -- so it deleted the local record and tore down
+        # the shared operator and monitoring stack while the namespace was still
+        # Terminating. Finalizers can wedge indefinitely, and the workspace was then
+        # an orphan with no rc-repro path left to it. Kubernetes will still finish on
+        # its own; the point is not to act as though it already had.
+        warn(emit, f"namespace {ns} is still terminating after "
+                   f"{int(NS_GONE_TRIES * NS_GONE_INTERVAL)}s — Kubernetes will "
+                   f"finish on its own. The local record is KEPT so you can retry: "
+                   f"`kubectl get ns {ns}`, then `rc-repro down --name {name} "
+                   f"--volumes` again once it is gone.", phase="teardown")
+        return False
     info(emit, f"uninstalling {RELEASE} from {ns} — the volume is kept",
          phase="teardown")
-    run(["helm", "uninstall", RELEASE, "--kube-context", context, "-n", ns],
-        timeout=APPLY_TIMEOUT, own=own)
+    # CHECKED. Both of these had their return codes dropped, so an RBAC denial or an
+    # unreachable API server left the release installed and the pods running while
+    # `down` reported success. "already uninstalled" is not a failure -- a repeated
+    # `down` is normal -- so that one case is allowed through by name.
+    rel = run(["helm", "uninstall", RELEASE, "--kube-context", context, "-n", ns],
+              timeout=APPLY_TIMEOUT, own=own)
+    if rel.returncode != 0 and "not found" not in why(rel).lower():
+        raise DockerError(f"could not uninstall {RELEASE} from {ns}: " + why(rel))
     # The hand-written MongoDB is not part of the release, so it is removed by
     # label rather than by helm -- and its PVC is deliberately left behind.
-    run(["kubectl", "--context", context, "-n", ns, "delete",
-         "statefulset,service", "-l", OWNER_SELECTOR], timeout=APPLY_TIMEOUT, own=own)
+    gone = run(["kubectl", "--context", context, "-n", ns, "delete",
+                "statefulset,service", "-l", OWNER_SELECTOR],
+               timeout=APPLY_TIMEOUT, own=own)
+    if gone.returncode != 0:
+        raise DockerError(f"could not remove MongoDB from {ns}: " + why(gone))
     return True
 
 
@@ -1762,6 +2091,19 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
     # it is not inferred from the cluster's name, which is what made a hand-made
     # `rc-repro-local` look like ours.
     had_cluster = not plan.create
+    # SAID, BECAUSE A WARM DOCKER CACHE DOES NOT HELP HERE AND NOTHING ADMITTED IT.
+    # Docker, kind's containerd and k3s's containerd are three separate image stores,
+    # so the ~1.6 GB Rocket.Chat image is pulled again per runtime even on a box that
+    # has run that exact version on Compose minutes earlier. Measured at ~90s of a
+    # k3s create's 1m43s. `kind load docker-image` would move it from the local
+    # daemon instead and is not done here: it is a 1.6 GB copy with its own disk and
+    # failure modes, it does not help k3s at all, and choosing to spend that belongs
+    # with somebody who asked for it rather than in a fix for a silence.
+    if not had_cluster or plan.distribution != "kind":
+        info(emit, f"pulling images into the {plan.distribution} cluster's own store — "
+                   f"separate from Docker's, so a version already pulled for Compose "
+                   f"is fetched again (about 1.6 GB the first time)",
+             phase="provision", pct=6)
     ensure_repo(emit=emit)
     chart_version = resolve_chart_version(resolved.rc_version, emit=emit)
     info(emit, f"chart {chart_version} for Rocket.Chat {resolved.rc_version}",
@@ -1892,7 +2234,7 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
     # sends someone to debug Rocket.Chat when the forward is what failed. If it is
     # not alive, say so and hand over the command that establishes one.
     time.sleep(1.0)
-    if forward_alive(pid):
+    if forward_alive(pid, namespace=namespace, host_port=host_port):
         info(emit, f"http://localhost:{host_port}", phase="boot", pct=90)
     else:
         pid = 0
@@ -1960,20 +2302,40 @@ def workspace_ready(name: str, *, context: str) -> bool:
     return True
 
 
-def forward_alive(pid: int | None) -> bool:
-    """Whether a recorded port-forward is still running and still ours.
+def forward_alive(pid: int | None, *, namespace: str = "",
+                  host_port: int | None = None) -> bool:
+    """Whether `pid` is OUR port-forward -- not merely someone's.
 
-    A pid alone is not enough: the OS recycles them, so this confirms the process
-    is still a kubectl port-forward before believing it. The same check keeps
-    teardown from signalling an unrelated process.
+    A pid alone is not enough: the OS recycles them. This used to accept any process
+    whose command line mentioned `port-forward`, which is a liveness check dressed as
+    an identity check. A recycled pid belonging to a different workspace's forward --
+    or another user's, on a shared box -- passed it, so rc-repro could believe a
+    workspace was reachable when it was not, decline to start the forward it needed,
+    and signal a stranger's process at teardown.
+
+    The argv already carries the proof: `kubectl --context X -n <namespace>
+    port-forward deployment/... <host>:<container>`. So identity comes from the
+    cmdline and needs no extra bookkeeping. Matched as whole NUL-separated tokens,
+    because a substring test lets `3000` match `13000`.
+
+    `namespace`/`host_port` are optional so the check degrades to what it did before
+    where a caller genuinely has neither; every caller in rc-repro passes both.
     """
     if not pid:
         return False
     try:
-        cmdline = Path(f"/proc/{int(pid)}/cmdline").read_bytes().decode("utf-8", "replace")
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
     except (OSError, ValueError, TypeError):
         return False
-    return "port-forward" in cmdline
+    argv = [t for t in raw.decode("utf-8", "replace").split("\0") if t]
+    if "port-forward" not in argv:
+        return False
+    if namespace and namespace not in argv:
+        return False
+    if host_port is not None and not any(
+            t.startswith(f"{host_port}:") for t in argv):
+        return False
+    return True
 
 
 def ensure_port_forward(name: str, *, namespace: str, context: str, host_port: int,
@@ -1985,7 +2347,7 @@ def ensure_port_forward(name: str, *, namespace: str, context: str, host_port: i
     assuming the one written at create time is still there. Idempotent: an
     already-live forward is left alone rather than duplicated onto a busy port.
     """
-    if forward_alive(pid):
+    if forward_alive(pid, namespace=namespace, host_port=host_port):
         return int(pid)
     return port_forward(name, namespace=namespace, context=context,
                         host_port=host_port, bind_host=bind_host, emit=emit)
@@ -2127,9 +2489,16 @@ def pod_metrics(name: str, *, context: str,
     that is quietly wrong is worse than one that is missing, which is the same
     reasoning `stats` already applies to a container it cannot find.
     """
-    res = run(["kubectl", "--context", context, "-n", namespace_for(name),
-               "top", "pods", "-l", selector, "--no-headers"],
-              timeout=APPLY_TIMEOUT, own=is_ours(context))
+    # An EMPTY selector means the whole namespace, and the flag is dropped rather than
+    # passed empty -- `stats` asks for that, because Compose sums every container in
+    # the workspace and reporting only the Rocket.Chat pods made the two runtimes
+    # measure different sets, omitting the database on the one where it is usually the
+    # largest consumer.
+    argv = ["kubectl", "--context", context, "-n", namespace_for(name),
+            "top", "pods", "--no-headers"]
+    if selector:
+        argv[-1:-1] = ["-l", selector]
+    res = run(argv, timeout=APPLY_TIMEOUT, own=is_ours(context))
     if res.returncode != 0:
         blob = (res.stderr or "") + (res.stdout or "")
         if "metrics" in blob.lower() or "not available" in blob.lower():
@@ -2699,16 +3068,16 @@ def ensure_operator(*, context: str, emit: Emit = null_emit) -> None:
     every workspace after the first.
     """
     run(["helm", "repo", "add", OPERATOR_REPO, OPERATOR_REPO_URL, "--force-update"],
-        timeout=APPLY_TIMEOUT, own=is_ours(context))
+        timeout=APPLY_TIMEOUT, env=helm_env(context))
     run(["helm", "repo", "update", OPERATOR_REPO], timeout=APPLY_TIMEOUT,
-        own=is_ours(context))
+        env=helm_env(context))
     info(emit, f"MongoDB operator in {OPERATOR_NAMESPACE} (once per cluster)",
          phase="provision", pct=15)
     res = run(["helm", "upgrade", "--install", OPERATOR_RELEASE, OPERATOR_CHART,
                "--kube-context", context, "-n", OPERATOR_NAMESPACE,
                "--create-namespace", "--set", "operator.watchNamespace=*",
                "--wait", "--timeout", "5m"],
-              timeout=INSTALL_TIMEOUT, own=is_ours(context))
+              timeout=INSTALL_TIMEOUT, env=helm_env(context))
     if res.returncode != 0:
         raise CreateFailedError("could not install the MongoDB operator: " + why(res))
 
@@ -2910,7 +3279,7 @@ def ensure_monitoring(*, context: str, emit: Emit = null_emit) -> None:
     changed anything about the workspace.
     """
     run(["helm", "repo", "add", HELM_REPO, HELM_REPO_URL, "--force-update"],
-        timeout=APPLY_TIMEOUT, own=is_ours(context))
+        timeout=APPLY_TIMEOUT, env=helm_env(context))
     if monitoring_installed(context):
         info(emit, "monitoring stack already on this cluster (shared)",
              phase="monitor")
@@ -2935,7 +3304,7 @@ def ensure_monitoring(*, context: str, emit: Emit = null_emit) -> None:
                "--set", "operator.prometheus.prometheusSpec."
                         "podMonitorSelectorNilUsesHelmValues=false",
                "--timeout", "9m"],
-              timeout=INSTALL_TIMEOUT, own=is_ours(context))
+              timeout=INSTALL_TIMEOUT, env=helm_env(context))
     if res.returncode != 0:
         raise CreateFailedError("could not install the monitoring stack: " + why(res))
     wait_for_grafana(context=context, emit=emit)
@@ -3417,3 +3786,32 @@ def scale_rocketchat(name: str, *, replicas: int, context: str) -> int:
                f"--replicas={replicas}", *targets],
               timeout=APPLY_TIMEOUT, own=is_ours(context))
     return res.returncode
+
+
+def wait_namespace_gone(ns: str, *, context: str, emit: Emit = null_emit,
+                        sleep=time.sleep) -> bool:
+    """Block until namespace `ns` is actually gone. False if it is still terminating.
+
+    Extracted for `prune --orphans`, which swept namespaces with `--wait=false` and
+    then asked `_reclaim_cluster` for the control plane in the same call -- so
+    `delete_cluster` refused, correctly, because the namespaces prune had just deleted
+    were still Terminating. Reclaiming the cluster took a SECOND prune twenty seconds
+    later, and about 600 MB survived the prune that had emptied it.
+
+    Same bound as `delete_namespace`'s own loop, and the same reasoning: a namespace
+    that has not gone has not gone, and saying otherwise is what left an orphan once.
+    """
+    own = is_ours(context)
+    for attempt in range(NS_GONE_TRIES):
+        check = run(["kubectl", "--context", context, "get", "namespace", ns,
+                     "-o", "jsonpath={.status.phase}"], own=own)
+        phase = (check.stdout or "").strip()
+        if check.returncode != 0 or not phase:
+            return True
+        if attempt % 4 == 0:
+            info(emit, f"namespace {ns} is {phase} — waiting for it to go before "
+                       f"the cluster can be reclaimed", phase="done")
+        sleep(NS_GONE_INTERVAL)
+    warn(emit, f"namespace {ns} is still terminating; the cluster is left alone. "
+               f"`rc-repro prune` again once `kubectl get ns` is clear.", phase="done")
+    return False

@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from dataclasses import asdict
-from pathlib import Path
 
 from rc_repro import compose, config, presets, rcapi, runner, versions
 from rc_repro import seed as seeder
@@ -27,6 +26,10 @@ from rc_repro.errors import (ConflictError, CreateFailedError, DockerError,
 from rc_repro.services import audit as auditsvc
 from rc_repro.services import edge as edgesvc
 from rc_repro.services import diagnose, postready, topology
+# `_common` for its --set coercions, private module and all: this decides whether
+# `presigned` is on, and the preset decides the same thing from the same string.
+# Two readings of "true" is how they come to disagree.
+from rc_repro.presets import _common
 from rc_repro.services.events import Emit, info, null_emit, warn
 
 _NAME_RE = re.compile(r"[^a-z0-9-]+")
@@ -239,10 +242,33 @@ def capacity() -> dict:
         return {"known": False}
     total_mb, avail_mb, swap_mb = mem
     reserve = host_reserve_mb(total_mb)
+    usable = max(0, avail_mb - reserve)
+    # `room` IS DENOMINATED IN COMPOSE WORKSPACES, AND SAYS SO. It divided by
+    # WORKSPACE_MB (1100) and was reported as the machine's capacity whatever runtime
+    # the reader was about to use -- while a Kubernetes microservices workspace costs
+    # 2400 plus 600 for a control plane, which `runtime_cost` already knows and this
+    # function was never told. Observed in the same minute: doctor saying "4128 MB
+    # available — room for about 1 more workspace" and `up --runtime kubernetes`
+    # exiting 3 with "needs about 2400 MB and only 2144 MB is free to use". Exactly the
+    # disagreement this docstring says the one formula exists to prevent.
+    #
+    # `room_by_runtime` is the honest answer, and `room` keeps its meaning for the
+    # three existing consumers rather than changing under them.
+    rooms = {}
+    for label, runtime, deployment in (("docker", topology.DOCKER, ""),
+                                       ("kubernetes-monolith", topology.KUBERNETES,
+                                        topology.MONOLITH),
+                                       ("kubernetes-microservices", topology.KUBERNETES,
+                                        topology.MICROSERVICES)):
+        cost = runtime_cost(runtime, deployment)
+        per = int(cost["workspace_mb"]) or WORKSPACE_MB
+        rooms[label] = max(0, usable - int(cost.get("cluster_mb") or 0)) // per
     return {"known": True, "total_mb": total_mb, "available_mb": avail_mb,
             "reserve_mb": reserve, "swap_mb": swap_mb,
             "workspace_mb": WORKSPACE_MB,
-            "room": max(0, avail_mb - reserve) // WORKSPACE_MB}
+            "room": usable // WORKSPACE_MB,
+            "room_denominated_in": "docker",
+            "room_by_runtime": rooms}
 
 
 def _kube_overhead_mb(req: "CreateReq", provisioning: bool = True) -> int:
@@ -404,8 +430,22 @@ def check_capacity(req: "CreateReq", preset_name: str = "", emit: Emit = null_em
 
     It cannot be the only defence, and should not be presented as one: the memory
     that kills a host is the memory workspaces take LATER, not at admission. This
-    stops the obviously-doomed create and keeps the ceiling visible; container
-    memory limits and enough RAM are what actually bound the total.
+    stops the obviously-doomed create and keeps the ceiling visible.
+
+    AND THE OTHER DEFENCE THIS USED TO NAME DOES NOT EXIST. It read "container memory
+    limits and enough RAM are what actually bound the total", and rc-repro sets no
+    memory limit on anything: the generated compose file carries `ulimits.nofile` on
+    MongoDB and nothing else -- no `mem_limit`, no `memswap_limit`, no `cpus`, no
+    `deploy.resources` -- and `values_for` sets no chart `resources` either. `docker
+    inspect` on a live workspace reports `NanoCpus=0 Memory=0`. So admission control is
+    in fact the only defence, on a paragraph that says admission control is not enough.
+    `perf/constrain.py` can cap a workspace, and only for the duration of a capacity
+    run.
+
+    Saying so rather than adding limits: a cap low enough to matter is a cap that
+    OOM-kills a legitimately busy Rocket.Chat, and picking the number needs measurement
+    across versions and deployment shapes rather than a guess made while fixing a
+    docstring. What is fixed here is the claim.
 
     A REFUSAL rather than a warning, because the failure is not confined to the
     workspace being created: the OOM killer picks its own victim, so on a shared
@@ -531,6 +571,42 @@ def name_candidates(name: str, actor: str = "") -> list[str]:
     return out
 
 
+def require_engine(target: str) -> None:
+    """Require the engine THIS workspace runs on -- not the one Compose needs.
+
+    `require_docker()` was called before anything looked at the runtime, so every
+    Kubernetes path went through a gate it has no use for. On a host with no Docker
+    at all -- which is the documented adopt-an-existing-cluster setup -- `upgrade`,
+    `upgrade --rollback`, `ready`, `logs`, `token`, `api`, `pat`, `seed` and `down`
+    all refused a perfectly healthy workspace with "Docker isn't running".
+
+    `teardown` is the sharpest case: it dispatches on the runtime *inside* itself,
+    under a comment about a workspace that "could be CREATED and never removed" --
+    and the gate three lines above defeated that dispatch entirely.
+
+    Three modules already got this right and said so in comments (`backup.py`,
+    `monitor.py`, and `envvars.py`, which refuses Kubernetes outright rather than
+    dispatching). Nobody generalised it, so each new call site started from the
+    Compose assumption again. This is that generalisation; the inline versions in
+    those three predate it and do the same thing.
+
+    CONTRACT: `target` is an already-resolved workspace name. `resolve_name` reads
+    repro.json and asks no engine anything, so resolving first costs nothing and is
+    what makes a runtime-aware gate possible at all.
+    """
+    if topology.of_repro(target) != topology.KUBERNETES:
+        require_docker()
+        return
+    # kubectl is the engine here. Said rather than assumed: without it every
+    # Kubernetes operation fails one layer deeper, in a subprocess whose "command
+    # not found" names nothing the reader can act on.
+    if not shutil.which("kubectl"):
+        raise PreflightError(
+            f"{target!r} runs on Kubernetes and `kubectl` is not on PATH, so "
+            f"rc-repro cannot reach it. Install kubectl and make sure your "
+            f"kubeconfig points at the cluster this workspace lives in.")
+
+
 def resolve_name(name: str | None, actor: str = "") -> str:
     """Explicit name (must exist) else the configured default (must exist).
 
@@ -615,7 +691,29 @@ def check_monitor_ports(exclude: str = "") -> None:
             raise ConflictError(f"monitoring needs host port {p}, already in use on this machine")
 
 
+#: The lock name port allocation serialises on. `repro_lock` is PER REPRO, and two
+#: creates for two different names hold two different locks -- so both could read
+#: `used_ports()`, see the same gap and pick the same port, and the heavy pool allows at
+#: least two creates at once by design. A box-wide name (no workspace is called this;
+#: `_require_valid_name` would reject the leading underscore) makes allocation the one
+#: cross-workspace critical section it has to be.
+_PORT_LOCK = "_ports"
+
+
 def pick_host_port(port: int, pre: presets.Preset, exclude: str = "") -> int:
+    """Choose a free host port, serialised box-wide.
+
+    Held only for the choice, not for the create: the window that matters is between
+    reading `used_ports()` and the caller writing its own record, and the record is
+    written by `create_repro` while it still holds its own per-repro lock. Two locks
+    rather than one, because holding a box-wide lock across a whole create would
+    serialise every concurrent workspace and defeat the heavy pool entirely.
+    """
+    with runner.repro_lock(_PORT_LOCK, timeout=_INTERACTIVE_LOCK_WAIT):
+        return _pick_host_port_locked(port, pre, exclude)
+
+
+def _pick_host_port_locked(port: int, pre: presets.Preset, exclude: str = "") -> int:
     span = pre.instances + 1 if pre.instances > 1 else 1
     if port:
         if port + span - 1 > runner.PORT_MAX:
@@ -708,6 +806,12 @@ class CreateReq:
     reg_token: str = ""
     params: dict = field(default_factory=dict)
     seed: bool = False
+    #: "The CALLER will run the seed, not create_repro." The CLI seeds after
+    #: `create_repro` returns so it can render the verification table and honour
+    #: `--verify-seed`; the GUI lets the service do it. Both must still record the
+    #: seed in the write-ahead note, or `ready` cannot finish an interrupted create --
+    #: which is what happened when the CLI passed `seed=False` to hide its intent.
+    seed_here: bool = False
     seed_profile: str = "small"
     pin: bool = False
     wait: bool = False
@@ -894,6 +998,84 @@ def _unknown_params(params: dict, pre: presets.Preset) -> list[str]:
     return sorted(set(params) - set(pre.params_help))
 
 
+#: Presets that hand the BROWSER a hostname, and the `--set` param that carries it.
+#: Each default names THIS machine -- `localhost:8081`, `keycloak:8085`, `minio:9000`
+#: -- which is right on a laptop and wrong on every shared install, where it names
+#: the visitor's own machine instead. The value is not the container network's
+#: business; it is whatever the person typing actually uses.
+_BROWSER_HOST_PARAM = {"saml": "idp_host", "oidc": "idp_host", "s3_minio": "s3_host"}
+
+
+def _requested_bind_host(req: "CreateReq") -> str:
+    """The interface these ports will be published on, as far as is known this early.
+
+    `req.bind_public` can still widen it later -- `_resolve_tls` sets that when an
+    ACME challenge needs the host reachable -- so this is the REQUESTED bind, not the
+    final one. Callers that must not over-promise use it in the conservative
+    direction: loopback here means "do not assume anything is reachable".
+    """
+    cfg = config.load_config()
+    return str(req.bind or cfg.get("bind_host") or config.DEFAULT_BIND_HOST)
+
+
+#: Binds from which nothing off this machine can reach a published port.
+_LOOPBACK_BINDS = ("127.0.0.1", "localhost", "::1", "")
+
+
+def _derive_idp_host(req: "CreateReq", emit: Emit = null_emit) -> None:
+    """Default a preset's browser-facing hostname from the URL the browser will use.
+
+    `--root-url https://rc.example.com` and `--domain rc.example.com` both say, in as
+    many words, "people will type this". The saml/oidc presets otherwise send the
+    browser to `localhost:8081` / `keycloak:8085`, and `s3_minio` in presigned mode
+    hands it `minio:9000` -- all of which name the visitor's own laptop, so the SAML
+    button returned to the login page, the OIDC popup opened blank, and file previews
+    failed, none of them logging anything. Keycloak also refuses an AuthnRequest whose
+    Destination is not the URL it arrived on, so the two cannot be left to disagree.
+
+    Explicit `--set` always wins; nothing is derived for a workspace nobody said would
+    be reached from elsewhere.
+    """
+    param = _BROWSER_HOST_PARAM.get(req.preset or "")
+    if not param:
+        return
+    params = dict(req.params or {})
+    if params.get(param):
+        return
+    # s3_minio ONLY in presigned mode. In the default proxy mode the browser never
+    # touches MinIO -- Rocket.Chat streams the bytes -- so `minio:9000` is reached
+    # over the compose network, which is strictly more reliable than a host address
+    # that depends on the bind and on DNS. Deriving there would trade a working
+    # internal URL for a fragile external one to fix a problem that does not exist.
+    if req.preset == "s3_minio" and not _common.truthy_param(params, "presigned"):
+        return
+    # A HOST IS ONLY WORTH DERIVING IF IT CAN BE REACHED, and with the default
+    # loopback bind it cannot -- by anything, including Rocket.Chat's own container.
+    # Measured: a port published on 127.0.0.1 is unreachable from a container by the
+    # host's address (connect fails), and reachable when published on 0.0.0.0 (200).
+    #
+    # That matters because OIDC's url serves the browser AND RC's backend. Deriving it
+    # here would have moved the backend off compose DNS -- which always worked -- onto
+    # an address nothing can reach, turning one broken leg into two. `up --preset oidc
+    # --domain rc.example.com` is the invocation that does it, and it is a plausible
+    # one. So: derive only when the ports are published somewhere a derived host could
+    # answer, and otherwise say so below rather than guess.
+    if _requested_bind_host(req) in _LOOPBACK_BINDS:
+        return
+    from urllib.parse import urlsplit
+    source = req.root_url or (f"https://{req.domain}" if req.domain else "")
+    host = urlsplit(source).hostname if source else ""
+    if not host or host in ("localhost", "127.0.0.1"):
+        return
+    params[param] = host
+    req.params = params
+    info(emit, f"the {req.preset} preset will address its own service as {host!r}, "
+               f"taken from the URL you gave — that is the name the browser follows, "
+               f"and its default names this machine. Override with "
+               f"`--set {param}=...`.",
+         phase="create")
+
+
 def _guard_project_collision(name: str) -> None:
     """Refuse to create when a docker compose project of the same derived name
     already exists but belongs to a DIFFERENT workspace.
@@ -937,8 +1119,58 @@ def create_repro(req: CreateReq, emit: Emit = null_emit, *, stream_output: bool 
         raise ValidationError(
             f"name {req.name!r} contains no usable characters (want a-z, 0-9, '-')")
     _require_valid_name(name)
+    # A CREATE THAT NEVER FINISHES LEAVES A WORKSPACE THAT LOOKS FINE. Measured by
+    # killing one mid-flight: `docker compose up -d` has already detached, so the
+    # containers come up on their own and `list` reports it `running` -- which is true.
+    # What is lost is everything after readiness: the preset's self-configuration, the
+    # seed, the edge route. So a `saml` workspace can be serving with no IdP
+    # certificate and nothing anywhere says the create stopped early.
+    #
+    # Advisory rather than repaired automatically: finishing it means waiting for
+    # Rocket.Chat to serve and then running post_ready, which can take the full
+    # readiness timeout, and `serve`'s startup must not hold the GUI shut for that.
+    # `rc-repro ready --name <it>` is the same work on demand and clears this note.
     with runner.repro_lock(name):
-        return _create_repro_locked(req, emit, stream_output=stream_output)
+        from rc_repro.services import journal
+        # WHAT THE NOTE HAS TO CARRY. `ready` is the command the note tells people to
+        # run, and it could not finish a seed because the request that asked for one
+        # died with the process -- `req.seed` lives in a CreateReq nobody can read any
+        # more, and meta.extra["seed"] is written only AFTER a seed succeeds. So the
+        # note said "may be running without its preset configuration or seed data",
+        # `ready` ran post_ready, seeded nothing, printed "ready" and CLEARED the note.
+        # That is worse than leaving it: the engineer follows the tool's own
+        # instruction, is told the workspace is complete, doctor agrees, and the
+        # evidence that anything was missing has been deleted.
+        note = journal.record(journal.CREATE_UNFINISHED, name,
+                              seed=bool(req.seed),
+                              seed_here=bool(req.seed_here),
+                              seed_profile=str(req.seed_profile or ""),
+                              seed_stats=bool(req.stats))
+        try:
+            out = _create_repro_locked(req, emit, stream_output=stream_output)
+        except BaseException:
+            # A REFUSAL CREATED NOTHING, so it must leave nothing. Without this the
+            # note survived every kind of refusal -- a bad version, a taken port, a
+            # capacity preflight, a namespace-ownership check, a Kubernetes-unsupported
+            # flag -- one per attempt, and `doctor` then warned about a workspace that
+            # does not exist while telling the reader to run `rc-repro ready` on it,
+            # which exits 4. The write-ahead note is for a create that died HALF WAY,
+            # which is a different thing from one that never started.
+            journal.clear(note)
+            raise
+        # EVERY note for this workspace, not just the one written above: an earlier
+        # create that failed left its own, and clearing only ours left that one
+        # claiming a finished workspace had never finished.
+        #
+        # UNLESS THE CALLER STILL HAS WORK TO DO. With `seed_here` the CLI runs the
+        # seed after this returns, so clearing here would delete the note in the
+        # window it exists for -- a kill between these two points leaves a workspace
+        # serving with no seed and nothing recording it. `cli.up` clears it once the
+        # seed is done.
+        if not req.seed_here:
+            journal.clear(note)
+            journal.clear_kind(journal.CREATE_UNFINISHED, _derive_for(req) or name)
+        return out
 
 
 def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
@@ -973,6 +1205,18 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
     req.preset, req.params = axes.preset, axes.params
     req.runtime, req.deployment, req.replicas = (axes.runtime, axes.deployment,
                                                  axes.replicas)
+    # ABOVE THE RUNTIME DISPATCH, deliberately, and this is why: it started life
+    # below it, so `--root-url` derived an IdP host on Compose and derived nothing at
+    # all on Kubernetes -- the same defect it was written to fix, surviving in the
+    # runtime that was not being tested. Both runtimes resolve the preset from
+    # `req.params`, so one call site above the fork covers both by construction.
+    #
+    # The IdP presets bake a browser-facing hostname into Rocket.Chat's settings and
+    # their default names THIS machine. `--root-url` and `--domain` are the caller
+    # telling us the address the browser will use, so use it rather than shipping a
+    # workspace whose SSO points somewhere the browser has never heard of.
+    _derive_idp_host(req, emit)
+
     if req.runtime == topology.KUBERNETES:
         # A PARALLEL path, not a branch woven through this function. Everything
         # below is compose-shaped -- host ports, a compose document, `docker
@@ -1058,7 +1302,7 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
     # Nothing about readiness should depend on DNS, a certificate, or the edge.
     root = f"http://localhost:{host_port}"
     token = req.reg_token or cfg.get("reg_token") or ""
-    bind_host = req.bind or cfg.get("bind_host") or config.DEFAULT_BIND_HOST
+    bind_host = _requested_bind_host(req)
     tlsspec = _resolve_tls(req, repro_name, bind_host, exclude=repro_name, emit=emit)
     if req.bind_public and bind_host not in ("0.0.0.0", "::"):
         # Derived from the challenge (see _resolve_tls), not requested.
@@ -1067,9 +1311,87 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
                    f"{req.acme_challenge} challenge - that exposes the workspace, and "
                    "it runs the fixed admin/admin123 credentials. `rc-repro down` when "
                    "you are finished.", phase="tls")
+    elif bind_host not in _LOOPBACK_BINDS:
+        # THE SAME EXPOSURE, ASKED FOR RATHER THAN DERIVED, AND IT WAS SILENT. The
+        # warning above fires only when rc-repro widened the bind ITSELF for an ACME
+        # challenge; `up --bind 0.0.0.0` typed by hand got the normal panel, a URL
+        # reading `http://localhost:<port>`, and nothing else. Verified from the box's
+        # own LAN address: /api/info 200, and POST /api/v1/login with admin/admin123
+        # returning a full admin authToken.
+        #
+        # `config.DEFAULT_BIND_HOST`'s comment states this threat model exactly, and
+        # `errors.GATE_PUBLIC_EXPOSURE` was declared for it. The opt-in is deliberate
+        # and stays; being quiet about it was not a decision, it was an omission.
+        #
+        # The SIDE SERVICES travel with it and are the part people do not picture: a
+        # Mailpit inbox holding every 2FA code and reset link the workspace issues,
+        # Keycloak, MinIO, phpLDAPadmin, and with --monitor a Grafana on admin/admin
+        # with anonymous view enabled. Seeded users are worse than the admin -- their
+        # password IS their username.
+        _side = ", ".join(
+            f"{svc}:{config.PRESET_PORTS[svc][0]}"
+            for svc in ([req.preset] if req.preset in config.PRESET_PORTS else []))
+        warn(emit, f"--bind {bind_host} publishes this workspace on every interface, "
+                   f"and it runs the FIXED credentials admin/admin123"
+                   + (f", plus {_side}" if _side else "")
+                   + (" and Grafana on admin/admin" if req.monitor else "")
+                   + ". Seeded users have their username as their password. Only do "
+                     f"this on a trusted network, and `rc-repro down --name "
+                     f"{repro_name} --volumes` when you are finished.",
+             phase="create")
     # RC advertises the https URL (links, OAuth callbacks, CORS all derive from
     # ROOT_URL); `root` stays http so rc-repro's own API calls need no CA.
     public = tlsspec.root_url if tlsspec else ""
+
+    # SAID AT CREATE TIME, because it cannot be discovered afterwards. The IdP presets
+    # send the BROWSER to a hostname baked into Rocket.Chat's settings, and the default
+    # names this machine -- `localhost:8081` for SAML, `keycloak:8085` for OIDC. A
+    # workspace bound wide, or given a public name, is one somebody intends to reach
+    # from ELSEWHERE, and from there both of those addresses are the visitor's own
+    # laptop: the SAML button bounces off nothing and returns to the login page, and
+    # the OIDC popup opens a name that does not resolve and renders blank. That is the
+    # entire bug report, and the create said nothing.
+    _browser_param = _BROWSER_HOST_PARAM.get(req.preset or "")
+    if _browser_param and not (req.params or {}).get(_browser_param):
+        # TWO STATES REACH HERE, and both leave this preset's own service addressed as
+        # this machine. `_derive_idp_host` fixes only the case where a URL was given
+        # AND the bind can carry it; everything else has to be said, because what is
+        # wrong is invisible -- SAML returns to the login page, OIDC opens a blank
+        # window, presigned previews fail, and none of them logs anything.
+        #
+        # Two things are wrong in either state, not one: the service the browser is
+        # sent TO, and the callback it is sent BACK to (Rocket.Chat's Site_Url). The
+        # recipe names both, because half a fix fails at the next step and reads as
+        # the same bug not being fixed.
+        _default_host = {"saml": "localhost", "oidc": "keycloak",
+                         "s3_minio": "minio"}[req.preset]
+        _svc_port = config.PRESET_PORTS[req.preset][0]
+        _advertised = req.root_url or req.domain
+        _why = ""
+        if bind_host not in _LOOPBACK_BINDS:
+            _why = (f"this {req.preset!r} workspace is bound to {bind_host}, so "
+                    f"somebody will open it from another machine")
+        elif _advertised:
+            # DELIBERATELY NOT DERIVED. Pointing the service at {_advertised} while its
+            # port is on loopback would break Rocket.Chat's own access to it as well --
+            # measured: a container cannot reach a 127.0.0.1-published port by the
+            # host's address. So the bind has to move first, and saying that is the
+            # only useful thing to do here.
+            _why = (f"this {req.preset!r} workspace advertises {_advertised}, but its "
+                    f"ports are published on {bind_host or config.DEFAULT_BIND_HOST} "
+                    f"where nothing off this box can reach them")
+        if _why:
+            warn(emit, f"{_why} — and its own service still points the browser at "
+                       f"{_default_host}:{_svc_port}, which names that browser's OWN "
+                       f"machine. SAML returns to the login page, OIDC opens a blank "
+                       f"window, presigned previews fail. None of them logs an error.",
+                 phase="create")
+            warn(emit, f"    Both halves have to move. Re-create with:\n"
+                       f"      --bind 0.0.0.0 --port {host_port} "
+                       f"--root-url http://<host>:{host_port} "
+                       f"--set {_browser_param}=<host>\n"
+                       f"    where <host> is the name people actually type.",
+                 phase="create")
 
     # Overrides already on this repro are carried forward: `up --force` rebuilds the
     # compose file from the spec, so without this a rebuild would silently drop env
@@ -1112,6 +1434,16 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
     # meant every caller that wanted to know had to parse the generated file --
     # Kubernetes has recorded it in the metadata since its first workspace.
     meta.extra["bind_host"] = bind_host
+    # WHAT ROCKET.CHAT ADVERTISES, when that is not what rc-repro calls it. `root_url`
+    # on the record is deliberately the plain loopback URL that rc-repro's own API
+    # calls use, and `public_url` is set only by TLS -- so `--root-url http://box:3007`
+    # was written into the compose ROOT_URL and recorded nowhere. Anything generated
+    # FOR THE BROWSER then got loopback: the livechat preset's demo page substitutes
+    # `{{ROOT_URL}}` to load Rocket.Chat's widget script, so on any machine but this
+    # one it fetched the script from the visitor's own localhost and the widget never
+    # appeared, with nothing logged anywhere.
+    if spec.root_url and spec.root_url != root:
+        meta.extra["advertised_url"] = spec.root_url
     if pre.post_ready:
         meta.extra["post_ready"] = pre.post_ready
     if pre.notes:
@@ -1142,6 +1474,27 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
         # edge's business -- so no tls/ files are written here, no port is claimed,
         # and nothing about this workspace's containers depends on it.
         local = tlsspec.mode == tlsmod.MODE_LOCAL
+        # REFUSED BEFORE ANYTHING IS WRITTEN. `edge.up()` checks `foreign_edge()` -- an
+        # edge belonging to a DIFFERENT RC_REPRO_HOME, which compose would silently
+        # replace because every home keys the project by the same name -- and it did so
+        # only after the local CA, the certificate, the route file and the whole edge
+        # project had been written. Observed: exit 8 with a correct cross-home message,
+        # and left behind edge/spec.json, edge/domain, edge/compose.yml, ca/{ca.crt,
+        # ca.key,ca.srl}, edge/certs/<name>.{crt,key} and edge/dynamic/_cert-<name>.yml
+        # for a workspace that does not exist. `edge status` then reported "STOPPED"
+        # and "every https name on this box is unreachable" -- false, the other home's
+        # edge was serving them -- and /api/edge answered installed:true, so the GUI
+        # showed a red badge on a box whose edge was running.
+        #
+        # A preflight, like the namespace and teardown gates: a refusal leaves nothing.
+        stolen = edgesvc.foreign_edge()
+        if stolen:
+            raise ConflictError(
+                f"the shared edge on this box belongs to another RC_REPRO_HOME "
+                f"({stolen}). Starting one from here would REPLACE it and take down "
+                f"every https name it serves, because compose keys the project by name "
+                f"and both homes use the same one. Use that home, or stop its edge "
+                f"first.")
         if local:
             info(emit, f"issuing a local certificate for {tlsspec.host}", phase="tls")
             edgesvc.issue_local_cert(tlsspec.host)
@@ -1267,7 +1620,11 @@ def _create_repro_locked(req: CreateReq, emit: Emit = null_emit, *,
     result["waited"] = wait
     if wait:
         result.update(wait_and_finalize(meta, emit))
-    if req.seed:
+    # NOT when the caller seeds. `seed_here` means the CLI runs it after this returns,
+    # so seeding here as well would seed the workspace twice -- the manifest only ever
+    # adds, so the readback would report rooms holding more than planned and the second
+    # pass would collide on names it had just created.
+    if req.seed and not req.seed_here:
         result["seed"] = run_seed_inline(meta, req.seed_profile, req.stats, emit)
     return result
 
@@ -1315,10 +1672,20 @@ def _reuse(name: str, wait: bool, req: CreateReq, emit: Emit, *, stream_output: 
     if req.monitor and not (isinstance(meta.extra, dict) and meta.extra.get("monitoring")):
         mismatch.append("monitoring (existing: not attached)")
     if mismatch:
-        warn(emit, f"{name!r} already exists and is reused as-is, ignoring requested "
-                   + "; ".join(mismatch)
-                   + ". Use --force to rebuild it, or --fresh to also wipe its data.",
-             phase="create")
+        msg = (f"{name!r} already exists and is reused as-is, ignoring requested "
+               + "; ".join(mismatch)
+               + ". Use --force to rebuild it, or --fresh to also wipe its data.")
+        warn(emit, msg, phase="create")
+        # AND IN THE ENVELOPE. In prose this is loud; under `--json` it was an NDJSON
+        # progress event and the envelope still said `ok: true, warnings: []`. A caller
+        # following the documented strategy -- read to end of stream, parse the last
+        # line -- saw unqualified success from a tool whose single purpose is running
+        # the version you asked for. `data.rc_version` and `data.reused` made it
+        # detectable by a careful reader, which is a mitigation, not the contract.
+        from rc_repro import jsonout
+        jsonout.warn_once("VERSION_IGNORED_ON_REUSE", msg,
+                          requested=resolved.rc_version, running=meta.rc_version,
+                          ignored=list(mismatch))
 
     state = runner.rc_state(name)
     if state == "running":
@@ -1339,7 +1706,11 @@ def _reuse(name: str, wait: bool, req: CreateReq, emit: Emit, *, stream_output: 
     result["waited"] = wait
     if wait:
         result.update(wait_and_finalize(meta, emit))
-    if req.seed:
+    # NOT when the caller seeds. `seed_here` means the CLI runs it after this returns,
+    # so seeding here as well would seed the workspace twice -- the manifest only ever
+    # adds, so the readback would report rooms holding more than planned and the second
+    # pass would collide on names it had just created.
+    if req.seed and not req.seed_here:
         result["seed"] = run_seed_inline(meta, req.seed_profile, req.stats, emit)
     return result
 
@@ -1364,7 +1735,7 @@ def wait_serving(meta: runner.Metadata, emit: Emit, timeout: float) -> dict:
         # dies with its pod, and this is the command someone runs when the URL is
         # not answering.
         return _wait_serving_kubernetes(meta, emit, timeout)
-    seen = {"restarts": 0}
+    seen: dict = {"restarts": 0, "cause": None}
 
     def is_alive() -> bool:
         return runner.rc_state(meta.name) in ("running", "restarting", "created")
@@ -1374,21 +1745,71 @@ def wait_serving(meta: runner.Metadata, emit: Emit, timeout: float) -> dict:
         # (usually CPU/RAM pressure or a boot error), not just "taking a while".
         rc = runner.rc_restart_count(meta.name)
         if rc >= 2 and rc > seen["restarts"]:
-            warn(emit, f"Rocket.Chat has restarted {rc}x - likely resource pressure "
-                       "(free some repros / raise Docker's CPU+RAM) or a boot error; "
-                       "check Logs.", phase="wait")
+            warn(emit, f"Rocket.Chat has restarted {rc}x - checking why", phase="wait")
+            # ASK, rather than assert. The old wording named resource pressure as the
+            # cause, and `diagnose` -- which exists for exactly this and holds the
+            # signature list -- was never consulted anywhere on the readiness path;
+            # its only caller is the `docker compose up` failure above. Measured: a
+            # workspace whose MONGO_URL pointed at a host that does not exist spent
+            # 303s restarting 10x and was then told it was short of RAM, on a box
+            # with 5.7 GB free, while its own logs said "Topology is closed" and
+            # diagnose.match() on those same logs returned the right answer.
+            #
+            # Giving up EARLY only when the cause is known. A boot that restarts
+            # twice and then settles is ordinary -- v0.71.1 is the whole lesson --
+            # so a restart count is not evidence of anything by itself. A matched
+            # signature is.
+            if seen["cause"] is None:
+                seen["cause"] = diagnose.diagnose_failure(meta.name) or ""
+            if seen["cause"]:
+                raise _readiness_failure(meta, seen, known=str(seen["cause"]))
         seen["restarts"] = max(seen["restarts"], rc)
         pct = max(0.0, min(99.0, elapsed / timeout * 100)) if timeout else None
         info(emit, f"still booting ({int(elapsed)}s)", phase="wait", pct=pct)
 
     try:
-        return rcapi.wait_ready(meta.root_url, timeout=timeout, is_alive=is_alive, on_tick=tick)
+        served = rcapi.wait_ready(meta.root_url, timeout=timeout, is_alive=is_alive,
+                                  on_tick=tick)
     except rcapi.NotReady as exc:
-        hint = ""
-        if seen["restarts"] >= 2:
-            hint = (f" - Rocket.Chat restarted {seen['restarts']}x; likely resource pressure "
-                    f"(free repros / raise Docker CPU+RAM), then `rc-repro ready --name {meta.name}`")
-        raise NotReadyError(str(exc) + hint) from exc
+        if seen["cause"] is None:
+            seen["cause"] = diagnose.diagnose_failure(meta.name) or ""
+        raise _readiness_failure(meta, seen, prefix=str(exc)) from exc
+    # SERVING IS NOT USABLE. Rocket.Chat answers /api/info with no database behind it,
+    # so a workspace whose mongodb had exited passed this and was reported ready,
+    # running and healthy -- while `api` and `seed` refused it and pointed the reader
+    # back at `ready`, the command that had just said yes.
+    why = degraded_reason(runner.services_by_project().get(meta.project, {}))
+    if why:
+        raise NotReadyError(
+            f"{meta.name!r} is serving, but {why} - Rocket.Chat answers /api/info "
+            f"without a database, so this looks ready and no login will work. "
+            f"`docker start {meta.project}-{ESSENTIAL_SERVICES[0]}-1`, or "
+            f"`rc-repro up --version {meta.rc_version} --name {meta.name}` to "
+            f"rebuild the stack.")
+    return served
+
+
+def _readiness_failure(meta: runner.Metadata, seen: dict, *, prefix: str = "",
+                       known: str = "") -> NotReadyError:
+    """The one place a readiness failure is worded.
+
+    `known` is a diagnosis from `diagnose`, which is preferred over anything guessed:
+    it comes from a matched log signature rather than from a restart count. The
+    resource-pressure sentence survives only as a POSSIBILITY, and only when nothing
+    was matched -- stated as fact it sent a reader hunting for memory they had.
+    """
+    cause = known or str(seen.get("cause") or "")
+    head = prefix or (f"Rocket.Chat is not becoming ready in {meta.name!r}")
+    if cause:
+        return NotReadyError(f"{head} - {cause}")
+    restarts = int(seen.get("restarts") or 0)
+    if restarts >= 2:
+        return NotReadyError(
+            f"{head} - Rocket.Chat restarted {restarts}x and nothing in its logs "
+            f"matches a known cause. Free memory or raise Docker's CPU+RAM if the "
+            f"box is loaded, then `rc-repro ready --name {meta.name}`; otherwise "
+            f"`rc-repro logs --name {meta.name}` has what happened.")
+    return NotReadyError(head)
 
 
 def finalize(meta: runner.Metadata, emit: Emit):
@@ -1407,6 +1828,39 @@ def wait_and_finalize(meta: runner.Metadata, emit: Emit = null_emit, timeout: fl
     elapsed = int(time.monotonic() - started)
     auth = finalize(meta, emit)
     postready.run_post_ready(meta, auth, emit)
+    # AND THE SEED THE INTERRUPTED CREATE ASKED FOR. The note says the workspace "may
+    # be running without its preset configuration or seed data" and names this command
+    # as the thing that completes it -- and this used to run post_ready, seed nothing,
+    # print "ready" and clear the note anyway. Verified: SIGKILL an `up --wait --seed`
+    # after compose has detached, run `ready`, get exit 0, and find a workspace with
+    # two users and one channel and no note left saying so. That is worse than leaving
+    # the note, because the evidence went with it.
+    #
+    # From the NOTE, not from meta: the request died with the process, and
+    # meta.extra["seed"] is written only after a seed has already succeeded.
+    from rc_repro.services import journal
+    pending = journal.pending_seed(meta.name)
+    if pending.get("seed_here"):
+        # The process that wrote this note is still running and will seed itself.
+        # `pending_seed` only returns ABANDONED notes, so this is the create-path call
+        # inside that same process rather than a later `ready`.
+        pending = {}
+    if pending and not (isinstance(meta.extra, dict) and meta.extra.get("seed")):
+        info(emit, f"finishing the seed the interrupted create asked for "
+                   f"(profile: {pending.get('seed_profile') or 'small'})", phase="seed")
+        try:
+            run_seed_inline(meta, str(pending.get("seed_profile") or "small"),
+                            bool(pending.get("seed_stats")), emit)
+        except ReproError as exc:
+            # The note STAYS: a seed that could not be finished is exactly what it is
+            # for, and clearing it here would delete the only record again.
+            warn(emit, f"the interrupted create's seed could not be finished ({exc}) - "
+                       f"the note stays; `rc-repro seed --name {meta.name}` retries it",
+                 phase="seed")
+            running = served.get("version", "?")
+            info(emit, "ready", phase="done", pct=100.0)
+            return {"booted_s": elapsed, "running_version": running}
+    journal.clear_kind(journal.CREATE_UNFINISHED, meta.name)
     running = served.get("version", "?")
     if running != "?" and not meta.rc_version.startswith(running):
         warn(emit, f"running version {running} != requested {meta.rc_version}", phase="wait")
@@ -1670,11 +2124,52 @@ def compose_note_groups(meta: runner.Metadata) -> list[dict]:
     return groups
 
 
+def local_url_note(meta: runner.Metadata, scenario: list[dict]) -> list[dict]:
+    """Correct `localhost` in a preset's own browser URLs, when it is wrong.
+
+    `ldap` prints phpLDAPadmin, `s3_minio` its console, `email` Mailpit's inbox,
+    `livechat` a demo page -- all browser URLs, all written when the browser was
+    assumed to be on the docker host. On a workspace bound wide or given a public URL
+    it is not, and `localhost` then names the reader's own machine: the same mistake
+    that made the saml and oidc buttons fail silently, in prose instead of a setting.
+
+    Said here rather than fixed in four presets because the right host is a fact about
+    the RECORD -- the bind host and the advertised URL -- which a preset builder is
+    never given.
+
+    KEYED ON THE NOTES THEMSELVES, which the first version got wrong: it fired
+    whenever a preset had side-service ports, so a `saml` workspace whose `idp_host`
+    had already put the real host in every line was told "the URLs above say
+    localhost". They did not. A correction that describes text the reader is not
+    looking at is worse than no correction.
+    """
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    body = [line for g in scenario for line in (g.get("body") or [])]
+    if not any("localhost" in line for line in body):
+        return []
+    ports = [p for p in (extra.get("sidecar_ports") or []) if isinstance(p, int)]
+    bind_host = str(extra.get("bind_host") or "")
+    advertised = str(extra.get("advertised_url") or "")
+    if not ports or not (advertised or bind_host not in ("", "127.0.0.1", "localhost")):
+        return []
+    from urllib.parse import urlsplit
+    host = (urlsplit(advertised).hostname if advertised else "") or "<this-box>"
+    return [note_group("Reaching this preset's own pages", body=[
+        f"The URLs above say `localhost`, which names whichever machine the browser "
+        f"is on. From anywhere but this box, use {host} instead: "
+        f"{', '.join(f'http://{host}:{p}' for p in sorted(ports)[:4])}.",
+        f"Those ports are published on {bind_host or '127.0.0.1'}, so they are "
+        f"reachable only as far as that bind allows."])]
+
+
 def note_groups_of(meta: runner.Metadata) -> list[dict]:
     """Every group this workspace has, scenario first. The one entry point."""
+    scenario = scenario_group(meta)
     if topology.of_meta(meta) == topology.KUBERNETES:
-        return scenario_group(meta) + kubernetes_note_groups(meta)
-    return scenario_group(meta) + compose_note_groups(meta)
+        # Not corrected here: a Kubernetes workspace is reached through a port-forward
+        # the reader runs themselves, so `localhost` is genuinely their localhost.
+        return scenario + kubernetes_note_groups(meta)
+    return scenario + compose_note_groups(meta) + local_url_note(meta, scenario)
 
 
 # --- seed (inline, used by create --seed) -------------------------------------
@@ -1736,6 +2231,26 @@ def check_seed(meta: runner.Metadata, auth, plan, result: dict,
 
 
 def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit) -> dict:
+    """Seed a workspace through REST, serialised like every other mutating operation.
+
+    IT WAS THE ONLY ONE THAT WAS NOT. `create_repro`, `set_state`, `teardown`,
+    `set_env`, `monitor.attach`, `backup.create`, `upgrade.run`, `run_scale` and
+    `clear_scale` all take `repro_lock`; a seed writes the same collections through a
+    different door and took nothing. `run_scale`'s own comment states the rule --
+    "running it while a backup is dumping would put half of it in the archive" -- and
+    the worse direction is the other one: `_Quiesced` STOPS Rocket.Chat for the dump, so
+    a seed running into it fails mid-manifest and the readback reports faults nobody
+    caused.
+
+    Reentrant per thread, so the `up --seed` path is unaffected: `create_repro` already
+    holds this lock and re-entering it is free.
+    """
+    with runner.repro_lock(meta.name, timeout=_INTERACTIVE_LOCK_WAIT):
+        return _seed_inline_locked(meta, profile, stats, emit)
+
+
+def _seed_inline_locked(meta: runner.Metadata, profile: str, stats: bool,
+                        emit: Emit) -> dict:
     from rc_repro import perf
     try:
         auth = login(meta)
@@ -1751,6 +2266,7 @@ def run_seed_inline(meta: runner.Metadata, profile: str, stats: bool, emit: Emit
     tokens: dict = {}
     try:
         s = seeder.seed(meta.root_url, auth, plan, tokens_out=tokens,
+                        workspace=meta.name,
                         log=lambda m: info(emit, m.strip(), phase="seed"))
     finally:
         resources = mon.stop() if mon else None
@@ -1880,6 +2396,34 @@ def repro_state(rc_status: str, has_containers: bool) -> str:
 TRANSIENT_STATES = ("restarting", "created", "paused", "dead")
 
 
+#: The services whose absence makes a "running" workspace a lie. Rocket.Chat serves
+#: /api/info with no database behind it -- measured: /api/info 200, login 000 after
+#: 15s, `ready` exit 0, `list` running, detail health "healthy", and the truth sitting
+#: in the same payload's containers array as ("mongodb", "exited"). Every remediation
+#: the tool then offered pointed back at `ready`, which reported success, so there was
+#: no way out of the loop without reading `docker ps` by hand.
+#:
+#: DELIBERATELY JUST THE DATABASE. A stopped Mailpit or phpLDAPadmin is a side service
+#: a person can live without; treating every preset sidecar as fatal would refuse
+#: workspaces that are fine.
+ESSENTIAL_SERVICES = ("mongodb",)
+
+
+def degraded_reason(services: dict) -> str:
+    """Why a workspace that LOOKS running is not usable, or "".
+
+    `services` is {service: docker Status string}. Reported as a distinct health
+    rather than as a state, because the workspace genuinely is running -- what is
+    wrong is that something it needs is not.
+    """
+    for svc in ESSENTIAL_SERVICES:
+        status = (services or {}).get(svc)
+        if status is not None and not status.startswith("Up "):
+            first = status.split(" (")[0].strip().lower() or "not running"
+            return f"{svc} is {first}"
+    return ""
+
+
 def _uptime_health(status: str) -> tuple[str, str]:
     """Parse a docker `Status` string -> (uptime, health).
     "Up 2 hours (healthy)" -> ("2 hours", "healthy"); "Exited (0) ..." -> ("", "")."""
@@ -1902,6 +2446,15 @@ def list_repros() -> list[dict]:
     default = config.load_config().get("default_repro")
     docker_up = runner.docker_available()
     states = (runner.project_states() or {}) if docker_up else {}
+    # ONE docker ps for every service of every project, so the list and the panel
+    # cannot disagree about whether a workspace is degraded -- which is exactly how
+    # they came to disagree about `state` before repro_state() existed.
+    #
+    # Still through `rc_status_by_project()` for the Rocket.Chat line, even though
+    # that now derives from the same cached call: it is the seam existing tests stub,
+    # and a stub that silently goes inert is how a test keeps passing for a reason
+    # other than the one in its name -- which happened twice on this branch already.
+    svc_map = runner.services_by_project() if docker_up else {}
     status_map = runner.rc_status_by_project() if docker_up else {}
     out = []
     for m in metas:
@@ -1917,6 +2470,9 @@ def list_repros() -> list[dict]:
             state = "?" if not docker_up else repro_state(
                 rc_status, bool(states.get(m.project)))
         uptime, health = _uptime_health(rc_status)
+        degraded_why = (degraded_reason(svc_map.get(m.project, {}))
+                        if state == "running" else "")
+        degraded = "degraded" if degraded_why else ""
         runtime = topology.of_meta(m)
         monitored = bool(isinstance(m.extra, dict) and m.extra.get("monitoring"))
         extra_ = m.extra if isinstance(m.extra, dict) else {}
@@ -1935,7 +2491,10 @@ def list_repros() -> list[dict]:
                     "public_url": m.public_url, "tls": m.extra.get("tls", "") if isinstance(m.extra, dict) else "",
                     "preset": m.preset, "pinned": m.pinned, "default": m.name == default,
                     "monitoring": monitored, "created_at": m.created_at,
-                    "uptime": uptime, "health": health or (state if state == "running" else ""),
+                    "uptime": uptime,
+                    "health": (degraded or health
+                               or (state if state == "running" else "")),
+                    "degraded": degraded_why,
                     "grafana_url": f"http://localhost:{config.MONITOR_PORTS[1]}" if monitored else None,
                     "links": repro_links(m)})
     return out
@@ -2151,7 +2710,12 @@ def detail(name: str) -> dict:
     d["state"] = repro_state(rc_status, bool(containers))
     up, health = _uptime_health(rc_status)
     d["uptime"] = up
-    d["health"] = health or (d["state"] if d["state"] != "down" else "")
+    # The SAME rule the list uses, so the summary can no longer contradict the
+    # containers array printed directly beneath it.
+    d["degraded"] = (degraded_reason({c["service"]: c["status"] for c in containers})
+                     if d["state"] == "running" else "")
+    d["health"] = ("degraded" if d["degraded"]
+                   else health or (d["state"] if d["state"] != "down" else ""))
     # A climbing restart count is the difference between "slow to boot" and
     # "crash-looping"; wait_serving already warns on it during a create, but after
     # that nothing surfaced it. Only asked when containers exist -- it costs two
@@ -2165,7 +2729,63 @@ def detail(name: str) -> dict:
     return d
 
 
-def set_state(name: str, action: str) -> None:
+#: Actions `set_state` understands. One tuple, so the validator, the error message
+#: and the front-ends cannot list three different sets.
+STATE_ACTIONS = ("start", "stop", "restart")
+
+
+def check_state_request(name: str, action: object) -> str:
+    """Refuse a bad stop/start/restart BEFORE any work is queued. Returns the target.
+
+    A PREFLIGHT, in the sense v0.70.9 established for namespace ownership: a refusal
+    must leave no trace. The GUI runs this as a job now, and a job answers 200 with an
+    id -- so a bad action or an unknown name would have become a job that failed rather
+    than a 400 or a 404 on the request that made the mistake. The checks are pure
+    argument validation and cost nothing, so they stay on the request thread; only the
+    work is queued.
+    """
+    if not isinstance(action, str):
+        raise ValidationError(f"action must be a string (want "
+                              f"{'|'.join(STATE_ACTIONS)}), got {type(action).__name__}")
+    if action not in STATE_ACTIONS:
+        raise ValidationError(f"unknown action {action!r} "
+                              f"(want {'|'.join(STATE_ACTIONS)})")
+    return resolve_name(name)
+
+
+def check_teardown_request(name: str, *, volumes: bool = False,
+                           confirm: bool = False) -> str:
+    """Refuse an unconfirmed or unowned teardown before it is queued. Returns the target.
+
+    Same reason as `check_state_request`, and the stake is higher: without it a member
+    who asked to destroy a colleague's workspace got 200 and a job id, and had to open
+    the Activity list to discover they had been refused. The refusal belongs on the
+    request. `teardown` repeats both checks, because the CLI calls it directly and a
+    guard that only one front-end performs is not a guard.
+    """
+    target = resolve_name(name)
+    if volumes and not confirm:
+        raise ValidationError(f"deleting {target!r}'s data volume and record is "
+                              "irreversible - pass confirm=true")
+    if volumes:
+        allowed, why = may_destroy(target, auditsvc.actor())
+        if not allowed:
+            auditsvc.record("down-volumes", target, outcome="denied")
+            raise ConflictError(why)
+    return target
+
+
+def set_state(name: str, action: str, emit: Emit = null_emit) -> dict:
+    """Stop/start/restart a workspace. Returns what happened, for a caller that
+    has to decide what to do next.
+
+    `needs_ready` is the one fact a front-end cannot work out for itself: on
+    Kubernetes a `start` scales the deployment back up and CANNOT re-establish the
+    port-forward that died with the old pod, so the workspace is running and its
+    URL is dark until `ready` waits for the pod and attaches a new one. The GUI used
+    to infer that from "did this emit anything", which is a proxy for the real
+    question and would answer wrongly the moment any other warning was added.
+    """
     target = resolve_name(name)
     # Guarded here rather than in each front-end: the CLI's `stop`/`start`/`restart`
     # and the GUI's always-enabled buttons both arrive through this one function, so
@@ -2181,7 +2801,10 @@ def set_state(name: str, action: str) -> None:
     if action not in ("start", "stop", "restart"):
         raise ValidationError(f"unknown action {action!r} (want start|stop|restart)")
     if topology.of_repro(target) == topology.KUBERNETES:
-        return _set_state_kubernetes(target, action)
+        _set_state_kubernetes(target, action, emit=emit)
+        return {"name": target, "action": action,
+                "runtime": topology.KUBERNETES,
+                "needs_ready": action in ("start", "restart")}
     fn = {"start": runner.start, "stop": runner.stop, "restart": runner.restart}.get(action)
     if fn is None:
         raise ValidationError(f"unknown action {action!r} (want start|stop|restart)")
@@ -2202,9 +2825,14 @@ def set_state(name: str, action: str) -> None:
                 hint = (f" - {target!r} was `down`ed, so it has no containers to "
                         "start; recreate them from its stored metadata instead")
             raise DockerError(f"`docker compose {action}` failed for {target!r}{hint}")
+    # Compose keeps its published port across a stop/start, so nothing has to be
+    # re-attached and there is nothing further for the caller to do.
+    return {"name": target, "action": action, "runtime": topology.DOCKER,
+            "needs_ready": False}
 
 
-def _set_state_kubernetes(target: str, action: str) -> None:
+def _set_state_kubernetes(target: str, action: str,
+                          emit: Emit = null_emit) -> None:
     """stop/start/restart by scaling, which is the nearest true thing Kubernetes has.
 
     Compose's contract is what this has to match, not Kubernetes' vocabulary: `stop`
@@ -2226,11 +2854,30 @@ def _set_state_kubernetes(target: str, action: str) -> None:
             k8s.stop_workspace(target, context=context)
             pid = extra.get("port_forward_pid")
             if pid:
-                _stop_port_forward(int(pid))
+                _stop_port_forward(int(pid), namespace=k8s.namespace_for(target))
                 runner.update_meta(target,
                                    lambda m: m.extra.pop("port_forward_pid", None))
         if action in ("start", "restart"):
             k8s.start_workspace(target, context=context)
+            # NO PORT-FORWARD HERE, and that is the tested answer rather than the
+            # obvious one. Restoring it looks like the right symmetry -- `stop` killed
+            # it, so `start` should put it back -- and it does not work: scaling up
+            # from zero takes far longer than `port_forward`'s brief pod wait, so
+            # kubectl attaches to a pod that is not ready, binds the socket for a
+            # moment and exits. Measured on a live cluster: `start` reported success,
+            # a reachability probe passed, the recorded pid was dead seconds later and
+            # the URL answered 000 for the next minute. The codebase already knew the
+            # shape of this -- "a forward ... stays alive briefly, long enough to be
+            # reused and even to serve one request, before it exits".
+            #
+            # Only `ready` waits for the pod before forwarding, so only `ready` can
+            # honestly restore the URL. What was missing was not the forward: it was
+            # SAYING so anywhere but the CLI. This is emitted from the service, so the
+            # GUI gets the same sentence instead of a bare {"ok": true}.
+            warn(emit, f"{target!r} is scaling back up. Its URL is a port-forward that "
+                       f"died with the old pod, and a new one can only be attached "
+                       f"once the pod is ready — `rc-repro ready --name {target}` "
+                       f"waits for it and re-establishes the forward.", phase="boot")
 
 
 def _clear_default_if(name: str) -> None:
@@ -2324,8 +2971,8 @@ def may_destroy(name: str, actor: str) -> tuple[bool, str]:
 
 
 def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: Emit = null_emit) -> dict:
-    require_docker()
     target = resolve_name(name)
+    require_engine(target)
     if volumes and not confirm:
         raise ValidationError(f"deleting {target!r}'s data volume and record is irreversible - "
                               "pass confirm=true")
@@ -2361,17 +3008,35 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
             context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
             pid = (meta.extra or {}).get("port_forward_pid")
             if pid:
-                _stop_port_forward(int(pid))
+                _stop_port_forward(int(pid), namespace=k8s.namespace_for(target))
             # A preset's UI forwards too, or `down` leaves 8082 bound to a namespace
             # that no longer exists -- and the NEXT workspace using that preset finds
             # the port taken by a corpse.
             for ui_pid in (meta.extra or {}).get("scenario_forwards", {}).values():
                 try:
-                    _stop_port_forward(int(ui_pid))
+                    _stop_port_forward(int(ui_pid),
+                                       namespace=k8s.namespace_for(target))
                 except (TypeError, ValueError):
                     pass
             found = k8s.delete_namespace(target, context=context, volumes=volumes,
                                          emit=emit)
+            # BRANCHED ON, at last. This value was returned to the caller as
+            # `{"found": ...}` and read by nobody -- not the CLI, not the web layer,
+            # not app.js -- so `--volumes` deleted the local record, the shared
+            # operator and the monitoring stack whatever it said, and reported the
+            # namespace and its PersistentVolumeClaim as removed. `delete_namespace`
+            # now means "confirmed absent" by True and raises when it could not ask,
+            # so False here is either a namespace that was already gone or one still
+            # terminating -- and neither is a reason to destroy the only record of it.
+            if volumes and not found:
+                warn(emit, f"{target!r}: the namespace is not confirmed gone, so the "
+                           f"local record is KEPT. Nothing else was removed -- the "
+                           f"operator and any monitoring stack are untouched. Re-run "
+                           f"`rc-repro down --name {target} --volumes` once "
+                           f"`kubectl get ns {k8s.namespace_for(target)}` says it is "
+                           f"absent.", phase="teardown")
+                return {"name": target, "removed": False, "found": found,
+                        "runtime": topology.KUBERNETES}
             if volumes:
                 # AFTER the namespace, never before: deleting it took this workspace's
                 # MongoDBCommunity with it while the operator was still there to clear
@@ -2388,7 +3053,8 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
                 # purpose, and Grafana stays reachable for a workspace coming back.
                 gpid = (meta.extra or {}).get("grafana_pid")
                 if gpid:
-                    _stop_port_forward(int(gpid))
+                    _stop_port_forward(int(gpid),
+                                       namespace=k8s.MONITORING_NAMESPACE)
                 k8s.remove_operator(context=context, excluding=ns, emit=emit)
                 # AND the monitoring stack, which had the same hole and is far more
                 # expensive: ten pods and ~840 MB left running after the workspace that
@@ -2440,17 +3106,25 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
 def prunable() -> list[str]:
     """Names of repros that are safe to prune: not pinned and with no containers
     (a plain `down`). Raises DockerError if docker can't be queried — deleting on
-    that ambiguity would be destructive."""
+    that ambiguity would be destructive.
 
-    require_docker()
-    states = runner.project_states()
-    if states is None:
-        raise DockerError("couldn't query docker compose projects - not pruning (is Docker healthy?)")
+    DOCKER ONLY IF THERE IS A COMPOSE WORKSPACE TO ASK ABOUT. `require_docker()` ran
+    unconditionally at the top, so `prune` was refused outright on a host that uses
+    only an adopted cluster and has no Docker at all -- while the loop below has asked
+    Kubernetes about Kubernetes workspaces for a while. The gate contradicted the
+    runtime it was gating.
+    """
     me = auditsvc.actor()
+    candidates = [m for m in runner.list_meta()
+                  if not (m.pinned or not may_destroy(m.name, me)[0])]
+    states: dict | None = None
+    if any(topology.of_meta(m) != topology.KUBERNETES for m in candidates):
+        require_docker()
+        states = runner.project_states()
+        if states is None:
+            raise DockerError("couldn't query docker compose projects - not pruning (is Docker healthy?)")
     out: list[str] = []
-    for m in runner.list_meta():
-        if m.pinned or not may_destroy(m.name, me)[0]:
-            continue
+    for m in candidates:
         if topology.of_meta(m) == topology.KUBERNETES:
             # ASK KUBERNETES, not Docker. "Is it down" was decided by whether a
             # compose PROJECT was running, and a Kubernetes workspace never has one
@@ -2464,7 +3138,7 @@ def prunable() -> list[str]:
                 continue
             out.append(m.name)
             continue
-        if m.project not in states:
+        if states is not None and m.project not in states:
             out.append(m.name)
     return out
 
@@ -2532,8 +3206,27 @@ def _reclaim_cluster(emit: Emit = null_emit) -> bool:
 
 
 def prune(*, confirm: bool = False, orphans: bool = False,
-          emit: Emit = null_emit) -> dict:
+          only: list[str] | None = None, emit: Emit = null_emit) -> dict:
+    """Delete every `down` workspace. `only` narrows it to a list already shown.
+
+    THE CONFIRMATION AND THE ACTION HAD DIFFERENT TARGET LISTS. `cli.prune` computed
+    `prunable()` to print the prompt and this recomputed it after the answer, so on a
+    shared box a workspace that went `down` while somebody read the prompt was deleted
+    without ever appearing on screen -- and the ownership gate does not help, because
+    with the default `owner` policy an admin passes for everybody. README says "`prune`
+    lists what it will delete".
+
+    `only` is the list that was shown; anything that has appeared since is skipped and
+    named. Anything that has GONE since is simply absent from the intersection.
+    """
     targets = prunable()
+    if only is not None:
+        shown = set(only)
+        appeared = [t for t in targets if t not in shown]
+        targets = [t for t in targets if t in shown]
+        for t in appeared:
+            warn(emit, f"{t!r} became prunable after the list was shown and is left "
+                       f"alone — run prune again to include it", phase="done")
     stray = orphan_namespaces() if orphans else []
     if not targets and not stray:
         # Still worth asking about the CLUSTER. With every workspace gone, rc-repro's
@@ -2546,7 +3239,12 @@ def prune(*, confirm: bool = False, orphans: bool = False,
                 "cluster": _reclaim_cluster(emit)}
     if not confirm:
         raise ValidationError(f"prune deletes {len(targets)} down repro(s) incl. data - pass confirm=true")
-    auditsvc.record("prune", ",".join(targets))
+    # The NAMESPACES go in the subject too. Recording only `targets` meant a sweep that
+    # deleted three namespaces and no local records wrote `- prune - system ok`, with no
+    # trace anywhere of what it destroyed -- and on a shared cluster orphan_namespaces()
+    # is explicit that one of those may be a colleague's.
+    subject = ",".join(targets + [f"ns:{ns}" for ns in stray])
+    auditsvc.record("prune", subject)
     removed = []
     for name in targets:
         # Per repro, not around the whole loop: prune touches every `down` repro,
@@ -2566,12 +3264,14 @@ def prune(*, confirm: bool = False, orphans: bool = False,
                     context = str((meta.extra or {}).get("context") or k8s.CONTEXT)
                     for ui_pid in (meta.extra or {}).get("scenario_forwards", {}).values():
                         try:
-                            _stop_port_forward(int(ui_pid))
+                            _stop_port_forward(
+                                int(ui_pid), namespace=k8s.namespace_for(name))
                         except (TypeError, ValueError):
                             pass
                     pid = (meta.extra or {}).get("port_forward_pid")
                     if pid:
-                        _stop_port_forward(int(pid))
+                        _stop_port_forward(int(pid),
+                                           namespace=k8s.namespace_for(name))
                     k8s.delete_namespace(name, context=context, volumes=True,
                                          emit=emit)
                     runner.remove(name)
@@ -2610,6 +3310,16 @@ def prune(*, confirm: bool = False, orphans: bool = False,
             else:
                 warn(emit, f"could not remove orphaned namespace {ns}: "
                            f"{(res.stderr or '').strip()[:120]}", phase="done")
+    # THE SWEEP USED `--wait=false`, AND THE RECLAIM RAN IMMEDIATELY AFTER. So
+    # `delete_cluster` refused -- correctly -- because the namespaces prune had just
+    # deleted were still Terminating, and reclaiming the cluster took a SECOND prune
+    # twenty seconds later. About 600 MB survived the prune that emptied it, which is
+    # the memory this tool tells people to worry about. Waiting for what we just
+    # deleted is the same lesson `delete_namespace` records against itself.
+    if swept:
+        from rc_repro.services import k8s
+        for ns in swept:
+            k8s.wait_namespace_gone(ns, context=k8s.CONTEXT)
     return {"targets": targets, "removed": removed, "orphans": swept,
             "cluster": _reclaim_cluster(emit)}
 
@@ -2769,6 +3479,24 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     # refusal now costs nothing, where before it left an `incomplete` record that `list`
     # showed as a workspace and whose port `used_ports()` went on reserving.
     plan = k8s.plan_cluster()
+    # BEFORE the write-ahead record below. Adopting a namespace that is not ours is
+    # refused, and a refusal that created nothing must leave nothing behind -- the
+    # provisional record exists so a create that dies HALF WAY can still be removed,
+    # which is a different situation from one that never started.
+    # ONLY WHEN THERE IS A CLUSTER TO ASK. `plan.create` means rc-repro is about to
+    # build its own, so the context does not exist in any kubeconfig yet and asking
+    # kubectl about a namespace in it fails with "context was not found" -- which
+    # `namespace_labels` correctly refuses to read as "no namespace", and then every
+    # first Kubernetes create on a fresh box failed. Found by doing exactly that after
+    # `prune` had reclaimed the cluster; the earlier runs of this check passed only
+    # because a cluster happened to be there.
+    #
+    # Nothing is lost by skipping it: a cluster that does not exist yet holds no
+    # namespace to collide with, and `ensure_namespace` makes the same check again once
+    # the cluster is up.
+    if not plan.create:
+        k8s.assert_namespace_available(repro_name, context=plan.context,
+                                       owner=req.actor)
     provisional = runner.Metadata(
         name=repro_name, project=k8s.namespace_for(repro_name),
         rc_version=resolved.rc_version, rc_image=resolved.rc_image,
@@ -2813,7 +3541,14 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     meta = runner.Metadata(
         name=repro_name, project=out["namespace"], rc_version=resolved.rc_version,
         rc_image=resolved.rc_image, mongo_tag=resolved.mongo_tag,
-        mongo_flavor=resolved.mongo_flavor, preset=req.preset, root_url=root,
+        # NOT `resolved.mongo_flavor`. That is a COMPOSE concept -- "official" vs
+        # "bitnami-legacy" -- and this runtime honours neither: `k8s.create_workspace`
+        # records `mongo_managed_by` and `mongo_image` for exactly this reason, and
+        # says so in its own comment. The DISPLAY was fixed when `rc-repro list`
+        # started printing "8.0 (official)" for a workspace running Docker Hub's
+        # mongo:8.0; the provisional record here kept writing the value, so a JSON
+        # consumer reading `mongo_flavor` still got a name for a different image.
+        mongo_flavor="", preset=req.preset, root_url=root,
         host_port=host_port, version_source=resolved.source, pinned=req.pin,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     topology.stamp(meta.extra, topology.KUBERNETES)
@@ -2844,7 +3579,14 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     # with for life; writing them at all is now only so the record says what the
     # workspace is without a reader having to re-derive it.
     groups = note_groups_of(meta)
-    meta.extra["note_groups"] = groups
+    # THE GROUPS ARE NOT PERSISTED. They are rendered presentation -- roughly 5.5 KB of
+    # a 6.4 KB Kubernetes record, the same content as `notes` a second time, and
+    # including an absolute `export KUBECONFIG=<home>/clients/kubernetes/config` that
+    # is wrong the moment the home moves or the workspace is copied between boxes,
+    # which backup/restore invite. Nothing ever read the stored copy: `detail()` calls
+    # `note_groups_of` itself, and so does the CLI. The only reason to write it was so
+    # the record "says what the workspace is", and it says that in `notes`.
+    meta.extra.pop("note_groups", None)
     # Derived, never written twice: the CLI and every workspace record made before
     # groups existed read this, and a second hand-maintained copy is how the two
     # would come to disagree.
@@ -2869,7 +3611,11 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
         # stopping there left every self-configuring preset half-applied.
         result.update(wait_and_finalize(meta, emit, timeout=600.0))
         result["ready"] = True
-    if req.seed:
+    # NOT when the caller seeds. `seed_here` means the CLI runs it after this returns,
+    # so seeding here as well would seed the workspace twice -- the manifest only ever
+    # adds, so the readback would report rooms holding more than planned and the second
+    # pass would collide on names it had just created.
+    if req.seed and not req.seed_here:
         result["seed"] = run_seed_inline(meta, req.seed_profile, req.stats, emit)
     # `--monitor` last, and only once the workspace is serving: attaching turns on
     # RC's own Prometheus_Enabled over REST, which needs a workspace that answers.
@@ -2896,19 +3642,20 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     return result
 
 
-def _stop_port_forward(pid: int) -> None:
+def _stop_port_forward(pid: int, *, namespace: str = "") -> None:
     """Kill a workspace's port-forward, if it is still ours to kill.
 
-    Best-effort and deliberately narrow: a recorded pid can have been recycled by
-    the OS, so this checks the process is still a kubectl port-forward before
-    signalling it. Killing an unrelated process because a pid was reused is a much
-    worse failure than leaving a dead forward recorded.
+    Best-effort and deliberately narrow, and it was not narrow enough: the check was
+    "is this process a kubectl port-forward", which is liveness wearing identity's
+    clothes. A recycled pid belonging to ANOTHER workspace's forward -- or another
+    user's, on a shared box -- passed it and was signalled, which is precisely the
+    failure this docstring already called much worse than leaving a dead pid recorded.
+
+    `namespace` is the discriminator, and every caller knows it. Delegated to
+    `k8s.forward_alive` so there is one definition of "ours".
     """
-    try:
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
-    except OSError:
-        return
-    if "port-forward" not in cmdline:
+    from rc_repro.services import k8s
+    if not k8s.forward_alive(pid, namespace=namespace):
         return
     try:
         os.kill(pid, signal.SIGTERM)

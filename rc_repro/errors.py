@@ -110,6 +110,16 @@ class AuthorityGateError(ReproError):
     http_status = 403
     code = "GATE"
     exit_code = 6
+    #: NOT ADVERTISED WHILE NOTHING RAISES IT. `_error_codes()` walks this hierarchy
+    #: and deliberately leaves `GATE_CODES` out, saying so in its own docstring --
+    #: "advertising a code nothing can produce is the exact failure this document
+    #: exists to prevent, and it would teach a caller to write a branch that never
+    #: runs". The walk then picked up the BASE code anyway, because exclusion was
+    #: applied to the registry and not to the class. `capabilities` really did
+    #: publish GATE, on a build with no `raise AuthorityGateError` anywhere.
+    #:
+    #: Set this True in the same commit that adds the first raise, not before.
+    advertised = False
 
     def __init__(self, message: str, *, kind: str = "", subject: str = "",
                  approve_with: str = "", code: str | None = None,

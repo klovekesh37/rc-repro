@@ -74,12 +74,28 @@ def _oplog(rc: Version) -> bool:
     return rc.major < 8
 
 
-def _resolve_online(version: str, rc: Version, timeout: float = 5.0) -> Resolved | None:
-    """Query releases.rocket.chat. Returns None on any problem (caller falls back)."""
+#: Set by `_resolve_online` when the release endpoint answered 404 -- i.e. it was
+#: reachable and said this version does not exist. Distinct from "could not ask",
+#: which is the only thing returning None used to mean.
+_NOT_A_RELEASE = "not_a_release"
+
+
+def _resolve_online(version: str, rc: Version, timeout: float = 5.0,
+                    why: list | None = None) -> Resolved | None:
+    """Query releases.rocket.chat. Returns None on any problem (caller falls back).
+
+    `why` collects WHY, because the caller has been unable to tell the difference. A
+    404 from a reachable endpoint means the version was never released; anything else
+    means the lookup failed. Both returned None, so `rc-repro versions 99.99.99` fell
+    through to the curated map, found a rule matching the series, and exited 0 with a
+    confident pairing for a release that does not exist -- as did `8.5.1-rc.1`.
+    """
     try:
         resp = requests.get(RELEASES_URL.format(version=version), timeout=timeout)
     except requests.RequestException:
         return None
+    if resp.status_code == 404 and why is not None:
+        why.append(_NOT_A_RELEASE)
     if resp.status_code != 200:
         return None
     try:
@@ -98,7 +114,18 @@ def _resolve_online(version: str, rc: Version, timeout: float = 5.0) -> Resolved
     if tag is None:
         return None
 
-    note = "compatibleMongoVersions=" + ",".join(compatible)
+    # WHICH END WAS TAKEN, SAID OUT LOUD. `_highest` picks the newest compatible
+    # MongoDB, and for a support reproduction the interesting one is usually the
+    # customer's, which for an older Rocket.Chat is usually the OLDEST supported. RC
+    # 4.8.7 offers 3.6,4.0,4.2,4.4,5.0: this resolves 5.0 while the shipped
+    # versions.yaml rule gives 4.4 with the note "needs MONGO_OPLOG_URL" -- so `up -v
+    # 4.8.7` and `up -v 4.8.7 --offline` pair a different MongoDB MAJOR, and one of
+    # them changes whether the oplog path is exercised at all. `--mongo` overrides and
+    # nothing prompted, which left the difference invisible.
+    note = ("compatibleMongoVersions=" + ",".join(compatible)
+            + (f" (took the NEWEST, {best}; the oldest supported is "
+               f"{_lowest(compatible)} — `--mongo <tag>` to pin the customer's)"
+               if len(compatible) > 1 else ""))
     if tag != best:
         # Said out loud in `rc-repro versions <x>`: the pairing on screen is then
         # explainable, instead of a number that appears nowhere in the API's answer.
@@ -141,6 +168,20 @@ def _series_tag(value: str) -> str | None:
     return f"{parts[0]}.0" if len(parts) == 1 else value
 
 
+def _lowest(tags: list[str]) -> str | None:
+    """The oldest parseable tag. Reported beside the chosen one, never chosen: changing
+    which end is taken would repair one class of reproduction and break another."""
+    best_raw, best_ver = None, None
+    for tag in tags:
+        try:
+            v = Version(tag)
+        except InvalidVersion:
+            continue
+        if best_ver is None or v < best_ver:
+            best_ver, best_raw = v, tag
+    return best_raw
+
+
 def _highest(tags: list[str]) -> str | None:
     best_raw, best_ver = None, None
     for tag in tags:
@@ -163,14 +204,26 @@ def resolve(version: str, *, offline: bool = False) -> Resolved:
     data = _load_map()
     rc_image = data.get("default_rc_image", "registry.rocket.chat/rocketchat/rocket.chat")
 
+    why: list[str] = []
     if not offline:
-        online = _resolve_online(version, rc)
+        online = _resolve_online(version, rc, why=why)
         if online is not None:
             online.rc_image = rc_image
             return online
 
     for rule in data["rules"]:
         if Version(version) in SpecifierSet(rule["rc"]):
+            note = rule.get("note", "")
+            if _NOT_A_RELEASE in why:
+                # SAID, rather than resolved silently. The pairing below is a rule for
+                # the SERIES and is the best guess available -- but the endpoint was
+                # reachable and answered 404, which is positive evidence that this
+                # version was never published, and a caller that gets a clean answer
+                # for a typo will spend the next ten minutes on a failing image pull.
+                note = (f"releases.rocket.chat has no {version} — it may be a typo, "
+                        f"unreleased, or a pre-release tag. The pairing below comes "
+                        f"from the series rule, not from that release."
+                        + (f" {note}" if note else ""))
             return Resolved(
                 rc_version=version,
                 rc_image=rc_image,
@@ -178,8 +231,9 @@ def resolve(version: str, *, offline: bool = False) -> Resolved:
                 mongo_flavor=_flavor(rule["mongo"]),
                 mongo_shell=_shell(rule["mongo"]),
                 oplog=_oplog(rc),
-                source="map (fallback)",
-                note=rule.get("note", ""),
+                source="map (no such release)" if _NOT_A_RELEASE in why
+                       else "map (fallback)",
+                note=note,
             )
 
     raise ValueError(f"no rule matches RC {version} and the live lookup was unavailable")

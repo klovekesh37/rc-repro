@@ -44,10 +44,12 @@ Two properties carried over from the first version because they were right:
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from rc_repro import config, runner, tls
@@ -57,6 +59,8 @@ from rc_repro.errors import ConflictError, ReproError, ValidationError
 EDGE_DIR = "edge"
 #: Traefik watches this for one routing file per registered name.
 DYNAMIC_DIR = "dynamic"
+#: The Edge spec as written, so a later process can rebuild it exactly.
+SPEC_FILE = "spec.json"
 
 #: The compose project name. The underscore is load-bearing: `sanitize()` maps
 #: every non `[a-z0-9-]` character to "-", so no repro can ever be named
@@ -334,7 +338,11 @@ def issue_local_cert(host: str) -> None:
     # parent is a FileNotFoundError -- `up --https` crashed outright.
     dynamic_dir().mkdir(parents=True, exist_ok=True)
     runner.atomic_write(certs_dir() / f"{host}.crt", cert_pem)
-    runner.atomic_write(certs_dir() / f"{host}.key", key_pem)
+    # 0600 on the KEY, set on the temp file so the target never exists world-readable.
+    # This landed at the umask (typically 0644) on a box whose `~/.rc-repro` is only
+    # tightened to 0700 by `serve` or a config save -- neither of which runs on a
+    # CLI-only `up --https`.
+    runner.atomic_write(certs_dir() / f"{host}.key", key_pem, mode=0o600)
     # Checked, because the declaration written below is what makes an absent certificate
     # a permanent error loop rather than a missing file nobody references.
     for part in ("crt", "key"):
@@ -431,6 +439,12 @@ def write(fd: Edge) -> None:
     tls.acme_dir().mkdir(parents=True, exist_ok=True)
     runner.atomic_write(compose_path(), compose_mod.to_yaml(compose_doc(fd)))
     runner.atomic_write(edge_dir() / "domain", fd.domain + "\n")
+    # THE WHOLE SPEC, because `current()` could only reconstruct the domain and the
+    # wildcard flag -- it silently dropped the email, the GUI host and the GUI port, so
+    # nothing but `serve --domain` could rebuild this edge faithfully. That is why
+    # `rc-repro edge start` could not apply a changed `acme.challenge`: it had no way to
+    # regenerate the compose file without losing where the GUI lives.
+    runner.atomic_write(edge_dir() / SPEC_FILE, json.dumps(asdict(fd), indent=2))
     # ONLY with a domain. A bare edge (started by `up --https` on a box that has
     # no public name) has nothing to route to the GUI, and writing the route
     # anyway produced `Host(``)` -- which Traefik rejects at load with "empty args
@@ -466,9 +480,23 @@ def register(name: str, host: str, instances: int = 1, local: bool = False) -> b
 
 def current() -> "Edge | None":
     """The edge as it was set up, or None. Read back from disk because `up`
-    is a different process from the `serve` that configured it."""
+    is a different process from the `serve` that configured it.
+
+    Prefers the recorded spec. The fallback below is what this used to be, and it is
+    kept for an edge written by a version that did not record one -- it reconstructs the
+    domain and infers the wildcard, and loses the email, the GUI host and the GUI port,
+    which is exactly why rebuilding from it was unsafe.
+    """
     if not installed():
         return None
+    spec = edge_dir() / SPEC_FILE
+    if spec.is_file():
+        try:
+            data = json.loads(spec.read_text(encoding="utf-8"))
+            fields = {f.name for f in dataclasses.fields(Edge)}
+            return Edge(**{k: v for k, v in data.items() if k in fields})
+        except (OSError, ValueError, TypeError):
+            pass                       # fall through rather than fail a start
     domain = served_domain()
     from rc_repro import tls as tlsmod
     return Edge(domain=domain, wildcard=bool(domain and tlsmod.dns_env_vars()))
@@ -561,8 +589,21 @@ def registered() -> list[str]:
 # --- docker -------------------------------------------------------------------
 
 def _docker(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    return subprocess.run(["docker", *args], text=True, capture_output=True,
-                          timeout=timeout)
+    """Run one docker command. NEVER RAISES; the caller reads returncode.
+
+    Same contract as `k8s.run`, and it did not have it. A missing binary or a timeout
+    came out as a raw `FileNotFoundError`/`TimeoutExpired` from a seam every caller
+    treats as returning a result -- so on a box with no docker at all, `edge status`,
+    `register` and `attach` produced a traceback instead of the handled error the rest
+    of the tool gives. 127 is what a shell reports for "command not found", and the
+    reason travels in stderr where `_why` already looks for it.
+    """
+    try:
+        return subprocess.run(["docker", *args], text=True, capture_output=True,
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(["docker", *args], returncode=127,
+                                           stdout="", stderr=str(exc))
 
 
 #: Where a unit file goes. Printed, never written -- see systemd_unit().
@@ -705,6 +746,42 @@ def port_holder(port: int = 443) -> str:
     from rc_repro import runner as runner_mod
 
     return "" if runner_mod.port_free(port) else "something outside Docker"
+
+
+def config_drift() -> tuple[list[str], list[str]]:
+    """`(only in the compose file, only in the running container)` for the edge's flags.
+
+    RUNNING IS NOT UP TO DATE, which cost two days once: `config set acme.challenge
+    http` rewrote the compose file, the container kept the command line it was created
+    with, and every message said the edge was fine. `edge start` re-applies now, but
+    nothing SAID when the two had diverged -- and a reader who has just changed a
+    setting has no way to tell whether it took.
+
+    Empty lists when they agree, or when there is nothing to compare (no edge, not
+    running, no compose file). Compared as flag lists rather than by order: compose
+    and docker do not have to agree about ordering for the configuration to be
+    identical.
+    """
+    if not installed() or not running():
+        return [], []
+    try:
+        import yaml
+
+        doc = yaml.safe_load(compose_path().read_text(encoding="utf-8")) or {}
+        svc = next(iter((doc.get("services") or {}).values()), {}) or {}
+        want = [str(a) for a in (svc.get("command") or [])]
+    except (OSError, ValueError, yaml.YAMLError):
+        return [], []
+    out = _docker("inspect", CONTAINER, "--format", "{{json .Config.Cmd}}")
+    if out.returncode != 0:
+        return [], []
+    try:
+        got = [str(a) for a in (json.loads(out.stdout or "null") or [])]
+    except ValueError:
+        return [], []
+    if not want or not got:
+        return [], []
+    return ([f for f in want if f not in got], [f for f in got if f not in want])
 
 
 def has_acme() -> bool:

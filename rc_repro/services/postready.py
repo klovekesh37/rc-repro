@@ -45,7 +45,7 @@ def _exec_in(meta: runner.Metadata, service: str, argv: list[str]) -> int:
     return res.returncode
 
 
-def _pr_saml_idp_cert(meta: runner.Metadata, auth: rcapi.Auth, action: dict, emit: Emit) -> None:
+def _pr_saml_idp_cert(meta: runner.Metadata, auth: rcapi.Auth, action: dict, emit: Emit) -> bool:
     info(emit, "fetching IdP cert (Keycloak first boot can take ~30s)...", phase="post_ready")
     # ONE call. `fetch_saml_idp_cert` already retries to its own deadline -- its
     # docstring says "Retries until the IdP (e.g. Keycloak, which boots slowly) is
@@ -70,7 +70,7 @@ def _pr_saml_idp_cert(meta: runner.Metadata, auth: rcapi.Auth, action: dict, emi
     return False
 
 
-def _pr_keycloak_master_ssl_off(meta: runner.Metadata, auth: rcapi.Auth, action: dict, emit: Emit) -> None:
+def _pr_keycloak_master_ssl_off(meta: runner.Metadata, auth: rcapi.Auth, action: dict, emit: Emit) -> bool:
     svc = action.get("service", "keycloak")
     port = action.get("port", 8080)
     kcadm = "/opt/keycloak/bin/kcadm.sh"
@@ -92,16 +92,57 @@ def _pr_keycloak_master_ssl_off(meta: runner.Metadata, auth: rcapi.Auth, action:
     return False
 
 
-def _pr_create_oauth_provider(meta: runner.Metadata, auth: rcapi.Auth, action: dict, emit: Emit) -> None:
-    if rcapi.add_oauth_service(meta.root_url, auth, config.ADMIN_PASSWORD, action["name"]):
-        for sid, val in action["settings"].items():
-            rcapi.set_setting(meta.root_url, auth, config.ADMIN_PASSWORD, sid, val)
-        info(emit, "OIDC provider created; login button registered.", phase="post_ready")
-    else:
+def _pr_create_oauth_provider(meta: runner.Metadata, auth: rcapi.Auth, action: dict, emit: Emit) -> bool:
+    """Create RC's Custom OAuth provider, then CONFIGURE it -- and report either.
+
+    Both halves used to be unreportable. The handler returned None on every path,
+    and `run_post_ready` collects a failure only on an explicit False, so the oidc
+    preset's one self-config action could not appear in the "only partly configured"
+    summary that exists precisely for this -- the warning printed, the summary said
+    nothing, and `up` exited 0.
+
+    Worse, every `set_setting` result was discarded. `add_oauth_service` creating the
+    provider is not the same as the provider being usable: the settings carry the
+    realm URL, the client id and the secret, and a provider created WITHOUT them
+    renders a login button that points nowhere. That is the failure a support
+    engineer sees as "I click the OIDC button and the page is blank" -- the button is
+    real, the endpoint behind it is empty, and nothing in the create said so.
+    """
+    if not rcapi.add_oauth_service(meta.root_url, auth, config.ADMIN_PASSWORD, action["name"]):
         warn(emit, "could not create the OAuth provider", phase="post_ready")
+        return False
+    settings = dict(action["settings"])
+    # The provider's settings are created BY the method above, and RC's settings are
+    # cached -- so the first PATCH can land before the id exists. Retried rather than
+    # slept past: a fixed sleep is either too short on a loaded box or wasted on a
+    # fast one, and this is the window in which a wrong answer looks like success.
+    failed = _apply_settings(meta, auth, settings, emit)
+    for _ in range(3):
+        if not failed:
+            break
+        time.sleep(2)
+        failed = _apply_settings(meta, auth, {k: settings[k] for k in failed}, emit)
+    if failed:
+        warn(emit, f"the OAuth provider exists but {len(failed)} of its "
+                   f"{len(settings)} settings did not apply: "
+                   f"{', '.join(sorted(failed)[:4])}"
+                   f"{'…' if len(failed) > 4 else ''}. Its login button will render "
+                   f"and lead nowhere.", phase="post_ready")
+        return False
+    info(emit, "OIDC provider created and configured; login button registered.",
+         phase="post_ready")
+    return True
 
 
-def _pr_livechat_setup(meta: runner.Metadata, auth: rcapi.Auth, action: dict, emit: Emit) -> None:
+def _apply_settings(meta: runner.Metadata, auth: rcapi.Auth, settings: dict,
+                    emit: Emit) -> list[str]:
+    """Apply each setting; return the ids that did not take."""
+    return [sid for sid, val in settings.items()
+            if not rcapi.set_setting(meta.root_url, auth, config.ADMIN_PASSWORD,
+                                     sid, val)]
+
+
+def _pr_livechat_setup(meta: runner.Metadata, auth: rcapi.Auth, action: dict, emit: Emit) -> bool:
     url, pw = meta.root_url, config.ADMIN_PASSWORD
     agents = [{"agentId": auth.user_id, "username": config.ADMIN_USERNAME}]
     rcapi.add_livechat_agent(url, auth, pw, config.ADMIN_USERNAME)
@@ -122,16 +163,22 @@ def _pr_livechat_setup(meta: runner.Metadata, auth: rcapi.Auth, action: dict, em
 
     canned = rcapi.save_canned_response(url, auth, pw, "hello",
                                         "Hi! Thanks for reaching out - how can I help?")
-    if available:
-        summary = f"Omnichannel: {len(agents)} agent(s) available"
-        if dept_ok:
-            summary += f", '{dept}' department created + assigned"
-        info(emit, summary + " - log into RC to go online.", phase="post_ready")
-    else:
-        warn(emit, "set up the Omnichannel agent manually (Admin -> Omnichannel -> Agents)", phase="post_ready")
     if not canned:
         info(emit, "(canned responses & business hours are Enterprise features - pass "
                    "--reg-token to enable, else set them up manually)", phase="post_ready")
+    # REPORTED, like every other handler. This returned None on both paths, so a
+    # livechat workspace whose agent could not be made available printed a warning
+    # and was still counted as fully configured -- the same hole the oidc action had.
+    # `canned` is deliberately NOT part of the verdict: it fails on a workspace with
+    # no licence, which is the normal case and not a fault.
+    if not available:
+        warn(emit, "set up the Omnichannel agent manually (Admin -> Omnichannel -> Agents)", phase="post_ready")
+        return False
+    summary = f"Omnichannel: {len(agents)} agent(s) available"
+    if dept_ok:
+        summary += f", '{dept}' department created + assigned"
+    info(emit, summary + " - log into RC to go online.", phase="post_ready")
+    return True
 
 
 _POST_READY_ACTIONS = {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import platform
@@ -23,6 +24,7 @@ from rc_repro import seed as seeder
 from rc_repro.perf import report as perf_report
 from rc_repro.perf.timings import fmt_ms
 from rc_repro.services import data as datasvc
+from rc_repro.services import journal
 from rc_repro.services import envvars as envsvc
 from rc_repro.services import lifecycle as lcsvc
 from rc_repro.services import topology
@@ -135,6 +137,18 @@ def _require_docker() -> None:
     """
     try:
         lcsvc.require_docker()
+    except errors.ReproError as exc:
+        _fail(exc)
+
+
+def _require_engine(target: str) -> None:
+    """The engine THIS workspace needs. See `lifecycle.require_engine`.
+
+    Every caller resolves the name first, which is the whole point: the gate cannot
+    know which engine to ask for until it knows what it is being asked about.
+    """
+    try:
+        lcsvc.require_engine(target)
     except errors.ReproError as exc:
         _fail(exc)
 
@@ -294,9 +308,18 @@ def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | No
 
 
 def _cli_emit(ev: Event) -> None:
-    """Print a service progress event on the terminal. Terminal/`done` events are
-    suppressed — the command wrapper prints the final panel itself."""
-    if ev.terminal or ev.phase == "done":
+    """Print a service progress event on the terminal. Terminal events, and the
+    INFORMATIONAL `done` ones, are suppressed — the command wrapper prints the final
+    panel itself and would otherwise say it twice.
+
+    A `done` WARNING is a different thing and is printed. The suppression used to key
+    on the phase alone, so six warnings a service raises at the end of its work reached
+    nobody on the CLI: an orphaned namespace that could not be removed, a workspace
+    skipped by `prune`, a cluster left alone, a monitoring volume left behind, and the
+    one k8s.py:3560 exists to say -- that `stop` frees Rocket.Chat's memory and NOT
+    operator-managed MongoDB's. Each was written to be read at exactly the moment it
+    fires, and `phase="done"` is where a service says what it finished doing."""
+    if ev.terminal or (ev.phase == "done" and ev.level == "info"):
         return
     if ev.level in ("warn", "error"):
         ui.warn("  " + ev.message)
@@ -364,7 +387,20 @@ def up(
     req = lcsvc.CreateReq(
         version=version, preset=preset, name=name, port=port, root_url=root_url,
         bind=bind, rc_image=rc_image, mongo=mongo, reg_token=reg_token,
-        params=_parse_set_params(set_), seed=False, pin=pin,
+        # THE REAL SEED REQUEST, even though the CLI seeds itself afterwards.
+        # `seed=False` meant the write-ahead note recorded `seed: False` with the
+        # profile defaulted, and `create_repro` cleared the note before control ever
+        # returned here -- so the `pending_seed` recovery landed in v0.72.2 covered the
+        # GUI and NOT `rc-repro up --seed`, the invocation the README documents. That
+        # is the exact scenario lifecycle.py describes: "told the workspace is
+        # complete, doctor agrees, and the evidence that anything was missing has been
+        # deleted."
+        #
+        # `seed_here=True` keeps the two-phase shape -- the CLI still runs the seed, so
+        # it keeps its richer rendering and `--verify-seed` -- while the note tells the
+        # truth about what was asked for and is cleared by whoever finishes it.
+        params=_parse_set_params(set_), seed=seed, seed_here=True,
+        seed_profile=seed_profile, stats=stats, pin=pin,
         wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
         force=force, monitor=monitor, actor=_cli_actor(),
         runtime=runtime, deployment=deployment, replicas=replicas,
@@ -388,6 +424,11 @@ def up(
     if seed:
         seeded = _run_seed(runner.read_meta(result["name"]), seed_profile,
                            stats=stats, verify=verify_seed)
+    # THE NOTE IS OURS TO CLOSE. `seed_here` told `create_repro` not to clear it,
+    # because between its return and this line the workspace is serving with no seed
+    # and a kill there is exactly what the note is for. `_run_seed` exits the process
+    # on failure, so reaching this means the seed landed -- or none was asked for.
+    journal.clear_kind(journal.CREATE_UNFINISHED, result["name"])
     if json_out:
         data = dict(result)
         if seeded is not None:
@@ -411,6 +452,16 @@ def _run_seed(meta: runner.Metadata, profile: str,
     try:
         auth = _login(meta)
     except Exception as exc:  # noqa: BLE001
+        # A 429 IS NOT "NOT READY". Rocket.Chat's own login limiter answers 429 after
+        # a few failed attempts, and pointing at `ready` there sends someone to a
+        # command that will report success and change nothing -- the workspace is up,
+        # it is the limiter refusing. Keyed on the status because the prose is RC's.
+        if "429" in str(exc) or "too many requests" in str(exc).lower():
+            _err(f"can't seed — Rocket.Chat's login rate limiter is refusing "
+                 f"({exc}). The workspace is up; wait about a minute and retry, or "
+                 f"turn the limiter off for this repro with "
+                 f"`rc-repro api -n {meta.name} -X POST /settings/"
+                 f"{config.RC_RATE_LIMITER_SETTING} -d '{{\"value\": false}}'`.")
         _err(f"can't seed — repro not ready (`rc-repro ready --name {meta.name}`): {exc}")
     try:
         plan = seeder.plan_from(profile, users, channels, messages)
@@ -426,6 +477,7 @@ def _run_seed(meta: runner.Metadata, profile: str,
     tokens: dict = {}
     try:
         s = seeder.seed(meta.root_url, auth, plan, tokens_out=tokens,
+                        workspace=meta.name,
                         log=(lambda m: None) if quiet else (lambda m: typer.echo(f"  {m}")))
     finally:
         resources = mon.stop() if mon else None   # stop the sampler thread even if seed raises
@@ -634,8 +686,9 @@ def ready(
     """Block until Rocket.Chat is serving (polls /api/info)."""
     if json_out:
         jsonout.activate()
-    _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    target = _resolve_name(name)
+    _require_engine(target)
+    m = runner.read_meta(target)
     if not json_out:
         typer.echo(f"Waiting for {m.name!r} to serve {m.root_url} ...")
     writer = jsonout.EventWriter() if json_out else None
@@ -808,12 +861,21 @@ def prune(
             typer.echo("  (on a shared cluster one of these may belong to a colleague)")
         typer.confirm("Continue?", abort=True)
     try:
-        res = lcsvc.prune(confirm=True, orphans=orphans, emit=_cli_emit)
+        res = lcsvc.prune(confirm=True, orphans=orphans, only=targets,
+                          emit=_cli_emit)
     except errors.ReproError as exc:
         _fail(exc)
+    # BOTH lists, because a sweep that removed only namespaces used to report
+    # "Nothing to prune." while deleting them and their PersistentVolumeClaims -- the
+    # irreversible half of this command, reported as the no-op half. `removed` is
+    # local records; `orphans` is namespaces no local record explained, which is the
+    # normal case for the situation --orphans exists for.
     if res["removed"]:
         ui.ok(f"✓ pruned {len(res['removed'])}: {', '.join(res['removed'])}")
-    else:
+    if res.get("orphans"):
+        ui.ok(f"✓ removed {len(res['orphans'])} orphaned namespace(s): "
+              f"{', '.join(res['orphans'])}")
+    if not res["removed"] and not res.get("orphans"):
         typer.echo("Nothing to prune.")
     if res.get("cluster"):
         ui.ok("✓ the cluster is gone too — the next Kubernetes workspace creates a new one.")
@@ -829,20 +891,12 @@ def _cluster_reclaimable() -> bool:
         return False
 
 
-def _say_reattach(target: str) -> None:
-    """Tell a Kubernetes workspace's owner how to get its URL answering again."""
-    from rc_repro.services import topology
-    if topology.of_repro(target) != topology.KUBERNETES:
-        return
-    ui.note(f"the URL needs its port-forward back: rc-repro ready --name {target}")
-
-
 @app.command()
 def start(name: str = typer.Option("", "--name", "-n")) -> None:
     """Resume a stopped repro (fast, no rebuild)."""
     target = _resolve_name(name)
     try:
-        lcsvc.set_state(target, "start")
+        lcsvc.set_state(target, "start", emit=_cli_emit)
     except errors.ReproError as exc:
         # Keeps the recreate hint AND the class's code: `stop` and `restart` exit 3
         # for this exact condition, and `start` exiting 1 made the same failure
@@ -850,11 +904,6 @@ def start(name: str = typer.Option("", "--name", "-n")) -> None:
         ui.die(f"could not start {target!r} — if it was `down`ed, use "
                "`rc-repro up` to recreate it", exit_code=exc.exit_code)
     ui.ok(f"✓ {target!r} started.")
-    # On Kubernetes the published port is a port-forward, and it died with the pod
-    # that `stop` scaled away. Compose republishes its ports itself; this does not,
-    # so a `start` that said nothing here would leave a URL that answers nothing and
-    # no clue why.
-    _say_reattach(target)
 
 
 @app.command()
@@ -862,7 +911,7 @@ def stop(name: str = typer.Option("", "--name", "-n")) -> None:
     """Pause a repro, keeping its containers and data."""
     target = _resolve_name(name)
     try:
-        lcsvc.set_state(target, "stop")
+        lcsvc.set_state(target, "stop", emit=_cli_emit)
     except errors.ReproError as exc:
         _fail(exc)
     ui.ok(f"✓ {target!r} stopped (resume with `rc-repro start`).")
@@ -873,20 +922,28 @@ def restart(name: str = typer.Option("", "--name", "-n")) -> None:
     """Restart a repro."""
     target = _resolve_name(name)
     try:
-        lcsvc.set_state(target, "restart")
+        lcsvc.set_state(target, "restart", emit=_cli_emit)
     except errors.ReproError as exc:
         _fail(exc)
     ui.ok(f"✓ {target!r} restarted.")
-    _say_reattach(target)
 
 
 @app.command()
 def use(name: str = typer.Argument(..., help="repro to make the default")) -> None:
     """Set the default repro for name-less commands."""
-    if not runner.exists(name):
-        _err(f"no repro named {name!r}")
-    config.update_config(lambda cfg: cfg.__setitem__("default_repro", name))
-    ui.ok(f"✓ default repro is now {name!r}.")
+    # THROUGH resolve_name, like every other name-taking command. This called
+    # `runner.exists()` on the literal string, so `use TICKET-1234` failed on a
+    # workspace really named `ticket-1234` while `info --name TICKET-1234` found it --
+    # and `name_candidates()`'s docstring is written about exactly that defect and says
+    # it was fixed. `use` was missed. On a box with accounts the owner-prefix half
+    # bites too: `up --name test` makes `alice-test`, and `use test` could not find it.
+    # A typed error, so the exit code is 4 rather than a flat 1.
+    try:
+        target = lcsvc.resolve_name(name)
+    except errors.ReproError as exc:
+        _fail(exc)
+    config.update_config(lambda cfg: cfg.__setitem__("default_repro", target))
+    ui.ok(f"✓ default repro is now {target!r}.")
 
 
 @app.command(name="list")
@@ -1154,6 +1211,42 @@ def users_cmd(
     _err(f"unknown action {action!r} (want: list | add | passwd | remove | role)")
 
 
+def _port_claim_note() -> str:
+    """A cluster holding this host's :80/:443, as a sentence, or "".
+
+    THE EDGE STARTING IS NOT THE EDGE WORKING, and every message on the start path
+    conflated the two. A k3s ServiceLB claims host ports by DNAT rather than by
+    binding, so the edge binds both ports, compose reports success, and this printed
+    "every registered name is served again" about a box where no name was served at
+    all -- for two days, on a manager's install, with `rc-repro edge status` agreeing
+    that the edge was running. It was running. It was also unreachable.
+
+    Cheap enough to run on the start path: one `kubectl get svc` per candidate
+    context, and only when a context answers at all.
+    """
+    from rc_repro.services import k8s
+
+    try:
+        # 3s, not the 8s probe default: this is a warning on the way to starting a
+        # proxy, and four probes at the default would put half a minute on `edge
+        # start` for any box with a kubeconfig pointing somewhere unreachable.
+        claim = k8s.port_claiming_cluster(timeout=3.0)
+    except Exception:  # noqa: BLE001 - a warning must never break a start
+        return ""
+    if not claim:
+        return ""
+    took = ", ".join(f":{p}" for p in claim.ports if p in (80, 443))
+    return (f"cluster {claim.context!r} holds this host's {took} at {claim.address} "
+            f"({claim.service}), so the edge is bound but cannot receive: names answer "
+            f"from the cluster, not from rc-repro.\n"
+            f"  Give the ports back: kubectl -n kube-system patch svc "
+            f"{claim.service.split('/')[-1]} -p "
+            f"'{{\"spec\":{{\"type\":\"NodePort\"}}}}'\n"
+            f"  A k3s reinstall undoes that patch. Permanently: install with "
+            f"`--disable traefik --disable servicelb`, or put those two under "
+            f"`disable:` in /etc/rancher/k3s/config.yaml.")
+
+
 def _report_gui_tls(domain: str, tries: int = 10, pause: float = 2.0) -> None:
     """Say whether `domain` is really being served over TLS yet, and why not.
 
@@ -1166,6 +1259,14 @@ def _report_gui_tls(domain: str, tries: int = 10, pause: float = 2.0) -> None:
 
     from rc_repro import tls as tlsmod
     from rc_repro.services import edge as edgesvc
+
+    # BEFORE the wait, not after it. With a cluster holding the ports no challenge of
+    # any kind can complete, so the twenty seconds of "waiting for the certificate…"
+    # were spent teaching the reader that this message means nothing.
+    claim = _port_claim_note()
+    if claim:
+        ui.warn(f"  ⚠ https://{domain} cannot get a certificate — {claim}")
+        return
 
     for attempt in range(tries):
         got = tlsmod.verify("127.0.0.1", 443, sni=domain, timeout=5.0)
@@ -1239,6 +1340,13 @@ def edge_cmd(
         if not st["running"]:
             ui.warn("  ⚠ every https name on this box is unreachable while it is "
                     "stopped — `rc-repro edge start`")
+        else:
+            # "running" was the whole answer here, and running is not reachable. The
+            # box that took two days to diagnose printed State: running, 3 routes, and
+            # served none of them. Same note as the start path, one place it is written.
+            claim = _port_claim_note()
+            if claim:
+                ui.warn(f"  ⚠ running but NOT reachable — {claim}")
         # Declared and unservable, which is silent apart from a log nobody was
         # pointed at. Reported BEFORE the early return below, or the box where it
         # matters most -- one with a GUI name and no workspace routes -- never shows it.
@@ -1267,14 +1375,48 @@ def edge_cmd(
     if action in ("start", "stop", "restart"):
         if not edgesvc.installed() and action != "stop":
             edgesvc.write(edgesvc.Edge())
+        elif action in ("start", "restart"):
+            # RE-RESOLVE FROM CONFIG. `start` used to just `up` the compose file that was
+            # already on disk, so a changed `acme.challenge` or `acme.staging` reached
+            # nothing -- the container came back with the challenge and the CA it was
+            # created with, and the log went on reporting the same failure. Measured:
+            # `config set acme.challenge http` then `edge restart` still validated over
+            # TLS-ALPN against the production CA.
+            #
+            # Rebuilt from the recorded spec, which is why the spec is recorded: the
+            # older reconstruction knew only the domain, so regenerating from it would
+            # have lost the GUI's host and port and pointed the front door at nothing.
+            fd = edgesvc.current()
+            if fd is not None:
+                edgesvc.write(edgesvc.Edge.resolve(
+                    fd.domain, fd.acme_email,
+                    gui_host=fd.gui_host, gui_port=fd.gui_port,
+                    http_port=fd.http_port, https_port=fd.https_port))
         if action in ("stop", "restart"):
             edgesvc.down()
             ui.ok("✓ edge stopped; :80 and :443 are free.")
         if action in ("start", "restart"):
-            if edgesvc.up(pull=False).returncode != 0:
+            # RENDERED, not raised. `up()` refuses with a ConflictError when an edge from
+            # a different RC_REPRO_HOME already holds the port -- a real, expected,
+            # actionable condition, and starting this one would take that one's names
+            # down. Uncaught here, so `rc-repro edge start` answered a two-user box with
+            # a Python TRACEBACK, source of cli.py included. `serve` learned this
+            # already; this path is the same call and did not.
+            try:
+                started_ok = edgesvc.up(pull=False).returncode == 0
+            except errors.ReproError as exc:
+                _fail(exc)
+            if not started_ok:
                 _err("the edge did not start. Check nothing else holds :80 or :443:\n"
                      "    sudo lsof -i :443")
-            ui.ok("✓ edge running — every registered name is served again.")
+            # BOUND IS NOT REACHABLE. See `_port_claim_note`: this line claimed every
+            # name was served again on a box where a cluster was taking every packet
+            # before Docker saw it, which is the state this whole check exists for.
+            claim = _port_claim_note()
+            if claim:
+                ui.warn(f"  ⚠ edge running, but NOT reachable — {claim}")
+            else:
+                ui.ok("✓ edge running — every registered name is served again.")
         return
 
     _err(f"unknown action {action!r} (want: status | start | stop | restart)")
@@ -1359,7 +1501,14 @@ def env_cmd(
     untouched, so no data is lost and it takes seconds.
     """
     if not set_ and not setting and not unset:
-        cur = envsvc.current(name)
+        # WRAPPED LIKE ITS SIBLINGS. `stats`, `logs`, `info`, `token`, `tls-status`,
+        # `chown` and `seed` all catch this; the env READ path did not, so an unknown
+        # name escaped to main() -- which then mishandled it (see `_exit_reporting`)
+        # and exited 1 where the table says 4.
+        try:
+            cur = envsvc.current(name)
+        except errors.ReproError as exc:
+            _fail(exc)
         rows = [(e["key"], e["value"] + ("   <- yours" if e["override"] else ""))
                 for e in cur["env"]]
         ui.panel(f"env: {cur['name']}", rows)
@@ -1567,8 +1716,9 @@ def _run_and_echo(cmd: list[str]) -> None:
 @app.command()
 def token(name: str = typer.Option("", "--name", "-n")) -> None:
     """Mint an API auth token (X-Auth-Token / X-User-Id headers)."""
-    _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    target = _resolve_name(name)
+    _require_engine(target)
+    m = runner.read_meta(target)
     try:
         auth = _login(m)
     except Exception as exc:  # noqa: BLE001 - surface any auth/connection failure
@@ -1592,8 +1742,9 @@ def api(
       rc-repro api POST /api/v1/users.update --pat -d '{"userId":"ID","data":{"name":"X"}}'
       rc-repro api POST /api/v1/users.update --2fa -d '{"userId":"ID","data":{"name":"X"}}'
     """
-    _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    target = _resolve_name(name)
+    _require_engine(target)
+    m = runner.read_meta(target)
     try:
         auth = _login(m)
         if pat:
@@ -1632,8 +1783,9 @@ def pat(
     bypass_2fa: bool = typer.Option(True, "--bypass-2fa/--no-bypass-2fa", help='create with "Ignore Two Factor Authentication"'),
 ) -> None:
     """Mint a Personal Access Token and print ready-to-use headers (curl/Postman)."""
-    _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    target = _resolve_name(name)
+    _require_engine(target)
+    m = runner.read_meta(target)
     try:
         auth = _login(m)
         token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, token_name=label, bypass_2fa=bypass_2fa, workspace=m.name)
@@ -1667,8 +1819,9 @@ def seed_cmd(
     Bulk users are credential-less and messages fire no app hooks; use the
     default REST seed when you need real, loginable users.
     """
-    _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    target = _resolve_name(name)
+    _require_engine(target)
+    m = runner.read_meta(target)
     if clear_scale:
         _clear_scale(m)
         return
@@ -1694,11 +1847,15 @@ def config_import(
     dump redacts and identity/environment settings (license, Site_Url, assets)
     that would break or pollute a local repro.
     """
-    _require_docker()
     path = Path(settings_file)
     if not path.is_file():
         _err(f"no such file: {settings_file}")
-    m = runner.read_meta(_resolve_name(name))
+    target = _resolve_name(name)
+    # `config-import` speaks REST to a URL -- `topology.require_compose`'s own
+    # docstring names it as runtime-agnostic -- so gating it on Docker refused it on
+    # a Kubernetes host that has none.
+    _require_engine(target)
+    m = runner.read_meta(target)
     onlyset = {p.strip() for p in only.split(",")} if only else None
     try:
         plan = datasvc.import_plan(m.name, str(path), only=onlyset)
@@ -1842,7 +1999,7 @@ def upgrade_cmd(
     no_rollback: bool = typer.Option(False, "--no-rollback", help="leave a failed upgrade in place instead of rolling it back"),
     rollback: bool = typer.Option(False, "--rollback", help="undo the last upgrade from its pre-upgrade backup"),
     bundle: str = typer.Option("", "--bundle", help="with --rollback: restore this bundle instead of the recorded one"),
-    offline: bool = typer.Option(False, "--offline", help="resolve the version from the built-in map, no network"),
+    offline: bool = typer.Option(False, "--offline", help="resolve the version from the built-in map, no network (so a version that was never released still resolves — the map matches on the series)"),
     force: bool = typer.Option(False, "--force", help="ignore refusals (downgrades, MongoDB major changes)"),
 ) -> None:
     """Upgrade a RUNNING repro to another Rocket.Chat version.
@@ -1913,8 +2070,9 @@ def stats(
     watch: bool = typer.Option(False, "--watch", "-w", help="stream live (Ctrl-C to stop)"),
 ) -> None:
     """Sample a repro's container CPU/RAM (peak over a window, or --watch live)."""
-    _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    target = _resolve_name(name)
+    _require_engine(target)
+    m = runner.read_meta(target)
     if topology.of_repro(m.name) == topology.KUBERNETES:
         # `kubectl top`, per pod, which is the shape that means something here: a
         # Compose repro has containers, a Kubernetes one has pods that come and go.
@@ -1922,19 +2080,55 @@ def stats(
         # its own rather than a translation of it.
         from rc_repro.services import k8s
         context = str((m.extra or {}).get("context") or k8s.CONTEXT)
+        # THE WHOLE NAMESPACE, not just the Rocket.Chat pods. Compose sums
+        # `docker compose ps -q`, which is every container in the workspace --
+        # MongoDB included, and on Kubernetes MongoDB is usually the largest single
+        # consumer. Scoped to LOG_SELECTOR this reported 1 row (rocketchat, 793.8 MB)
+        # for a 5-pod namespace also holding mongodb-0, nats-0, nats-1 and nats-box,
+        # and called that the workspace's resource use. Two runtimes measuring
+        # different sets is the quietly-wrong number `pod_metrics` exists to avoid.
+        deadline = time.monotonic() + (0.0 if watch else max(0.0, for_))
+        peak: dict[str, dict] = {}
         while True:
             try:
-                rows = k8s.pod_metrics(m.name, context=context)
+                rows = k8s.pod_metrics(m.name, context=context, selector="")
             except errors.ReproError as exc:
                 _fail(exc)
-            typer.echo("")
+            if watch:
+                typer.echo("")
+                for r in rows:
+                    typer.echo(f"  {r['pod']:<44} CPU {r['cpu_millicores']:>6.0f}m"
+                               f"   RAM {r['mem_bytes'] / 1e6:>7.1f} MB")
+                if not rows:
+                    ui.note("no pods are running in this workspace's namespace")
+                try:
+                    time.sleep(2)
+                except KeyboardInterrupt:
+                    return
+                continue
+            # `--for` WAS ACCEPTED AND DROPPED. It was read only after this branch
+            # returned, so `stats --for 30` came back in 0s having sampled once --
+            # exactly the accepted-and-ignored shape `_KUBERNETES_UNSUPPORTED` exists
+            # to prevent for other flags. Sampled to a peak now, like Compose.
             for r in rows:
-                typer.echo(f"  {r['pod']:<44} CPU {r['cpu_millicores']:>6.0f}m"
-                           f"   RAM {r['mem_bytes'] / 1e6:>7.1f} MB")
-            if not rows:
-                ui.note("no Rocket.Chat pods are running")
-            if not watch:
+                prev = peak.get(r["pod"])
+                if prev is None or r["mem_bytes"] > prev["mem_bytes"]:
+                    peak[r["pod"]] = dict(r)
+                else:
+                    prev["cpu_millicores"] = max(prev["cpu_millicores"],
+                                                 r["cpu_millicores"])
+            if time.monotonic() >= deadline:
+                typer.echo("")
+                for r in sorted(peak.values(), key=lambda x: -x["mem_bytes"]):
+                    typer.echo(f"  {r['pod']:<44} CPU {r['cpu_millicores']:>6.0f}m"
+                               f"   RAM {r['mem_bytes'] / 1e6:>7.1f} MB")
+                if not peak:
+                    ui.note("no pods are running in this workspace's namespace")
                 return
+            # ONE sleep. There were two identical blocks here, so `--for 30` slept
+            # four seconds a round and sampled 7 times instead of 15 -- half the
+            # window, silently, in the code that had just been changed to honour the
+            # flag at all.
             try:
                 time.sleep(2)
             except KeyboardInterrupt:
@@ -2434,6 +2628,8 @@ def loadtest(
     # always valid even if we abort before setting them.
     applied_constraints: list = []
     limiter_was_off = True
+    # Journal ids. "" means "no note", and journal.clear("") is a no-op.
+    limiter_note = constrain_note = metrics_note = mongo_note = ""
     metrics_changed, mongo_prior, sampler, mon = False, None, None, None
     resources = None
     summary = None
@@ -2447,6 +2643,16 @@ def loadtest(
                 applied_constraints = constrain_mod.apply(m.name, per_service)
             except RuntimeError as exc:
                 _err(f"could not apply --constrain: {exc}")
+            # JOURNALLED HERE TOO. This function is a second implementation of
+            # services/perf.py's run_loadtest, and only the service half wrote notes --
+            # so a CLI run killed by SIGKILL or an OOM left the rate limiter off, the
+            # containers capped, the metrics endpoint open and the profiler armed, with
+            # nothing on disk recording any of it and `doctor` therefore silent.
+            # Measured exactly that way: kill -9 a CLI loadtest, find
+            # API_Enable_Rate_Limiter still false and zero journal notes.
+            constrain_note = journal.record(
+                journal.CONSTRAINTS_APPLIED, m.name,
+                applied=[dataclasses.asdict(a) for a in applied_constraints])
             snapshot["constraints"] = constrain_mod.human(per_service)
             if not json_out:
                 ui.note(f"  constrained: {snapshot['constraints']} (restored after the test)")
@@ -2456,10 +2662,13 @@ def loadtest(
         # (an unreadable setting -> None -> restores to ON, never left disabled).
         limiter_was_off = rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                             config.RC_RATE_LIMITER_SETTING) is False
-        if not limiter_was_off and not rcapi.set_setting(
-            m.root_url, auth, config.ADMIN_PASSWORD, config.RC_RATE_LIMITER_SETTING, False
-        ):
-            _warn("  ⚠ could not disable the API rate limiter — results may be throttled (429s)")
+        if not limiter_was_off:
+            limiter_note = journal.record(journal.RATE_LIMITER_OFF, m.name)
+            if not rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                     config.RC_RATE_LIMITER_SETTING, False):
+                journal.clear(limiter_note)
+                limiter_note = ""
+                _warn("  ⚠ could not disable the API rate limiter — results may be throttled (429s)")
 
         if not json_out:
             typer.secho(f"Load test: {label} @ {load} as {identity} -> {target} "
@@ -2475,11 +2684,15 @@ def loadtest(
         if diag:
             if rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                  monitoring.RC_METRICS_SETTING) is not True:
+                metrics_note = journal.record(journal.RC_METRICS_ON, m.name)
                 metrics_changed = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                                     monitoring.RC_METRICS_SETTING, True)
             mongo_prior = mongoprof.start(m.name, slowms)
             if mongo_prior is None:
                 _warn("  ⚠ Mongo slow-query capture unavailable (profiler could not be enabled)")
+            else:
+                mongo_note = journal.record(journal.MONGO_PROFILER_ON, m.name,
+                                            prior=mongo_prior)
 
         mon = perf.ResourceMonitor(m.name).start() if stats else None
         since_ms = int(time.time() * 1000)
@@ -2503,12 +2716,14 @@ def loadtest(
             try:
                 rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                   config.RC_RATE_LIMITER_SETTING, True)
+                journal.clear(limiter_note)
             except Exception:  # noqa: BLE001 - best-effort restore
                 _warn("  ⚠ could not restore the API rate limiter setting")
         if metrics_changed:
             try:
                 rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                   monitoring.RC_METRICS_SETTING, False)
+                journal.clear(metrics_note)
             except Exception:  # noqa: BLE001
                 _warn("  ⚠ could not restore the Prometheus metrics setting")
         if mongo_prior:
@@ -2516,10 +2731,17 @@ def loadtest(
             # resource-cap restore below and leave the containers capped.
             try:
                 mongoprof.stop(m.name, mongo_prior)
+                journal.clear(mongo_note)
             except Exception:  # noqa: BLE001
                 _warn("  ⚠ could not restore the Mongo profiler level")
-        for problem in constrain_mod.restore(applied_constraints):
+        # Cleared only on a SUCCESSFUL restore -- see services/perf.py. `restore`
+        # returns problems rather than raising, so clearing first deleted the note on
+        # the one path it is for.
+        _cap_problems = constrain_mod.restore(applied_constraints)
+        for problem in _cap_problems:
             _warn(f"  ⚠ could not restore resource limits — {problem}")
+        if not _cap_problems:
+            journal.clear(constrain_note)
 
     # Collect the diagnosis artifacts (profile entries survive the level reset).
     mongo_slow = mongoprof.collect(m.name, since_ms) if (diag and mongo_prior) else None
@@ -2618,7 +2840,15 @@ def loadtest(
             result["saved_baseline"] = saved_to
         if report_file:
             result["report"] = report_file
-        typer.echo(json.dumps(result, indent=2))
+        # THE ENVELOPE, not a bare payload. `jsonout.activate()` runs at the top of this
+        # command, so the caller has been told stdout is a machine document -- and this
+        # printed `json.dumps(..., indent=2)`: no `schema`, no `contract`, no `ok`, no
+        # `error`, over many lines. `jsonout`'s own module docstring names loadtest and
+        # capacity as the bug it was written to fix, and it was fixed for the ERROR path
+        # only. README sells `--slo` as the thing that "drops into CI" and tells that CI
+        # step to read to end of stream and parse the last line; the last line of this
+        # was `}`.
+        jsonout.reply("loadtest", result)
 
     if not passed:
         raise typer.Exit(1)
@@ -2697,6 +2927,7 @@ def capacity(
     # still restores. Restore-tracked vars are initialised first.
     applied_constraints: list = []
     limiter_was_off = True
+    limiter_note = constrain_note = metrics_note = ""
     metrics_changed = False
     steps: list[dict] = []
     last_pass = first_fail = None
@@ -2735,13 +2966,18 @@ def capacity(
                 applied_constraints = constrain_mod.apply(m.name, per_service)
             except RuntimeError as exc:
                 _err(f"could not apply --constrain: {exc}")
+            constrain_note = journal.record(
+                journal.CONSTRAINTS_APPLIED, m.name,
+                applied=[dataclasses.asdict(a) for a in applied_constraints])
         limiter_was_off = rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                             config.RC_RATE_LIMITER_SETTING) is False
         if not limiter_was_off:
+            limiter_note = journal.record(journal.RATE_LIMITER_OFF, m.name)
             rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                               config.RC_RATE_LIMITER_SETTING, False)
         if rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                              monitoring.RC_METRICS_SETTING) is not True:
+            metrics_note = journal.record(journal.RC_METRICS_ON, m.name)
             metrics_changed = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                                 monitoring.RC_METRICS_SETTING, True)
         identity = f"{len(users)} seeded users" if users else "admin token"
@@ -2777,14 +3013,21 @@ def capacity(
                                   config.RC_RATE_LIMITER_SETTING, True)
             except Exception:  # noqa: BLE001
                 ui.warn("  ⚠ could not restore the API rate limiter setting")
+            else:
+                journal.clear(limiter_note)
         if metrics_changed:
             try:
                 rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
                                   monitoring.RC_METRICS_SETTING, False)
+                journal.clear(metrics_note)
             except Exception:  # noqa: BLE001
                 ui.warn("  ⚠ could not restore the Prometheus metrics setting")
-        for problem in constrain_mod.restore(applied_constraints):
+        # Same as loadtest above: the note outlives a failed restore.
+        _cap_problems = constrain_mod.restore(applied_constraints)
+        for problem in _cap_problems:
             ui.warn(f"  ⚠ could not restore resource limits — {problem}")
+        if not _cap_problems:
+            journal.clear(constrain_note)
         # users.json holds seeded-user tokens — don't leave them on disk.
         (runner.workspace(m.name) / "loadtest" / "users.json").unlink(missing_ok=True)
 
@@ -2827,9 +3070,12 @@ def capacity(
             typer.echo("")
             ui.ok(f"✓ wrote {path_}")
     if json_out:
-        typer.echo(json.dumps({"ctx": ctx, "steps": steps, "capacity_vus": last_pass,
-                               "breach_vus": first_fail, "result": result, "why": why},
-                              indent=2))
+        # See loadtest above: an envelope, because that is what `capabilities` says this
+        # command answers with and what the contract promises.
+        jsonout.reply("capacity", {"ctx": ctx, "steps": steps,
+                                   "capacity_vus": last_pass,
+                                   "breach_vus": first_fail, "result": result,
+                                   "why": why})
 
 
 @app.command()
@@ -2839,8 +3085,8 @@ def logs(
     tail: int = typer.Option(0, "--tail", help="only the last N lines (0 = all)"),
 ) -> None:
     """Tail a repro's logs."""
-    _require_docker()
     target = _resolve_name(name)
+    _require_engine(target)
     # Logs are the first thing anyone reads when reproducing a ticket, so this
     # dispatches rather than refusing. It used to send Kubernetes users away with a
     # `kubectl` line -- workable in a terminal, and nothing at all in the browser,
@@ -3045,6 +3291,16 @@ def doctor(
         jsonout.activate()
     report = doctorsvc.run_checks()
     if json_out:
+        # `doctor --json` used to answer `{"ok": true, "warnings": [], "data":
+        # {"verdict": "warn", "counts": {"warn": 6}}}`. Six warnings, and the field
+        # designed to carry them empty -- reachable through data.checks[].status, which
+        # is not what a caller is told to read.
+        for row in report.get("checks", []):
+            if row.get("status") in ("warn", "fail"):
+                jsonout.warn_once(f"DOCTOR_{str(row.get('check') or 'check').upper()}"
+                                  .replace("-", "_"),
+                                  str(row.get("message") or ""),
+                                  check=row.get("check"), status=row.get("status"))
         jsonout.reply("doctor", report)
         # PreflightError's own code, not a bare 1: "this box is not ready" is a
         # different answer from "rc-repro broke", and a CI step branching on the
@@ -3601,5 +3857,88 @@ def serve(
                 proxy_headers=False)
 
 
+def main() -> None:
+    """The console-script entry point, and the last line of the error contract.
+
+    FOUR REACHABLE STATES RAISED A NON-ReproError and blew straight past every handler
+    in this file: a workspace directory holding a docker-compose.yml and no repro.json
+    (FileNotFoundError -- which is exactly what an interrupted create leaves between
+    the two atomic_writes, and `runner.exists()` returns True for it while
+    `list_meta()` skips it, so the workspace is invisible to `list` and reachable by
+    name only as a traceback); a repro.json missing fields, from an older build or a
+    truncated write (TypeError: Metadata.__init__() missing 7 required positional
+    arguments); a malformed config.yaml (yaml.parser.ParserError); and a non-writable
+    RC_REPRO_HOME (PermissionError on .../locks).
+
+    Each printed a Python traceback, exited 1, and under `--json` wrote ZERO BYTES to
+    stdout. That last part is the one that matters: "exactly one envelope, and it is
+    the last line" is the single promise a caller is told it may depend on, and it was
+    broken precisely when the caller most needed it. Exit 1 is `internal` in
+    EXIT_CODES, so a script could not tell a corrupt state file from a bug either.
+
+    The traceback still goes to stderr, unabridged -- this changes where the failure is
+    reported, not whether it is.
+    """
+    try:
+        app()
+    except SystemExit:
+        # A command that exited normally. Click's standalone mode has already turned
+        # its `typer.Exit` into this, which is why the branches BELOW have to do that
+        # conversion themselves -- they run outside click.
+        raise
+    except errors.ReproError as exc:
+        _exit_reporting(exc)        # a domain error that escaped a command's handler
+    except KeyboardInterrupt:
+        ui.warn("interrupted")
+        sys.exit(130)
+    except BaseException as exc:    # noqa: BLE001 - the contract's last line
+        import traceback
+        traceback.print_exc()
+        _exit_reporting(errors.ReproError(
+            f"{type(exc).__name__}: {exc} - this is unhandled, and the traceback is "
+            f"on stderr. If it names a file under RC_REPRO_HOME, that file is the "
+            f"problem."), code=1)
+
+
+def _exit_reporting(exc: errors.ReproError, code: int | None = None) -> NoReturn:
+    """Report `exc` through the normal contract and exit, from OUTSIDE a command.
+
+    `_fail` -> `ui.die` signals by raising `typer.Exit`, and typer.Exit is
+    `RuntimeError`-derived, NOT a SystemExit:
+
+        >>> [c.__name__ for c in typer.Exit.__mro__][:3]
+        ['Exit', 'RuntimeError', 'Exception']
+
+    Click converts it inside `app()`. Out here nothing does, so calling `_fail`
+    directly from `main()` let it propagate as an uncaught exception: a second
+    traceback after the message, and the wrong exit code -- 1 instead of the class's
+    own. Measured: `rc-repro env --name nope` printed the right error, then a
+    traceback, then exited 1 where the published table says 4. The BaseException
+    branch was written with this guard and the ReproError branch beside it was not,
+    which is how the same defect survived the commit that fixed it.
+
+    Rejected: making `ui.die` raise SystemExit instead. That changes behaviour inside
+    every command, where click's standalone mode handles typer.Exit correctly today --
+    a large blast radius for a two-line problem out here.
+    """
+    want = code if code is not None else getattr(exc, "exit_code", 1)
+    # `--json` MAY NOT HAVE BEEN PARSED YET. The flag is a command parameter, so
+    # `jsonout.activate()` runs inside the command -- and some failures happen before
+    # any command does. `_before_any_command` is the sharp one: it reads the accounts
+    # file on EVERY invocation, so an unreadable or wrong-type `~/.rc-repro/users` (a
+    # stale directory, a file owned by another user on the shared box) failed there and
+    # left a `--json` caller with the empty stdout this whole contract exists to
+    # prevent. If the caller asked for JSON on the command line, they get JSON.
+    if not jsonout.active() and "--json" in sys.argv[1:]:
+        jsonout.activate()
+    try:
+        _fail(exc)
+    except SystemExit:
+        raise
+    except BaseException:  # noqa: BLE001 - typer.Exit, whose code we already have
+        pass
+    sys.exit(want)
+
+
 if __name__ == "__main__":
-    sys.exit(app())
+    main()
