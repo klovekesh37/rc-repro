@@ -35,16 +35,11 @@ docs/
 # directory to re-include something inside it.
 .claude/*
 !.claude/skills/
-# The rest of `.claude` splits cleanly into project artifacts and personal state.
-# `agents/` (the code-reviewer, live-verifier and regression-prover definitions),
-# `hooks/guard-commit.py` (which enforces two CLAUDE.md rules that have been broken
-# here before) and `settings.json` (which wires that hook) describe how to work on
-# THIS repository, so a teammate's clone should have them.
-# `settings.local.json` is one person's permission allow-list and stays out.
-!.claude/agents/
-!.claude/hooks/
-!.claude/settings.json
-.claude/settings.local.json
+# Everything else under `.claude/` is one person's tooling and stays out: `agents/`,
+# `hooks/`, `settings.json` and `settings.local.json`. They describe how somebody
+# chooses to work on this repository, not what the repository is -- and a whitelist
+# for them is a standing invitation to re-commit whatever the tool regenerates.
+# `skills/` above is the exception because the rc-repro skill is a project artifact.
 .codex/
 .agents/*
 !.agents/skills/
