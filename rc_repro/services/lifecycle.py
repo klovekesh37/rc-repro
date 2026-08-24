@@ -1718,7 +1718,11 @@ def _reuse(name: str, wait: bool, req: CreateReq, emit: Emit, *, stream_output: 
 def _up(name: str, *, pull: bool, emit: Emit, stream_output: bool) -> int:
     if not stream_output:
         return runner.up(name, pull=pull)   # docker draws its own progress on the terminal
-    on_line = lambda ln: info(emit, ln, phase="boot")  # noqa: E731
+    # `echo="docker"` marks this as ECHO rather than narrative: every line of
+    # `docker compose pull` comes through here, so a create emits several hundred
+    # "Downloading 45.09MB" events. The GUI wants them; the durable log does not, and
+    # would spend its whole size cap on one create. `RC_REPRO_LOG_ECHO=1` keeps them.
+    on_line = lambda ln: info(emit, ln, phase="boot", echo="docker")  # noqa: E731
     if pull:
         runner.compose_stream(name, "pull", on_line=on_line)   # non-fatal, like runner.up
     return runner.compose_stream(name, "up", "-d", "--remove-orphans", on_line=on_line)
@@ -2198,7 +2202,12 @@ def check_seed(meta: runner.Metadata, auth, plan, result: dict,
         verdict = seeder.verify(plan, facts)
     except Exception as exc:  # noqa: BLE001 - a check must never break the seed
         warn(emit, f"could not read the seed back: {exc}", phase="seed")
-        return {"ok": None, "faults": [], "unreadable": [], "checked": 0, "rooms": []}
+        # `why` travels with the verdict, so a caller rendering from the RETURN VALUE
+        # can say what went wrong without also subscribing to the events. The CLI does
+        # exactly that -- it has the richer renderer -- and passing it an emit as well
+        # made every line print twice.
+        return {"ok": None, "why": str(exc), "faults": [], "unreadable": [],
+                "checked": 0, "rooms": []}
     result["verification"] = {k: verdict[k] for k in
                               ("ok", "faults", "extra", "unreadable", "checked")}
     result["readback"] = verdict["rooms"]
@@ -3065,7 +3074,17 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
                 # On Compose there was nothing to fix: the stack is part of the
                 # workspace's own compose project and goes down with it.
                 k8s.remove_monitoring(context=context, excluding=ns, emit=emit)
+                # CHECKED, not assumed. `ignore_errors=True` means a record that
+                # could not be removed -- a permission problem, a file held open --
+                # is silently left behind, and the success line two branches below
+                # then says "and the local record". Saying so is the whole difference
+                # between a stale record somebody knows about and one they do not.
                 shutil.rmtree(runner.workspace(target), ignore_errors=True)
+                if runner.workspace(target).exists():
+                    warn(emit, f"the namespace is gone but {runner.workspace(target)} "
+                               f"could not be removed, so `list` will still show "
+                               f"{target!r}. Remove that directory by hand.",
+                         phase="teardown")
                 _clear_default_if(target)
             # Docker's nouns are wrong here. "containers, data volume, and
             # record" for a workspace that has a namespace and a PVC says nothing
@@ -3272,8 +3291,20 @@ def prune(*, confirm: bool = False, orphans: bool = False,
                     if pid:
                         _stop_port_forward(int(pid),
                                            namespace=k8s.namespace_for(name))
-                    k8s.delete_namespace(name, context=context, volumes=True,
-                                         emit=emit)
+                    # THE ANSWER IS READ, exactly as `teardown` reads it. This
+                    # discarded it and then removed the local record and reported the
+                    # workspace pruned regardless -- which is the defect v0.70.9 fixed
+                    # in `teardown` and left standing here, twenty lines away. A
+                    # namespace that could not be deleted therefore lost the only
+                    # record that knew about it, while it and its PersistentVolumeClaim
+                    # went on running.
+                    if not k8s.delete_namespace(name, context=context, volumes=True,
+                                                emit=emit):
+                        warn(emit, f"{name!r} was NOT pruned: its namespace is not "
+                                   f"confirmed gone, so the record is kept. "
+                                   f"`kubectl get ns {k8s.namespace_for(name)}`, then "
+                                   f"prune again.", phase="done")
+                        continue
                     runner.remove(name)
                     _clear_default_if(name)
                     removed.append(name)
@@ -3319,7 +3350,14 @@ def prune(*, confirm: bool = False, orphans: bool = False,
     if swept:
         from rc_repro.services import k8s
         for ns in swept:
-            k8s.wait_namespace_gone(ns, context=k8s.CONTEXT)
+            # SAID, when it does not go. The cluster reclaim below refuses while any
+            # workspace namespace remains, so dropping this answer turned the
+            # single-pass prune back into the two-run behaviour it was fixed for --
+            # silently, which is the part worth fixing.
+            if not k8s.wait_namespace_gone(ns, context=k8s.CONTEXT, emit=emit):
+                warn(emit, f"namespace {ns} is still terminating, so the cluster is "
+                           f"left alone this pass — `rc-repro prune` again once "
+                           f"`kubectl get ns` is clear.", phase="done")
     return {"targets": targets, "removed": removed, "orphans": swept,
             "cluster": _reclaim_cluster(emit)}
 

@@ -1097,7 +1097,14 @@ def create_app(allow_hosts: list[str] | None = None, *,
         if not target:
             return JSONResponse({"error": "no such session", "kind": "NotFoundError"},
                                 status_code=404)
-        sessions.revoke_sid(target.sid)
+        # THE ANSWER IS READ. `revoke_sid` returns False when the sid was not in the
+        # store, and this reported `{"ok": true, "ended": 1}` regardless -- so a
+        # sign-out that revoked nothing looked like one that worked. Reachable as a
+        # race: the session can expire between `list_for` above and this line.
+        if not sessions.revoke_sid(target.sid):
+            return JSONResponse(
+                {"error": "that session had already ended", "kind": "NotFoundError"},
+                status_code=404)
         return {"ok": True, "ended": 1}
 
     # --- people (admin) -------------------------------------------------------

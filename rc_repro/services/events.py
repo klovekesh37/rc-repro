@@ -35,10 +35,36 @@ def null_emit(_: Event) -> None:
     """Discard events (default for callers that don't care about progress)."""
 
 
+def _tee(ev: "Event") -> None:
+    """Also record the event in the durable log, if one is enabled.
+
+    HERE, because this module is the single funnel every long-running function goes
+    through -- so the log covers ~125 emit sites without one of them being touched. The
+    same property that got the GUI its progress bar for free.
+
+    IMPORTED INSIDE THE FUNCTION, and that is not a style choice. This module
+    deliberately imports nothing from `rc_repro` and is imported by thirteen others;
+    `eventlog` reaches `config` and `lifecycle`, and `lifecycle` imports this. A
+    module-level import here is a circular import that breaks every command at startup.
+
+    Swallows everything. Progress reporting must not fail because a log could not be
+    written, and `eventlog` is already silent by contract -- this is the second belt.
+    """
+    try:
+        from rc_repro.services import eventlog
+        eventlog.event(ev)
+    except Exception:  # noqa: BLE001 - a log must never break the thing it describes
+        pass
+
+
 def info(emit: Emit, message: str, *, phase: str = "info", pct: float | None = None,
          **data: Any) -> None:
-    emit(Event(message, phase=phase, pct=pct, data=data))
+    ev = Event(message, phase=phase, pct=pct, data=data)
+    _tee(ev)
+    emit(ev)
 
 
 def warn(emit: Emit, message: str, *, phase: str = "info", **data: Any) -> None:
-    emit(Event(message, phase=phase, level="warn", data=data))
+    ev = Event(message, phase=phase, level="warn", data=data)
+    _tee(ev)
+    emit(ev)

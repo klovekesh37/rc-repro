@@ -92,9 +92,24 @@ def _err(msg: str, exit_code: int = 1) -> NoReturn:
     Saying "unclassified" is honest; picking a plausible code would tell a caller
     to retry, or not to, on no evidence.
     """
+    _log_failure(errors.ReproError.code, msg)
     if jsonout.active():
         jsonout.fail(errors.ReproError(msg))
     ui.die(msg, exit_code=exit_code)
+
+
+def _log_failure(code: str, message: str) -> None:
+    """Record a failure in the durable log, with the stable code beside the prose.
+
+    Both `_err` and `_fail` route through here, which between them are every error path
+    in this file -- the same reason those two wrappers exist at all. Best-effort and
+    silent: the failure being reported matters more than logging it.
+    """
+    try:
+        from rc_repro.services import eventlog
+        eventlog.failed(code, message)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _fail(exc: errors.ReproError) -> NoReturn:
@@ -106,6 +121,7 @@ def _fail(exc: errors.ReproError) -> NoReturn:
     workspace that is still booting and one that is known dead looked identical.
     See errors.EXIT_CODES for the published map.
     """
+    _log_failure(getattr(exc, "code", "") or errors.ReproError.code, str(exc))
     if jsonout.active():
         jsonout.fail(exc)
     ui.die(str(exc), exit_code=exc.exit_code)
@@ -484,12 +500,24 @@ def _run_seed(meta: runner.Metadata, profile: str,
     total = time.monotonic() - t0
     if not quiet:
         _print_seed_result(s, total, resources, meta)
+    # NO `emit`. `check_seed` emits the same facts this renders from the returned
+    # verdict, so passing one printed every line twice -- caught live, as duplicated
+    # "readback: 11 rooms match the plan". The reason a readback could not run now
+    # travels as `why`, so nothing is lost by rendering from the value alone.
     verdict = lcsvc.check_seed(meta, auth, plan, s, tokens=tokens)
     if not quiet:
         _print_seed_verification(verdict)
     # `--verify-seed` turns the report into a gate. Off by default on purpose: a
     # check that fails a healthy workspace is one people learn to bypass, and the
     # readback is worth having as information whether or not it refuses.
+    # UNPROVEN IS NOT PASSED. This gated on `faults`, which is [] when the readback
+    # could not run -- so `--verify-seed`, the flag whose whole job is to refuse an
+    # unverified seed, exited 0 on a seed it had verified nothing about.
+    if verify and verdict.get("ok") is None:
+        _fail(errors.CreateFailedError(
+            "seed verification could not run, so the seed is UNPROVEN (drop "
+            "--verify-seed to accept it anyway; the attempt is recorded in "
+            "repro.json either way)"))
     if verify and verdict.get("faults"):
         _fail(errors.CreateFailedError(
             f"seed verification failed: {len(verdict['faults'])} mismatch(es) between "
@@ -500,7 +528,17 @@ def _run_seed(meta: runner.Metadata, profile: str,
 
 def _print_seed_verification(verdict: dict) -> None:
     """The readback, in one line when it agrees and a list when it does not."""
-    if not verdict or verdict.get("ok") is None:
+    if not verdict:
+        return
+    if verdict.get("ok") is None:
+        # NOT SILENCE. `ok is None` means the readback could not run AT ALL, and
+        # returning here printed nothing whatsoever -- so a verification that failed
+        # looked exactly like one nobody asked for, the absence of the "✓ readback"
+        # line being the only difference. The shipped agent skill says it in bold:
+        # treat a missing `verification.ok` as UNPROVEN.
+        why = verdict.get("why") or "no reason recorded"
+        ui.warn(f"  ⚠ the seed readback could not run ({why}), so nothing about this "
+                f"seed is verified. `rc-repro seed --name <it>` re-runs it.")
         return
     faults = verdict.get("faults") or []
     unreadable = verdict.get("unreadable") or []
@@ -752,7 +790,11 @@ def down(
             ui.warn(f"deleting {target!r}, owned by {owner}.")
     try:
         # confirm=True: the prompt above (or --yes) already gated it.
-        out = lcsvc.teardown(target, volumes=volumes, confirm=True)
+        # `emit` MATTERS HERE. This passed none, so every warning the teardown raises
+        # went nowhere -- including the one that says the local record was KEPT because
+        # the namespace could not be confirmed gone. The GUI streams these and showed
+        # it; the CLI printed a success line over the top of it.
+        out = lcsvc.teardown(target, volumes=volumes, confirm=True, emit=_cli_emit)
     except errors.ReproError as exc:
         _fail(exc)
     # The nouns depend on the runtime, and this line hardcoded Docker's. A
@@ -766,6 +808,18 @@ def down(
         return
     what = ("namespace, PersistentVolumeClaim and record" if kube
             else "containers, data volume, and record")
+    # `(out or {})` like the `kube` line above: teardown returning None is a shape the
+    # tests around this rely on, and `.get` on it is an AttributeError that surfaces as
+    # exit 1 from a command that worked.
+    if volumes and not (out or {}).get("removed", True):
+        # THE SERVICE SAID NO. This printed "✓ removed" from the `--volumes` FLAG rather
+        # than from the result, so a teardown that refused and kept the record reported
+        # complete success -- and `list` then went on showing the workspace, which is
+        # how the contradiction reaches somebody. The warning above says why; this says
+        # what to do, and the exit code stops a script believing it.
+        ui.warn(f"{target!r} was NOT removed — see above. `rc-repro list` still shows "
+                f"it, which is correct: the record is deliberately kept.")
+        raise typer.Exit(errors.NotReadyError.exit_code)
     if volumes:
         ui.ok(f"✓ {target!r} removed ({what}).")
     else:
@@ -3879,21 +3933,42 @@ def main() -> None:
     The traceback still goes to stderr, unabridged -- this changes where the failure is
     reported, not whether it is.
     """
+    # THE TIMELINE'S TWO ENDS. `run` ties every event between them to one invocation,
+    # which is what makes the log readable backwards from a failure. Best-effort: a log
+    # that cannot be written must not stop the command.
+    _t0 = time.monotonic()
+    try:
+        from rc_repro.services import eventlog
+        eventlog.started(" ".join(sys.argv[1:]), actor=_cli_actor())
+    except Exception:  # noqa: BLE001
+        pass
+
+    def _done(code: int) -> None:
+        try:
+            from rc_repro.services import eventlog
+            eventlog.ended(code, time.monotonic() - _t0)
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
         app()
-    except SystemExit:
+    except SystemExit as exc:
+        _done(int(exc.code or 0) if isinstance(exc.code, int) else 0)
         # A command that exited normally. Click's standalone mode has already turned
         # its `typer.Exit` into this, which is why the branches BELOW have to do that
         # conversion themselves -- they run outside click.
         raise
     except errors.ReproError as exc:
+        _done(getattr(exc, "exit_code", 1))
         _exit_reporting(exc)        # a domain error that escaped a command's handler
     except KeyboardInterrupt:
         ui.warn("interrupted")
+        _done(130)
         sys.exit(130)
     except BaseException as exc:    # noqa: BLE001 - the contract's last line
         import traceback
         traceback.print_exc()
+        _done(1)
         _exit_reporting(errors.ReproError(
             f"{type(exc).__name__}: {exc} - this is unhandled, and the traceback is "
             f"on stderr. If it names a file under RC_REPRO_HOME, that file is the "

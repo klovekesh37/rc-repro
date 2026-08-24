@@ -318,6 +318,18 @@ class JobManager:
             # Re-establish the request's identity on this thread (see above).
             CURRENT_ACTOR.set(actor)
             CURRENT_ORIGIN.set(origin)
+            # AND the log's, for the same reason and by the same mechanism. One `serve`
+            # is one process, so `run` cannot separate two concurrent jobs; the job id
+            # can, and every event a service function emits from this thread picks it up
+            # without knowing the log exists.
+            try:
+                from rc_repro.services import eventlog
+                eventlog.CURRENT_JOB.set(job.id)
+                eventlog.CURRENT_WS.set(label or "")
+                eventlog.configure(actor=actor)
+                eventlog.job_started(job.id, kind, label)
+            except Exception:  # noqa: BLE001 - a log must never break a job
+                pass
             # Set status/result BEFORE emitting the terminal event: a client that
             # polls /api/jobs/<id> on seeing `terminal` would otherwise still read
             # status="running", result=null. finished_at goes with them, for the
@@ -373,6 +385,17 @@ class JobManager:
                 # In `finally`, not after the try: a job that raises still holds a
                 # slot, and one leaked slot on the measurement pool (size 1) wedges
                 # every future load test for the life of the process.
+                #
+                # The log record belongs here for the same reason, and my first
+                # placement got it wrong -- after the `raise` in the BaseException
+                # branch, where it was both unreachable AND absent from the success
+                # path. Every outcome passes through `finally`; nothing else does.
+                try:
+                    from rc_repro.services import eventlog
+                    eventlog.job_ended(job.id, kind, label, job.status,
+                                       job.error or "")
+                except Exception:  # noqa: BLE001
+                    pass
                 if slots is not None:
                     slots.release()
 

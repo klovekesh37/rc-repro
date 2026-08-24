@@ -5629,6 +5629,62 @@ def test_the_repo_copies_of_the_skill_match_the_packaged_one():
             f"{rel} has drifted from the packaged skill — copy it again")
 
 
+def test_the_skill_states_only_numbers_the_build_still_confirms():
+    """The skill said `standard` seeds 283 messages. The plan builds 287.
+
+    Nothing caught it because a number in prose has no reader. `capabilities`
+    publishes the profile NAMES and not their shapes, so this file was the only
+    statement of the counts anywhere -- and it was wrong, in the one document a
+    caller is told to trust before it has run anything. The registry walks
+    elsewhere in this suite exist for exactly this shape of defect; the three
+    claims below are the ones in the skill that a build change can falsify, so
+    they get the same treatment as `ROUTE_ROLES` and `PHASES`.
+    """
+    import re
+
+    from rc_repro import errors, presets, seed
+    from rc_repro.services import skill
+
+    text = skill.packaged().read_text(encoding="utf-8")
+
+    # 1. The seed shape, as a sentence the file actually contains.
+    m = re.search(r"`standard` is (\d+) rooms, (\d+) messages, (\d+) threads "
+                  r"across (\d+) users", text)
+    assert m, "the skill no longer states the `standard` profile's shape"
+    plan = seed.plan_from("standard")
+    assert [int(g) for g in m.groups()] == [len(plan.rooms), plan.total_messages,
+                                           plan.total_replies, plan.users], (
+        "the skill's `standard` numbers no longer match what seed.plan_from builds")
+
+    # 2. The preset catalogue, both directions. A name the file invents is a caller
+    #    sent to a refusal; a preset nobody documented is a feature with no door.
+    #    `multi-instance` is the deliberate exception -- it is the deployment axis
+    #    under its old name, and the file explains it as that rather than listing it.
+    sentence = text.split("`capabilities.presets` lists what this build has:")[1]
+    listed = set(re.findall(r"`([a-z0-9_-]+)`", sentence.split(".")[0]))
+    catalog = {pre.name for pre in presets.list_presets()}
+    assert listed <= catalog, f"the skill names presets that do not exist: {listed - catalog}"
+    assert catalog - listed == {"multi-instance"}, (
+        f"undocumented preset(s): {catalog - listed - {'multi-instance'}}")
+    assert "--preset multi-instance" in text
+
+    # 3. The exit-code table callers are told to branch on. `6` is in EXIT_CODES and
+    #    nothing raises it, so the file names it as reserved instead of as a rule.
+    bullets = {int(d) for d in re.findall(r"^   - `(\d)` ", text, re.M)}
+    assert bullets == set(errors.EXIT_CODES) - {0, 6}, (
+        f"the skill's exit-code table and errors.EXIT_CODES disagree: "
+        f"{bullets ^ (set(errors.EXIT_CODES) - {0, 6})}")
+    assert "`6` (gate)" in text
+
+    # 4. The sample envelope carries a real version, in the one file whose closing
+    #    section is about telling a caller whether it is current. Pinning it here is
+    #    what lets it stay a real value instead of drifting into a fossil -- it was
+    #    four minor versions behind when this walk was written.
+    from rc_repro import __version__
+    assert f'"rc_repro_version":"{__version__}"' in text, (
+        "the skill's sample envelope names a version this build is not")
+
+
 def test_the_skill_knows_stale_from_edited_locally(tmp_path, monkeypatch):
     """Two ways an installed file can differ, needing opposite answers: the package
     moved on (reinstall it) or a human edited it (that is theirs). The sidecar's
@@ -8563,3 +8619,448 @@ def test_a_successful_signin_does_not_hand_back_the_whole_throttle_window():
     assert not appmod._signin_fails.get("5.6.7.8")
     with appmod._signin_lock:
         appmod._signin_fails.clear()
+
+
+def test_an_absent_namespace_is_confirmed_gone_not_a_failure(monkeypatch):
+    """`delete_namespace` returned False when the namespace did not exist.
+
+    `teardown` reads that as "not confirmed gone", keeps the local record and says so
+    -- which means a Kubernetes record whose namespace has ALREADY been removed can
+    never be deleted. `down --volumes` refuses it every time, for ever, and `list` goes
+    on showing a workspace that is not there.
+
+    Reached the moment a cluster is recreated: `prune` reclaims the kind cluster, the
+    next `up` builds a new one, and every record from the old cluster is now immortal.
+    Reported from a live box exactly that way -- the record dated three days earlier,
+    the cluster's namespaces eight minutes old.
+
+    Introduced by the change that gave `namespace_labels` three answers rather than
+    two. Splitting "I could not ask" from "it is not there" was right; wiring the second
+    into the failure branch beside it was not.
+    """
+    from rc_repro.services import k8s
+
+    # None = the namespace does not exist. (Cannot-ask RAISES, and still does.)
+    monkeypatch.setattr(k8s, "namespace_labels", lambda ns, *, context: None)
+    monkeypatch.setattr(k8s, "is_ours", lambda c: True)
+
+    assert k8s.delete_namespace("gone", context="c", volumes=True) is True, (
+        "an absent namespace reported as not-confirmed-gone; the record can never go")
+
+    # And the case this branch was written for is untouched: cannot-ask still raises,
+    # so a wrong context or an RBAC denial never reads as "nothing to remove".
+    #
+    # `clusters()` is stubbed to report the cluster PRESENT. Without that, the
+    # deleted-cluster path added later would see this box's real kind listing -- which
+    # is empty -- prove the cluster gone and return True, which is right for a deleted
+    # cluster and not what this half is about.
+    from rc_repro.errors import DockerError
+
+    def cannot_ask(ns, *, context):
+        raise DockerError("could not ask cluster 'c' about namespace")
+    monkeypatch.setattr(k8s, "namespace_labels", cannot_ask)
+    monkeypatch.setattr(k8s, "clusters", lambda: ([k8s.CLUSTER_NAME], ""))
+    try:
+        k8s.delete_namespace("gone", context="c", volumes=True)
+    except DockerError:
+        pass
+    else:
+        raise AssertionError("an unreachable cluster was treated as an absent namespace")
+
+
+def test_down_reports_the_result_not_the_flag(monkeypatch, tmp_path):
+    """`down --volumes` printed "✓ removed" from the FLAG, not from the result.
+
+    So a teardown that refused -- returning `removed: False` and emitting a warning
+    saying the local record was deliberately KEPT -- was reported as complete success,
+    exit 0. The GUI got it right because it streams the events; the CLI passed no
+    `emit` at all, so the warning went nowhere and the success line printed over the
+    top of it. `list` then kept showing the workspace, which is how somebody finds out.
+    """
+    from typer.testing import CliRunner
+
+    from rc_repro import cli
+    from rc_repro.services import lifecycle as lc
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "resolve_name", lambda *a, **k: "stuck")
+    monkeypatch.setattr(lc, "owner_of", lambda *a, **k: "", raising=False)
+    monkeypatch.setattr(lc, "may_destroy", lambda *a, **k: (True, ""), raising=False)
+
+    def refuses(name, **kw):
+        emit = kw.get("emit")
+        if emit:
+            from rc_repro.services.events import Event
+            emit(Event("'stuck': the namespace is not confirmed gone, so the local "
+                       "record is KEPT.", phase="teardown", level="warn"))
+        return {"name": "stuck", "removed": False, "found": False,
+                "runtime": "kubernetes"}
+    monkeypatch.setattr(lc, "teardown", refuses)
+
+    res = CliRunner().invoke(cli.app, ["down", "--name", "stuck", "--volumes", "--yes"])
+
+    assert res.exit_code != 0, (
+        f"exit 0 on a refused teardown\n{res.output}")
+    assert "was NOT removed" in res.output, res.output
+    # The service's own reason reaches the terminal, which needs the emit to be passed.
+    assert "not confirmed gone" in res.output, (
+        f"the teardown's warning never reached the user\n{res.output}")
+    assert "✓" not in res.output.split("was NOT removed")[0][-40:], res.output
+
+    # And a teardown that SUCCEEDS still reports success.
+    monkeypatch.setattr(lc, "teardown", lambda name, **kw: {
+        "name": "ok", "removed": True, "found": True, "runtime": "kubernetes"})
+    res = CliRunner().invoke(cli.app, ["down", "--name", "ok", "--volumes", "--yes"])
+    assert res.exit_code == 0, res.output
+    assert "removed" in res.output and "NOT removed" not in res.output, res.output
+
+
+def test_a_deleted_cluster_lets_its_records_be_removed(monkeypatch):
+    """A DELETED cluster is not an UNREACHABLE one, and the refusal could not tell.
+
+    When a kind cluster is removed its kubeconfig entry survives, so `kubectl get ns`
+    fails with "The connection to the server 127.0.0.1:39911 was refused" and
+    `namespace_labels` raises -- correctly, because a cluster that is merely stopped
+    genuinely cannot be asked, and collapsing that into "not there" once destroyed a
+    live workspace's record.
+
+    But a namespace cannot outlive the cluster it lived in. So there was NO WAY to
+    delete the record of a workspace whose cluster had gone: the namespace query cannot
+    answer, `teardown` refuses, and `doctor` reports the cluster missing for ever.
+    Reported from a live box in exactly that state.
+    """
+    from rc_repro.errors import DockerError
+    from rc_repro.services import k8s
+
+    def refused(ns, *, context):
+        raise DockerError("could not ask cluster 'kind-rc-repro-local' about namespace "
+                          "rc-repro-x: The connection to the server 127.0.0.1:39911 "
+                          "was refused")
+    monkeypatch.setattr(k8s, "namespace_labels", refused)
+    monkeypatch.setattr(k8s, "is_ours", lambda c: True)
+
+    # The kind probe SUCCEEDED and the cluster is not in it -> provably gone.
+    monkeypatch.setattr(k8s, "clusters", lambda: ([], ""))
+    assert k8s.delete_namespace("x", context=k8s.CONTEXT, volumes=True) is True, (
+        "a record whose cluster was deleted still cannot be removed")
+
+    # The cluster IS there and merely unreachable -> still a refusal. This is the case
+    # the guard was written for and it must not be weakened.
+    monkeypatch.setattr(k8s, "clusters", lambda: ([k8s.CLUSTER_NAME], ""))
+    try:
+        k8s.delete_namespace("x", context=k8s.CONTEXT, volumes=True)
+    except DockerError:
+        pass
+    else:
+        raise AssertionError("an unreachable but EXISTING cluster was treated as gone")
+
+    # The probe itself failed (no Docker, no kind) -> also still a refusal: that is
+    # "I could not ask" a second time, not evidence of absence.
+    monkeypatch.setattr(k8s, "clusters", lambda: ([], "Cannot connect to the Docker daemon"))
+    try:
+        k8s.delete_namespace("x", context=k8s.CONTEXT, volumes=True)
+    except DockerError:
+        pass
+    else:
+        raise AssertionError("a failed kind probe was treated as proof of absence")
+
+    # And a cluster rc-repro does not own is never assumed gone on kind's word.
+    monkeypatch.setattr(k8s, "is_ours", lambda c: False)
+    monkeypatch.setattr(k8s, "clusters", lambda: ([], ""))
+    try:
+        k8s.delete_namespace("x", context="some-remote", volumes=True)
+    except DockerError:
+        pass
+    else:
+        raise AssertionError("kind's listing was used to judge a foreign cluster")
+
+
+def test_a_stale_kubernetes_record_is_a_warning_not_a_failed_preflight(monkeypatch,
+                                                                      tmp_path):
+    """`doctor` reported a missing cluster as a FAIL when any record referenced it.
+
+    So the verdict read "Not ready — fix the ✗ item(s)" about a box that was completely
+    usable: the next `up` builds a fresh cluster, and the stale record is a cleanup task
+    rather than a broken machine. A verdict that fails on tidiness is one people stop
+    reading. It is a warning now, and it names the command that clears the record --
+    the place to learn about a stale record is the command that removes it.
+
+    Driven through `run_checks` rather than by reading the source, so it asserts the
+    STATUS a caller sees and the verdict it produces.
+    """
+    from rc_repro import runner
+    from rc_repro.services import doctor as doctorsvc
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    meta = runner.Metadata(
+        name="ghost", project="rc-repro-ghost", rc_version="8.5.1", rc_image="i",
+        mongo_tag="8.0", mongo_flavor="", preset="default",
+        root_url="http://localhost:3000", host_port=3000, version_source="map")
+    meta.extra.update({"runtime": "kubernetes", "namespace": "rc-repro-ghost",
+                       "context": k8s.CONTEXT})
+    monkeypatch.setattr(runner, "list_meta", lambda: [meta])
+
+    # A box with the tools, no cluster, and one Kubernetes record pointing at it.
+    pre = k8s.Preflight(
+        tools={}, cluster_exists=False, cluster_reachable=False, storage_classes=[],
+        default_storage_class="", ingress_classes=[], other_clusters=[], namespaces=[],
+        distribution="kind", node_count=0, architectures=[], metrics=False,
+        loadbalancer="", context=k8s.CONTEXT, provider="kind", will_create=True,
+        probe_failed="")
+    monkeypatch.setattr(k8s, "preflight", lambda *a, **k: pre)
+
+    rows = doctorsvc.run_checks()["checks"]
+    hits = [r for r in rows if r.get("check") == "kubernetes-cluster"]
+    assert hits, sorted({r.get("check") for r in rows})
+    row = hits[0]
+
+    assert row["status"] == "warn", (
+        f"a stale record still {row['status']}s the preflight: {row['message']}")
+    assert "is gone" in row["message"], row["message"]
+    # Actionable: names the record and the command that clears it.
+    assert "ghost" in row["message"], row["message"]
+    assert "rc-repro down" in row["message"], row["message"]
+
+
+def test_an_unproven_seed_does_not_pass_verify_seed(monkeypatch, tmp_path):
+    """`--verify-seed` gated on `faults`, which is [] when the readback COULD NOT RUN.
+
+    `check_seed` returns `{"ok": None, "faults": [], ...}` when it cannot read the
+    workspace back -- a login failure, a 429, a workspace that stopped answering. So
+    the flag whose entire job is to refuse an unverified seed exited 0 on a seed it had
+    verified nothing about, and `_print_seed_verification` returned before printing
+    anything, making it indistinguishable from a seed nobody asked to verify.
+
+    The shipped agent skill states the rule the other way round and in bold: "Treat a
+    false or missing `verification.ok` as unproven -- do not infer success from a 2xx
+    write or an attempted message count."
+    """
+    import inspect
+
+    from rc_repro import cli
+
+    src = inspect.getsource(cli._run_seed)
+    # The unknown is gated BEFORE the faults check, and on `ok`, not on `faults`.
+    assert 'verify and verdict.get("ok") is None' in src, (
+        "--verify-seed still passes a readback that could not run")
+    assert src.index('verdict.get("ok") is None') < src.index('verdict.get("faults")'), (
+        "the unknown case must be judged before the fault list")
+    assert "UNPROVEN" in src
+
+    # And the renderer says something rather than nothing.
+    rsrc = inspect.getsource(cli._print_seed_verification)
+    assert "could not run" in rsrc, "an unrunnable readback still prints nothing"
+    assert 'if not verdict or verdict.get("ok") is None:\n        return' not in rsrc
+
+    # AND THE REASON REACHES THE USER. This first asserted that `check_seed` is passed
+    # an `emit`, which pinned the mechanism rather than the property -- and the
+    # mechanism was then correctly removed, because the service emits the same facts
+    # the CLI renders and every line printed twice. The reason travels in the verdict
+    # as `why` now, so what matters is that the renderer shows it.
+    assert 'verdict.get("why")' in rsrc, (
+        "the reason a readback could not run is not shown to anybody")
+    from rc_repro.services import lifecycle as lc
+    csrc = inspect.getsource(lc.check_seed)
+    assert '"why": str(exc)' in csrc, "check_seed does not record why it could not read back"
+
+
+def test_prune_reads_the_same_answer_teardown_does(monkeypatch):
+    """`prune` discarded `delete_namespace`'s answer and reported the workspace pruned.
+
+    It then called `runner.remove(name)` unconditionally -- so a namespace that could
+    NOT be deleted lost the only local record that knew about it, while it and its
+    PersistentVolumeClaim went on running. That is precisely the defect v0.70.9 fixed in
+    `teardown`, left standing twenty lines away in the same file.
+    """
+    import inspect
+
+    from rc_repro.services import lifecycle as lc
+
+    src = inspect.getsource(lc.prune)
+    assert "if not k8s.delete_namespace(" in src, (
+        "prune still removes the record without checking the namespace went")
+    # The record removal must be AFTER the check, not before it.
+    assert src.index("if not k8s.delete_namespace(") < src.index("runner.remove(name)")
+    assert "was NOT pruned" in src, "prune does not say when it kept a record"
+    # And the cluster reclaim reports a namespace that would not go.
+    assert "if not k8s.wait_namespace_gone(" in src, (
+        "prune drops the wait's answer, so the single-pass reclaim degrades silently")
+
+
+def test_ending_a_session_that_had_already_ended_is_not_a_success(monkeypatch, tmp_path):
+    """`revoke_sid` returns False when the sid is not in the store, and the route
+    answered `{"ok": true, "ended": 1}` regardless.
+
+    Reachable as a race: a session can expire between the `list_for` lookup and the
+    revoke. A sign-out that revoked nothing should not report that it did.
+    """
+    import inspect
+
+    import rc_repro.web.app as appmod
+
+    src = inspect.getsource(appmod.build_app) if hasattr(appmod, "build_app") \
+        else pathlib_read()
+    assert "if not sessions.revoke_sid(" in src, (
+        "a failed session revoke is still reported as success")
+
+
+def pathlib_read():
+    import pathlib
+    import rc_repro.web.app as appmod
+    return pathlib.Path(appmod.__file__).read_text()
+
+
+def test_the_event_log_never_writes_a_credential(monkeypatch, tmp_path):
+    """The one way this feature can make things WORSE rather than better.
+
+    Before it, credentials lived in memory and on stdout. After it there is a FILE, so a
+    hole in the redaction creates an exposure that did not exist. Terminal events carry
+    the whole result document, the token/pat/env paths hold live credentials, and
+    `MONGO_URL` carries a password in its VALUE -- which is why `_URL_USERINFO` exists
+    and why matching on key names alone is not enough.
+    """
+    import json
+
+    from rc_repro.services import eventlog
+    from rc_repro.services.events import Event
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    eventlog._DISABLED = False
+    eventlog._SIZE = None
+
+    eventlog.event(Event(
+        "connecting to mongodb://admin:s3cr3t-pw@mongodb:27017/rocketchat",
+        phase="boot",
+        data={
+            "MONGO_URL": "mongodb://rcuser:another-secret@mongodb:27017/rc",
+            "LDAP_BIND_PASSWORD": "bind-me",
+            "OAUTH_CLIENT_SECRET": "shh",
+            "api_key": "AKIAEXAMPLE",
+            "result": {"authToken": "live-token", "nested": {"password": "deep"}},
+            "token": "another-live-token",
+            "harmless": "rocketchat",
+        }))
+    text = eventlog.log_path().read_text()
+
+    for leaked in ("s3cr3t-pw", "another-secret", "bind-me", "shh", "AKIAEXAMPLE",
+                   "live-token", "another-live-token", "deep"):
+        assert leaked not in text, f"{leaked!r} was written to the log"
+    # Redacted, not simply dropped: the shape of the event is still readable.
+    doc = json.loads(text.strip().splitlines()[-1])
+    assert doc["data"]["harmless"] == "rocketchat"
+    assert doc["data"]["LDAP_BIND_PASSWORD"] == "********"
+    assert "result" not in doc["data"] and "token" not in doc["data"]
+    # The URL's userinfo is redacted in the MESSAGE too, where no key name exists.
+    assert "mongodb://admin:********@" in doc["msg"], doc["msg"]
+
+
+def test_events_imports_standalone_so_the_log_cannot_cycle():
+    """The failure mode that would break every command at startup.
+
+    `services/events.py` deliberately imports nothing from `rc_repro` and is imported by
+    thirteen modules. `eventlog` reaches `config` for the path and `lifecycle` for the
+    redaction helpers, and `lifecycle` imports `events`. A module-level import in the
+    tee is a circular import, and the symptom is not a subtle bug -- it is every command
+    failing to start.
+    """
+    import ast
+    import pathlib
+    import subprocess
+    import sys
+
+    from rc_repro.services import events
+
+    tree = ast.parse(pathlib.Path(events.__file__).read_text())
+    top = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+    for node in top:
+        mod = getattr(node, "module", "") or ""
+        names = [a.name for a in node.names]
+        assert not mod.startswith("rc_repro"), (
+            f"events.py imports {mod} at module level — that is the cycle")
+        assert not any(n.startswith("rc_repro") for n in names), names
+
+    # And proven by import, in a fresh interpreter, with nothing else loaded first.
+    root = str(pathlib.Path(events.__file__).parent.parent.parent)
+    proc = subprocess.run(
+        [sys.executable, "-c", "import rc_repro.services.events; print('ok')"],
+        capture_output=True, text=True, timeout=60,
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": root, "HOME": "/tmp"})
+    assert proc.returncode == 0 and "ok" in proc.stdout, proc.stderr[-400:]
+
+
+def test_the_event_log_is_bounded_private_and_silent(monkeypatch, tmp_path):
+    """Three properties that stop a log becoming its own problem."""
+    import os
+
+    from rc_repro.services import eventlog
+    from rc_repro.services.events import Event
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setenv("RC_REPRO_LOG_MAX_MB", "0.002")     # ~2 KB, to rotate quickly
+    eventlog._DISABLED = False
+    eventlog._SIZE = None
+
+    for i in range(400):
+        eventlog.event(Event(f"line {i} " + "x" * 60, phase="boot"))
+
+    cur = eventlog.log_path()
+    old = cur.with_suffix(cur.suffix + ".1")
+    assert cur.exists() and old.exists(), "did not rotate"
+    # TWO files, not a growing family.
+    assert len(list(cur.parent.glob("rc-repro.log*"))) == 2, sorted(cur.parent.iterdir())
+    assert oct(cur.stat().st_mode)[-3:] == "600", oct(cur.stat().st_mode)
+    assert oct(cur.parent.stat().st_mode)[-3:] == "700", oct(cur.parent.stat().st_mode)
+
+    # An unwritable home DISABLES it and never raises -- the operation being described
+    # matters more than describing it.
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    os.chmod(ro, 0o500)
+    monkeypatch.setenv("RC_REPRO_HOME", str(ro))
+    monkeypatch.delenv("RC_REPRO_LOG_MAX_MB", raising=False)
+    eventlog._DISABLED = False
+    eventlog._SIZE = None
+    try:
+        eventlog.event(Event("into a read-only home", phase="boot"))
+        assert eventlog._DISABLED is True, "a failed write did not disable the log"
+    finally:
+        os.chmod(ro, 0o700)
+        eventlog._DISABLED = False
+        eventlog._SIZE = None
+
+
+def test_dockers_echo_stays_out_but_warnings_never_do(monkeypatch, tmp_path):
+    """`_up` turns every line of `docker compose pull` into an event.
+
+    A GUI create emits several hundred "Downloading 45.09MB" records -- echo, not
+    narrative. Logging it buries the four lines that matter and spends the whole size
+    cap on one create. A warning or an error is never skipped, echo or not.
+    """
+    import inspect
+
+    from rc_repro.services import eventlog
+    from rc_repro.services import lifecycle as lc
+    from rc_repro.services.events import Event
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    eventlog._DISABLED = False
+    eventlog._SIZE = None
+
+    eventlog.event(Event("Downloading 45.09MB", phase="boot", data={"echo": "docker"}))
+    eventlog.event(Event("resolved 8.5.1", phase="create"))
+    eventlog.event(Event("pull failed: rate limit", phase="boot", level="warn",
+                         data={"echo": "docker"}))
+    text = eventlog.log_path().read_text()
+
+    assert "Downloading 45.09MB" not in text, "docker echo reached the log"
+    assert "resolved 8.5.1" in text
+    assert "rate limit" in text, "a WARNING was skipped because it carried echo"
+
+    # Opt back in when somebody is debugging a pull.
+    monkeypatch.setenv("RC_REPRO_LOG_ECHO", "1")
+    eventlog.event(Event("Downloading 99MB", phase="boot", data={"echo": "docker"}))
+    assert "Downloading 99MB" in eventlog.log_path().read_text()
+
+    # And the tag really is applied at the one place that produces the echo.
+    assert 'echo="docker"' in inspect.getsource(lc._up)

@@ -30,22 +30,30 @@ question is about documented behaviour rather than observed behaviour.
    code means. Do not assume a flag exists because it did in another version.
 2. **Branch on the exit code and `error.code`, never on prose.** Messages get
    reworded between releases; codes do not.
+   - `1` internal — an unhandled failure. There is still an envelope on stdout;
+     the traceback is on stderr. Retrying unchanged will not help.
    - `2` usage — fix the call; retrying unchanged will not help.
    - `3` preflight — the environment is not usable. Run `rc-repro doctor --json`.
    - `4` not found — no such workspace.
    - `5` not ready — still unknown, you may poll again.
    - `7` create failed — known dead. Stop; do not retry in a loop.
    - `8` conflict — the name or port is taken. Pick another.
+
+   `capabilities.exit_codes` is the whole table. It also lists `6` (gate), which
+   nothing in this build raises; treat it as reserved rather than as a gap.
 3. **Never import rc-repro's Python internals and never scrape human output.**
-   Use the documented commands with `--json`. stdout is the document; anything on
-   stderr is for a person.
+   Use `--json` on the commands that have it — `capabilities.commands[].json` says
+   which, and it is a minority, not all of them. For the rest (`seed`, `logs`,
+   `token`, `env`, `backup`, `restore`, `upgrade`, `prune`, …) the **exit code** is
+   the machine-readable part, and every command sets it from the one table above.
+   stdout is the document; anything on stderr is for a person.
 
 ## The output contract
 
 Every `--json` reply is one envelope:
 
 ```json
-{"schema":"rc-repro.info.v1","contract":1,"rc_repro_version":"0.64.0",
+{"schema":"rc-repro.info.v1","contract":1,"rc_repro_version":"0.76.2",
  "generated_at":"...","ok":true,"data":{...},"warnings":[],"error":null}
 ```
 
@@ -56,9 +64,9 @@ same envelope with `ok: false` and `error.code` set; there is always exactly one
 including when the failure happened before any work started, and including when the
 failure was an unhandled one (its traceback goes to stderr, never stdout).
 
-`down` was listed here as streaming and is not — it emits the envelope alone.
-`capabilities.commands[].streams` is derived from the build and is the authority;
-this sentence was prose that drifted.
+Only those two stream. `capabilities.commands[].streams` is derived from the build
+and is the authority — `down` in particular emits the envelope alone, despite being
+the other long-running command.
 
 `contract` is the wire generation — if you do not recognise it, refuse rather than
 guess. `schema` versions each payload separately. New keys may appear in `data` or
@@ -78,6 +86,34 @@ rc-repro info --name TICKET-1234 --json      # URL, admin login, links, pods
 `up --wait` blocks until Rocket.Chat serves. Without it, poll `rc-repro ready
 --name <n> --json`, which exits 5 while it is still coming up and 0 once it serves.
 
+### Boot the backing service the ticket is about
+
+```
+rc-repro up --version 8.6.1 --name TICKET-1234 --preset ldap --wait --json
+rc-repro up --version 8.6.1 --name TICKET-1235 --preset ldap --set users=130000 --wait --json
+```
+
+`capabilities.presets` lists what this build has: `ldap`, `saml`, `oidc`, `email`,
+`s3_minio`, `livechat`, `airgapped`, `default`. A preset starts the side service,
+wires Rocket.Chat to it, and applies the settings on first boot — so the feature is
+already on when you arrive: an `ldap` workspace has users to log in as, an `email`
+one catches every message Rocket.Chat sends instead of mailing it, `airgapped` has no
+route to Rocket.Chat Cloud.
+
+`--set key=value` tunes one, and `rc-repro presets` prints each preset's own params
+with their defaults. Two worth knowing: `--set users=130000` on `ldap` is the
+directory-scale case, and `--set idp_host=<host>` on `saml`/`oidc` is what makes the
+IdP reachable when the browser is not on this machine.
+
+Three constraints, each of which is a refusal rather than a surprise:
+
+- `--preset` takes a **name from that list, never a path**.
+- **One preset per workspace.** A preset is all-or-nothing, not additive — boot two
+  workspaces rather than looking for a way to combine two scenarios.
+- A preset cannot be combined with `--deployment multi-instance` on Docker; the
+  refusal says so instead of silently dropping one of them. `--preset multi-instance`
+  is the old spelling of `--deployment multi-instance` — it still works, and warns.
+
 ### Put realistic content in it
 
 ```
@@ -94,7 +130,7 @@ in the workspace's `repro.json`.
 A profile contains every kind of room, because tickets are rarely about a public
 channel: public and private channels, public and private teams, channels of either
 visibility inside a team, discussions (some anchored to a parent message), direct
-messages, threads and reactions. `standard` is 22 rooms, 283 messages, 48 threads.
+messages, threads and reactions. `standard` is 22 rooms, 287 messages, 48 threads across 20 users.
 
 In the verification, `faults` means something asked for is not there. Rooms holding
 **more** than planned are reported separately and are not faults — seeding only ever
@@ -171,12 +207,41 @@ you do.
 **requires `--yes`**, because there is nobody to prompt. Without `--volumes` the
 data is kept and `rc-repro up --version <same> --name <same>` brings it back.
 
+`down --volumes` can also **refuse**: exit `5`, a warning naming the reason, and the
+record deliberately kept — so `list` still showing the workspace afterwards is
+correct, not a contradiction. Here `5` means "it is still there, read the warning",
+not "poll again"; retrying the identical command is not the fix. The usual cause is a
+Kubernetes namespace that will not finish terminating.
+
 On Kubernetes, `down` leaves the shared cluster running on purpose — it is shared by
 every workspace. `rc-repro prune` reclaims it **if rc-repro created it**, and refuses
 while any rc-repro-owned namespace remains; a cluster you supplied is never deleted.
 
 `down --volumes` also removes the shared MongoDB operator and the shared
 Prometheus/Grafana stack, once no other workspace still needs them.
+
+## When the envelope is not enough
+
+Every invocation also appends to `$RC_REPRO_HOME/logs/rc-repro.log` (by default
+`~/.rc-repro/logs/rc-repro.log`) — one JSON object per line, mode 0600, with
+credentials dropped rather than masked. Each record carries a `run` id constant for
+one invocation, so
+
+```
+grep '"run":"<id>"' ~/.rc-repro/logs/rc-repro.log
+```
+
+is that command from `start` to `end`, including work a `serve` job did on another
+thread. `actor` is empty until this machine has accounts (`rc-repro users add`) —
+that is attribution being off, not an unrecorded caller.
+
+Reach for it when the envelope's `error.code` tells you *what* failed and you
+need *when* and *in what order* — a create that died three phases in looks identical
+in the envelope whichever phase it was. `RC_REPRO_LOG_MAX_MB=0` turns it off.
+
+This file is for reading, not for parsing as a contract: it has no `schema` and no
+`contract` field, and it is not covered by the guarantees above. Branch on the
+envelope; read the log to understand.
 
 ## Things that will bite you
 

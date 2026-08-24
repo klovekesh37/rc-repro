@@ -1684,9 +1684,48 @@ def delete_namespace(name: str, *, context: str, volumes: bool = False,
     # caller deleted the local record and told the reader the namespace and its
     # PersistentVolumeClaim were gone, while all of it went on running with the only
     # record that knew about it destroyed. `namespace_labels` raises instead.
-    labels = namespace_labels(ns, context=context)
+    try:
+        labels = namespace_labels(ns, context=context)
+    except DockerError:
+        # A DELETED CLUSTER IS NOT AN UNREACHABLE ONE, and this is the difference the
+        # refusal above cannot see. When the cluster is gone its kubeconfig entry
+        # survives, so `kubectl get ns` fails with "connection refused" and
+        # `namespace_labels` raises -- correctly, for a cluster that might be merely
+        # down. But a namespace cannot outlive the cluster it lived in, so if the
+        # cluster is PROVABLY absent the namespace is gone and there is nothing to
+        # guess about.
+        #
+        # Without this there was no way to delete the record of a workspace whose
+        # cluster had been removed: the namespace query cannot answer, so `teardown`
+        # refused, so `doctor` went on reporting "Cluster 'rc-repro-local' is gone and
+        # its workspaces cannot be reached" for ever. doctor already knew; this is the
+        # same question asked by the delete path.
+        #
+        # Only on a cluster rc-repro owns, and only when the kind probe SUCCEEDED and
+        # came back without it. A failed probe (no Docker, no kind) re-raises: that is
+        # "I could not ask" a second time, and it stays a refusal.
+        if is_ours(context):
+            names, probe_failed = clusters()
+            if not probe_failed and CLUSTER_NAME not in names:
+                info(emit, f"cluster {CLUSTER_NAME!r} no longer exists, so namespace "
+                           f"{ns} went with it — removing the local record",
+                     phase="teardown")
+                return True
+        raise
     if labels is None:
-        return False
+        # ABSENT IS THE MOST CONFIRMED-GONE STATE THERE IS, and this returned False for
+        # it -- so `teardown` read "not confirmed gone", kept the local record, and said
+        # so. The consequence is that a Kubernetes record whose namespace has already
+        # been removed could NEVER be deleted: `down --volumes` refused it every time,
+        # for ever. The commonest way to reach that is `prune` reclaiming the cluster,
+        # or the cluster being recreated -- after which every record from the old one is
+        # immortal.
+        #
+        # Introduced by the change that gave `namespace_labels` three answers instead of
+        # two. Splitting "I could not ask" from "it is not there" was right; wiring the
+        # second one into the failure branch beside it was not. "I could not ask" still
+        # raises, which is the case that mattered.
+        return True
     if labels.get(OWNER_LABEL_KEY) != OWNER_LABEL_VALUE:
         # Refused rather than deleted. Reaching a namespace rc-repro does not own is
         # either the adoption bug above leaving one half-labelled, or the wrong

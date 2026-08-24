@@ -96,7 +96,7 @@ CHECKS: tuple[str, ...] = (
     "kubernetes-metrics", "kubernetes-other-clusters", "inotify",
     "kubernetes-cert-manager", "kubernetes-edge-port", "kubernetes-chart-repo",
     "install-fresh", "edge-config-drift", "preset-browser-host",
-    "interrupted-work",
+    "interrupted-work", "event-log",
 )
 
 
@@ -416,6 +416,26 @@ def run_checks() -> dict:
         # a read-only mount, a full disk or a container's user mapping all deny a write
         # with the bits looking fine.
         from rc_repro.services import journal as journalsvc
+        # WHERE THE HISTORY IS, and whether it is being written. A log nobody can find
+        # is one nobody reads, and a log that has silently stopped writing is worse than
+        # none -- so this reports the path, the size and the disabled case. Never a
+        # fail: the tool works perfectly without it.
+        try:
+            from rc_repro.services import eventlog
+            _lp = eventlog.log_path()
+            if eventlog.max_bytes() <= 0:
+                line("warn", "Event log disabled (RC_REPRO_LOG_MAX_MB=0) — nothing is "
+                             "recording what rc-repro did", check="event-log")
+            elif _lp.exists():
+                _mb = _lp.stat().st_size / 1_048_576
+                line("ok", f"Event log: {_lp} ({_mb:.1f} MB of "
+                           f"{eventlog.max_bytes() / 1_048_576:.0f} MB, then one "
+                           f"rotation)", check="event-log")
+            else:
+                line("ok", f"Event log: {_lp} — written from the first command that "
+                           f"reports progress", check="event-log")
+        except Exception:  # noqa: BLE001 - a check must never break the report
+            line("warn", "Event log status could not be determined", check="event-log")
         for label, path in (("state root", home),
                             ("workspaces", home / "repros"),
                             ("locks", home / "locks"),
@@ -599,12 +619,27 @@ def run_checks() -> dict:
                 # requires kind (`can_provision`), so saying which kind settles it.
                 _kind = pre.tools.get("kind")
                 _by = f" by kind {_kind.pretty}" if _kind and _kind.present else ""
-                line("fail" if in_use else "ok",
+                # WARN, NOT FAIL, and this is a deliberate downgrade. A record whose
+                # cluster has been removed blocks nothing: the next `up` builds a fresh
+                # cluster, and the stale record is a cleanup task rather than a broken
+                # machine. Reported as a fail it made `doctor` answer "Not ready — fix
+                # the ✗ item(s)" about a box that was completely usable, which is how a
+                # verdict stops being read.
+                #
+                # And it says what to DO. The place to learn about a stale record is the
+                # command that removes it, so the row names that command and the
+                # workspaces it applies to -- the data went with the cluster either way.
+                _stale = ", ".join(sorted(k8s_workspaces)[:3])
+                _more = ("…" if len(k8s_workspaces) > 3 else "")
+                line("warn" if in_use else "ok",
                      f"No cluster yet — {k8s.CLUSTER_NAME!r} is created on first use"
                      f"{_by}"
                      if not in_use else
-                     f"Cluster {k8s.CLUSTER_NAME!r} is gone and its workspaces "
-                     "cannot be reached", check="kubernetes-cluster")
+                     f"Cluster {k8s.CLUSTER_NAME!r} is gone, so {len(k8s_workspaces)} "
+                     f"record(s) point at nothing ({_stale}{_more}). Their data went "
+                     f"with it; `rc-repro down --name <it> --volumes` clears each "
+                     f"record, and the next `up` builds a fresh cluster.",
+                     check="kubernetes-cluster")
                 # The box that has BOTH. Saying which one is about to be used is not
                 # enough on its own -- someone with a running k3s and no kind cluster
                 # needs to be told their cluster was seen and set aside, or the next
