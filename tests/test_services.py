@@ -3559,8 +3559,8 @@ def test_the_port_forward_targets_the_deployment_not_the_service(monkeypatch, tm
     # waiting for existence alone spawned a forward that died immediately.
     monkeypatch.setattr(k8s, "run", _fake_run({"jsonpath": (0, "Running")}))
     monkeypatch.setattr(k8s.subprocess, "Popen",
-                        lambda argv, **kw: spawned.append(argv) or type(
-                            "P", (), {"pid": 4242})())
+                        lambda argv, **kw: spawned.append(argv) or _FakeProc(4242))
+    monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: True)
     pid = k8s.port_forward("k", namespace="rc-repro-k", context=k8s.CONTEXT,
                            host_port=3010, sleep=lambda _s: None)
     assert pid == 4242
@@ -3586,8 +3586,8 @@ def test_a_dead_port_forward_is_replaced_rather_than_trusted(monkeypatch, tmp_pa
     spawned = []
     monkeypatch.setattr(k8s, "run", _fake_run({"jsonpath": (0, "Running")}))
     monkeypatch.setattr(k8s.subprocess, "Popen",
-                        lambda argv, **kw: spawned.append(argv) or type(
-                            "P", (), {"pid": 77})())
+                        lambda argv, **kw: spawned.append(argv) or _FakeProc(77))
+    monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: True)
     assert k8s.ensure_port_forward("k", namespace="ns", context=k8s.CONTEXT,
                                    host_port=3010, pid=999999999) == 77
     assert spawned, "it trusted a dead pid"
@@ -3804,8 +3804,8 @@ def test_bind_reaches_the_port_forward_instead_of_being_dropped(monkeypatch, tmp
     monkeypatch.setattr(k8s, "run", _fake_run({"jsonpath": (0, "true")}))
     spawned: list = []
     monkeypatch.setattr(k8s.subprocess, "Popen",
-                        lambda argv, **kw: spawned.append(argv) or type(
-                            "P", (), {"pid": 9})())
+                        lambda argv, **kw: spawned.append(argv) or _FakeProc(9))
+    monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: True)
 
     k8s.port_forward("n", namespace="ns", context=k8s.CONTEXT, host_port=3000,
                      bind_host="0.0.0.0", sleep=lambda _s: None)
@@ -3837,18 +3837,22 @@ def test_teardown_waits_for_the_namespace_rather_than_claiming_it_is_gone(
     def spy(argv, timeout=None, own=False):
         import subprocess as sp
         joined = " ".join(argv)
-        # TWO jsonpath queries reach here now, and they ask different questions:
-        # `.metadata.labels` proves the namespace is rc-repro's before anything is
-        # deleted, `.status.phase` watches it go. One branch answered both and fed
-        # the phase string to the label parser.
-        if "{.metadata.labels}" in joined:
+        # ONE query answers both questions now, which is what a cluster actually
+        # returns: the labels that prove the namespace is rc-repro's and the phase
+        # that says whether it has gone are fields of the same object. The stub
+        # returns that object rather than two narrow strings, because a stub that
+        # answers in a shape kubectl cannot produce is how the fix under test would
+        # pass here and fail on a real cluster.
+        if "get namespace" in joined and "-o json" in joined:
+            phase = phases.pop(0) if phases else ""
+            if not phase:
+                # `--ignore-not-found`: gone is exit 0 with nothing on stdout.
+                return sp.CompletedProcess(argv, 0, "", "")
             return sp.CompletedProcess(argv, 0, json.dumps({
-                k8s.OWNER_LABEL_KEY: k8s.OWNER_LABEL_VALUE,
-                k8s.WORKSPACE_LABEL: "k"}), "")
-        if "get namespace" in joined and "jsonpath" in joined:
-            return sp.CompletedProcess(argv, 0, phases.pop(0) if phases else "", "")
-        if "get namespace" in joined:
-            return sp.CompletedProcess(argv, 0, "namespace/rc-repro-k\n", "")
+                "metadata": {"name": "rc-repro-k", "labels": {
+                    k8s.OWNER_LABEL_KEY: k8s.OWNER_LABEL_VALUE,
+                    k8s.WORKSPACE_LABEL: "k"}},
+                "status": {"phase": phase}}), "")
         if "get pvc" in joined:
             return sp.CompletedProcess(argv, 0, "persistentvolumeclaim/data-mongodb-0\n", "")
         return sp.CompletedProcess(argv, 0, "", "")
@@ -4018,7 +4022,13 @@ def test_the_install_is_idempotent_so_bringing_one_back_works(monkeypatch):
                         lambda argv, **kw: seen.append(argv) or
                         __import__("subprocess").CompletedProcess(argv, 0, "", ""))
     k8s.install(namespace="ns", context=k8s.CONTEXT, values={}, chart_version="7.0.0")
-    assert seen[0][1:3] == ["upgrade", "--install"], seen[0][:4]
+    # THE INSTALL CALL, not the first subprocess call. `install` now asks for the
+    # release's state first, because a release left `pending-install` by a killed
+    # operation blocks every later attempt -- so the install is no longer argv[0] and
+    # asserting on the ordinal was testing the call order rather than the property.
+    installs = [a for a in seen if a[:3] == ["helm", "upgrade", "--install"]]
+    assert len(installs) == 1, seen
+    assert "--install" in installs[0], installs[0][:4]
 
 
 def test_a_downed_workspace_is_down_not_perpetually_starting(monkeypatch, tmp_path):
@@ -4191,10 +4201,13 @@ def test_ready_asks_kubernetes_not_docker(monkeypatch, tmp_path):
     monkeypatch.setattr(lc.runner, "rc_state",
                         lambda *a, **kw: pytest.fail("it asked docker"))
     monkeypatch.setattr(k8s, "workspace_ready", lambda *a, **kw: True)
-    # `ready` now also confirms the socket answers, not just that a pid came back --
-    # see test_ready_confirms_the_socket_not_just_the_pid. Stubbed true here so this
-    # test stays about which RUNTIME is asked, which is what it is named for.
+    # `ready` now also confirms the socket answers AND that Rocket.Chat is what
+    # answers -- see test_ready_confirms_the_socket_not_just_the_pid and
+    # test_ready_refuses_a_url_served_by_something_that_is_not_rocketchat. Both
+    # stubbed true here so this test stays about which RUNTIME is asked, which is
+    # what it is named for.
     monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: True)
+    monkeypatch.setattr(lc.rcapi, "api_info", lambda url, **kw: {"version": "8.5.1"})
     established: list = []
     monkeypatch.setattr(k8s, "ensure_port_forward",
                         lambda *a, **kw: established.append(kw) or 4242)
@@ -4953,10 +4966,110 @@ def test_ready_confirms_the_socket_not_just_the_pid(monkeypatch, tmp_path):
     else:
         raise AssertionError("a URL that answers nothing must not report ready")
 
-    # Reachable -> ready.
+    # Reachable AND Rocket.Chat answering -> ready. Both are now required: the port
+    # answering says only that the port answers, so /api/info is what says the thing
+    # on the other end is this workspace.
     monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: True)
+    monkeypatch.setattr(lc.rcapi, "api_info", lambda url, **kw: {"version": "8.5.1"})
     out = lc._wait_serving_kubernetes(m, lc.null_emit, timeout=5.0)
     assert out == {"ready": True, "url": "http://localhost:3999"}, out
+
+
+def test_a_port_forward_that_never_bound_is_not_recorded_as_a_pid(monkeypatch, tmp_path):
+    """`port_forward` returned `proc.pid` the instant it spawned kubectl.
+
+    kubectl cannot share a port: if something already holds it, it prints
+    `Unable to listen on port N: bind: address already in use` and exits within
+    milliseconds -- to DEVNULL, so nothing saw it -- and the pid was recorded anyway.
+    The record then named a dead process while the squatter answered the URL, which is
+    the first half of `ready` certifying somebody else's software.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(k8s, "run", _fake_run({"jsonpath": (0, "Running")}))
+    # kubectl exited: it never got the socket. Something else answers on the port,
+    # which is exactly why this must not be read as success.
+    monkeypatch.setattr(k8s.subprocess, "Popen",
+                        lambda argv, **kw: _FakeProc(4242, exited=1))
+    monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: True)
+    said: list = []
+    pid = k8s.port_forward("k", namespace="ns", context=k8s.CONTEXT, host_port=3010,
+                           emit=lambda e: said.append(e.message),
+                           sleep=lambda _s: None)
+    assert pid == 0, "a pid was recorded for a forward that never came up"
+    assert any("did not come up" in m for m in said), said
+
+    # And the ordinary case still works: child alive, port answers.
+    monkeypatch.setattr(k8s.subprocess, "Popen",
+                        lambda argv, **kw: _FakeProc(4242))
+    assert k8s.port_forward("k", namespace="ns", context=k8s.CONTEXT, host_port=3010,
+                            sleep=lambda _s: None) == 4242
+
+
+def test_ready_refuses_a_url_served_by_something_that_is_not_rocketchat(
+        monkeypatch, tmp_path):
+    """`ready` printed "is serving at <url>" and exited 0 for a URL a FOREIGN process
+    was serving.
+
+    The Kubernetes readiness path concluded from a Ready pod plus "the port answers",
+    and never asked Rocket.Chat anything -- while the Docker path has always gone
+    through `rcapi.wait_ready`, which polls /api/info. So the two runtimes disagreed
+    about what "ready" means, and the weaker one certified the wrong software. The
+    port is validated only at create time and 3000+ is the most contested range on a
+    dev box, so this is an ordinary event, not a contrived one.
+
+    Occupancy is not identity. A support engineer reading that URL draws every
+    conclusion about a program that is not Rocket.Chat.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="http://localhost:3998",
+                           host_port=3998, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+
+    monkeypatch.setattr(k8s, "workspace_ready", lambda *a, **kw: True)
+    monkeypatch.setattr(k8s, "ensure_port_forward", lambda *a, **kw: 0)
+    monkeypatch.setattr(lc.runner, "update_meta", lambda *a, **kw: None)
+    # The port answers -- but not with Rocket.Chat.
+    monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: True)
+    monkeypatch.setattr(lc.rcapi, "api_info", lambda url, **kw: None)
+    monkeypatch.setattr(k8s, "terminal_pod_failure", lambda *a, **kw: None)
+
+    # WHOSE forward holds the port is deliberately not part of the test, because it
+    # turned out not to be the right question. The first version of this fix refused
+    # only when OUR forward was dead, and a live run found the case that misses: on a
+    # dual-stack box kubectl binds `[::1]` quite happily while a squatter holds
+    # `127.0.0.1`, so the forward is ALIVE, `localhost` resolves v4-first to the
+    # squatter, and `ready` polled to a timeout instead of saying so. Measured with
+    # `ss -ltnp`: python on 127.0.0.1:3001 and kubectl on [::1]:3001 at once.
+    #
+    # The workspace's own state is the sound test: Kubernetes says ready, the port
+    # answers, and it is not Rocket.Chat -- so that port is not this workspace,
+    # whoever owns the socket.
+    # Two strikes rather than the shipped four: this test is about the refusal, and
+    # the grace period has its own assertion below.
+    monkeypatch.setattr(lc, "FOREIGN_PORT_STRIKES", 2)
+    for alive in (False, True):
+        monkeypatch.setattr(k8s, "forward_alive", lambda *a, **kw: alive)
+        with pytest.raises(errors.ConflictError) as caught:
+            lc._wait_serving_kubernetes(m, lc.null_emit, timeout=60.0)
+        said = str(caught.value)
+        assert "3998" in said and "not with Rocket.Chat" in said, said
+        assert "trusted to be this workspace" in said, \
+            "say that the URL itself is not evidence"
+        assert "IPv4" in said, "the dual-stack case is the one a reader cannot guess"
+
+    # But NOT on the first look. A pod that has only just passed its probe may take a
+    # moment more to serve, and accusing somebody then is worse than waiting -- so the
+    # refusal needs consecutive strikes, and without room for them this is an honest
+    # timeout rather than an accusation.
+    monkeypatch.setattr(lc, "FOREIGN_PORT_STRIKES", 10**6)
+    with pytest.raises(errors.NotReadyError):
+        lc._wait_serving_kubernetes(m, lc.null_emit, timeout=0.5)
 
 
 def test_a_create_stops_waiting_for_a_pod_that_cannot_start(monkeypatch):
@@ -5335,18 +5448,23 @@ def test_a_scenario_forward_targets_the_deployment_not_the_service(monkeypatch):
     def fake_run(argv, **kw):
         if "get" in argv and "svc" in argv:
             out = "keycloak 8081 8080\n"
-        elif "endpoints" in argv:
-            out = "10.244.0.9"
+        elif "endpointslices" in argv:
+            # EndpointSlice, not the deprecated `endpoints`: kubectl warns on every
+            # call to the old one ("v1 Endpoints is deprecated in v1.33+") and this
+            # is a WAIT LOOP, so the day it stops being served the old call would
+            # spin to its timeout rather than fail visibly.
+            out = json.dumps({"items": [
+                {"metadata": {"labels": {"kubernetes.io/service-name": "keycloak"}},
+                 "endpoints": [{"conditions": {"ready": True}}]}]})
         else:
             out = ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
-    class _P:
-        pid = 4242
-
     monkeypatch.setattr(k8s, "run", fake_run)
+    # `_FakeProc`, because the code asks `poll()` now: a scenario forward is only
+    # published if OUR kubectl got the socket, not merely if the port answers.
     monkeypatch.setattr(k8s.subprocess, "Popen",
-                        lambda argv, **kw: (spawned.append(argv), _P())[1])
+                        lambda argv, **kw: (spawned.append(argv), _FakeProc(4242))[1])
     monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: True)
 
     out = k8s.scenario_ui_forwards("w", namespace="rc-repro-w", context=k8s.CONTEXT,
@@ -5603,6 +5721,237 @@ def test_pod_rows_answers_empty_rather_than_raising_when_the_cluster_is_asleep()
     with mock.patch.object(k8s, "run", return_value=type(
             "R", (), {"returncode": 1, "stdout": "", "stderr": "connection refused"})()):
         assert k8s.pod_rows("k", context="c") == []
+
+
+def test_a_release_has_a_state_and_a_wedged_one_is_freed(monkeypatch):
+    """`helm list -q` lists a `pending-install` release exactly as it lists a healthy
+    one -- from helm's own --help: "By default, it lists all releases in any status."
+
+    So `release_installed` said True for a release a killed `helm install` had left
+    locked, `up` went on to `helm upgrade --install`, and helm refused with "another
+    operation (install/upgrade/rollback) is in progress" -- whose central claim is
+    false: nothing is in progress, the process that was doing it is gone. Every later
+    attempt failed identically and rc-repro offered no way out.
+
+    The remedy depends on whether there is anything to go back TO, which is why "just
+    run helm rollback" is not the whole answer: a pending-install at revision 1 never
+    completed once, so a rollback has no target.
+    """
+    from rc_repro.services import k8s
+
+    # A state, not a presence.
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: _completed(
+        0, out=_helm_list("rocketchat", status="pending-install", revision=1)))
+    assert k8s.release_state("rocketchat", "ns", "c") == ("pending-install", 1)
+
+    calls: list = []
+
+    def spy(argv, **kw):
+        calls.append(" ".join(argv))
+        if "helm list" in " ".join(argv):
+            return _completed(0, out=_helm_list("rocketchat",
+                                                status="pending-install", revision=1))
+        return _completed(0)
+
+    monkeypatch.setattr(k8s, "run", spy)
+    said: list = []
+    assert k8s.clear_pending_release("rocketchat", "ns", "c",
+                                     emit=said.append) == "uninstalled"
+    assert any("helm uninstall rocketchat" in c for c in calls), calls
+    assert not any("helm rollback" in c for c in calls), \
+        "revision 1 never completed, so there is nothing to roll back to"
+
+    # With a good revision behind it, rolling back is the right move.
+    calls.clear()
+
+    def spy2(argv, **kw):
+        calls.append(" ".join(argv))
+        if "helm list" in " ".join(argv):
+            return _completed(0, out=_helm_list("rocketchat",
+                                                status="pending-upgrade", revision=4))
+        return _completed(0)
+
+    monkeypatch.setattr(k8s, "run", spy2)
+    assert "rolled back" in k8s.clear_pending_release("rocketchat", "ns", "c")
+    assert any("helm rollback rocketchat 3" in c for c in calls), calls
+
+    # A healthy release is left entirely alone.
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: _completed(
+        0, out=_helm_list("rocketchat", status="deployed", revision=2)))
+    assert k8s.clear_pending_release("rocketchat", "ns", "c") == ""
+
+
+def test_the_upgrade_re_supplies_the_values_file_like_the_official_guide(monkeypatch):
+    """The guide says: change the image tag in your values.yaml and run `helm
+    upgrade`. This did `--reuse-values` instead, and two things broke.
+
+    `--reuse-values` never applies the NEW chart's defaults (helm: "reuse the last
+    release's values and merge in any overrides"), so a chart that ADDS a templated
+    value renders against a map without it -- RC 7.4.0 -> 7.10.15 crosses chart
+    6.23.2 -> 6.26.0, which added `podMonitor`, and it died on `nil pointer
+    evaluating interface {}.enabled`.
+
+    Worse, it carries per-chart-version workarounds. `containerSecurityContext:
+    {fsGroup: null}` is REQUIRED on chart 6.26.0 and BREAKS chart 7.0.0, which fixed
+    the problem upstream -- so carrying it across that upgrade reintroduces the bug
+    it exists to fix. `--reset-then-reuse-values` does not save this either: it still
+    re-applies the last release's values over the new defaults. Only re-supplying a
+    values file, with that key recomputed against the TARGET chart, is correct.
+    """
+    from rc_repro.services import k8s
+
+    seen: list = []
+    sent: list = []
+
+    def fake(argv, **kw):
+        seen.append(argv)
+        sent.append(kw.get("input") or "")
+        return _completed(0)
+
+    monkeypatch.setattr(k8s.subprocess, "run", fake)
+    # STUBBED AT THE `run` SEAM, not at `release_values`, deliberately: a test that
+    # monkeypatches the new function fails against the old code with AttributeError,
+    # which proves a rename rather than a defect. Answering `helm get values` here
+    # means the assertions below run against either version and fail on BEHAVIOUR.
+    release = {"containerSecurityContext": {"fsGroup": None},
+               "externalMongodbUrl": "mongodb://keep-me",
+               "microservices": {"enabled": True},
+               "externalMongodbOplogUrl": "mongodb://local",
+               "image": {"repository": "old", "tag": "7.4.0"}}
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: _completed(
+        0, out=json.dumps(release) if "get" in argv else ""))
+    # The TARGET chart has no `fsGroup` on the container, so nothing should be sent.
+    monkeypatch.setattr(k8s, "container_security_context", lambda cv: {})
+
+    k8s.upgrade_image(namespace="ns", context="c", chart_version="7.0.0",
+                      image_repo="r", tag="8.0.0", oplog=False)
+
+    argv = seen[-1]
+    assert argv[:2] == ["helm", "upgrade"]
+    assert "--values" in argv and "-" in argv, argv
+    assert not any("reuse-values" in a for a in argv), \
+        "a reuse flag is back; the guide supplies the whole file"
+    assert not any(a == "--set" for a in argv), \
+        "the tag goes in the values file, the way the guide changes it"
+
+    body = json.loads(sent[-1])
+    assert body["image"] == {"repository": "r", "tag": "8.0.0"}
+    assert body["externalMongodbUrl"] == "mongodb://keep-me", \
+        "create-time decisions must survive the upgrade"
+    assert body["microservices"] == {"enabled": True}
+    assert "containerSecurityContext" not in body, \
+        "a workaround for the OLD chart was carried onto the new one"
+    assert "externalMongodbOplogUrl" not in body, \
+        "RC 8 dropped oplog tailing; the key is removed, not carried"
+
+    # And where the target chart DOES need it, it is present -- recomputed, not reused.
+    monkeypatch.setattr(k8s, "container_security_context",
+                        lambda cv: {"containerSecurityContext": {"fsGroup": None}})
+    k8s.upgrade_image(namespace="ns", context="c", chart_version="6.26.0",
+                      image_repo="r", tag="7.10.15", oplog=False)
+    assert json.loads(sent[-1])["containerSecurityContext"] == {"fsGroup": None}
+
+
+def test_a_release_with_no_values_of_its_own_is_not_a_failure(monkeypatch):
+    """`helm get values` answers the literal string `null` for a release installed
+    with no values. That is an empty values file, not an error, and reading it as one
+    would refuse every upgrade of such a release."""
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: _completed(0, out="null"))
+    assert k8s.release_values("rocketchat", "ns", "c") == {}
+
+    # A refused read is still refused: not knowing the values is not the same as
+    # there being none, and upgrading on {} would erase the release's whole config.
+    from rc_repro.errors import DockerError
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: _completed(
+        1, err="Error: release: not found"))
+    with pytest.raises(DockerError):
+        k8s.release_values("rocketchat", "ns", "c")
+
+
+def test_the_flag_that_undoes_a_failed_install_is_named_for_the_helm_installed():
+    """**`--atomic` does not exist in helm 4** -- it is `--rollback-on-failure`.
+
+    So the standard advice for a wedged release would itself fail on a box running
+    helm 4, and an unrecognised flag turns a working install into a broken one.
+    Verified against the 4.2.3 on this machine: `helm upgrade --help` lists
+    `--rollback-on-failure` and no `--atomic`.
+    """
+    from rc_repro.services import k8s
+
+    class _T:
+        present, version = True, ()
+
+    def at(ver):
+        t = _T(); t.version = ver; return t
+
+    import unittest.mock as m
+    with m.patch.object(k8s, "tool", lambda n: at((4, 2, 3))):
+        assert k8s.helm_rollback_on_failure() == ["--rollback-on-failure"]
+    with m.patch.object(k8s, "tool", lambda n: at((3, 14, 0))):
+        assert k8s.helm_rollback_on_failure() == ["--atomic"]
+    with m.patch.object(k8s, "tool", lambda n: at(())):
+        assert k8s.helm_rollback_on_failure() == [], \
+            "an unknown helm gets no flag rather than a guessed one"
+
+
+def test_a_multi_line_helm_error_keeps_its_reason(monkeypatch):
+    """`why()` took the last line announcing itself as an error, and a Helm TEMPLATE
+    error puts the location on that line and the cause on the indented lines after it.
+
+    So the file and line survived and `nil pointer` did not -- which is what made the
+    chart-version upgrade failure unreadable from rc-repro's own output. The
+    docstring's premise, diagnostics first and error last, holds for klog and inverts
+    here.
+    """
+    from rc_repro.services import k8s
+
+    helm = ("Error: UPGRADE FAILED: template: rocketchat/templates/podmonitor.yaml:24:18\n"
+            '  executing "podmonitor.yaml" at <.Values.podMonitor.enabled>:\n'
+            "    nil pointer evaluating interface {}.enabled\n")
+    got = k8s.why(_completed(1, err=helm))
+    assert "nil pointer" in got, got
+    assert "podmonitor.yaml:24:18" in got, "the location is still useful"
+
+    # The klog case must be untouched: a warning is not an error however loudly printed.
+    klog = ("W0824 12:00:00.1 warnings.go:70] v1 Endpoints is deprecated\n"
+            "Error: release: not found\n")
+    assert k8s.why(_completed(1, err=klog)) == "Error: release: not found"
+
+
+class _FakeProc:
+    """A `Popen` double that can answer `poll()`, because the code now asks.
+
+    `port_forward` used to return `proc.pid` the instant it spawned, so a stub with
+    nothing but a `pid` was enough. It now confirms the child actually got the socket
+    -- kubectl exits within milliseconds when the port is taken, and returning that
+    pid recorded a dead process while a squatter served the URL. A double without
+    `poll()` cannot express either outcome.
+    """
+
+    def __init__(self, pid: int, exited: int | None = None):
+        self.pid = pid
+        self._exited = exited
+
+    def poll(self):
+        return self._exited
+
+
+def _helm_list(*names: str, status: str = "deployed", revision: int = 1) -> str:
+    """What `helm list -o json` really returns, for a stub that must not lie.
+
+    The stubs here answered with the bare release name, which is the `-q` shape.
+    `release_state` asks for `-o json` because a release has a STATUS and `-q` throws
+    it away -- a `pending-install` release is listed by `-q` identically to a healthy
+    one, which is how a wedged release read as a working one. A stub that keeps
+    answering in the old shape would make the fix look broken here and leave it
+    broken in production, which is this repo's payload-shape trap in a new place.
+    """
+    return json.dumps([{"name": nm, "namespace": "ns", "revision": revision,
+                        "updated": "2026-08-24 00:00:00", "status": status,
+                        "chart": "c-1.0.0", "app_version": "1.0.0"}
+                       for nm in names if nm])
 
 
 # --- the agent skill ------------------------------------------------------------
@@ -5872,6 +6221,206 @@ def _k8s_meta(**extra):
         mongo_tag="8.0", mongo_flavor="official", preset="default",
         root_url="http://localhost:3000", host_port=3000, version_source="map",
         extra=base)
+
+
+def test_a_forward_that_hid_its_arguments_is_not_called_dead(monkeypatch):
+    """`forward_alive` identifies our port-forward from /proc/<pid>/cmdline -- and on
+    a host where `kubectl` is a symlink to `k3s`, that command line is empty.
+
+    k3s ships kubectl as a multi-call binary: dispatching rewrites its own argv, so
+    the process shows `kubectl` and then nothing. Measured on such a host -- `ss
+    -ltnp` reported that exact pid holding both :3000 sockets while this function
+    returned False. Reading that as "the forward is gone" made `ensure_port_forward`
+    respawn onto a port its own live forward already held, every single call, and told
+    the reader the URL was not published while it was answering 200.
+
+    An argv with nothing in it to check is "I cannot identify it this way", not a
+    mismatch. Same distinction the rest of this module is built on.
+    """
+    from rc_repro.services import k8s
+
+    class _Proc:
+        def __init__(self, path):
+            self.path = str(path)
+
+        def read_bytes(self):
+            if self.path.endswith("/cmdline"):
+                return cmdline
+            raise OSError("no")
+
+        def read_text(self, encoding=None):
+            if self.path.endswith("/comm"):
+                return comm
+            raise OSError("no")
+
+    monkeypatch.setattr(k8s, "Path", _Proc)
+    monkeypatch.setattr(k8s, "forward_reachable", lambda *a, **kw: port_up)
+
+    # The k3s shape: argv[0] and a hundred empty slots.
+    cmdline, comm, port_up = b"kubectl \0" + b"\0" * 100, "kubectl", True
+    assert k8s.forward_alive(4242, namespace="rc-repro-k", host_port=3000) is True
+
+    # ...but only while the port it was started for is actually held. Three facts
+    # together: our recorded pid, still a kubectl, and the port is up.
+    port_up = False
+    assert k8s.forward_alive(4242, namespace="rc-repro-k", host_port=3000) is False
+
+    # A recycled pid running something else is still refused.
+    cmdline, comm, port_up = b"nginx\0", "nginx", True
+    assert k8s.forward_alive(4242, namespace="rc-repro-k", host_port=3000) is False
+
+    # And a FULL argv is still matched strictly -- the strong path is unchanged, so a
+    # different workspace's forward on a recycled pid does not pass.
+    cmdline = b"\0".join([b"kubectl", b"--context", b"c", b"-n", b"rc-repro-OTHER",
+                          b"port-forward", b"deployment/x", b"3000:3000"])
+    comm = "kubectl"
+    assert k8s.forward_alive(4242, namespace="rc-repro-k", host_port=3000) is False
+    cmdline = cmdline.replace(b"rc-repro-OTHER", b"rc-repro-k")
+    assert k8s.forward_alive(4242, namespace="rc-repro-k", host_port=3000) is True
+
+
+def test_a_service_with_no_ready_pod_behind_it_is_reported(monkeypatch):
+    """A Service whose selector matches nothing looked exactly like a healthy
+    workspace.
+
+    Readiness reads POD status and the port-forward targets the DEPLOYMENT, so nothing
+    on either path ever traverses the Service -- the URL answers 200 from the host
+    while every pod in the cluster gets nothing. That matters more than it sounds
+    because the Kubernetes default deployment is microservices, where in-cluster
+    Service traffic is what carries the product, so a working port-forward is weaker
+    evidence than it looks.
+
+    Reported and not gated: endpoints churn during a rollout, so a transient empty set
+    is normal, and a false negative here would block a boot -- a worse failure than
+    the one being found. Every doubt therefore returns "nothing to say".
+    """
+    from rc_repro.services import k8s
+
+    slices = {"items": [
+        {"metadata": {"labels": {"kubernetes.io/service-name": "rocketchat-rocketchat"}},
+         "endpoints": [{"conditions": {"ready": False}}]},
+        {"metadata": {"labels": {"kubernetes.io/service-name": "rocketchat-ddp-streamer"}},
+         "endpoints": [{"conditions": {"ready": True}}]},
+    ]}
+    # THE SHAPES ARE COPIED FROM A LIVE MICROSERVICES WORKSPACE, and that matters:
+    # the first version of this test put `app.kubernetes.io/instance` in each
+    # Service's LABELS, matching the first version of the code -- and the chart does
+    # not do that. `rocketchat-ddp-streamer` carries only
+    # `app.kubernetes.io/managed-by: Helm` as a label and names the instance in its
+    # SELECTOR. So code and test agreed with each other and neither agreed with
+    # Kubernetes, and the check was a silent no-op that this test passed. Verified by
+    # dumping every Service on a real workspace.
+    inst = "app.kubernetes.io/instance"
+    svcs = {"items": [
+        # Rocket.Chat's own, selector-backed: judged.
+        {"metadata": {"name": "rocketchat-rocketchat",
+                      "labels": {"app.kubernetes.io/managed-by": "Helm"}},
+         "spec": {"selector": {inst: k8s.RELEASE, "app.kubernetes.io/name": "rocketchat"},
+                  "type": "ClusterIP"}},
+        {"metadata": {"name": "rocketchat-ddp-streamer",
+                      "labels": {"app.kubernetes.io/managed-by": "Helm"}},
+         "spec": {"selector": {inst: k8s.RELEASE,
+                               "app.kubernetes.io/name": "rocketchat-ddp-streamer"},
+                  "type": "ClusterIP"}},
+        # Our own hand-rolled MongoDB: its selector names no instance, so it is
+        # excluded without being named -- it has its own lifecycle and its own
+        # reasons to be briefly empty.
+        {"metadata": {"name": "mongodb",
+                      "labels": {"rc-repro.io/workspace": "w"}},
+         "spec": {"selector": {"app": "mongodb"}, "type": "ClusterIP"}},
+        # No selector: wired by hand, so there are no pods to be missing.
+        {"metadata": {"name": "rocketchat-manual", "labels": {}},
+         "spec": {"type": "ClusterIP"}},
+        # ExternalName has no endpoints by definition.
+        {"metadata": {"name": "rocketchat-alias", "labels": {}},
+         "spec": {"selector": {inst: k8s.RELEASE}, "type": "ExternalName"}},
+    ]}
+
+    def answer(argv, **kw):
+        if "endpointslices" in argv:
+            return _completed(0, out=json.dumps(slices))
+        if "svc" in argv:
+            return _completed(0, out=json.dumps(svcs))
+        return _completed(0, out="{}")
+
+    monkeypatch.setattr(k8s, "run", answer)
+    assert k8s.services_without_endpoints("w", context="c") == \
+        ["rocketchat-rocketchat"], k8s.services_without_endpoints("w", context="c")
+
+    # A refused read says nothing rather than accusing every Service in the namespace
+    # -- the same rule as everywhere else in this module.
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: _completed(
+        1, err="Error from server (Forbidden): cannot list endpointslices"))
+    assert k8s.services_without_endpoints("w", context="c") == []
+    assert k8s.service_ready_addresses("ns", context="c") is None
+
+    # And it reads EndpointSlice, not the API kubectl warns about on every call.
+    import inspect
+    src = inspect.getsource(k8s.service_ready_addresses)
+    assert "endpointslices" in src
+    assert '"endpoints", ' not in src, "the deprecated v1 Endpoints API is back"
+
+    # The filter reads the SELECTOR. Asserted directly because getting this wrong is
+    # invisible: it makes the function return [] for everything, which looks exactly
+    # like a healthy workspace and is what shipped in the first attempt.
+    pick = inspect.getsource(k8s.services_without_endpoints)
+    assert 'spec.get("selector") or {}).get(' in pick, \
+        "the instance is matched on the selector, not on the Service's labels"
+
+
+def test_a_dead_port_forward_is_said_out_loud_and_names_its_repair(monkeypatch, tmp_path):
+    """`list` showed `running` beside a URL that refused connections, and nothing
+    anywhere said `ready` was the repair.
+
+    A port-forward dies with its pod, so this is ordinary rather than exceptional --
+    a restart, a rescheduled pod, a reboot. And "running" is not WRONG: it is the
+    pods' state, and they may be perfectly healthy. That is exactly why the reader had
+    nothing to go on -- the state was right, the URL was dead, and the two facts never
+    met. So the note is derived on every read rather than recorded, and disappears the
+    moment the forward is back.
+    """
+    from rc_repro.services import k8s, topology
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    m = lc.runner.Metadata(name="k", project="rc-repro-k", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="http://localhost:3000",
+                           host_port=3000, version_source="t")
+    topology.stamp(m.extra, topology.KUBERNETES)
+    m.extra.update({"context": k8s.CONTEXT, "namespace": "rc-repro-k",
+                    "port_forward_pid": 4242})
+
+    def titles(meta):
+        return [g["title"] for g in lc.note_groups_of(meta)]
+
+    monkeypatch.setattr(k8s, "forward_alive", lambda *a, **kw: False)
+    groups = lc.note_groups_of(m)
+    dead = [g for g in groups if g["title"] == "The URL is not published right now"]
+    assert dead, titles(m)
+    assert any("rc-repro ready --name k" in c for c in dead[0]["commands"]), dead[0]
+    assert any("localhost:3000" in b for b in dead[0]["body"]), dead[0]
+    # It must not read as an accusation against Rocket.Chat, which may be fine.
+    assert any("says nothing about Rocket.Chat" in b for b in dead[0]["body"])
+
+    # A live forward says nothing at all.
+    monkeypatch.setattr(k8s, "forward_alive", lambda *a, **kw: True)
+    assert "The URL is not published right now" not in titles(m)
+
+    # AND NEITHER DOES A RECORD WITH NO PID. `forward_alive(None)` is False, and
+    # reading that as "no forward is running" is the exact confusion this release
+    # spent itself removing -- a record written before the pid was tracked tells us
+    # nothing about what is listening, so a note claiming a fact must stay quiet.
+    monkeypatch.setattr(k8s, "forward_alive", lambda *a, **kw: False)
+    m.extra.pop("port_forward_pid")
+    assert "The URL is not published right now" not in titles(m), \
+        "no pid recorded is 'I cannot say', not 'nothing is running'"
+
+    # A Compose workspace is not affected: it publishes a real port.
+    c = lc.runner.Metadata(name="d", project="rc-repro-d", rc_version="8.5.1",
+                           rc_image="i", mongo_tag="8.0", mongo_flavor="official",
+                           preset="default", root_url="http://localhost:3001",
+                           host_port=3001, version_source="t")
+    assert "The URL is not published right now" not in titles(c)
 
 
 def test_a_workspace_made_before_groups_existed_still_renders_as_groups():
@@ -6206,8 +6755,8 @@ def test_the_mongodb_operator_goes_with_the_last_workspace_but_not_before(monkey
             calls.append(" ".join(argv))
             j = " ".join(argv)
             if "helm list" in j:
-                return sp.CompletedProcess(argv, 0,
-                                           k8s.OPERATOR_RELEASE if installed else "", "")
+                return sp.CompletedProcess(
+                    argv, 0, _helm_list(k8s.OPERATOR_RELEASE) if installed else "[]", "")
             if "get mongodbcommunity" in j:
                 return sp.CompletedProcess(argv, 0, "\n".join(mongodbs), "")
             return sp.CompletedProcess(argv, rc, "", "boom" if rc else "")
@@ -6252,7 +6801,7 @@ def test_removing_the_operator_never_fails_a_teardown(monkeypatch):
     def run(argv, timeout=None, own=False):
         j = " ".join(argv)
         if "helm list" in j:
-            return sp.CompletedProcess(argv, 0, k8s.OPERATOR_RELEASE, "")
+            return sp.CompletedProcess(argv, 0, _helm_list(k8s.OPERATOR_RELEASE), "")
         if "get mongodbcommunity" in j:
             return sp.CompletedProcess(argv, 0, "", "")
         return sp.CompletedProcess(argv, 1, "", "uninstall exploded")
@@ -6340,7 +6889,7 @@ def test_the_workspace_being_destroyed_does_not_vote_to_keep_the_stack(monkeypat
     def run(argv, timeout=None, own=False):
         j = " ".join(argv)
         if "helm list" in j:
-            return sp.CompletedProcess(argv, 0, k8s.MONITORING_RELEASE, "")
+            return sp.CompletedProcess(argv, 0, _helm_list(k8s.MONITORING_RELEASE), "")
         if "get namespace" in j and "-l" in j:
             return sp.CompletedProcess(argv, 0, "namespace/rc-repro-going\n", "")
         if "get namespace rc-repro-going" in j or "jsonpath" in j and "monitoring" in j:
@@ -6375,8 +6924,8 @@ def test_detaching_monitoring_that_was_never_attached_says_nothing_alarming(monk
 
     def run(argv, timeout=None, own=False):
         calls.append(" ".join(argv))
-        # `helm list -q` answers with no releases: nothing is installed here.
-        return sp.CompletedProcess(argv, 0, "", "")
+        # `helm list -o json` answers with an empty array: nothing installed here.
+        return sp.CompletedProcess(argv, 0, "[]", "")
 
     monkeypatch.setattr(k8s, "run", run)
     events = []
@@ -7146,6 +7695,122 @@ def test_cannot_ask_the_cluster_is_not_the_same_answer_as_nothing_is_there(monke
         k8s.delete_namespace("x", context="c", volumes=True)
 
 
+def test_a_cluster_that_cannot_be_asked_never_reads_as_a_deleted_namespace(monkeypatch):
+    """`delete_namespace`'s wait loop read `returncode != 0` as "the namespace is
+    gone" -- so ONE transient API error, one expired credential or one wrong context
+    made `down --volumes` announce a deletion that had not happened and drop the local
+    record, leaving a namespace with no rc-repro path back to it.
+
+    Measured on this box: kubectl exits **1** for an absent namespace AND for a
+    context that does not exist, so no threshold on the exit code can tell them
+    apart. The exit code says only whether the API server answered; absence has to
+    come from the payload. `.docs/design/k8s-answer-contract.md` has the runs.
+
+    This is the `down` half. `wait_namespace_gone` below is the `prune` half, and it
+    had the identical defect twenty lines away.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setattr(k8s, "namespace_labels",
+                        lambda ns, **kw: {k8s.OWNER_LABEL_KEY: k8s.OWNER_LABEL_VALUE,
+                                          k8s.WORKSPACE_LABEL: "x"})
+    monkeypatch.setattr(k8s, "workspace_pvcs", lambda *a, **k: ["data-x-0"])
+
+    def _run(argv, **kw):
+        if "delete" in argv:
+            return _completed(0)
+        # The cluster cannot be asked. NOT `Error from server (NotFound)`, which is
+        # the API server asserting absence -- this is a client-side failure, and the
+        # two must not land in the same branch.
+        return _completed(1, err="Unable to connect to the server: dial tcp: "
+                                 "i/o timeout")
+
+    monkeypatch.setattr(k8s, "run", _run)
+    said: list = []
+    assert k8s.delete_namespace("x", context="c", volumes=True,
+                                emit=lambda e: said.append(e.message),
+                                sleep=lambda s: None) is False, \
+        "a namespace nobody could ask about was reported deleted"
+    joined = " ".join(said)
+    assert "could not confirm" in joined, joined
+    assert "record is KEPT" in joined, "say what was NOT done"
+    # A DIFFERENT SENTENCE from the Terminating case, because the remedy differs:
+    # one says wait, this one says go and look at your cluster.
+    assert "still terminating" not in joined, \
+        "an unreachable cluster is not a namespace that is taking its time"
+
+
+def test_waiting_for_an_orphan_asks_the_cluster_it_was_deleted_from(monkeypatch, tmp_path):
+    """`prune --orphans` deleted with `_orphan_context()` and then waited with the
+    hardcoded `k8s.CONTEXT`.
+
+    `_orphan_context()` exists BECAUSE that hardcoding was already found and fixed
+    once, at the delete call, one block above -- and it was reintroduced at the wait.
+    On any cluster rc-repro did not create the two disagree, so the wait asked a
+    context that is not in the kubeconfig, kubectl exited non-zero, and the loop read
+    that as "gone": `✓ removed 1 orphaned namespace(s)`, exit 0, over a namespace
+    still Terminating. Invisible on kind, where the two happen to be equal, which is
+    why a live pass on kind did not catch it.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(lc, "prunable", lambda: [])
+    monkeypatch.setattr(lc.auditsvc, "record", lambda *a, **kw: None)
+    monkeypatch.setattr(lc, "orphan_namespaces", lambda *a, **k: ["rc-repro-p9"])
+    monkeypatch.setattr(lc, "_orphan_context", lambda: "someone-elses-cluster")
+    monkeypatch.setattr(lc, "_reclaim_cluster", lambda emit: False)
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: _completed(0))
+
+    asked: list = []
+
+    def spy_wait(ns, *, context, emit=None, **kw):
+        asked.append(context)
+        return True
+
+    monkeypatch.setattr(k8s, "wait_namespace_gone", spy_wait)
+    lc.prune(confirm=True, orphans=True)
+    assert asked == ["someone-elses-cluster"], (
+        f"waited on {asked} but deleted from 'someone-elses-cluster' — the two must "
+        f"be the same cluster")
+    assert k8s.CONTEXT not in asked, "the hardcoded kind context is back"
+
+
+def test_a_refused_cluster_read_is_not_reported_as_a_cluster_with_nothing(monkeypatch):
+    """`doctor` told somebody with a working default StorageClass, Traefik and one
+    Ready node that they had none of the three, and gave it a green verdict.
+
+    `reachable()` probes `/readyz`, which a restricted credential can usually still
+    get -- so passing it is no evidence the actual reads will be permitted. Each of
+    the three then read a permission denial as an absence, because `[]` was the
+    answer for both "this cluster has none" and "I was not allowed to look".
+
+    The wire shape is the nasty part and is measured, not imagined: a denied
+    `get storageclass -o json` emits an EMPTY items document on stdout **and** exits
+    1. A classifier that looked at the payload before the exit code would rebuild the
+    bug inside the fix.
+    """
+    from rc_repro.services import k8s
+
+    denied = _completed(1, out='{"apiVersion":"v1","items":[],"kind":"List"}',
+                        err='Error from server (Forbidden): storageclasses.storage.'
+                            'k8s.io is forbidden: User "sa" cannot list resource')
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: denied)
+
+    assert k8s.storage_classes("limited") is None, \
+        "a forbidden read was reported as 'no StorageClass'"
+    assert k8s.ingress_classes("limited") is None
+    assert k8s.nodes_summary("limited") is None
+
+    # And an empty cluster still answers empty -- the fix must not turn "none" into
+    # "unknown", or every kind cluster would start warning about its absent ingress.
+    empty = _completed(0, out='{"apiVersion":"v1","items":[],"kind":"List"}')
+    monkeypatch.setattr(k8s, "run", lambda argv, **kw: empty)
+    assert k8s.storage_classes("kind") == ([], "")
+    assert k8s.ingress_classes("kind") == []
+    assert k8s.nodes_summary("kind") == (0, [])
+
+
 def test_a_namespace_still_terminating_is_not_reported_as_gone(monkeypatch):
     """`delete_namespace` waited, then returned True even while the namespace was
     still Terminating -- and True is read as "confirmed absent", so the caller deleted
@@ -7164,7 +7829,12 @@ def test_a_namespace_still_terminating_is_not_reported_as_gone(monkeypatch):
     def _run(argv, **kw):
         if "delete" in argv:
             return _completed(0)
-        return _completed(0, out="Terminating")      # never goes away
+        # The document a real `get namespace -o json` returns, not a bare phase
+        # string: `-o json` is what the code asks for, so a stub answering with
+        # anything else is testing a wire shape that does not exist.
+        return _completed(0, out=json.dumps({                # never goes away
+            "metadata": {"name": "rc-repro-x"},
+            "status": {"phase": "Terminating"}}))
 
     monkeypatch.setattr(k8s, "run", _run)
     said: list = []
@@ -7282,7 +7952,13 @@ def test_not_knowing_who_you_are_is_not_proof_the_namespace_is_yours(monkeypatch
 
     labels = {k8s.OWNER_LABEL_KEY: k8s.OWNER_LABEL_VALUE,
               k8s.WORKSPACE_LABEL: "w", k8s.OWNER_OF_LABEL: "bob"}
-    monkeypatch.setattr(k8s, "namespace_labels", lambda ns, **kw: labels)
+    # THE NAMESPACE DOCUMENT, because the preflight reads the phase as well as the
+    # labels now and gets both from one `get namespace -o json`. Stubbing
+    # `namespace_labels` no longer intercepts anything, and a stub that answers a call
+    # the code does not make tests nothing.
+    ns_doc = json.dumps({"metadata": {"name": "rc-repro-w", "labels": labels},
+                         "status": {"phase": "Active"}})
+    monkeypatch.setattr(k8s, "run", lambda *a, **k: _completed(0, out=ns_doc))
 
     with pytest.raises(ConflictError) as caught:
         k8s.assert_namespace_available("w", context="c")          # no owner at all
@@ -7293,8 +7969,52 @@ def test_not_knowing_who_you_are_is_not_proof_the_namespace_is_yours(monkeypatch
         k8s.assert_namespace_available("w", context="c", owner="alice")
 
     # bob himself is fine.
-    monkeypatch.setattr(k8s, "run", lambda *a, **k: _completed())
     k8s.assert_namespace_available("w", context="c", owner="bob")
+
+    # And a namespace of bob's that is still going away is refused for a DIFFERENT
+    # reason, with a different remedy: waiting, not identifying yourself.
+    gone = json.dumps({"metadata": {"name": "rc-repro-w", "labels": labels},
+                       "status": {"phase": "Terminating"}})
+    monkeypatch.setattr(k8s, "run", lambda *a, **k: _completed(0, out=gone))
+    with pytest.raises(ConflictError) as terminating:
+        k8s.assert_namespace_available("w", context="c", owner="bob")
+    assert "Terminating" in str(terminating.value), terminating.value
+
+
+def test_the_no_auth_message_names_the_reason_that_actually_applies(monkeypatch):
+    """It always said "no operator below 6.0, so no auth", and that was never the
+    reason on any workspace anyone booted.
+
+    `OPERATOR_MIN_MONGO` is (6, 0) and every supported Rocket.Chat resolves MongoDB to
+    6.0, 7.0, 8.0 or 8.2, so the version floor is satisfied every time. The real
+    reason is the other branch: the operator is OPT-IN and off. Somebody who wanted
+    authentication was therefore sent to raise a MongoDB version that was not the
+    obstacle -- while the workspace notes printed moments later said the true thing,
+    so the two outputs contradicted each other.
+    """
+    from rc_repro.services import k8s
+
+    monkeypatch.delenv(k8s.USE_OPERATOR_ENV, raising=False)
+    # The version floor is met for every version this tool actually pairs.
+    for tag in ("6.0", "7.0", "8.0", "8.2"):
+        parts = tuple(int(n) for n in tag.split("."))
+        assert parts >= k8s.OPERATOR_MIN_MONGO, tag
+        assert not k8s.operator_supports(tag), \
+            "opt-in and off is the reason, not the version"
+        assert k8s.operator_supports(tag, forced=True), \
+            "forced, the same version IS supported -- so the floor was never the bar"
+
+    # And 5.0 is the one case where the version really is the reason.
+    assert not k8s.operator_supports("5.0", forced=True)
+
+    # The source must offer both reasons rather than one. A walk, because this is a
+    # message and no test would otherwise notice it going back to a single branch.
+    import inspect
+    body = inspect.getsource(k8s.create_workspace)
+    assert "no authentication:" in body
+    assert "opt-in" in body and "cannot manage MongoDB below" in body, (
+        "the message must be able to name either reason")
+    assert "no operator below" not in body, "the always-false wording is back"
 
 
 def test_a_refused_create_is_refused_before_the_write_ahead_record():
@@ -8475,6 +9195,7 @@ def test_a_seed_is_serialised_like_every_other_mutation():
     """
     import inspect
 
+    from rc_repro.services import data as lc_data
     from rc_repro.services import lifecycle as lc
 
     src = inspect.getsource(lc.run_seed_inline)
@@ -8485,6 +9206,38 @@ def test_a_seed_is_serialised_like_every_other_mutation():
     # And the seed is pooled: hundreds of REST writes against one workspace.
     from rc_repro.web import jobs
     assert jobs._slots_for("seed") is not None, "seed submits unbounded"
+
+    # CONFIG-IMPORT IS THE OTHER ONE, and it was missed right beside the seed: it
+    # applies a customer dump's settings to a live workspace over REST and had
+    # neither a lock nor a pool. Two on one workspace interleave setting by setting,
+    # and one running into a backup's `_Quiesced` -- which stops Rocket.Chat for the
+    # dump -- half-applies, leaving settings matching neither the dump nor the
+    # workspace. Verified by reading it rather than assumed: an audit claimed
+    # `data.py` already locked it, and the two locks there belong to run_scale and
+    # clear_scale.
+    src_import = inspect.getsource(lc_data.import_apply)
+    assert "repro_lock" in src_import, "config-import still races every other mutator"
+    assert jobs._slots_for("config-import") is not None, \
+        "config-import submits unbounded"
+    assert jobs._slots_for("config-import") is jobs._slots_for("seed"), \
+        "the two data-mutating operations share one ceiling"
+
+    # DOING AND UNDOING SHARE A CEILING. `scale` was pooled and `clear-scale` was not,
+    # which bounds half the work -- the same asymmetry `monitor`/`monitor-off` was
+    # fixed for, and `clear-scale` bulk-deletes through the same Mongo exec that
+    # `scale` bulk-inserts through.
+    for pair in (("scale", "clear-scale"), ("monitor", "monitor-off")):
+        assert jobs._slots_for(pair[0]) is jobs._slots_for(pair[1]) is not None, pair
+
+    # The reads stay unpooled ON PURPOSE, and this records why so it is a decision
+    # rather than an oversight. `ready` is what the dashboard polls every few seconds:
+    # a ceiling there queues the GUI's own refresh behind whatever else is running,
+    # and the hazard an audit raised for it -- concurrent `ensure_port_forward` calls
+    # recording pids for forwards that never bound -- is closed at the source, since
+    # `port_forward` now returns 0 rather than a pid when it cannot get the socket.
+    for cheap in ("env", "ready", "state"):
+        assert jobs._slots_for(cheap) is None, (
+            f"{cheap} is a read and pooling it queues the dashboard's own polling")
 
 
 def test_the_monitor_job_is_pooled_and_the_walk_can_see_it():

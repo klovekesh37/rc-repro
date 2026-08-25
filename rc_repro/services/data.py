@@ -140,6 +140,22 @@ def import_plan(name: str, settings_path: str, only: set[str] | None = None) -> 
 def import_apply(name: str, settings_path: str, only: set[str] | None = None,
                  emit: Emit = null_emit) -> dict:
     """Apply the plan built from `settings_path` to the repro's live settings."""
+    target = lifecycle.resolve_name(name)
+    # LOCKED, like `run_scale` and the REST seed. This is the other data-mutating
+    # operation and it had neither a lock nor a job pool: two imports on one workspace
+    # could interleave setting by setting, and one running into a backup's `_Quiesced`
+    # -- which STOPS Rocket.Chat for the dump -- fails half-applied, leaving settings
+    # that match neither the dump nor the workspace. `seed` was fixed for exactly this
+    # and this was missed beside it.
+    #
+    # Reentrant per thread (see runner.repro_lock), so a caller that already holds it
+    # is unaffected -- nothing does today, and this stays safe if something does.
+    with runner.repro_lock(target, timeout=lifecycle._INTERACTIVE_LOCK_WAIT):
+        return _import_apply_locked(target, settings_path, only, emit)
+
+
+def _import_apply_locked(name: str, settings_path: str, only: set[str] | None = None,
+                         emit: Emit = null_emit) -> dict:
     m = runner.read_meta(lifecycle.resolve_name(name))
     plan = _build_plan(settings_path, only)
     try:

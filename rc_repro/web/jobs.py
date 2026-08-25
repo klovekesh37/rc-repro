@@ -80,7 +80,20 @@ _HEAVY_KINDS = frozenset({"create", "up", "restore", "rollback", "upgrade",
                           "monitor", "monitor-off",
                           # A seed drives hundreds of REST writes and is the one
                           # data-mutating operation that had neither a pool nor a lock.
-                          "seed"})
+                          "seed",
+                          # ...and `config-import` was the OTHER one. Same argument,
+                          # missed beside it: it applies a customer dump's settings to
+                          # a live workspace over REST, so two at once interleave and
+                          # one running into a backup's quiesce half-applies. It now
+                          # takes `repro_lock` as well; the pool is the other half,
+                          # bounding how many run across DIFFERENT workspaces.
+                          "config-import",
+                          # And `clear-scale` is the undo of `scale`, which IS pooled.
+                          # The same asymmetry `monitor`/`monitor-off` was fixed for:
+                          # a ceiling on doing a thing and none on undoing it bounds
+                          # half the work. It bulk-deletes the users and messages
+                          # `scale` bulk-inserted, through the same Mongo exec.
+                          "clear-scale"})
 _measure_slots = threading.BoundedSemaphore(1)
 _heavy_slots = threading.BoundedSemaphore(max(2, (os.cpu_count() or 4) // 2))
 

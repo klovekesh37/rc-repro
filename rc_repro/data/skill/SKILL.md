@@ -53,7 +53,7 @@ question is about documented behaviour rather than observed behaviour.
 Every `--json` reply is one envelope:
 
 ```json
-{"schema":"rc-repro.info.v1","contract":1,"rc_repro_version":"0.76.2",
+{"schema":"rc-repro.info.v1","contract":1,"rc_repro_version":"0.76.7",
  "generated_at":"...","ok":true,"data":{...},"warnings":[],"error":null}
 ```
 

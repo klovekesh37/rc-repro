@@ -1577,3 +1577,45 @@ def test_a_forced_mongo_major_upgrade_says_what_it_actually_does(monkeypatch, tm
         "if _apply_image no longer selects only Rocket.Chat services, the warning "
         "above is wrong")
     assert 'service["image"] = f"{rc_image}:{tag}"' in img
+
+
+def test_a_truncated_bundle_fails_inside_the_error_contract(tmp_path):
+    """A truncated bundle raised a bare `EOFError` from gzip, so the CLI's
+    `except ReproError` missed it and Typer printed `Aborted.` at exit 1 -- which is
+    what a cancelled confirmation prompt prints. The one failure mode that looked
+    like the user's own doing.
+
+    It also escaped the `--json` envelope and the web layer's status mapping, which
+    answered a bare 500.
+
+    Measured across real corruption modes, and the gap is narrow rather than the
+    whole function: random bytes, an empty file, a gzip header followed by junk and a
+    mid-stream corruption were all reported properly as ValidationError. Only
+    TRUNCATION escaped -- `EOFError` is not a `tarfile.TarError`, not an `OSError` and
+    not a `ValueError`, so none of the existing clauses caught it.
+    """
+    import io
+
+    good = tmp_path / "good.tar.gz"
+    with tarfile.open(good, "w:gz") as tar:
+        body = json.dumps({"schema": bk.SCHEMA, "name": "x"}).encode("utf-8")
+        item = tarfile.TarInfo(bk.MANIFEST)
+        item.size = len(body)
+        tar.addfile(item, io.BytesIO(body))
+    raw = good.read_bytes()
+
+    for label, data in (("half", raw[: len(raw) // 2]),
+                        ("gzip header only", raw[:10])):
+        cut = tmp_path / f"cut-{label.replace(' ', '-')}.tar.gz"
+        cut.write_bytes(data)
+        with pytest.raises(errors.ValidationError) as caught:
+            bk.read_manifest(cut)
+        assert "truncated" in str(caught.value), (label, str(caught.value))
+
+    # The modes that already worked must keep their own wording -- a fix that
+    # relabelled every unreadable file "truncated" would be worse than the bug.
+    junk = tmp_path / "junk.tar.gz"
+    junk.write_bytes(b"not a gzip at all")
+    with pytest.raises(errors.ValidationError) as other:
+        bk.read_manifest(junk)
+    assert "not a readable backup bundle" in str(other.value), other.value

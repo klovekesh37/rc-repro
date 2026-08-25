@@ -172,6 +172,12 @@ class Preflight:
     #: than inferred from `cluster_reachable`, because "not answering" and "not made
     #: yet" are different sentences and send a reader to different places.
     will_create: bool = False
+    #: Which cluster facts could not be READ, as opposed to read as empty. Same
+    #: distinction as `probe_failed` below, one level down: a restricted kubeconfig
+    #: can pass `/readyz` and then be refused every actual read, and reporting those
+    #: as "no StorageClass, no ingress, 0 nodes" made doctor state three false facts
+    #: under a green verdict. Named here so the verdict can see them.
+    unreadable: list[str] = field(default_factory=list)
     #: Why the cluster question could not be ANSWERED, as opposed to answered no.
     #: `kind get clusters` fails when Docker is down, and returns nothing when there
     #: are simply no clusters -- both give an empty list. Reporting the first as
@@ -322,6 +328,145 @@ def run(argv: list[str], *, timeout: float = PROBE_TIMEOUT,
                                            stderr=str(exc))
 
 
+#: The three answers an external tool can give about a thing, and the reason this
+#: module has a type for them at all. `namespace_labels` has said it since it was
+#: written -- "'I could not ask' and 'it is not there' are different answers and only
+#: one of them is safe to act on" -- and it was the ONLY function that implemented it.
+#: Five others collapsed the three back to two, each by reading a non-zero exit as a
+#: negative answer, and that one habit produced a `down --volumes` that deleted a
+#: workspace's record while its namespace was still there, a `prune` that reported
+#: namespaces reclaimed that were still Terminating, and a `doctor` that reported "0
+#: nodes, no StorageClass, no ingress" for a cluster with all three.
+#:
+#: MEASURED, not assumed: kubectl exits 1 for BOTH "namespace absent" and "context
+#: does not exist", so no threshold on the exit code can separate them. `.docs/design/
+#: k8s-answer-contract.md` has the runs.
+REFUSED, ABSENT, PRESENT = "refused", "absent", "present"
+
+
+@dataclass(frozen=True)
+class Answer:
+    """What the cluster said about one thing: PRESENT, ABSENT or REFUSED.
+
+    `absent` is a fact the cluster asserted and is safe to act on. `refused` means
+    nobody knows -- a wrong context, an expired credential, an RBAC denial, an API
+    server that is not answering -- and acting on it as though it meant "no" is the
+    defect this type exists to make unwriteable.
+
+    There is deliberately no truthiness. `if answer:` would be the very collapse
+    being prevented, so a caller has to name which of the three it means.
+    """
+
+    state: str
+    doc: dict | None = None
+    res: subprocess.CompletedProcess | None = None
+
+    @property
+    def present(self) -> bool:
+        return self.state == PRESENT
+
+    @property
+    def absent(self) -> bool:
+        return self.state == ABSENT
+
+    @property
+    def refused(self) -> bool:
+        return self.state == REFUSED
+
+    @property
+    def items(self) -> list[dict]:
+        """The objects of a list read; empty for a list that legitimately holds none.
+
+        Empty is only ever "the cluster has none of these" -- a refused read never
+        reaches here, because `refused` is a separate state and not an empty list.
+        That equivalence is exactly what made `doctor` report "0 nodes".
+        """
+        return list(((self.doc or {}).get("items")) or [])
+
+    def why(self, *, limit: int = 400) -> str:
+        return why(self.res, limit=limit) if self.res is not None else ""
+
+    def require(self, what: str, *, context: str) -> "Answer":
+        """Raise unless the cluster actually answered. For paths that must not guess.
+
+        The wording is `namespace_labels`' own, because it was right: it names the
+        cluster, quotes the tool, and says why a guess is not on offer.
+        """
+        if self.refused:
+            raise DockerError(
+                f"could not ask cluster {context!r} about {what}: " + self.why()
+                + " — refusing to guess, because 'I cannot ask' and 'it is not "
+                  "there' are different answers and only one of them is safe to "
+                  "act on")
+        return self
+
+
+def _classify(res: subprocess.CompletedProcess, *, single: bool) -> Answer:
+    """Turn a finished kubectl into one of the three answers.
+
+    The rule, and the only rule: **a zero exit means the API server answered.**
+    Absence is then read from the PAYLOAD -- empty for a single object fetched with
+    `--ignore-not-found` -- and never from the exit code.
+    """
+    if res.returncode != 0:
+        # SECONDARY, AND ONLY EVER SECONDARY: the API server's own reason code.
+        # `--ignore-not-found` makes an absent object exit 0 with an empty payload, so
+        # reaching here at all means either a kubectl older than the flag or a call
+        # site that did not pass it -- and in both cases the server's `(NotFound)` is
+        # still a real assertion of absence, so throwing it away would be its own bug.
+        #
+        # The flag stays the primary test because THIS test was once the only one and
+        # got it wrong: the first cut matched `"not found"`, which also matches
+        # `Error in configuration: context was not found for specified context: ...`
+        # -- a kubeconfig problem read as an absent namespace, the exact confusion
+        # this module exists to prevent. Only the API server says
+        # `Error from server (NotFound)`; a client-side configuration error never does.
+        if single and "fromserver(notfound)" in why(res).lower().replace(" ", ""):
+            return Answer(ABSENT, None, res)
+        return Answer(REFUSED, None, res)
+    raw = (res.stdout or "").strip()
+    if single and not raw:
+        # `--ignore-not-found` turns "not there" into exit 0 with nothing on stdout,
+        # which is the whole reason it is passed. `-o json` rather than a jsonpath
+        # because a jsonpath can be legitimately empty for an object that EXISTS --
+        # a namespace with no labels reads identically to no namespace at all, and
+        # that collision would rebuild the bug inside the fix.
+        return Answer(ABSENT, None, res)
+    try:
+        doc = json.loads(raw) if raw else {}
+    except (ValueError, TypeError):
+        # The server answered and we cannot parse it. That is not absence.
+        return Answer(REFUSED, None, res)
+    return Answer(PRESENT, doc if isinstance(doc, dict) else {}, res)
+
+
+def ask_object(kind: str, name: str, *, context: str, namespace: str = "",
+               timeout: float = PROBE_TIMEOUT) -> Answer:
+    """Ask about ONE named object: PRESENT with its document, ABSENT, or REFUSED."""
+    argv = ["kubectl", "--context", context]
+    if namespace:
+        argv += ["-n", namespace]
+    argv += ["get", kind, name, "--ignore-not-found", "-o", "json"]
+    return _classify(run(argv, own=is_ours(context), timeout=timeout), single=True)
+
+
+def ask_list(kind: str, *, context: str, namespace: str = "",
+             selector: str = "", timeout: float = PROBE_TIMEOUT) -> Answer:
+    """Ask for a COLLECTION: PRESENT with `.items` (possibly empty), or REFUSED.
+
+    There is no ABSENT for a list. A cluster that holds no StorageClass answers with
+    an empty collection and exit 0; a cluster nobody could reach is REFUSED. Reading
+    those as the same empty list is finding F-010.
+    """
+    argv = ["kubectl", "--context", context]
+    if namespace:
+        argv += ["-n", namespace]
+    argv += ["get", kind, "-o", "json"]
+    if selector:
+        argv += ["-l", selector]
+    return _classify(run(argv, own=is_ours(context), timeout=timeout), single=False)
+
+
 def why(res, *, limit: int = 400) -> str:
     """The line that explains a failure, not the first 400 characters of noise.
 
@@ -334,17 +479,36 @@ def why(res, *, limit: int = 400) -> str:
     non-empty line, which is where these tools put it.
     """
     text = f"{getattr(res, 'stderr', '') or ''}\n{getattr(res, 'stdout', '') or ''}"
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    raw = [ln for ln in text.splitlines() if ln.strip()]
+    lines = [ln.strip() for ln in raw]
     if not lines:
         return "no reason given"
-    named = [ln for ln in lines
+    named = [i for i, ln in enumerate(lines)
              if re.match(r"^(error|Error|ERROR|fatal|Fatal)\b", ln)
              or "error:" in ln.lower()]
     # Warnings are not errors, however loudly they are printed. klog prefixes them
     # with I/W and a timestamp, and helm's install failure sits after them.
-    named = [ln for ln in named if not re.match(r"^[IWD]\d{4} ", ln)]
-    chosen = named[-1] if named else lines[-1]
-    return chosen[:limit]
+    named = [i for i in named if not re.match(r"^[IWD]\d{4} ", lines[i])]
+    at = named[-1] if named else len(lines) - 1
+    # THE CONTINUATION LINES ARE THE REASON, and they were being thrown away. This
+    # docstring's premise -- diagnostics first, error last -- holds for klog and
+    # inverts for a Helm TEMPLATE error, which announces the location on the `Error:`
+    # line and puts the cause on the indented lines after it:
+    #
+    #     Error: UPGRADE FAILED: rocketchat/templates/podmonitor.yaml:24:18
+    #       executing "..." at <.Values.podMonitor.enabled>:
+    #         nil pointer evaluating interface {}.enabled
+    #
+    # So the file and line survived and "nil pointer" did not, which is why an
+    # upgrade that failed for a knowable reason read as unexplained. Indentation is
+    # the signal helm itself uses, and a line that starts a new diagnostic is never
+    # indented.
+    chosen = [lines[at]]
+    for nxt in range(at + 1, len(raw)):
+        if not raw[nxt][:1].isspace():
+            break
+        chosen.append(lines[nxt])
+    return " ".join(chosen)[:limit]
 
 
 def _parse_version(text: str) -> tuple[int, ...]:
@@ -401,7 +565,7 @@ def reachable(context: str = CONTEXT,
     return res.returncode == 0 and "ok" in (res.stdout or "").lower()
 
 
-def storage_classes(context: str = CONTEXT) -> tuple[list[str], str]:
+def storage_classes(context: str = CONTEXT) -> tuple[list[str], str] | None:
     """(all storage class names, the default one).
 
     The guide's step 1, and it opens with the warning that matters here: "Local
@@ -409,15 +573,16 @@ def storage_classes(context: str = CONTEXT) -> tuple[list[str], str]:
     storage provisioner enabled." Without one, a PVC stays Pending forever and the
     workspace never boots -- with no error that names storage.
     """
-    res = run(["kubectl", "--context", context, "get", "storageclass", "-o", "json"],
-              own=is_ours(context))
-    if res.returncode != 0:
-        return [], ""
-    try:
-        items = (json.loads(res.stdout or "{}") or {}).get("items") or []
-    except (ValueError, TypeError):
-        return [], ""
+    # `None`, NOT `[], ""`. A cluster that could not be asked was reporting the same
+    # answer as a cluster with no storage provisioner, so `doctor` told somebody with
+    # a perfectly good default StorageClass that their volume would stay Pending --
+    # and gave it a green verdict, because a warning about missing storage is a
+    # warning and "I could not read your cluster" is not something it could say.
+    seen = ask_list("storageclass", context=context)
+    if seen.refused:
+        return None
     names, default = [], ""
+    items = seen.items
     for item in items:
         meta = item.get("metadata") or {}
         name = meta.get("name") or ""
@@ -594,7 +759,7 @@ def port_claiming_cluster(ports: tuple[int, ...] = (80, 443),
     return None
 
 
-def nodes_summary(context: str = CONTEXT) -> tuple[int, list[str]]:
+def nodes_summary(context: str = CONTEXT) -> tuple[int, list[str]] | None:
     """(how many nodes, which architectures). Both matter, for different reasons.
 
     Node COUNT decides whether a node-local default StorageClass can bite: `local-path`
@@ -603,28 +768,29 @@ def nodes_summary(context: str = CONTEXT) -> tuple[int, list[str]]:
     kind and k3s the node is this machine and on a managed cluster it need not be --
     `bitnamilegacy/mongodb`, which every Rocket.Chat below 8 pairs with, is amd64-only.
     """
-    res = run(["kubectl", "--context", context, "get", "nodes", "-o",
-               "jsonpath={range .items[*]}{.status.nodeInfo.architecture} {end}"],
-              own=is_ours(context))
-    if res.returncode != 0:
-        return 0, []
-    arches = (res.stdout or "").split()
-    return len(arches), sorted(set(arches))
+    # "0 nodes" was the answer for a cluster nobody could read, and it is a
+    # sentence doctor then printed next to a tick.
+    seen = ask_list("nodes", context=context)
+    if seen.refused:
+        return None
+    arches = [str((((it.get("status") or {}).get("nodeInfo") or {}).get("architecture")) or "")
+              for it in seen.items]
+    return len(seen.items), sorted({a for a in arches if a})
 
 
-def ingress_classes(context: str = CONTEXT) -> list[str]:
+def ingress_classes(context: str = CONTEXT) -> list[str] | None:
     """Ingress controllers installed in this cluster.
 
     kind ships none -- verified on this box, `get ingressclass` returns "No
     resources found" -- which is why rc-repro installs Traefik into its OWN
     cluster and refuses `--domain` against yours rather than installing into it.
     """
-    res = run(["kubectl", "--context", context, "get", "ingressclass", "-o", "name"],
-              own=is_ours(context))
-    if res.returncode != 0:
-        return []
-    return [ln.split("/", 1)[-1].strip()
-            for ln in (res.stdout or "").splitlines() if ln.strip()]
+    seen = ask_list("ingressclass", context=context)
+    if seen.refused:
+        return None
+    return [str(((it.get("metadata") or {}).get("name")) or "")
+            for it in seen.items
+            if ((it.get("metadata") or {}).get("name"))]
 
 
 def workspace_namespaces(context: str = CONTEXT) -> list[str]:
@@ -707,11 +873,26 @@ def preflight(context: str = "") -> Preflight:
     out.cluster_reachable = reachable(out.context)
     if not out.cluster_reachable:
         return out
-    out.storage_classes, out.default_storage_class = storage_classes(out.context)
-    out.ingress_classes = ingress_classes(out.context)
+    # EACH ANSWER READ, not assumed. `reachable()` probes /readyz, which a
+    # restricted credential can usually still get -- so passing it is not evidence
+    # that any of the reads below will be permitted.
+    sc = storage_classes(out.context)
+    if sc is None:
+        out.unreadable.append("storage")
+    else:
+        out.storage_classes, out.default_storage_class = sc
+    ic = ingress_classes(out.context)
+    if ic is None:
+        out.unreadable.append("ingress")
+    else:
+        out.ingress_classes = ic
     out.namespaces = workspace_namespaces(out.context)
     out.distribution = distribution(out.context)
-    out.node_count, out.architectures = nodes_summary(out.context)
+    ns_ = nodes_summary(out.context)
+    if ns_ is None:
+        out.unreadable.append("nodes")
+    else:
+        out.node_count, out.architectures = ns_
     out.metrics = metrics_available(out.context)
     out.loadbalancer = loadbalancer_address(out.context)
     return out
@@ -935,6 +1116,28 @@ def plan_cluster() -> ClusterPlan:
         + ("not pointed at one either" if not active else
            f"pointed at {active!r}, which is not answering")
         + ". Install kind, or point kubectl at a cluster you already have.")
+
+
+def ensure_kubeconfig(plan, emit: Emit = null_emit) -> str:
+    """The context to use, with rc-repro's OWN kubeconfig guaranteed to know it.
+
+    `ensure_cluster` was called only when a cluster had to be created -- and its own
+    docstring says the export must happen either way, naming this exact case: "a
+    different or fresh RC_REPRO_HOME". So the comment described the fix and the call
+    site defeated it. With a kind cluster already up and a fresh home, every command
+    failed with `context was not found for specified context: kind-rc-repro-local`
+    and could not self-heal, because the only thing that writes that context ran
+    later -- or, when the cluster existed, never.
+
+    CLAUDE.md tells anyone writing a script to `export RC_REPRO_HOME=$(mktemp -d)`,
+    so this was reachable by following our own instructions once a cluster existed.
+
+    For a cluster rc-repro did not create there is nothing to export: the user's own
+    kubeconfig already names it, and rewriting it is not ours to do.
+    """
+    if plan.create or plan.context == CONTEXT:
+        return ensure_cluster(emit=emit)
+    return plan.context
 
 
 def ensure_cluster(emit: Emit = null_emit) -> str:
@@ -1509,29 +1712,22 @@ def namespace_labels(ns: str, *, context: str) -> dict[str, str] | None:
     kube-context, an expired credential or an RBAC denial all produce the second
     while looking like the first.
     """
-    res = run(["kubectl", "--context", context, "get", "namespace", ns,
-               "-o", "jsonpath={.metadata.labels}"], own=is_ours(context))
-    if res.returncode == 0:
-        raw = (res.stdout or "").strip()
-        if not raw:
-            return {}
-        try:
-            return {str(k): str(v) for k, v in json.loads(raw).items()}
-        except (ValueError, AttributeError):
-            return {}
-    # THE SERVER'S REASON CODE, not a substring of English. `"not found" in text` was
-    # the first cut and it classified `Error in configuration: context was not found
-    # for specified context: no-such-context` as an absent namespace -- measured
-    # against a live cluster with a bogus --context, which is exactly the "I could not
-    # ask" case this function exists to separate out. Only the API says
-    # `Error from server (NotFound)`; a kubeconfig problem never does.
-    blame = why(res).lower().replace(" ", "")
-    if "fromserver(notfound)" in blame:
+    # NO LONGER MATCHED ON THE SERVER'S PROSE. This read `Error from server
+    # (NotFound)` out of stderr, which worked and was still the wrong shape: the
+    # comment it replaces records that the first attempt matched `"not found"` and
+    # classified `Error in configuration: context was not found for specified
+    # context: ...` as an absent namespace. Both versions depend on how kubectl
+    # words itself, which is not a contract -- the skill file tells callers never to
+    # branch on our prose for the same reason. `--ignore-not-found` makes the API
+    # server state absence in the PAYLOAD, so there is no wording to get wrong.
+    seen = ask_object("namespace", ns, context=context).require(
+        f"namespace {ns}", context=context)
+    if seen.absent:
         return None
-    raise DockerError(
-        f"could not ask cluster {context!r} about namespace {ns}: " + why(res)
-        + " — refusing to guess, because 'I cannot ask' and 'it is not there' are "
-          "different answers and only one of them is safe to act on")
+    labels = ((seen.doc or {}).get("metadata") or {}).get("labels") or {}
+    if not isinstance(labels, dict):
+        return {}
+    return {str(k): str(v) for k, v in labels.items()}
 
 
 def assert_namespace_available(name: str, *, context: str, owner: str = "") -> None:
@@ -1542,10 +1738,35 @@ def assert_namespace_available(name: str, *, context: str, owner: str = "") -> N
     labelling -- but by then a provisional record exists, and a refusal that created
     nothing should leave nothing behind. Observed: a refused create left an
     `incomplete` record that `prune` then offered to delete.
+
+    IT ALSO READS THE PHASE, because ownership was the only thing it looked at. A
+    namespace that is `Terminating` still carries its labels, so this passed, and the
+    create then died several steps later on `unable to create new content in namespace
+    X because it is being terminated` -- at exit 7, after emitting "namespace X" as a
+    completed step for a namespace it had not created, and leaving exactly the record
+    this preflight exists to prevent, holding a host port. The everyday trigger is
+    `down --volumes` followed by re-creating under the same ticket name.
+
+    Refused rather than waited out. Kubernetes finishes on its own and the wait is
+    usually seconds, but a finalizer can wedge indefinitely, and a preflight that
+    sometimes blocks for a minute is a worse contract than one that says retry.
     """
-    labels = namespace_labels(namespace_for(name), context=context)
-    if labels is not None:
-        _refuse_foreign_namespace(namespace_for(name), name, labels, owner)
+    seen = ask_object("namespace", namespace_for(name), context=context).require(
+        f"namespace {namespace_for(name)}", context=context)
+    if seen.absent:
+        return
+    meta = (seen.doc or {}).get("metadata") or {}
+    phase = ((seen.doc or {}).get("status") or {}).get("phase") or ""
+    if phase == "Terminating":
+        raise ConflictError(
+            f"namespace {namespace_for(name)} is still Terminating, so nothing can be "
+            f"created in it yet. Kubernetes will finish on its own -- `kubectl get ns "
+            f"{namespace_for(name)}` shows when -- then run this again. A workspace "
+            f"just torn down with `--volumes` takes a few seconds to go.")
+    labels = meta.get("labels") or {}
+    _refuse_foreign_namespace(namespace_for(name), name,
+                             {str(k): str(v) for k, v in labels.items()}
+                             if isinstance(labels, dict) else {}, owner)
 
 
 def ensure_namespace(name: str, *, context: str, owner: str = "",
@@ -1601,7 +1822,7 @@ def apply(manifest: str, *, namespace: str, context: str) -> None:
 
 
 def install(*, namespace: str, context: str, values: dict,
-            chart_version: str = "") -> None:
+            chart_version: str = "", emit: Emit = null_emit) -> None:
     """`helm install` with values on stdin, so nothing is written to disk.
 
     The release is `rocketchat` -- the official docs' own name -- so every command
@@ -1611,6 +1832,18 @@ def install(*, namespace: str, context: str, values: dict,
     # sequence, and plain `install` fails on a release that is already there --
     # which is every `up` over an existing workspace, and every retry after a
     # partial failure.
+    # A RELEASE LEFT PENDING BY A KILLED OPERATION BLOCKS EVERY LATER ATTEMPT, and
+    # helm's refusal says "another operation (install/upgrade/rollback) is in
+    # progress" -- which is not true and sends the reader looking for a process that
+    # does not exist. Freed here rather than reported, because the state is not
+    # something the person asking for a workspace did or can be expected to fix, and
+    # `up` retrying identically was the only thing rc-repro offered.
+    try:
+        clear_pending_release(RELEASE, namespace, context, emit=emit)
+    except DockerError:
+        # Could not even list the releases. Let the install below fail on its own
+        # terms; its message is about the thing actually being attempted.
+        pass
     argv = ["helm", "upgrade", "--install", RELEASE, CHART,
             "--kube-context", context, "-n", namespace, "--values", "-"]
     if chart_version:
@@ -1626,6 +1859,50 @@ def install(*, namespace: str, context: str, values: dict,
                                 + why(res))
 
 
+def helm_rollback_on_failure() -> list[str]:
+    """The flag that makes a failed install undo itself, named for the helm installed.
+
+    **`--atomic` DOES NOT EXIST IN HELM 4** -- it is `--rollback-on-failure`, checked
+    against the 4.2.3 on this box. So the usual advice for a wedged release ("just
+    add --atomic") would itself fail here, and a flag helm does not recognise turns a
+    working install into a broken one. `CORE_TOOLS` admits helm 3, which has
+    `--atomic` and not the new name, so the flag is chosen rather than written down.
+
+    Empty for a helm too old to be sure about: no flag is the behaviour we already
+    had, and guessing wrong costs the install itself.
+    """
+    found = tool("helm")
+    if not found.present or not found.version:
+        return []
+    return ["--rollback-on-failure"] if found.version >= (4, 0) else ["--atomic"]
+
+
+def release_values(release: str, namespace: str, context: str) -> dict:
+    """The values a release was installed with -- its `values.yaml`, from helm itself.
+
+    `helm get values` returns exactly the user-supplied values, which is what a values
+    file IS: the chart's computed defaults are its own business and come back only
+    with `--all`. So this is the guide's "your values.yaml", read from the live
+    release rather than rebuilt from our own records -- it cannot drift from what is
+    actually deployed, and it needs no assumption that the copy `record_rendered`
+    wrote is still current.
+    """
+    res = run(["helm", "get", "values", release, "--kube-context", context,
+               "-n", namespace, "-o", "json"],
+              timeout=APPLY_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        raise DockerError(
+            f"could not read the values of release {release!r} in {namespace}: "
+            + why(res))
+    try:
+        doc = json.loads(res.stdout or "null")
+    except (ValueError, TypeError):
+        doc = None
+    # `helm get values` answers `null` for a release installed with no values of its
+    # own. That is an empty values file, not a failure.
+    return doc if isinstance(doc, dict) else {}
+
+
 def upgrade_image(*, namespace: str, context: str, chart_version: str,
                   image_repo: str, tag: str, oplog: bool) -> None:
     """Move a release to a new Rocket.Chat image, the way the official guide does.
@@ -1638,23 +1915,55 @@ def upgrade_image(*, namespace: str, context: str, chart_version: str,
     which for a tool whose entire purpose is reproducing a customer's exact version
     would quietly deploy different software than the one asked for.
 
-    Second, `--reuse-values` rather than a re-rendered values file: everything else
-    about the workspace -- the admin env, microservices, replica count, whether
-    MongoDB comes from a Secret or a URL, a preset's settings -- was decided at
-    create time, and rebuilding that set from scratch risks silently dropping a
-    piece of it. The one value that must NOT be carried over is the oplog URL:
-    Rocket.Chat 8 dropped oplog tailing and chart 7.0.0 removed the key, so it is
-    explicitly cleared when the target no longer wants it.
+    Second, the release's own values are carried over rather than a values file being
+    re-rendered: everything else about the workspace -- the admin env, microservices,
+    replica count, whether MongoDB comes from a Secret or a URL, a preset's settings
+    -- was decided at create time, and rebuilding that set from scratch risks
+    silently dropping a piece of it. The one value that must NOT be carried over is
+    the oplog URL: Rocket.Chat 8 dropped oplog tailing and chart 7.0.0 removed the
+    key, so it is explicitly cleared when the target no longer wants it.
+
+    THIS IS THE GUIDE'S PROCEDURE LITERALLY: read the release's values file, change
+    the image tag in it, `helm upgrade` with it. It was `--reuse-values`, which is the
+    one thing the guide does not do, and two separate failures came of that.
+
+    First, `--reuse-values` never applies the NEW chart's defaults -- helm's own
+    words: "reuse the last release's values and merge in any overrides". A chart that
+    ADDS a templated value then renders against a map with no such key. RC 7.4.0 ->
+    7.10.15 crosses chart 6.23.2 -> 6.26.0, which added `podMonitor`, and it died on
+    `nil pointer evaluating interface {}.enabled`.
+
+    Second, and worse, it carries values that were only ever correct for the chart
+    they were computed against. `container_security_context` exists because chart
+    6.26.0 renders a pod-level `fsGroup` onto a CONTAINER and needs it deleted, while
+    7.0.0 fixed that upstream and BREAKS if handed the deletion -- the same undeclared
+    field from the other direction, as that docstring records. Carrying `fsGroup:
+    null` across that upgrade reintroduces the bug it was written to fix.
+
+    Note that this defeats `--reset-then-reuse-values` as well: that flag still
+    re-applies the last release's values on top of the new defaults, so the stale
+    per-chart workaround still arrives. Only recomputing it against the TARGET chart
+    is correct, and supplying a whole values file is what makes that possible. So no
+    reuse flag is passed here at all -- the file is complete, which is the guide's
+    whole model.
     """
-    argv = ["helm", "upgrade", RELEASE, CHART, "--kube-context", context,
-            "-n", namespace, "--version", chart_version, "--reuse-values",
-            "--set", f"image.repository={image_repo}",
-            "--set", f"image.tag={tag}"]
+    values = release_values(RELEASE, namespace, context)
+    # RECOMPUTED FOR THE TARGET CHART, never carried -- see the second paragraph.
+    values.pop("containerSecurityContext", None)
+    values.update(container_security_context(chart_version))
+    image = values.get("image")
+    values["image"] = {**(image if isinstance(image, dict) else {}),
+                       "repository": image_repo, "tag": tag}
     if not oplog:
-        argv += ["--set", "externalMongodbOplogUrl=null"]
+        # Rocket.Chat 8 dropped oplog tailing and chart 7.0.0 removed the key. With a
+        # whole values file supplied, DELETING the key is how you say "not this any
+        # more"; `--set ...=null` was the way to say it through a flag.
+        values.pop("externalMongodbOplogUrl", None)
+    argv = ["helm", "upgrade", RELEASE, CHART, "--kube-context", context,
+            "-n", namespace, "--version", chart_version, "--values", "-"]
     try:
-        res = subprocess.run(argv, capture_output=True, text=True,
-                             timeout=INSTALL_TIMEOUT, check=False,
+        res = subprocess.run(argv, input=json.dumps(values), capture_output=True,
+                             text=True, timeout=INSTALL_TIMEOUT, check=False,
                              env=helm_env(context))
     except (OSError, subprocess.SubprocessError) as exc:
         raise DockerError(f"helm upgrade failed: {exc}") from exc
@@ -1748,19 +2057,42 @@ def delete_namespace(name: str, *, context: str, volumes: bool = False,
         if res.returncode != 0:
             raise DockerError(f"could not delete namespace {ns}: "
                               + why(res))
+        # `check.returncode != 0` USED TO MEAN "GONE" HERE. It does not: kubectl
+        # exits 1 for an absent namespace AND for a context that does not exist, so
+        # one transient API error, one expired credential or one wrong context made
+        # `down --volumes` announce a deletion that had not happened and drop the
+        # local record -- leaving a namespace nobody could reach through rc-repro
+        # again. `ask_object` reads absence from the payload instead, which is the
+        # only place it can honestly come from.
+        seen = None
         for attempt in range(NS_GONE_TRIES):
-            check = run(["kubectl", "--context", context, "get", "namespace", ns,
-                         "-o", "jsonpath={.status.phase}"], own=own)
-            phase = (check.stdout or "").strip()
-            if check.returncode != 0 or not phase:
+            seen = ask_object("namespace", ns, context=context)
+            if seen.absent:
                 info(emit, f"namespace {ns} and its volume(s) are gone",
                      phase="teardown", pct=100)
                 return True
-            if attempt % 4 == 0:
-                info(emit, f"namespace {ns} is {phase} — waiting for the pods and "
-                           "volume(s) to go", phase="teardown",
+            if seen.present:
+                phase = ((seen.doc or {}).get("status") or {}).get("phase") or "Terminating"
+                if attempt % 4 == 0:
+                    info(emit, f"namespace {ns} is {phase} — waiting for the pods and "
+                               "volume(s) to go", phase="teardown",
+                         pct=min(90, 20 + attempt * 5))
+            elif attempt % 4 == 0:
+                # Kept polling rather than failing at the first refusal, because a
+                # single unlucky probe is not evidence of anything either.
+                info(emit, f"cannot reach cluster {context!r} to confirm {ns} is "
+                           f"gone — still trying", phase="teardown",
                      pct=min(90, 20 + attempt * 5))
             sleep(NS_GONE_INTERVAL)
+        if seen is not None and seen.refused:
+            # A DIFFERENT SENTENCE, because it is a different problem with a
+            # different fix. "Still terminating" says wait; this says the cluster
+            # could not be asked at all, and waiting will not change that.
+            warn(emit, f"could not confirm that namespace {ns} is gone: "
+                       f"{seen.why()} — the local record is KEPT. Check the cluster "
+                       f"({context!r}), then `rc-repro down --name {name} --volumes` "
+                       f"again.", phase="teardown")
+            return False
         # FALSE, because it is not gone. This returned True, and the caller reads
         # True as "confirmed absent" -- so it deleted the local record and tore down
         # the shared operator and monitoring stack while the namespace was still
@@ -1952,6 +2284,15 @@ def port_forward(name: str, *, namespace: str, context: str, host_port: int,
                                 env=owned_env() if is_ours(context) else None)
     except (OSError, subprocess.SubprocessError):
         return 0
+    # CONFIRMED, not assumed: `return proc.pid` recorded a pid for a kubectl that had
+    # already exited because the port was taken. See `forward_bound`.
+    if not forward_bound(proc, host_port, sleep=sleep):
+        warn(emit, f"the port-forward for {name!r} did not come up on port "
+                   f"{host_port}, so nothing is published there. Something else "
+                   f"probably holds that port — `ss -ltnp | grep {host_port}` says "
+                   f"what, and `rc-repro down --name {name}` then `rc-repro up` "
+                   f"picks a free one.", phase="wait")
+        return 0
     return proc.pid
 
 
@@ -2024,11 +2365,13 @@ def scenario_ui_forwards(name: str, *, namespace: str, context: str,
         # same lesson as `svc/` needing ready endpoints -- learned here for the
         # third time, on the third kind of forward.
         for _ in range(ENDPOINT_WAIT_TRIES):
-            ep = run(["kubectl", "--context", context, "-n", namespace, "get",
-                      "endpoints", svc, "-o",
-                      "jsonpath={.subsets[0].addresses[0].ip}"],
-                     own=is_ours(context))
-            if (ep.stdout or "").strip():
+            # EndpointSlice, not the deprecated `endpoints`: kubectl warns on every
+            # call to the old one ("v1 Endpoints is deprecated in v1.33+") and this is
+            # a WAIT LOOP, so the day it stops being served this would spin to its
+            # timeout rather than fail visibly. `discovery.k8s.io/v1` is GA from 1.21,
+            # this module's kubectl floor.
+            counts = service_ready_addresses(namespace, context=context)
+            if counts and counts.get(svc, 0) > 0:
                 break
             sleep(ENDPOINT_WAIT_INTERVAL)
         else:
@@ -2054,8 +2397,10 @@ def scenario_ui_forwards(name: str, *, namespace: str, context: str,
         except (OSError, subprocess.SubprocessError):
             continue
         # Confirmed, not assumed -- the same rule the workspace URL and Grafana both
-        # had to learn: port-forward returns a pid before it binds the socket.
-        if forward_reachable(host_p, tries=20):
+        # had to learn: port-forward returns a pid before it binds the socket. And
+        # `forward_bound` rather than `forward_reachable`, because the port answering
+        # is not evidence that OUR kubectl is the thing answering.
+        if forward_bound(proc, host_p):
             forwards[host_p] = proc.pid
             info(emit, f"{svc} published at http://localhost:{host_p}", phase="boot")
         else:
@@ -2121,7 +2466,7 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
     # cluster and no kind" has already happened by here. Provisioning is the ONE step
     # that differs between a kind box and a k3s box; everything below is the same code.
     plan = plan or plan_cluster()
-    context = ensure_cluster(emit=emit) if plan.create else plan.context
+    context = ensure_kubeconfig(plan, emit=emit)
     if not plan.create:
         info(emit, f"using your {plan.distribution} cluster {context!r} — rc-repro "
                    "creates a namespace in it and never removes the cluster",
@@ -2203,9 +2548,24 @@ def create_workspace(*, name: str, resolved, host_port: int, microservices: bool
             mongo_url = operator_mongo_url(namespace, app_password)
             oplog_url = operator_mongo_url(namespace, app_password, oplog=True)
         else:
+            # THE STATED REASON WAS WRONG FOR EVERY VERSION THIS TOOL ACTUALLY RUNS.
+            # This branch is reached for two unrelated causes -- the operator was not
+            # asked for (it is opt-in), or it was and cannot manage that MongoDB --
+            # and it always blamed the second. `OPERATOR_MIN_MONGO` is 6.0 and every
+            # supported Rocket.Chat resolves to 6.0, 7.0, 8.0 or 8.2, so "no operator
+            # below 6.0" was never the real reason on any workspace anyone booted.
+            # Someone who wanted authentication was sent to raise a MongoDB version
+            # that was not the obstacle, while the workspace notes printed moments
+            # later said the true thing -- so the two outputs contradicted each other.
+            floor = ".".join(str(n) for n in OPERATOR_MIN_MONGO)
+            why_no_auth = (
+                "the MongoDB operator is opt-in — add `--mongo-operator` for a "
+                "database with SCRAM authentication"
+                if not (use_operator or operator_enabled()) else
+                f"the operator cannot manage MongoDB below {floor}, so this falls "
+                f"back to a plain StatefulSet")
             info(emit, f"MongoDB {resolved.mongo_tag}, {MONGO_VOLUME_GB}Gi volume "
-                       "(no operator below "
-                       f"{'.'.join(str(n) for n in OPERATOR_MIN_MONGO)}, so no auth)",
+                       f"(no authentication: {why_no_auth})",
                  phase="provision", pct=20)
             apply(mongo_manifest(name, resolved.mongo_tag, owner=owner),
                   namespace=namespace, context=context)
@@ -2304,6 +2664,88 @@ READY_SELECTOR = ("app.kubernetes.io/name in "
                   "(rocketchat,rocketchat-ddp-streamer)")
 
 
+def service_ready_addresses(namespace: str, *, context: str) -> dict[str, int] | None:
+    """Ready endpoint count per Service in a namespace. `None` if it could not be read.
+
+    **EndpointSlice, not Endpoints.** kubectl says it plainly on every call to the old
+    one -- "v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1
+    EndpointSlice" -- and `discovery.k8s.io/v1` has been GA since Kubernetes 1.21,
+    which is this module's declared kubectl floor. So there is no version this tool
+    supports where the new API is unavailable.
+
+    A Service with pods behind it but no READY endpoints is the case worth having
+    this for: readiness reads pod status and the port-forward targets the Deployment,
+    so nothing on either path ever traverses the Service. A selector that matches
+    nothing therefore looked exactly like a healthy workspace -- and the Kubernetes
+    default deployment is microservices, where in-cluster Service traffic is what
+    carries the product.
+    """
+    seen = ask_list("endpointslices", context=context, namespace=namespace)
+    if seen.refused:
+        return None
+    out: dict[str, int] = {}
+    for slice_ in seen.items:
+        svc = ((slice_.get("metadata") or {}).get("labels")
+               or {}).get("kubernetes.io/service-name")
+        if not svc:
+            continue
+        ready = sum(1 for e in (slice_.get("endpoints") or [])
+                    if ((e.get("conditions") or {}).get("ready")))
+        out[str(svc)] = out.get(str(svc), 0) + ready
+    return out
+
+
+def services_without_endpoints(name: str, *, context: str) -> list[str]:
+    """Rocket.Chat Services in this workspace that no ready pod is behind.
+
+    REPORTED, NOT GATED, and that is deliberate. Endpoints churn during a rollout, so
+    a transient empty set is normal; making readiness depend on this would turn an
+    ordinary restart into a workspace that never comes ready. And a false negative
+    here -- a Service this cannot see, a chart that renames one -- would block every
+    boot, which is a far worse failure than the one being detected.
+
+    Empty list on any doubt: a namespace whose slices could not be read, or one with
+    no Services at all, says nothing.
+    """
+    namespace = namespace_for(name)
+    counts = service_ready_addresses(namespace, context=context)
+    if counts is None:
+        return []
+    svcs = ask_list("svc", context=context, namespace=namespace)
+    if svcs.refused:
+        return []
+    bad = []
+    for svc in svcs.items:
+        meta = svc.get("metadata") or {}
+        svc_name = str(meta.get("name") or "")
+        spec = svc.get("spec") or {}
+        # A Service with no selector is wired by hand (or is a headless alias) and has
+        # no pods to be missing. ExternalName has no endpoints by definition.
+        if not svc_name or not (spec.get("selector") or {}):
+            continue
+        if str(spec.get("type") or "") == "ExternalName":
+            continue
+        # THE SELECTOR, NOT THE LABELS, and this was wrong first time round: the
+        # first version filtered on the Service's own
+        # `app.kubernetes.io/instance` LABEL, and the chart does not set it on most
+        # of them -- `rocketchat-ddp-streamer` carries only
+        # `app.kubernetes.io/managed-by: Helm`. So the filter excluded every Service
+        # it was meant to judge and the whole check was a silent no-op: it returned
+        # [] for a workspace whose ddp-streamer Service had been deliberately broken.
+        # Caught by breaking one on a live cluster, which is the only way it could
+        # have been caught -- a stub would have answered whatever the test put in it.
+        #
+        # The SELECTOR carries the instance on every one of them, verified against a
+        # real microservices workspace, and it excludes our hand-rolled `mongodb`
+        # (selector `{"app": "mongodb"}`) without naming it.
+        if (spec.get("selector") or {}).get(
+                "app.kubernetes.io/instance") != RELEASE:
+            continue
+        if counts.get(svc_name, 0) == 0:
+            bad.append(svc_name)
+    return sorted(bad)
+
+
 def workspace_ready(name: str, *, context: str) -> bool:
     """Whether every probed Rocket.Chat workload reports itself Ready.
 
@@ -2367,6 +2809,19 @@ def forward_alive(pid: int | None, *, namespace: str = "",
     except (OSError, ValueError, TypeError):
         return False
     argv = [t for t in raw.decode("utf-8", "replace").split("\0") if t]
+    # AN ARGV OF ONE IS NOT AN ARGV THAT DISAGREES. On a host where `kubectl` is a
+    # symlink to `k3s` -- which is every k3s host, and this is how k3s ships kubectl --
+    # the multi-call binary rewrites its own command line when it dispatches, so
+    # /proc/<pid>/cmdline reads `kubectl` and then nothing. Measured: `ss -ltnp` showed
+    # that very pid holding both :3000 sockets while this returned False.
+    #
+    # Reading that as "the forward is gone" made `ensure_port_forward` respawn onto a
+    # port its own live forward already held, on every call, and told the reader the
+    # URL was not published while it answered 200. So a command line that carries no
+    # arguments to check is "I cannot identify it this way", not a mismatch -- the
+    # distinction this module is otherwise built on.
+    if len(argv) <= 1:
+        return _forward_alive_without_argv(pid, host_port=host_port)
     if "port-forward" not in argv:
         return False
     if namespace and namespace not in argv:
@@ -2375,6 +2830,27 @@ def forward_alive(pid: int | None, *, namespace: str = "",
             t.startswith(f"{host_port}:") for t in argv):
         return False
     return True
+
+
+def _forward_alive_without_argv(pid: int, *, host_port: int | None) -> bool:
+    """Fallback identity when the process hid its own arguments.
+
+    Three facts together, and none of them alone would do: the pid came from OUR
+    record, the process is still a `kubectl`, and the port it was started for is
+    actually held. Pid recycling is what the argv check exists to defeat, and a
+    recycled pid that is also a kubectl that is also listening on exactly the port we
+    recorded is a coincidence worth accepting -- the alternative is calling every
+    healthy forward on every k3s host dead.
+    """
+    try:
+        comm = Path(f"/proc/{int(pid)}/comm").read_text(encoding="utf-8").strip()
+    except (OSError, ValueError, TypeError):
+        return False
+    if comm not in ("kubectl", "k3s"):
+        return False
+    if host_port is None:
+        return True
+    return forward_reachable(int(host_port), tries=1, interval=0.0)
 
 
 def ensure_port_forward(name: str, *, namespace: str, context: str, host_port: int,
@@ -3115,7 +3591,7 @@ def ensure_operator(*, context: str, emit: Emit = null_emit) -> None:
     res = run(["helm", "upgrade", "--install", OPERATOR_RELEASE, OPERATOR_CHART,
                "--kube-context", context, "-n", OPERATOR_NAMESPACE,
                "--create-namespace", "--set", "operator.watchNamespace=*",
-               "--wait", "--timeout", "5m"],
+               "--wait", "--timeout", "5m", *helm_rollback_on_failure()],
               timeout=INSTALL_TIMEOUT, env=helm_env(context))
     if res.returncode != 0:
         raise CreateFailedError("could not install the MongoDB operator: " + why(res))
@@ -3137,12 +3613,99 @@ def mongodb_resources(context: str) -> list[str]:
     return sorted({ns for ns in (res.stdout or "").split() if ns})
 
 
+#: Helm release statuses that mean "an operation died part-way and the release is
+#: LOCKED". Helm refuses the next install/upgrade with "another operation
+#: (install/upgrade/rollback) is in progress" -- a sentence whose central claim is
+#: false, because nothing is in progress; the process that was doing it is gone.
+PENDING_STATES = ("pending-install", "pending-upgrade", "pending-rollback")
+
+
+def release_state(release: str, namespace: str, context: str) -> tuple[str, int]:
+    """A release's STATUS and revision: `("", 0)` when there is no such release.
+
+    `helm list -q` was the whole answer here, and from helm's own `--help`: "By
+    default, it lists all releases in any status." So a release wedged in
+    `pending-install` was reported present exactly as a healthy one was, `up` went on
+    to `helm upgrade --install`, and helm refused it -- for every subsequent attempt,
+    including `--force`, with no path out that rc-repro knew about.
+
+    A release has a STATE, not a presence. Same correction as the kubectl reads in
+    this module: an external tool's several answers must not be collapsed into two.
+    """
+    res = run(["helm", "list", "--kube-context", context, "-n", namespace,
+               "-o", "json"], timeout=APPLY_TIMEOUT, own=is_ours(context))
+    if res.returncode != 0:
+        # Not "absent". The caller decides what to do about not knowing; guessing
+        # "there is nothing there" here is what would delete a record for a release
+        # that exists.
+        raise DockerError(
+            f"could not list helm releases in {namespace} on {context!r}: "
+            + why(res))
+    try:
+        items = json.loads(res.stdout or "[]") or []
+    except (ValueError, TypeError):
+        return "", 0
+    for item in items if isinstance(items, list) else []:
+        if (item or {}).get("name") == release:
+            try:
+                rev = int((item or {}).get("revision") or 0)
+            except (TypeError, ValueError):
+                rev = 0
+            return str((item or {}).get("status") or ""), rev
+    return "", 0
+
+
 def release_installed(release: str, namespace: str, context: str) -> bool:
     """Whether a helm release is in this cluster. Used before uninstalling one, so
-    "there was nothing there" is reported as nothing rather than as a failure."""
-    res = run(["helm", "list", "--kube-context", context, "-n", namespace, "-q"],
-              timeout=APPLY_TIMEOUT, own=is_ours(context))
-    return release in (res.stdout or "").split()
+    "there was nothing there" is reported as nothing rather than as a failure.
+
+    Presence really is the question at those call sites -- a wedged release still
+    needs uninstalling -- so this stays a bool and reads it from `release_state`.
+    """
+    try:
+        return bool(release_state(release, namespace, context)[0])
+    except DockerError:
+        # These callers ask before an uninstall. Not knowing is not "absent", and the
+        # uninstall itself reports its own failure honestly, so let it try.
+        return True
+
+
+def clear_pending_release(release: str, namespace: str, context: str, *,
+                          emit: Emit = null_emit) -> str:
+    """Free a release stuck in a pending state. Returns what was done, or "".
+
+    The remedy DEPENDS ON WHETHER THERE IS ANYTHING TO GO BACK TO, and getting that
+    wrong is why "just run helm rollback" is not the whole answer: a
+    `pending-install` at revision 1 never had a successful revision, so a rollback
+    has no target and fails. That one is uninstalled instead -- nothing it created
+    was ever serving.
+    """
+    state, revision = release_state(release, namespace, context)
+    if state not in PENDING_STATES:
+        return ""
+    own = is_ours(context)
+    if revision <= 1:
+        warn(emit, f"the {release!r} release is stuck in {state} at revision "
+                   f"{revision} — it never completed once, so it is being removed "
+                   f"rather than rolled back", phase="provision")
+        res = run(["helm", "uninstall", release, "--kube-context", context,
+                   "-n", namespace], timeout=APPLY_TIMEOUT, own=own)
+        action = "uninstalled"
+    else:
+        warn(emit, f"the {release!r} release is stuck in {state} — rolling it back "
+                   f"to revision {revision - 1} before continuing", phase="provision")
+        res = run(["helm", "rollback", release, str(revision - 1),
+                   "--kube-context", context, "-n", namespace],
+                  timeout=INSTALL_TIMEOUT, own=own)
+        action = f"rolled back to revision {revision - 1}"
+    if res.returncode != 0:
+        raise CreateFailedError(
+            f"the {release!r} release in {namespace} is stuck in {state} and could "
+            f"not be freed: {why(res)}. Nothing is actually in progress — the "
+            f"operation that was holding it has gone. Free it by hand with "
+            f"`helm uninstall {release} -n {namespace}` and try again")
+    info(emit, f"{release!r} {action}", phase="provision")
+    return action
 
 
 def operator_installed(context: str) -> bool:
@@ -3342,7 +3905,7 @@ def ensure_monitoring(*, context: str, emit: Emit = null_emit) -> None:
                         "serviceMonitorSelectorNilUsesHelmValues=false",
                "--set", "operator.prometheus.prometheusSpec."
                         "podMonitorSelectorNilUsesHelmValues=false",
-               "--timeout", "9m"],
+               "--timeout", "9m", *helm_rollback_on_failure()],
               timeout=INSTALL_TIMEOUT, env=helm_env(context))
     if res.returncode != 0:
         raise CreateFailedError("could not install the monitoring stack: " + why(res))
@@ -3523,12 +4086,17 @@ def set_monitoring_label(namespace: str, *, context: str, wanted: bool) -> None:
 
 def forward_reachable(host_port: int, *, tries: int = 20, interval: float = 0.5,
                       sleep=time.sleep) -> bool:
-    """Whether something is actually listening on the host port yet.
+    """Whether SOMETHING is listening on the host port yet. Occupancy, not identity.
 
     `kubectl port-forward` returns a pid long before it has bound the socket, so a
     URL printed straight after spawning it is a guess. The workspace path learned
     this the hard way; the Grafana path repeated it and the matrix caught it --
     `monitor` reported attached and exit 0, and a curl a moment later got nothing.
+
+    **It cannot tell you WHOSE socket it is.** A foreign process holding the port
+    answers this exactly as our own forward does, so nothing may conclude "the
+    workspace is serving" from this alone -- `forward_bound` answers the process
+    question and `rcapi.api_info` the "is it actually Rocket.Chat" one.
     """
     import socket
 
@@ -3539,6 +4107,36 @@ def forward_reachable(host_port: int, *, tries: int = 20, interval: float = 0.5,
                 return True
         sleep(interval)
     return False
+
+
+def forward_bound(proc: subprocess.Popen, host_port: int, *, tries: int = 20,
+                  interval: float = 0.5, sleep=time.sleep) -> bool:
+    """Whether THIS child actually got the socket. Waits for one answer or the other.
+
+    `kubectl port-forward` cannot share a port: if something already holds it, kubectl
+    prints `Unable to listen on port N: bind: address already in use` and exits within
+    milliseconds. Returning `proc.pid` regardless recorded a pid that was already
+    dead -- and because `forward_reachable` only asks whether the port ANSWERS, and
+    the squatter answers, `ready` then certified the workspace's URL while a different
+    program served it. Every conclusion drawn from that URL was about the wrong
+    software, which is the worst thing this module can do.
+
+    The child exiting is a definite no; the socket answering while the child lives is
+    a yes; neither yet means keep waiting.
+
+    stderr stays on DEVNULL rather than a pipe. This process is detached and outlives
+    the command, so nothing would be reading that pipe -- kubectl writes a line per
+    dropped connection and would eventually fill the buffer and block the forward
+    itself. `proc.poll()` answers the only question needed here.
+    """
+    for _ in range(tries):
+        if proc.poll() is not None:
+            return False
+        if forward_reachable(host_port, tries=1, interval=0.0, sleep=sleep):
+            return True
+        sleep(interval)
+    return proc.poll() is None and forward_reachable(
+        host_port, tries=1, interval=0.0, sleep=sleep)
 
 
 def grafana_forward(*, context: str, host_port: int, bind_host: str = "") -> int:
@@ -3557,6 +4155,10 @@ def grafana_forward(*, context: str, host_port: int, bind_host: str = "") -> int
                                 stderr=subprocess.DEVNULL, start_new_session=True,
                                 env=owned_env() if is_ours(context) else None)
     except (OSError, subprocess.SubprocessError):
+        return 0
+    # Same rule as the workspace forward. This path has form: it is where "reported
+    # attached and exit 0, and a curl a moment later got nothing" was measured.
+    if not forward_bound(proc, host_port):
         return 0
     return proc.pid
 
@@ -3840,17 +4442,30 @@ def wait_namespace_gone(ns: str, *, context: str, emit: Emit = null_emit,
     Same bound as `delete_namespace`'s own loop, and the same reasoning: a namespace
     that has not gone has not gone, and saying otherwise is what left an orphan once.
     """
-    own = is_ours(context)
+    # SAME CORRECTION AS `delete_namespace`, and it mattered more here: on a cluster
+    # rc-repro did not create, the caller passed a context that does not exist in the
+    # kubeconfig, kubectl exited non-zero, and this returned True -- so `prune
+    # --orphans` printed "removed 1 orphaned namespace(s)" with exit 0 over a
+    # namespace still Terminating, which is the exact regression this function's
+    # docstring says it was written to prevent.
+    seen = None
     for attempt in range(NS_GONE_TRIES):
-        check = run(["kubectl", "--context", context, "get", "namespace", ns,
-                     "-o", "jsonpath={.status.phase}"], own=own)
-        phase = (check.stdout or "").strip()
-        if check.returncode != 0 or not phase:
+        seen = ask_object("namespace", ns, context=context)
+        if seen.absent:
             return True
-        if attempt % 4 == 0:
-            info(emit, f"namespace {ns} is {phase} — waiting for it to go before "
-                       f"the cluster can be reclaimed", phase="done")
+        if seen.present:
+            phase = ((seen.doc or {}).get("status") or {}).get("phase") or "Terminating"
+            if attempt % 4 == 0:
+                info(emit, f"namespace {ns} is {phase} — waiting for it to go before "
+                           f"the cluster can be reclaimed", phase="done")
+        elif attempt % 4 == 0:
+            info(emit, f"cannot reach cluster {context!r} to confirm {ns} is gone — "
+                       f"still trying", phase="done")
         sleep(NS_GONE_INTERVAL)
+    if seen is not None and seen.refused:
+        warn(emit, f"could not confirm that namespace {ns} is gone: {seen.why()} — "
+                   f"the cluster is left alone.", phase="done")
+        return False
     warn(emit, f"namespace {ns} is still terminating; the cluster is left alone. "
                f"`rc-repro prune` again once `kubectl get ns` is clear.", phase="done")
     return False

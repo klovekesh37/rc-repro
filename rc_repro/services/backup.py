@@ -32,6 +32,7 @@ import os
 import shutil
 import tarfile
 import tempfile
+import zlib
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -530,6 +531,24 @@ def read_manifest(bundle: str | Path) -> dict:
             if fh is None:
                 raise ValidationError(f"{path} has no {MANIFEST}; is it an rc-repro backup?")
             data = json.loads(fh.read().decode("utf-8"))
+    except (EOFError, zlib.error) as exc:
+        # A TRUNCATED BUNDLE LEFT THE ERROR CONTRACT ENTIRELY. gzip raises a bare
+        # `EOFError` -- "Compressed file ended before the end-of-stream marker was
+        # reached" -- and it is not a `tarfile.TarError`, not an `OSError` and not a
+        # `ValueError`, so none of the clauses here caught it. The CLI's
+        # `except ReproError` missed it too and Typer printed `Aborted.` with exit 1,
+        # which is what a cancelled confirmation prompt prints: the one failure that
+        # looks like the user's own doing. Measured against real bundles: a file cut
+        # to 50% and one cut to its gzip header escape, while random bytes, an empty
+        # file and a mid-stream corruption were all reported properly -- so this is a
+        # narrow gap, not a broken function.
+        #
+        # `zlib.error` is here because it is a sibling of the same kind -- neither
+        # OSError nor ValueError, so nothing else would catch it. I could not produce
+        # one through this path; it costs a clause rather than a guess.
+        raise ValidationError(
+            f"{path} ends part-way through: it is truncated, or still being written. "
+            f"({exc})") from exc
     except tarfile.TarError as exc:
         raise ValidationError(f"{path} is not a readable backup bundle: {exc}") from exc
     except OSError as exc:
@@ -792,15 +811,30 @@ def _restore_locked(target: str, path: Path, manifest: dict, emit: Emit, *,
     with tempfile.TemporaryDirectory(prefix="rcrepro-restore-") as tmp:
         staging = Path(tmp)
         info(emit, "unpacking the bundle", phase="restore", pct=20)
-        with tarfile.open(path, "r:gz") as tar:
-            members = _safe_members(tar)
-            try:
-                # Defence in depth on top of _safe_members, and the default from
-                # Python 3.14 -- asking for it now keeps the behaviour identical
-                # across versions instead of changing under us at an upgrade.
-                tar.extractall(staging, members=members, filter="data")
-            except TypeError:   # pragma: no cover - Python < 3.11.4 has no `filter`
-                tar.extractall(staging, members=members)
+        # GUARDED, where it was not. `read_manifest` runs before this and catches most
+        # unreadable bundles -- but a file truncated AFTER the manifest member passes
+        # that check and fails here, and an unwrapped `EOFError` from gzip leaves the
+        # error contract: no `ReproError`, so the CLI prints `Aborted.` at exit 1 and
+        # the web layer answers a bare 500. Nothing is lost either way, because this
+        # is still the staging step and no database has been touched yet.
+        try:
+            with tarfile.open(path, "r:gz") as tar:
+                members = _safe_members(tar)
+                try:
+                    # Defence in depth on top of _safe_members, and the default from
+                    # Python 3.14 -- asking for it now keeps the behaviour identical
+                    # across versions instead of changing under us at an upgrade.
+                    tar.extractall(staging, members=members, filter="data")
+                except TypeError:   # pragma: no cover - Python < 3.11.4 has no `filter`
+                    tar.extractall(staging, members=members)
+        except (EOFError, zlib.error) as exc:
+            raise ValidationError(
+                f"{path} ends part-way through: it is truncated, or still being "
+                f"written. Nothing has been restored. ({exc})") from exc
+        except tarfile.TarError as exc:
+            raise ValidationError(
+                f"{path} could not be unpacked: {exc}. Nothing has been "
+                f"restored.") from exc
         archive = staging / ARCHIVE
         if not archive.exists():
             raise ValidationError(f"{path} has no {ARCHIVE}; is it an rc-repro backup?")

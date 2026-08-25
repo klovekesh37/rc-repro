@@ -2024,6 +2024,33 @@ def kubernetes_note_groups(meta: runner.Metadata) -> list[dict]:
     # screen, and the browser had to de-duplicate it against the link row to avoid
     # showing it twice. What is NOT said anywhere else is what a non-loopback bind
     # means, and that is the only case this group appears in at all.
+    # THE URL IS ONLY PUBLISHED WHILE THE FORWARD LIVES, and nothing said so once it
+    # had stopped. A port-forward dies with its pod, so this is ordinary rather than
+    # exceptional -- a `restart`, a rescheduled pod, a reboot -- and `list` then showed
+    # `running` beside a URL that refused connections. "running" is not wrong about the
+    # pods, which is exactly why the reader has nothing to go on: the state is right,
+    # the URL is dead, and the repair was documented nowhere.
+    #
+    # Derived on every read rather than recorded, like every other group here, so it
+    # disappears the moment the forward is back. Worded to cover a stopped workspace
+    # too, because `_summary` is a read that does not know the state and a note that is
+    # only right for one of the two would be worse than one that names both verbs.
+    # ONLY WHERE A PID WAS RECORDED. `forward_alive(None)` is False, and reading that
+    # as "no forward is running" would be the same mistake this release spent itself
+    # removing: a record written before rc-repro tracked the pid, or by a path that
+    # never had one, tells us nothing about what is listening. No pid is "I cannot
+    # say", and the note claims a fact, so it stays quiet.
+    forward = []
+    recorded_pid = extra.get("port_forward_pid")
+    if ns and recorded_pid and not k8s.forward_alive(recorded_pid, namespace=ns,
+                                                    host_port=port):
+        forward = [note_group("The URL is not published right now", body=[
+            f"No port-forward is running for this workspace, so {root} will not "
+            f"answer -- a forward dies with its pod, and rc-repro does not keep one "
+            f"alive in the background. This says nothing about Rocket.Chat itself; "
+            f"the pods may be perfectly healthy."],
+            commands=[f"rc-repro ready --name {meta.name}",
+                      f"rc-repro start --name {meta.name}   # if it is stopped"])]
     reach = []
     if addr:
         reach = [note_group("Reachable from other machines", body=[
@@ -2043,6 +2070,7 @@ def kubernetes_note_groups(meta: runner.Metadata) -> list[dict]:
             ("Pods", f"about {pods}"),
         ]),
         mongo_group,
+        *forward,
         *reach,
         # THE ORDER IS THE SEQUENCE somebody has to perform, and it was wrong: the
         # port-forward came first, so the first command anyone pasted ran against
@@ -3064,6 +3092,17 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
                 if gpid:
                     _stop_port_forward(int(gpid),
                                        namespace=k8s.MONITORING_NAMESPACE)
+                # RETURN DELIBERATELY NOT READ, and this is the one place on this
+                # path where that is right. An audit flagged it as the same defect as
+                # the four fixed in v0.76.4 and it is not: `remove_operator` returns
+                # False for THREE reasons -- not installed, still wanted by another
+                # workspace, and a failed uninstall -- and the first two are the
+                # normal outcome of a shared resource being shared. Only the third is
+                # a problem, and it already warns at the point of failure, with the
+                # helm reason. Branching on the bool here would report "the operator
+                # could not be removed" every time it was correctly left up for a
+                # second workspace. Checked by reading both functions: a false
+                # warning on the everyday path is worse than no warning.
                 k8s.remove_operator(context=context, excluding=ns, emit=emit)
                 # AND the monitoring stack, which had the same hole and is far more
                 # expensive: ten pods and ~840 MB left running after the workspace that
@@ -3073,6 +3112,9 @@ def teardown(name: str, *, volumes: bool = False, confirm: bool = False, emit: E
                 # `monitor --off` ever called it, so `down --volumes` walked past it.
                 # On Compose there was nothing to fix: the stack is part of the
                 # workspace's own compose project and goes down with it.
+                # Same, and more so: `remove_monitoring` returns True even when the
+                # uninstall failed, because the release is gone either way and it has
+                # already warned and cleared the finalizers itself.
                 k8s.remove_monitoring(context=context, excluding=ns, emit=emit)
                 # CHECKED, not assumed. `ignore_errors=True` means a record that
                 # could not be removed -- a permission problem, a file held open --
@@ -3328,9 +3370,15 @@ def prune(*, confirm: bool = False, orphans: bool = False,
         removed.append(name)
         info(emit, f"pruned {name!r}", phase="done")
     swept = []
+    # HOISTED, and that is the fix. The sweep below resolved the context properly and
+    # the wait further down used the hardcoded `k8s.CONTEXT` -- the very hardcoding
+    # `_orphan_context` was introduced to remove, reintroduced one block later. On any
+    # cluster rc-repro did not create the two disagreed, so the wait asked a context
+    # that does not exist and read the failure as "gone". One variable, so they cannot
+    # drift apart again.
+    ctx = _orphan_context()
     if stray:
         from rc_repro.services import k8s
-        ctx = _orphan_context()
         for ns in stray:
             res = k8s.run(["kubectl", "--context", ctx, "delete", "namespace",
                            ns, "--wait=false"], timeout=k8s.APPLY_TIMEOUT,
@@ -3354,7 +3402,7 @@ def prune(*, confirm: bool = False, orphans: bool = False,
             # workspace namespace remains, so dropping this answer turned the
             # single-pass prune back into the two-run behaviour it was fixed for --
             # silently, which is the part worth fixing.
-            if not k8s.wait_namespace_gone(ns, context=k8s.CONTEXT, emit=emit):
+            if not k8s.wait_namespace_gone(ns, context=ctx, emit=emit):
                 warn(emit, f"namespace {ns} is still terminating, so the cluster is "
                            f"left alone this pass — `rc-repro prune` again once "
                            f"`kubectl get ns` is clear.", phase="done")
@@ -3533,6 +3581,13 @@ def _create_kubernetes(req: CreateReq, emit: Emit = null_emit) -> dict:
     # namespace to collide with, and `ensure_namespace` makes the same check again once
     # the cluster is up.
     if not plan.create:
+        # THE PREFLIGHT NEEDS A KUBECONFIG THAT KNOWS THIS CONTEXT, and on a fresh
+        # RC_REPRO_HOME it does not have one: the cluster exists, so nothing was
+        # created, so nothing exported the context this is about to ask through.
+        # Every attempt then failed with `context was not found` and the next one
+        # failed identically, because the export runs later in the create it never
+        # reached. Idempotent, and a no-op for a cluster rc-repro did not make.
+        k8s.ensure_kubeconfig(plan, emit=emit)
         k8s.assert_namespace_available(repro_name, context=plan.context,
                                        owner=req.actor)
     provisional = runner.Metadata(
@@ -3727,6 +3782,12 @@ def kubernetes_state(name: str, meta) -> str:
     return "running" if k8s.workspace_ready(name, context=context) else "starting"
 
 
+#: How many consecutive ready-but-not-Rocket.Chat rounds before the port is called
+#: foreign. Each round costs a `workspace_ready` probe plus a socket check, so this is
+#: seconds of grace for a pod that has just passed its probe -- not a retry budget.
+FOREIGN_PORT_STRIKES = 4
+
+
 def _wait_serving_kubernetes(meta: runner.Metadata, emit: Emit,
                              timeout: float) -> dict:
     """Wait for a Kubernetes workspace to serve, and make sure it is reachable.
@@ -3746,6 +3807,9 @@ def _wait_serving_kubernetes(meta: runner.Metadata, emit: Emit,
     namespace = str(extra.get("namespace") or k8s.namespace_for(meta.name))
     deadline = _time.monotonic() + timeout
     last = 0.0
+    #: Consecutive rounds where the workspace is ready and the port answers with
+    #: something that is not Rocket.Chat. Grace, not tolerance: it ends in a refusal.
+    foreign = 0
     while _time.monotonic() < deadline:
         if k8s.workspace_ready(meta.name, context=context):
             pid = k8s.ensure_port_forward(
@@ -3763,10 +3827,71 @@ def _wait_serving_kubernetes(meta: runner.Metadata, emit: Emit,
             # is not up yet go round again rather than reporting a workspace the
             # caller cannot reach.
             if k8s.forward_reachable(meta.host_port):
-                info(emit, f"{meta.name!r} is serving at {meta.root_url}",
-                     phase="ready", pct=100)
-                return {"ready": True, "url": meta.root_url}
-            extra = dict(extra, port_forward_pid=pid)
+                # OCCUPANCY IS NOT IDENTITY, and this was the only runtime that
+                # confused the two. The Docker path has always gone through
+                # `rcapi.wait_ready`, which polls /api/info; here readiness was
+                # concluded from a Ready pod plus "the port answers" and nothing ever
+                # asked Rocket.Chat anything. A foreign process holding the recorded
+                # port therefore passed: `ready` printed "is serving at <url>" and
+                # exited 0 while a completely different program served that URL, and
+                # every conclusion a support engineer drew from it was about the wrong
+                # software. The port is only validated at create time and 3000+ is the
+                # most contested range on a dev box, so this is an ordinary event.
+                served = rcapi.api_info(meta.root_url)
+                if served is not None:
+                    # THE SERVICE IS NEVER TRAVERSED by anything on this path, and on
+                    # this runtime that matters: readiness reads pod status, the
+                    # port-forward targets the Deployment, and the default deployment
+                    # is microservices, where in-cluster Service traffic is what
+                    # carries the product. So a Service whose selector matches nothing
+                    # looked exactly like a healthy workspace -- reachable through the
+                    # forward, 200 from the host, and dead to every pod in the cluster.
+                    #
+                    # WARNED, not gated: endpoints churn during a rollout and a false
+                    # negative here would block a boot, which is worse than the defect.
+                    empty = k8s.services_without_endpoints(meta.name, context=context)
+                    if empty:
+                        warn(emit, "no ready pod is behind "
+                                   + ", ".join(empty)
+                                   + f" — the URL works because the port-forward goes "
+                                     f"straight to the Deployment, but nothing inside "
+                                     f"the cluster can reach {'these' if len(empty) > 1 else 'it'}"
+                                     f". `kubectl -n {namespace} get endpointslices` "
+                                     f"shows what is behind each Service.",
+                             phase="ready")
+                    info(emit, f"{meta.name!r} is serving at {meta.root_url}",
+                         phase="ready", pct=100)
+                    return {"ready": True, "url": meta.root_url}
+                # WHOSE forward is irrelevant once the workspace itself is ready.
+                # The first version raised only when our forward was dead, and the
+                # live run found the case that misses: on a dual-stack box kubectl
+                # binds `[::1]` quite happily while a squatter holds `127.0.0.1`, so
+                # our forward is ALIVE, `localhost` resolves v4-first to the squatter,
+                # and this polled to a timeout. Measured -- `ss -ltnp` showed python
+                # on 127.0.0.1:3001 and kubectl on [::1]:3001 at the same moment.
+                #
+                # So the test is the workspace's own state: if Kubernetes says it is
+                # ready and the port answers with something that is not Rocket.Chat,
+                # then whatever is on that port is not this workspace, and waiting
+                # will not change it. Counted rather than acted on at once, because a
+                # pod that has just passed its probe may not be serving for another
+                # moment, and accusing somebody then would be worse than waiting.
+                foreign += 1
+                if foreign >= FOREIGN_PORT_STRIKES:
+                    raise ConflictError(
+                        f"port {meta.host_port} is answering, but not with "
+                        f"Rocket.Chat, and {meta.name!r} is otherwise ready — so "
+                        f"nothing served on {meta.root_url} can be trusted to be this "
+                        f"workspace. Something else holds that port. `ss -ltnp | grep "
+                        f"{meta.host_port}` says what; note it may hold only IPv4 "
+                        f"while the port-forward has IPv6, which looks healthy from "
+                        f"rc-repro and wrong from a browser. Free the port, or "
+                        f"`rc-repro down --name {meta.name}` then `rc-repro up` for "
+                        f"one that is free.")
+                extra = dict(extra, port_forward_pid=pid)
+            else:
+                foreign = 0
+                extra = dict(extra, port_forward_pid=pid)
         # Stop waiting for something Kubernetes has already decided cannot happen.
         # A mistyped version or an unreachable registry used to cost the full timeout
         # and then report the timeout rather than the cause.

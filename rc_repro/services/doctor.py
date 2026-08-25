@@ -519,8 +519,12 @@ def run_checks() -> dict:
                 # rather than left to infer it from a context called `default` -- and
                 # the node count is what decides whether a node-local StorageClass can
                 # bite.
+                # "0 nodes" WAS PRINTED FOR A CLUSTER NOBODY COULD READ, beside a
+                # tick, on a single-node cluster that was up. A count we do not have
+                # is not a count of zero.
                 shape = ", ".join(
-                    [f"{pre.node_count} node" + ("s" if pre.node_count != 1 else "")]
+                    (["node count unknown"] if "nodes" in pre.unreadable else
+                     [f"{pre.node_count} node" + ("s" if pre.node_count != 1 else "")])
                     + ([", ".join(pre.architectures)] if pre.architectures else []))
                 where = (f" ({pre.distribution or 'unknown'}, {shape})" if shape
                          else f" ({pre.distribution or 'unknown'})") + where
@@ -533,7 +537,17 @@ def run_checks() -> dict:
                                "cluster itself", check="kubernetes-cluster")
                 else:
                     line("ok", f"Cluster {k8s.CLUSTER_NAME!r} reachable{where}", check="kubernetes-cluster")
-                if not pre.default_storage_class:
+                if "storage" in pre.unreadable:
+                    # NOT "no default StorageClass". The cluster refused the read, so
+                    # rc-repro does not know whether a volume would bind -- and saying
+                    # it would not is a false fact that sends someone to install a
+                    # provisioner they already have. `up` will refuse with the real
+                    # permission error; this says so rather than pre-empting it wrongly.
+                    line(needed, f"Cluster {pre.context!r} would not let rc-repro read "
+                                 "its StorageClasses, so whether a workspace's volume "
+                                 "can bind is unknown — check the credential in your "
+                                 "kubeconfig has read access", check="kubernetes-storage")
+                elif not pre.default_storage_class:
                     # The guide's own warning, and the failure is silent: a PVC
                     # stays Pending forever and nothing names storage.
                     line(needed, f"Cluster {pre.context!r} has no default "
@@ -551,7 +565,11 @@ def run_checks() -> dict:
                 # `ingress_blocker` is what refuses when something asks for a hostname.
                 # A doctor that warns about a feature you are not using teaches people
                 # to ignore its warnings.
-                if pre.ingress_classes:
+                if "ingress" in pre.unreadable:
+                    line("warn", f"Cluster {pre.context!r} would not let rc-repro read "
+                                 "its IngressClasses — whether a hostname can be "
+                                 "served from it is unknown", check="kubernetes-ingress")
+                elif pre.ingress_classes:
                     line("ok", "Ingress: " + ", ".join(pre.ingress_classes)
                          + " — a hostname can be served from this cluster",
                          check="kubernetes-ingress")
@@ -651,6 +669,22 @@ def run_checks() -> dict:
                                f"will NOT be used — rc-repro creates its own while kind "
                                f"is installed. Uninstall kind to use {other!r} instead",
                          check="kubernetes-other-clusters")
+            elif pre.context == k8s.CONTEXT and pre.cluster_exists:
+                # NOT "its API server is not answering", which is what this said and
+                # was measured to be false: the cluster was up, `/readyz` said ok and
+                # the control plane had been running for minutes. The real state is
+                # that THIS RC_REPRO_HOME has never used the cluster, so rc-repro's
+                # own kubeconfig does not name the context yet -- and the next `up`
+                # exports it and reuses the cluster.
+                #
+                # The old wording pointed at deleting a healthy cluster that may hold
+                # somebody else's workspace, which is the worst advice available here.
+                # And it fired by following CLAUDE.md's own instruction to run scripts
+                # under `export RC_REPRO_HOME=$(mktemp -d)`.
+                line("ok", f"Cluster {k8s.CLUSTER_NAME!r} exists and this "
+                           f"RC_REPRO_HOME has not used it yet, so its kubeconfig is "
+                           f"not exported here — the next `rc-repro up` exports it "
+                           f"and reuses the cluster", check="kubernetes-cluster")
             elif pre.context:
                 line(needed, f"Cluster {pre.context!r} is configured but its API "
                              "server is not answering", check="kubernetes-cluster")
