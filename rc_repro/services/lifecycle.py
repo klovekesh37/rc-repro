@@ -2446,6 +2446,26 @@ TRANSIENT_STATES = ("restarting", "created", "paused", "dead")
 ESSENTIAL_SERVICES = ("mongodb",)
 
 
+def _forward_gap(meta: runner.Metadata) -> str:
+    """Why a running Kubernetes workspace's URL will not answer, or "".
+
+    Only where a pid was actually recorded: `forward_alive(None)` is False, and
+    reading that as "nothing is running" is the confusion this release spent itself
+    removing. A `/proc` read per row is cheap enough for `list`.
+    """
+    from rc_repro.services import k8s
+
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    pid = extra.get("port_forward_pid")
+    if not pid:
+        return ""
+    ns = str(extra.get("namespace") or k8s.namespace_for(meta.name))
+    if k8s.forward_alive(pid, namespace=ns, host_port=meta.host_port):
+        return ""
+    return ("no port-forward, so the URL will not answer — "
+            f"`rc-repro ready --name {meta.name}` re-establishes it")
+
+
 def degraded_reason(services: dict) -> str:
     """Why a workspace that LOOKS running is not usable, or "".
 
@@ -2507,8 +2527,17 @@ def list_repros() -> list[dict]:
             state = "?" if not docker_up else repro_state(
                 rc_status, bool(states.get(m.project)))
         uptime, health = _uptime_health(rc_status)
-        degraded_why = (degraded_reason(svc_map.get(m.project, {}))
-                        if state == "running" else "")
+        if topology.of_meta(m) == topology.KUBERNETES:
+            # `list` printed `running` beside a URL that refused connections, and only
+            # `info` said otherwise. A port-forward dies with its pod, so this is the
+            # NORMAL state after any restart -- and `running` is not wrong about the
+            # pods, which is exactly why the reader has nothing to go on. Carried in
+            # `degraded`, the field both front-ends already render for the Compose
+            # side, so no consumer has to learn a new key.
+            degraded_why = _forward_gap(m) if state == "running" else ""
+        else:
+            degraded_why = (degraded_reason(svc_map.get(m.project, {}))
+                            if state == "running" else "")
         degraded = "degraded" if degraded_why else ""
         runtime = topology.of_meta(m)
         monitored = bool(isinstance(m.extra, dict) and m.extra.get("monitoring"))
@@ -3240,6 +3269,10 @@ def orphan_namespaces(context: str = "") -> list[str]:
         found = k8s.workspace_namespaces(ctx)
     except Exception:  # noqa: BLE001 - no cluster is not an error here
         return []
+    if found is None:
+        # Could not ask. Sweeping nothing is the safe answer: the alternative is
+        # `prune --orphans` reporting a clean cluster it never managed to read.
+        return []
     known = {k8s.namespace_for(m.name) for m in runner.list_meta()}
     return sorted(ns for ns in found
                   if ns not in known and ns != k8s.OPERATOR_NAMESPACE)
@@ -3765,7 +3798,17 @@ def kubernetes_state(name: str, meta) -> str:
     """
     from rc_repro.services import k8s
     context = str((getattr(meta, "extra", None) or {}).get("context") or k8s.CONTEXT)
-    if k8s.namespace_for(name) not in k8s.workspace_namespaces(context):
+    # "?" ON A REFUSED READ, which is the word the Docker branch one function up
+    # already uses when the daemon is unreachable -- and which the browser already
+    # renders (app.js `stateClass`, and the guard that stops it claiming "0 running").
+    # Without it a healthy workspace read as `down` whenever the cluster could not be
+    # asked: measured at 8.3s, one PROBE_TIMEOUT, with `docker pause` on the control
+    # plane, while the workspace was serving throughout. `down` is the word that
+    # invites `up --force` and `down --volumes`, so it is the worst available guess.
+    held = k8s.workspace_namespaces(context)
+    if held is None:
+        return "?"
+    if k8s.namespace_for(name) not in held:
         return "down"
     # The namespace EXISTING is not the workspace running. A plain `down` keeps the
     # namespace and its PVC on purpose and uninstalls the release, so a torn-down
@@ -3819,6 +3862,14 @@ def _wait_serving_kubernetes(meta: runner.Metadata, emit: Emit,
             if pid and pid != extra.get("port_forward_pid"):
                 runner.update_meta(meta.name,
                                    lambda m: m.extra.update({"port_forward_pid": pid}))
+                # AND IN MEMORY, or whoever renders from this `meta` afterwards is
+                # reading the pid we just replaced. `ready` repaired a dead forward
+                # and then printed "The URL is not published right now" underneath
+                # "is serving at <url>" -- both true of different moments, and only
+                # on the repair path. That note is the only honest signal about a
+                # dead forward, so a false one there teaches people to ignore it.
+                if isinstance(meta.extra, dict):
+                    meta.extra["port_forward_pid"] = pid
             # The pod being Ready is not the URL answering. `kubectl port-forward`
             # returns a pid before it binds the socket, so declaring ready here on
             # the strength of the pid alone is a guess -- and after `restart` it was

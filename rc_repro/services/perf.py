@@ -504,7 +504,15 @@ def bench_one(version: str, profile: str, offline: bool, no_pull: bool, emit: Em
     mon = None
     try:
         pre = presets_load_default()
-        host_port = runner.pick_port()
+        # THROUGH THE BOX-WIDE LOCK, like every other allocation. `runner.pick_port`
+        # is the unsynchronised primitive: it reads the claimed set and returns,
+        # claiming nothing, so two callers between a read and a write get the same
+        # number -- measured, `[3005, 3005, 3005]` for three calls in a row. `up` was
+        # never exposed (it goes through `pick_host_port`, which holds `_PORT_LOCK`
+        # and comes back with five distinct ports under five threads), but a
+        # `benchmark` racing an `up` was.
+        from rc_repro.services.lifecycle import pick_host_port
+        host_port = pick_host_port(0, pre)
         spec = compose.Spec.from_resolved(
             resolved, project_name=runner.project_name(name),
             root_url=f"http://localhost:{host_port}", host_port=host_port, reg_token=None, preset=pre)
